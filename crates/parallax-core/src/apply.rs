@@ -229,8 +229,10 @@ fn apply_dnsmasq(
     let conf_str = conf_path.to_string_lossy().into_owned();
     let pid_path = out_dir.join(DNSMASQ_PIDFILE);
     let pid_str = pid_path.to_string_lossy().into_owned();
+    let conf_arg = format!("--conf-file={conf_str}");
+    let pid_arg = format!("--pid-file={pid_str}");
     sys.runner
-        .run_checked("dnsmasq", &["--test", "--conf-file", &conf_str], None)?;
+        .run_checked("dnsmasq", &["--test", &conf_arg], None)?;
     // dnsmasq only re-reads hosts files on SIGHUP, not server=/alias= lines: restart.
     if let Some(pid) = sys.fs.read(&pid_path)? {
         let pid = pid.trim().to_string();
@@ -239,18 +241,8 @@ fn apply_dnsmasq(
             log.push(format!("dnsmasq: stopped previous instance (pid {pid})"));
         }
     }
-    sys.runner.run_checked(
-        "dnsmasq",
-        &[
-            "--conf-file",
-            &conf_str,
-            "--pid-file",
-            &pid_str,
-            "--user",
-            "root",
-        ],
-        None,
-    )?;
+    sys.runner
+        .run_checked("dnsmasq", &[&conf_arg, &pid_arg, "--user=root"], None)?;
     log.push("dnsmasq: started with the generated shim config".into());
     Ok(())
 }

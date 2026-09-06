@@ -12,5 +12,5 @@ ip link add wg0 type wireguard
 ip address replace 10.8.0.1/16 dev wg0
 wg syncconf wg0 /var/lib/parallax/wireguard/wg0.conf
 ip link set up dev wg0
-dnsmasq --test --conf-file /var/lib/parallax/dnsmasq/parallax.conf
-dnsmasq --conf-file /var/lib/parallax/dnsmasq/parallax.conf --pid-file /var/lib/parallax/dnsmasq/dnsmasq.pid --user root
+dnsmasq --test --conf-file=/var/lib/parallax/dnsmasq/parallax.conf
+dnsmasq --conf-file=/var/lib/parallax/dnsmasq/parallax.conf --pid-file=/var/lib/parallax/dnsmasq/dnsmasq.pid --user=root
