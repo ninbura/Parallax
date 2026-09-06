@@ -1,0 +1,1 @@
+template 'personal' asks for split DNS but the mobile WireGuard apps cannot do it; this export sends all DNS to the shim

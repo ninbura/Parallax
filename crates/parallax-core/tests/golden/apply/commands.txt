@@ -1,0 +1,16 @@
+nft --version
+wg --version
+ip -V
+dnsmasq --version
+nft -c -f /var/lib/parallax/nftables/parallax.nft
+nft -f /var/lib/parallax/nftables/parallax.nft
+nft -a list chain ip filter DOCKER-USER
+nft delete rule ip filter DOCKER-USER handle 12
+nft -f /var/lib/parallax/nftables/docker-user.nft
+ip link show dev wg0
+ip link add wg0 type wireguard
+ip address replace 10.8.0.1/16 dev wg0
+wg syncconf wg0 /var/lib/parallax/wireguard/wg0.conf
+ip link set up dev wg0
+dnsmasq --test --conf-file /var/lib/parallax/dnsmasq/parallax.conf
+dnsmasq --conf-file /var/lib/parallax/dnsmasq/parallax.conf --pid-file /var/lib/parallax/dnsmasq/dnsmasq.pid --user root

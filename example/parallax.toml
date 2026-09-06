@@ -1,0 +1,134 @@
+# Parallax configuration: the canonical scenario.
+#
+# One home LAN (192.168.1.0/24, which collides with most guest networks) is
+# presented to every VPN client as 192.168.240.0/24. Two policy templates:
+# "personal" reaches everything, "family" reaches exactly one service. Both
+# transports (WireGuard and Tailscale via Headscale) are always on; every
+# template applies to both. `transport` on a peer records which one that
+# device uses; it is not a policy choice.
+#
+# Keys in this file are throwaway demo keys so the file round-trips in tests.
+# Never reuse them.
+
+[server.wireguard]
+interface = "wg0"
+listen_port = 51820
+# Every template pool is carved from this range; the gateway takes 10.8.0.1.
+supernet = "10.8.0.0/16"
+# What clients connect to.
+endpoint = "vpn.mydomain.com:51820"
+# Public half of the key in private_key_file. `parallax keygen --write-config` fills this in.
+public_key = "DSuieBHAaq5V19ySBwUTiLBh9Pnduq1K9gcWaxXqMVc="
+private_key_file = "/etc/parallax/wg-server.key"
+
+[server.headscale]
+# Control plane only; carries no traffic. Driven through its API from M2 on.
+server_url = "https://headscale.mydomain.com"
+api_key_file = "/etc/parallax/headscale-api.key"
+# "embedded" uses Headscale's built-in DERP relay; "tailscale" uses the public relay map.
+derp = "embedded"
+# Name of the subnet-router node running inside the parallax container.
+subnet_router_node = "parallax-gateway"
+interface = "tailscale0"
+
+[server.dns]
+# The shim listens on the WireGuard gateway address unless overridden.
+# listen = "10.8.0.1"
+port = 53
+# Catch-all for tunnel-wide-fallback templates only (mobile WireGuard apps).
+public_resolver = "1.1.1.1"
+
+[server.firewall]
+# "nftables" (default) or "iptables-nft".
+backend = "nftables"
+# Set when the gateway runs host-networked next to Docker: adds DOCKER-USER accepts.
+docker_coexistence = true
+
+# A physical network the gateway reaches. `mapped_to` is the collision-free
+# prefix clients see; host bits are preserved (192.168.1.5 -> 192.168.240.5).
+# `domains` are the DNS zones whose names live here: they scope the shim, the
+# clients' routing domains and (M2) Headscale split DNS. The real home
+# resolver stays the source of truth; Parallax holds no records.
+[[network]]
+name = "home"
+interface = "eth0"
+subnet = "192.168.1.0/24"
+mapped_to = "192.168.240.0/24"
+upstream_dns = ["192.168.1.1"]
+domains = ["mydomain.com"]
+# Leave off unless your router cannot hold a static route back to the tunnel
+# ranges; masquerading hides the peer's address from LAN services.
+masquerade = false
+
+# Named host:port targets. `nginx_vhost = true` also emits an allow/deny
+# snippet for the vhost, because L3 rules gate the port, not the virtual host.
+[[service]]
+name = "immich"
+host = "192.168.1.5"
+proto = "tcp"
+port = 443
+nginx_vhost = true
+
+# Templates are the policy classes. The WireGuard pool *is* the trust tier:
+# firewall and nginx rules match the pool, so adding a peer needs no new rule.
+[[template]]
+name = "personal"
+grants = [{ kind = "all_networks" }]
+[template.wireguard]
+pool = "10.8.1.0/24"
+[template.headscale]
+user = "gabriel"
+[template.dns]
+# split: only the home zones go to the shim; everything else stays local.
+wireguard = "split"
+tailscale = "split"
+[template.client]
+# mapped_subnets: routes for the visible networks' client prefixes plus the shim.
+allowed_ips = "mapped_subnets"
+persistent_keepalive = 25
+
+[[template]]
+name = "family"
+grants = [{ kind = "service", name = "immich" }]
+[template.wireguard]
+pool = "10.8.2.0/24"
+[template.headscale]
+tag = "tag:family"
+[template.dns]
+# Plain WireGuard cannot split DNS on phones, so send everything to the shim;
+# the Tailscale client does split DNS natively on every platform.
+wireguard = "tunnel_wide"
+tailscale = "split"
+[template.client]
+# grants_only: the config routes just the granted hosts (in virtual space) plus the shim.
+allowed_ips = "grants_only"
+persistent_keepalive = 25
+
+# Peers. `parallax peer add` appends these; addresses come from the template pool.
+[[peer]]
+name = "router"
+template = "personal"
+transport = "wireguard"
+# Private key not retained: the config was exported once at creation.
+wireguard = { public_key = "pOCSkrZRwni5dyxWn1+puxPZBrRqtoyd+dwrRAn4ogk=", address = "10.8.1.1" }
+
+[[peer]]
+name = "laptop"
+template = "personal"
+transport = "wireguard"
+# Private key retained (--keep-private-key) so configs can be regenerated.
+wireguard = { public_key = "zo060cy2M+x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk=", address = "10.8.1.2", private_key = "AAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAkI=" }
+
+[[peer]]
+name = "sister-phone"
+template = "family"
+transport = "wireguard"
+expires = "2027-12-31"
+wireguard = { public_key = "Xf7dO2vUf2+ijuFdlp1bsOpTd01Ii9r53xxuASSz7yI=", address = "10.8.2.1", private_key = "AAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA0M=", preshared_key = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=" }
+
+# M2 will add Tailscale peers like this one; the engine accepts them today so
+# the model is final, but does nothing with them until Headscale is wired in.
+# [[peer]]
+# name = "apple-tv"
+# template = "personal"
+# transport = "tailscale"

@@ -1,0 +1,1 @@
+peer 'router' does not retain its private key; only the one-time export at creation contained it

@@ -1,0 +1,47 @@
+# Parallax: both services are required. `parallax` carries every packet
+# (WireGuard, the Tailscale subnet router, NETMAP, the DNS shim) in the host
+# network namespace; `headscale` is the control plane and carries no traffic.
+services:
+  parallax:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: parallax:local
+    container_name: parallax
+    restart: unless-stopped
+    # Host networking: wg0 and tailscale0 live next to the LAN interface, and
+    # the nftables table sees real interface names. Requires ip_forward=1 on the host.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE   # only needed if the host has not loaded the wireguard module yet
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./config:/etc/parallax          # parallax.toml + wg-server.key (0600)
+      - parallax-state:/var/lib/parallax
+      - tailscale-state:/var/lib/tailscale
+      - /lib/modules:/lib/modules:ro
+    environment:
+      PARALLAX_CONFIG: /etc/parallax/parallax.toml
+      PARALLAX_OUT: /var/lib/parallax
+    depends_on:
+      - headscale
+
+  headscale:
+    image: headscale/headscale:0.26
+    container_name: headscale
+    restart: unless-stopped
+    command: serve
+    volumes:
+      - ./headscale:/etc/headscale       # config.yaml (see headscale/config.yaml)
+      - headscale-data:/var/lib/headscale
+    ports:
+      - "8080:8080"      # control plane (put behind TLS; server_url must be https)
+      - "3478:3478/udp"  # embedded DERP STUN (derp = "embedded")
+      - "9090:9090"      # metrics (optional)
+
+volumes:
+  parallax-state:
+  tailscale-state:
+  headscale-data:

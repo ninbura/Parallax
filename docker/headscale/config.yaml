@@ -1,0 +1,49 @@
+# Minimal Headscale configuration for Parallax. Adjust server_url to the
+# HTTPS endpoint your reverse proxy exposes. Parallax (M2) manages users,
+# preauth keys, the ACL policy, DNS config and route approval through the API.
+server_url: https://headscale.mydomain.com
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 0.0.0.0:9090
+grpc_listen_addr: 0.0.0.0:50443
+grpc_allow_insecure: false
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+derp:
+  server:
+    # derp = "embedded" in parallax.toml
+    enabled: true
+    region_id: 999
+    region_code: "parallax"
+    region_name: "Parallax embedded DERP"
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
+  # derp = "tailscale": set enabled: false above and keep this URL
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  auto_update_enabled: true
+  update_frequency: 24h
+disable_check_updates: true
+ephemeral_node_inactivity_timeout: 30m
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+log:
+  format: text
+  level: info
+# Parallax generates and pushes the policy; keep this in database mode.
+policy:
+  mode: database
+dns:
+  magic_dns: true
+  base_domain: ts.mydomain.com
+  nameservers:
+    global: []
+    # M2 fills split nameservers per Network.domains -> the shim address.
+    split: {}
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"

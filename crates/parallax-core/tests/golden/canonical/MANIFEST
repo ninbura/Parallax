@@ -1,0 +1,15 @@
+clients/laptop/linux.conf (secret)
+clients/laptop/macos.conf (secret)
+clients/laptop/mobile.conf (secret)
+clients/laptop/windows.conf (secret)
+clients/sister-phone/linux.conf (secret)
+clients/sister-phone/macos.conf (secret)
+clients/sister-phone/mobile.conf (secret)
+clients/sister-phone/windows.conf (secret)
+dnsmasq/parallax.conf
+nftables/docker-user.nft
+nftables/parallax.nft
+nginx/snippets/parallax-family.conf
+nginx/snippets/parallax-personal.conf
+nginx/snippets/parallax-service-immich.conf
+wireguard/wg0.conf (secret)

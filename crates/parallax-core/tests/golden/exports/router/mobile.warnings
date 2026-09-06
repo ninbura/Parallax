@@ -1,0 +1,2 @@
+peer 'router' does not retain its private key; only the one-time export at creation contained it
+template 'personal' asks for split DNS but the mobile WireGuard apps cannot do it; this export sends all DNS to the shim
