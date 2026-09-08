@@ -12,9 +12,11 @@
 //!   ranges are disjoint.
 //! - Every template ends with a per-source default deny; every transport
 //!   ends with a catch-all deny for unknown sources.
-//! - The gateway host itself is not a destination: INPUT from a tunnel
-//!   interface accepts only the DNS shim and ICMP echo, then drops. Anything
-//!   else bound on the (host-networked) gateway stays unreachable from peers.
+//! - The gateway host itself is not a destination unless a network declares
+//!   `gateway_address`: grants covering that address become INPUT accepts with
+//!   the same source and port constraints. Everything else from a tunnel
+//!   interface to the host (beyond the DNS shim and ICMP echo) is dropped, so
+//!   a host-networked gateway does not expose its other services to peers.
 
 use std::fmt::Write as _;
 
@@ -198,6 +200,43 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
     let mut ping = Rule::new(Chain::Input, Action::Accept, "ping the gateway").iifs(&ingress);
     ping.icmp_echo = true;
     rs.rules.push(ping);
+    for t in &cfg.templates {
+        for r in model.reaches(t) {
+            let ReachKind::Lan {
+                network,
+                real,
+                port,
+            } = r.kind
+            else {
+                continue;
+            };
+            let Some(g) = network.gateway_address.filter(|g| real.contains(g)) else {
+                continue;
+            };
+            for tr in &transports {
+                let src = match tr.tier_source(server, t) {
+                    TierSource::Cidr(c) => Match::Cidr(c),
+                    TierSource::Set(s) => Match::Set(s),
+                };
+                rs.rules.push(
+                    Rule::new(
+                        Chain::Input,
+                        Action::Accept,
+                        format!(
+                            "{}/{}: {} (on the gateway host)",
+                            t.name,
+                            tr.kind(),
+                            r.label
+                        ),
+                    )
+                    .iif(tr.ingress_interface(server))
+                    .src(src)
+                    .dst(Match::Cidr(Ipv4Net::new(g, 32).expect("/32")))
+                    .l4(port),
+                );
+            }
+        }
+    }
     rs.rules.push(
         Rule::new(
             Chain::Input,

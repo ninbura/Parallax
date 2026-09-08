@@ -64,6 +64,8 @@ PY
 }
 serve home 443 home-immich
 serve home 8080 home-other
+serve gw 9090 gw-self
+serve gw 9091 gw-hidden
 serve foreign 443 foreign-immich
 # Home DNS: authoritative-ish answers for mydomain.com; foreign DNS for hisdomain.com.
 inns home dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
@@ -86,6 +88,7 @@ docker_coexistence = false
 [[network]]
 name = "home"
 interface = "eth0"
+gateway_address = "192.168.1.1"
 subnet = "192.168.1.0/24"
 mapped_to = "192.168.240.0/24"
 upstream_dns = ["192.168.1.5"]
@@ -95,6 +98,10 @@ name = "immich"
 host = "192.168.1.5"
 port = 443
 nginx_vhost = true
+[[service]]
+name = "gwapp"
+host = "192.168.1.1"
+port = 9090
 [[template]]
 name = "personal"
 grants = [{ kind = "all_networks" }]
@@ -104,7 +111,7 @@ pool = "10.8.1.0/24"
 user = "tester"
 [[template]]
 name = "family"
-grants = [{ kind = "service", name = "immich" }]
+grants = [{ kind = "service", name = "immich" }, { kind = "service", name = "gwapp" }]
 [template.wireguard]
 pool = "10.8.2.0/24"
 [template.headscale]
@@ -153,7 +160,8 @@ curl_as() { # src, url  -> body or "BLOCKED"
 # (a) mapped virtual IP lands on the real host
 [ "$(curl_as 10.8.1.1 http://192.168.240.5:8080/)" = home-other ] || fail "(a) personal -> 192.168.240.5:8080"
 [ "$(curl_as 10.8.1.1 http://192.168.240.5:443/)" = home-immich ] || fail "(a) personal -> 192.168.240.5:443"
-pass "(a) personal peer reaches the mapped virtual address on the real host"
+[ "$(curl_as 10.8.1.1 http://192.168.240.1:9090/)" = gw-self ] || fail "(a) personal -> service on the gateway host"
+pass "(a) personal peer reaches the mapped virtual address on the real host and on the gateway host"
 
 # (b) shim answers in virtual space
 ANS=$(inns client dig +short -b 10.8.1.1 @10.8.0.1 immich.mydomain.com)
@@ -163,6 +171,8 @@ pass "(b) shim rewrites immich.mydomain.com to 192.168.240.5"
 # (c) guest: granted host:port works, everything else is dropped despite 0.0.0.0/0
 [ "$(curl_as 10.8.2.1 http://192.168.240.5:443/)" = home-immich ] || fail "(c) guest -> immich"
 [ "$(curl_as 10.8.2.1 http://192.168.240.5:8080/)" = BLOCKED ] || fail "(c) guest reached a non-granted port"
+[ "$(curl_as 10.8.2.1 http://192.168.240.1:9090/)" = gw-self ] || fail "(c) guest -> granted service on the gateway host"
+[ "$(curl_as 10.8.2.1 http://192.168.240.1:9091/)" = BLOCKED ] || fail "(c) guest reached a non-granted port on the gateway host"
 [ "$(curl_as 10.8.2.1 http://192.168.240.1:8080/)" = BLOCKED ] || fail "(c) guest reached the gateway LAN address"
 ANS=$(inns client dig +short +time=1 +tries=1 -b 10.8.2.1 @10.8.0.1 immich.mydomain.com || true)
 [ "$ANS" = 192.168.240.5 ] || fail "(c) guest could not use the shim (tunnel-wide DNS): '$ANS'"

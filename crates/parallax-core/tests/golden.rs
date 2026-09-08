@@ -114,6 +114,51 @@ fn internet_grant_and_masquerade_match_golden() {
 }
 
 #[test]
+fn gateway_address_turns_grants_into_input_accepts() {
+    let mut cfg = canonical_config();
+    cfg.networks[0].gateway_address = Some("192.168.1.5".parse().unwrap());
+    let bundle = bundle_for(&cfg);
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    check_golden("variants/gateway-address.nft", &fw.contents);
+    let input: Vec<&str> = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("chain input"))
+        .take_while(|l| !l.contains("chain forward"))
+        .collect();
+    assert!(
+        input
+            .iter()
+            .any(|l| l.contains("ip saddr 10.8.1.0/24 ip daddr 192.168.1.5 accept")),
+        "{input:#?}"
+    );
+    assert!(
+        input
+            .iter()
+            .any(|l| l.contains("ip saddr 10.8.2.0/24 ip daddr 192.168.1.5 tcp dport 443 accept")),
+        "{input:#?}"
+    );
+    let drop_idx = input
+        .iter()
+        .position(|l| l.contains("may not reach anything else"))
+        .unwrap();
+    let accept_idx = input
+        .iter()
+        .position(|l| l.contains("family/wireguard: service immich"))
+        .unwrap();
+    assert!(accept_idx < drop_idx, "grant accepts must precede the drop");
+    // A gateway address outside the subnet is rejected.
+    cfg.networks[0].gateway_address = Some("192.168.9.5".parse().unwrap());
+    let (errors, _) = parallax_core::validate::check(&cfg);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("gateway_address 192.168.9.5 is not inside")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn guest_allowed_ips_are_granted_hosts_only_in_virtual_space() {
     let cfg = canonical_config();
     let model = Model::resolve(&cfg, today()).unwrap();

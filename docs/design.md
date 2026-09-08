@@ -56,6 +56,7 @@ pub struct ServerConfig {
 pub struct Network {
     pub name: String,
     pub interface: String,
+    pub gateway_address: Option<Ipv4Addr>, // the gateway host's own LAN address
     pub subnet: Ipv4Net,              // real
     pub mapped_to: Option<Ipv4Net>,   // virtual, same prefix length
     pub upstream_dns: Vec<Ipv4Addr>,
@@ -133,9 +134,18 @@ with a catch-all deny. `TailscaleTransport` implements those five methods
 today and returns `NotImplemented` for provision/export.
 
 The INPUT chain is locked down too: from a tunnel interface only the shim
-(UDP/TCP 53 to the shim address) and ICMP echo are accepted, then drop. A
-host-networked gateway otherwise exposes every published container port and
-its SSH to guest peers. LAN-side INPUT is untouched (policy accept).
+(UDP/TCP 53 to the shim address), ICMP echo, and grants that cover a network's
+`gateway_address` are accepted, then drop. A host-networked gateway otherwise
+exposes every published container port and its SSH to guest peers. With
+`gateway_address` set, services on the gateway box itself are reachable
+through the mapping exactly like any other LAN host, tier by tier. LAN-side
+INPUT is untouched (policy accept).
+
+Docker note: a Docker-published port on the gateway host is reached through
+`docker-proxy` listening on the host address, because the NETMAP DNAT and
+Docker's DNAT cannot both apply to one connection. That is Docker's default
+(`userland-proxy: true`); with it disabled, published ports are not reachable
+via the virtual address.
 
 ## Generated artifacts (output directory layout)
 

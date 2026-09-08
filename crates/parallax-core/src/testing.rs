@@ -48,6 +48,7 @@ pub fn canonical_config() -> Config {
         networks: vec![Network {
             name: "home".into(),
             interface: "eth0".into(),
+            gateway_address: None,
             subnet: "192.168.1.0/24".parse().unwrap(),
             mapped_to: Some("192.168.240.0/24".parse().unwrap()),
             upstream_dns: vec![Ipv4Addr::new(192, 168, 1, 1)],

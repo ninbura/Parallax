@@ -52,6 +52,10 @@ docker_coexistence = true
 [[network]]
 name = "home"
 interface = "eth0"
+# The gateway host's own address here. Set it when services run on the
+# gateway box itself (e.g. Docker containers with published ports); grants
+# covering it then open the host, not just the LAN behind it.
+# gateway_address = "192.168.1.2"
 subnet = "192.168.1.0/24"
 mapped_to = "192.168.240.0/24"
 upstream_dns = ["192.168.1.1"]

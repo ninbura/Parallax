@@ -440,6 +440,14 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                 n.subnet
             ));
         }
+        if let Some(g) = n.gateway_address {
+            if !n.subnet.contains(&g) {
+                errors.push(format!(
+                    "{ctx}: gateway_address {g} is not inside subnet {}",
+                    n.subnet
+                ));
+            }
+        }
         if !n.domains.is_empty() && n.upstream_dns.is_empty() {
             errors.push(format!(
                 "{ctx}: domains {:?} need at least one upstream_dns resolver",

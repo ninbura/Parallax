@@ -16,6 +16,12 @@ pub struct Network {
     pub name: String,
     /// Gateway interface attached to this network (e.g. `eth0`).
     pub interface: String,
+    /// The gateway host's own address on this network. Grants that cover it
+    /// become INPUT accepts, so services running on the gateway box itself
+    /// (including Docker-published ports) are reachable through the mapping.
+    /// Without it, peers can only ping the gateway and use the DNS shim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_address: Option<Ipv4Addr>,
     /// The real prefix as configured on the LAN.
     pub subnet: Ipv4Net,
     /// Collision-free virtual prefix presented to clients. Same prefix length
