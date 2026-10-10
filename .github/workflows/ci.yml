@@ -34,3 +34,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -f docker/Dockerfile -t parallax:ci .
       - run: docker run --rm --entrypoint parallax parallax:ci --version
+      - run: sudo modprobe wireguard
+      - run: docker run --rm --network host --cap-add NET_ADMIN -v "$PWD/example/parallax.toml:/etc/parallax/parallax.toml:ro" parallax:ci check

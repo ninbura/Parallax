@@ -1,13 +1,15 @@
 #!/bin/sh
 # Parallax container entrypoint.
 #   run       apply the configuration, start tailscaled, stay up; SIGHUP re-applies
+#   check     run the startup checks only, then exit (used by CI)
 #   <other>   pass through to the parallax binary (e.g. `peer add ...`)
 set -eu
 
 CONFIG="${PARALLAX_CONFIG:-/etc/parallax/parallax.toml}"
 OUT="${PARALLAX_OUT:-/var/lib/parallax}"
 
-if [ "${1:-run}" != "run" ]; then
+MODE="${1:-run}"
+if [ "$MODE" != "run" ] && [ "$MODE" != "check" ]; then
     exec parallax -c "$CONFIG" "$@"
 fi
 
@@ -24,13 +26,22 @@ if ! ip link add parallax-probe type wireguard 2>/dev/null; then
     fail "cannot create a WireGuard interface: the host kernel lacks the wireguard module (modprobe wireguard on the host, or use a kernel >= 5.6)"
 fi
 ip link del parallax-probe
-if ! nft -c -f - <<'NFT' 2>/dev/null
+if ! NFT_ERR="$(nft -c -f - 2>&1 <<'NFT'
 table inet parallax_probe {
-    chain pre { type nat hook prerouting priority dstnat; ip daddr 192.0.2.0/24 dnat ip prefix to ip daddr map { 192.0.2.0/24 : 198.51.100.0/24 } }
+    chain pre {
+        type nat hook prerouting priority dstnat;
+        ip daddr 192.0.2.0/24 dnat ip prefix to ip daddr map { 192.0.2.0/24 : 198.51.100.0/24 }
+    }
 }
 NFT
+)"
 then
-    fail "the kernel or nft rejects NETMAP (prefix nat); needs nftables >= 0.9.4 and kernel nf_nat with prefix mapping"
+    fail "the kernel or nft rejects NETMAP (prefix nat); needs nftables >= 0.9.4 and kernel nf_nat with prefix mapping. nft said:
+$NFT_ERR"
+fi
+if [ "$MODE" = "check" ]; then
+    echo "parallax: startup checks passed"
+    exit 0
 fi
 
 # --- private key bootstrap -------------------------------------------------
