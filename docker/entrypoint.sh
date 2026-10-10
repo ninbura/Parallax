@@ -65,18 +65,25 @@ apply() {
 teardown() {
     echo "parallax: shutting down"
     [ -f "$OUT/dnsmasq/dnsmasq.pid" ] && kill "$(cat "$OUT/dnsmasq/dnsmasq.pid")" 2>/dev/null || true
-    kill "$TAILSCALED_PID" 2>/dev/null || true
+    kill "$TAILSCALED_PID" "${SLEEP_PID:-}" 2>/dev/null || true
     nft delete table inet parallax 2>/dev/null || true
     ip link del "$(sed -n 's/^interface *= *"\(wg[0-9]*\)"/\1/p' "$CONFIG" | head -n1)" 2>/dev/null || true
     exit 0
 }
 
+reload() {
+    echo "parallax: SIGHUP, re-applying"
+    apply || echo "parallax: re-apply failed; fix $CONFIG and send SIGHUP again" >&2
+}
+
 trap teardown TERM INT
-trap apply HUP
+trap reload HUP
 apply
 echo "parallax: gateway up; send SIGHUP to re-apply after editing $CONFIG"
+# A trapped signal makes `wait` return >128, which `set -e` would treat as fatal.
 while :; do
-    wait "$TAILSCALED_PID" 2>/dev/null || true
     sleep 3600 &
-    wait $!
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" || true
+    kill "$SLEEP_PID" 2>/dev/null || true
 done
