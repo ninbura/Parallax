@@ -111,7 +111,7 @@ fn peer_lifecycle_preserves_comments() {
     assert!(ok, "{err}");
     assert!(out.contains("Address = 10.8.2.2/32"), "{out}");
     assert!(
-        out.contains("AllowedIPs = 192.168.240.5/32, 10.8.0.1/32"),
+        out.contains("AllowedIPs = 198.18.1.5/32, 10.8.0.1/32"),
         "{out}"
     );
     assert!(out.contains("PresharedKey = "), "{out}");
@@ -141,7 +141,7 @@ fn peer_lifecycle_preserves_comments() {
     let (ok, out, _) = s.run(&["peer", "show", "tablet"]);
     assert!(ok);
     assert!(
-        out.contains("reaches service immich as 192.168.240.5/32"),
+        out.contains("reaches service immich as 198.18.1.5/32"),
         "{out}"
     );
 
@@ -180,8 +180,8 @@ fn validation_errors_are_specific() {
     let text = std::fs::read_to_string(s.config())
         .unwrap()
         .replace(
-            "mapped_to = \"192.168.240.0/24\"",
-            "mapped_to = \"192.168.240.0/25\"",
+            "mapped_to = \"198.18.1.0/24\"",
+            "mapped_to = \"198.18.1.0/25\"",
         )
         .replace(
             "{ kind = \"service\", name = \"immich\" }",

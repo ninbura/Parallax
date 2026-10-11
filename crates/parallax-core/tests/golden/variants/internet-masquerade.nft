@@ -55,12 +55,12 @@ table inet parallax {
 
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
-		iifname { "wg0", "tailscale0" } ip daddr 192.168.240.0/24 dnat ip prefix to ip daddr map { 192.168.240.0/24 : 192.168.1.0/24 } comment "netmap home: virtual -> real"
+		iifname { "wg0", "tailscale0" } ip daddr 198.18.1.0/24 dnat ip prefix to ip daddr map { 198.18.1.0/24 : 192.168.1.0/24 } comment "netmap home: virtual -> real"
 	}
 
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
-		oifname { "wg0", "tailscale0" } ip saddr 192.168.1.0/24 snat ip prefix to ip saddr map { 192.168.1.0/24 : 192.168.240.0/24 } comment "netmap home: real -> virtual (LAN-initiated)"
+		oifname { "wg0", "tailscale0" } ip saddr 192.168.1.0/24 snat ip prefix to ip saddr map { 192.168.1.0/24 : 198.18.1.0/24 } comment "netmap home: real -> virtual (LAN-initiated)"
 		oifname "eth0" ip saddr { 10.8.0.0/16, 100.64.0.0/10 } ip daddr 192.168.1.0/24 masquerade comment "network home: masquerade (opt-in, hides peer identity)"
 		oifname "eth0" ip saddr { 10.8.0.0/16, 100.64.0.0/10 } ip daddr != @lan_real masquerade comment "internet egress"
 	}

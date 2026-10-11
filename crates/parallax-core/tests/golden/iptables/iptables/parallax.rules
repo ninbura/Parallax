@@ -35,10 +35,10 @@ COMMIT
 *nat
 :PARALLAX_PREROUTING - [0:0]
 :PARALLAX_POSTROUTING - [0:0]
--A PARALLAX_PREROUTING -i wg0 -d 192.168.240.0/24 -m comment --comment "netmap home: virtual -> real" -j NETMAP --to 192.168.1.0/24
--A PARALLAX_PREROUTING -i tailscale0 -d 192.168.240.0/24 -m comment --comment "netmap home: virtual -> real" -j NETMAP --to 192.168.1.0/24
--A PARALLAX_POSTROUTING -o wg0 -s 192.168.1.0/24 -m comment --comment "netmap home: real -> virtual (LAN-initiated)" -j NETMAP --to 192.168.240.0/24
--A PARALLAX_POSTROUTING -o tailscale0 -s 192.168.1.0/24 -m comment --comment "netmap home: real -> virtual (LAN-initiated)" -j NETMAP --to 192.168.240.0/24
+-A PARALLAX_PREROUTING -i wg0 -d 198.18.1.0/24 -m comment --comment "netmap home: virtual -> real" -j NETMAP --to 192.168.1.0/24
+-A PARALLAX_PREROUTING -i tailscale0 -d 198.18.1.0/24 -m comment --comment "netmap home: virtual -> real" -j NETMAP --to 192.168.1.0/24
+-A PARALLAX_POSTROUTING -o wg0 -s 192.168.1.0/24 -m comment --comment "netmap home: real -> virtual (LAN-initiated)" -j NETMAP --to 198.18.1.0/24
+-A PARALLAX_POSTROUTING -o tailscale0 -s 192.168.1.0/24 -m comment --comment "netmap home: real -> virtual (LAN-initiated)" -j NETMAP --to 198.18.1.0/24
 -A PARALLAX_POSTROUTING -o eth0 -s 10.8.0.0/16 -m set ! --match-set lan_real dst -m comment --comment "internet egress" -j MASQUERADE
 -A PARALLAX_POSTROUTING -o eth0 -s 100.64.0.0/10 -m set ! --match-set lan_real dst -m comment --comment "internet egress" -j MASQUERADE
 COMMIT

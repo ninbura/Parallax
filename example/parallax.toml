@@ -1,7 +1,7 @@
 # Parallax configuration: the canonical scenario.
 #
 # One home LAN (192.168.1.0/24, which collides with most guest networks) is
-# presented to every VPN client as 192.168.240.0/24. Two policy templates:
+# presented to every VPN client as 198.18.1.0/24. Two policy templates:
 # "personal" reaches everything, "family" reaches exactly one service. Both
 # transports (WireGuard and Tailscale via Headscale) are always on; every
 # template applies to both. `transport` on a peer records which one that
@@ -45,7 +45,11 @@ backend = "nftables"
 docker_coexistence = true
 
 # A physical network the gateway reaches. `mapped_to` is the collision-free
-# prefix clients see; host bits are preserved (192.168.1.5 -> 192.168.240.5).
+# prefix clients see; host bits are preserved (192.168.1.5 -> 198.18.1.5).
+# 198.18.0.0/15 is reserved for benchmarking (RFC 2544), so no home or office
+# LAN a client roams onto will use it; mirroring the real third octet keeps it
+# memorable (192.168.N.0/24 -> 198.18.N.0/24). Proxy apps with "fake-IP" DNS
+# (Clash, Surge, sing-box) also default to it, so avoid it on such clients.
 # `domains` are the DNS zones whose names live here: they scope the shim, the
 # clients' routing domains and (M2) Headscale split DNS. The real home
 # resolver stays the source of truth; Parallax holds no records.
@@ -57,7 +61,7 @@ interface = "eth0"
 # covering it then open the host, not just the LAN behind it.
 # gateway_address = "192.168.1.2"
 subnet = "192.168.1.0/24"
-mapped_to = "192.168.240.0/24"
+mapped_to = "198.18.1.0/24"
 upstream_dns = ["192.168.1.1"]
 domains = ["mydomain.com"]
 # Leave off unless your router cannot hold a static route back to the tunnel

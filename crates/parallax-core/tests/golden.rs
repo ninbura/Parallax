@@ -167,7 +167,7 @@ fn guest_allowed_ips_are_granted_hosts_only_in_virtual_space() {
     assert_eq!(
         ips,
         vec![
-            "192.168.240.5/32".parse().unwrap(),
+            "198.18.1.5/32".parse().unwrap(),
             "10.8.0.1/32".parse().unwrap()
         ]
     );
@@ -176,7 +176,7 @@ fn guest_allowed_ips_are_granted_hosts_only_in_virtual_space() {
     assert_eq!(
         ips,
         vec![
-            "192.168.240.0/24".parse().unwrap(),
+            "198.18.1.0/24".parse().unwrap(),
             "10.8.0.1/32".parse().unwrap()
         ]
     );

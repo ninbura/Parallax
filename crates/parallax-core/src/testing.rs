@@ -18,7 +18,7 @@ pub fn keypair(n: u8) -> KeyPair {
 }
 
 /// The canonical scenario from the design: home LAN 192.168.1.0/24 mapped to
-/// 192.168.240.0/24, templates `personal` and `family`, three WireGuard peers.
+/// 198.18.1.0/24, templates `personal` and `family`, three WireGuard peers.
 pub fn canonical_config() -> Config {
     let server_key = keypair(200);
     let router = keypair(1);
@@ -50,7 +50,7 @@ pub fn canonical_config() -> Config {
             interface: "eth0".into(),
             gateway_address: None,
             subnet: "192.168.1.0/24".parse().unwrap(),
-            mapped_to: Some("192.168.240.0/24".parse().unwrap()),
+            mapped_to: Some("198.18.1.0/24".parse().unwrap()),
             upstream_dns: vec![Ipv4Addr::new(192, 168, 1, 1)],
             domains: vec!["mydomain.com".into()],
             masquerade: false,

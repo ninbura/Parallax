@@ -80,7 +80,7 @@ mod tests {
     fn home() -> Mapping {
         Mapping::new(
             "192.168.1.0/24".parse().unwrap(),
-            "192.168.240.0/24".parse().unwrap(),
+            "198.18.1.0/24".parse().unwrap(),
         )
         .unwrap()
     }
@@ -90,10 +90,10 @@ mod tests {
         let m = home();
         assert_eq!(
             m.to_virtual("192.168.1.5".parse().unwrap()),
-            Some("192.168.240.5".parse().unwrap())
+            Some("198.18.1.5".parse().unwrap())
         );
         assert_eq!(
-            m.to_real("192.168.240.1".parse().unwrap()),
+            m.to_real("198.18.1.1".parse().unwrap()),
             Some("192.168.1.1".parse().unwrap())
         );
         assert_eq!(m.to_virtual("10.0.0.1".parse().unwrap()), None);
@@ -105,7 +105,7 @@ mod tests {
     fn rejects_prefix_mismatch() {
         assert!(Mapping::new(
             "192.168.1.0/24".parse().unwrap(),
-            "192.168.240.0/25".parse().unwrap()
+            "198.18.1.0/25".parse().unwrap()
         )
         .is_err());
     }
@@ -115,11 +115,11 @@ mod tests {
         let m = home();
         assert_eq!(
             m.net_to_virtual("192.168.1.5/32".parse().unwrap()),
-            Some("192.168.240.5/32".parse().unwrap())
+            Some("198.18.1.5/32".parse().unwrap())
         );
         assert_eq!(
             m.net_to_virtual("192.168.1.128/25".parse().unwrap()),
-            Some("192.168.240.128/25".parse().unwrap())
+            Some("198.18.1.128/25".parse().unwrap())
         );
         assert_eq!(m.net_to_virtual("192.168.0.0/16".parse().unwrap()), None);
     }

@@ -90,7 +90,7 @@ name = "home"
 interface = "eth0"
 gateway_address = "192.168.1.1"
 subnet = "192.168.1.0/24"
-mapped_to = "192.168.240.0/24"
+mapped_to = "198.18.1.0/24"
 upstream_dns = ["192.168.1.5"]
 domains = ["mydomain.com"]
 [[service]]
@@ -145,11 +145,11 @@ mkclient() { # iface, conf, addr, wan-side
 mkclient wgp "$WORK/laptop.conf" 10.8.1.1
 mkclient wgf "$WORK/guest.conf" 10.8.2.1
 # Split tunnel routes: virtual range + shim through the tunnel, foreign LAN stays on lan0.
-inns client ip route add 192.168.240.0/24 dev wgp src 10.8.1.1
+inns client ip route add 198.18.1.0/24 dev wgp src 10.8.1.1
 inns client ip route add 10.8.0.1/32 dev wgp src 10.8.1.1
 # The guest uses a separate routing table so both tunnels can coexist in one namespace.
 inns client ip rule add from 10.8.2.1 table 200
-inns client ip route add 192.168.240.0/24 dev wgf table 200
+inns client ip route add 198.18.1.0/24 dev wgf table 200
 inns client ip route add 10.8.0.1/32 dev wgf table 200
 sleep 1
 
@@ -158,24 +158,24 @@ curl_as() { # src, url  -> body or "BLOCKED"
 }
 
 # (a) mapped virtual IP lands on the real host
-[ "$(curl_as 10.8.1.1 http://192.168.240.5:8080/)" = home-other ] || fail "(a) personal -> 192.168.240.5:8080"
-[ "$(curl_as 10.8.1.1 http://192.168.240.5:443/)" = home-immich ] || fail "(a) personal -> 192.168.240.5:443"
-[ "$(curl_as 10.8.1.1 http://192.168.240.1:9090/)" = gw-self ] || fail "(a) personal -> service on the gateway host"
+[ "$(curl_as 10.8.1.1 http://198.18.1.5:8080/)" = home-other ] || fail "(a) personal -> 198.18.1.5:8080"
+[ "$(curl_as 10.8.1.1 http://198.18.1.5:443/)" = home-immich ] || fail "(a) personal -> 198.18.1.5:443"
+[ "$(curl_as 10.8.1.1 http://198.18.1.1:9090/)" = gw-self ] || fail "(a) personal -> service on the gateway host"
 pass "(a) personal peer reaches the mapped virtual address on the real host and on the gateway host"
 
 # (b) shim answers in virtual space
 ANS=$(inns client dig +short -b 10.8.1.1 @10.8.0.1 immich.mydomain.com)
-[ "$ANS" = 192.168.240.5 ] || fail "(b) shim answered '$ANS'"
-pass "(b) shim rewrites immich.mydomain.com to 192.168.240.5"
+[ "$ANS" = 198.18.1.5 ] || fail "(b) shim answered '$ANS'"
+pass "(b) shim rewrites immich.mydomain.com to 198.18.1.5"
 
 # (c) guest: granted host:port works, everything else is dropped despite 0.0.0.0/0
-[ "$(curl_as 10.8.2.1 http://192.168.240.5:443/)" = home-immich ] || fail "(c) guest -> immich"
-[ "$(curl_as 10.8.2.1 http://192.168.240.5:8080/)" = BLOCKED ] || fail "(c) guest reached a non-granted port"
-[ "$(curl_as 10.8.2.1 http://192.168.240.1:9090/)" = gw-self ] || fail "(c) guest -> granted service on the gateway host"
-[ "$(curl_as 10.8.2.1 http://192.168.240.1:9091/)" = BLOCKED ] || fail "(c) guest reached a non-granted port on the gateway host"
-[ "$(curl_as 10.8.2.1 http://192.168.240.1:8080/)" = BLOCKED ] || fail "(c) guest reached the gateway LAN address"
+[ "$(curl_as 10.8.2.1 http://198.18.1.5:443/)" = home-immich ] || fail "(c) guest -> immich"
+[ "$(curl_as 10.8.2.1 http://198.18.1.5:8080/)" = BLOCKED ] || fail "(c) guest reached a non-granted port"
+[ "$(curl_as 10.8.2.1 http://198.18.1.1:9090/)" = gw-self ] || fail "(c) guest -> granted service on the gateway host"
+[ "$(curl_as 10.8.2.1 http://198.18.1.1:9091/)" = BLOCKED ] || fail "(c) guest reached a non-granted port on the gateway host"
+[ "$(curl_as 10.8.2.1 http://198.18.1.1:8080/)" = BLOCKED ] || fail "(c) guest reached the gateway LAN address"
 ANS=$(inns client dig +short +time=1 +tries=1 -b 10.8.2.1 @10.8.0.1 immich.mydomain.com || true)
-[ "$ANS" = 192.168.240.5 ] || fail "(c) guest could not use the shim (tunnel-wide DNS): '$ANS'"
+[ "$ANS" = 198.18.1.5 ] || fail "(c) guest could not use the shim (tunnel-wide DNS): '$ANS'"
 pass "(c) guest reaches only its granted host:port; wider AllowedIPs change nothing"
 
 # (d) reapply is idempotent
@@ -184,12 +184,12 @@ inns gw $P apply -o "$WORK/out" >/dev/null
 inns gw nft list table inet parallax > "$WORK/nft2"; inns gw wg showconf wg0 > "$WORK/wg2"
 diff -q "$WORK/nft1" "$WORK/nft2" >/dev/null || fail "(d) nft ruleset changed on reapply"
 diff -q "$WORK/wg1" "$WORK/wg2" >/dev/null || fail "(d) wg config changed on reapply"
-[ "$(curl_as 10.8.1.1 http://192.168.240.5:8080/)" = home-other ] || fail "(d) traffic broken after reapply"
+[ "$(curl_as 10.8.1.1 http://198.18.1.5:8080/)" = home-other ] || fail "(d) traffic broken after reapply"
 pass "(d) reapply is idempotent"
 
 # (e) raw mapped IP access with the shim stopped
 kill "$(cat "$WORK/out/dnsmasq/dnsmasq.pid")"; sleep 0.5
-[ "$(curl_as 10.8.1.1 http://192.168.240.5:8080/)" = home-other ] || fail "(e) mapped IP needs the shim"
+[ "$(curl_as 10.8.1.1 http://198.18.1.5:8080/)" = home-other ] || fail "(e) mapped IP needs the shim"
 pass "(e) raw mapped IP works with the shim stopped"
 inns gw $P apply -o "$WORK/out" >/dev/null   # bring the shim back
 
@@ -197,11 +197,11 @@ inns gw $P apply -o "$WORK/out" >/dev/null   # bring the shim back
 FOREIGN=$(inns client dig +short @192.168.1.5 immich.hisdomain.com)   # via lan0, local resolver
 [ "$FOREIGN" = 192.168.1.5 ] || fail "(f) foreign resolver answered '$FOREIGN'"
 HOME_ANS=$(inns client dig +short -b 10.8.1.1 @10.8.0.1 immich.mydomain.com)
-[ "$HOME_ANS" = 192.168.240.5 ] || fail "(f) home name via shim answered '$HOME_ANS'"
+[ "$HOME_ANS" = 198.18.1.5 ] || fail "(f) home name via shim answered '$HOME_ANS'"
 [ "$(inns client curl -s -m 3 --resolve immich.hisdomain.com:443:$FOREIGN http://immich.hisdomain.com:443/)" = foreign-immich ] \
     || fail "(f) immich.hisdomain.com did not reach the foreign box"
 [ "$(inns client curl -s -m 3 --interface 10.8.1.1 --resolve immich.mydomain.com:443:$HOME_ANS http://immich.mydomain.com:443/)" = home-immich ] \
     || fail "(f) immich.mydomain.com did not reach the home box"
-pass "(f) foreign 192.168.1.5 and home 192.168.240.5 are both reachable, names resolve to the right one"
+pass "(f) foreign 192.168.1.5 and home 198.18.1.5 are both reachable, names resolve to the right one"
 
 echo "ALL PASS"

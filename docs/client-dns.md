@@ -1,6 +1,6 @@
 # Name resolution across colliding subnets
 
-Raw mapped addresses always work without DNS: `192.168.240.1` reaches the
+Raw mapped addresses always work without DNS: `198.18.1.1` reaches the
 home router through routing plus the PREROUTING NETMAP rule and nothing else.
 This is the foundational guarantee and has its own integration test (shim
 stopped, mapped access still works).

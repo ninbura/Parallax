@@ -760,7 +760,7 @@ mod tests {
 
     #[test]
     fn detects_prefix_length_mismatch() {
-        let e = errors_of(|c| c.networks[0].mapped_to = Some("192.168.240.0/25".parse().unwrap()));
+        let e = errors_of(|c| c.networks[0].mapped_to = Some("198.18.1.0/25".parse().unwrap()));
         assert!(has(&e, "same prefix length"), "{e:?}");
     }
 
@@ -840,7 +840,7 @@ mod tests {
         let family = m.template("family").unwrap();
         let r = m.reaches(family);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].client_net(), Some("192.168.240.5/32".parse().unwrap()));
+        assert_eq!(r[0].client_net(), Some("198.18.1.5/32".parse().unwrap()));
         let personal = m.template("personal").unwrap();
         let immich = cfg.service("immich").unwrap();
         assert!(m.reaches_service(personal, immich));

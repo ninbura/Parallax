@@ -13,7 +13,7 @@ design, not a "WireGuard-only" mode.
 
 - Most home LANs are `192.168.1.0/24`, so a roaming split tunnel cannot address
   home. Parallax NETMAPs each LAN to a collision-free virtual prefix
-  (`192.168.1.5` ⇄ `192.168.240.5`) and rewrites DNS answers to match, from
+  (`192.168.1.5` ⇄ `198.18.1.5`) and rewrites DNS answers to match, from
   the same single mapping.
 - Access is a **template** (policy class) with grants; every WireGuard peer of
   a template draws from a dedicated pool, so the address *is* the tier and the
