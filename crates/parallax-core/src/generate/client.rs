@@ -131,11 +131,6 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
                         template.name
                     ));
                 }
-                if !model.needs_catch_all_resolver() {
-                    warnings.push(
-                        "the shim has no catch-all resolver (no template uses tunnel_wide DNS), so this device would not resolve public names while connected".into(),
-                    );
-                }
             } else {
                 s.push_str("# DNS is tunnel-wide by template policy; the shim forwards non-home zones to a public resolver.\n");
             }

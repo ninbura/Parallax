@@ -29,9 +29,10 @@ Names need two pieces:
 | Tailscale (M2)                  | native    | Headscale pushes per-zone restricted nameservers; the client resolver does the split on every OS |
 
 Template `dns.wireguard = "split"` on a mobile export falls back to tunnel-wide
-with a warning. The shim only gets a catch-all resolver when some template
-uses `tunnel_wide`; `generate` warns if a split-only setup would leave mobile
-exports without one.
+with a warning. The shim therefore gets a catch-all resolver whenever any
+template configures WireGuard DNS (`split` or `tunnel_wide`), since any of its
+peers may be exported for a phone. Split clients on other platforms only send
+the home zones to the shim, so they never use it.
 
 Honest caveats for tunnel-wide devices: unicast names on the visited network
 do not resolve while connected; mDNS/Bonjour (casting, AirPlay) is multicast

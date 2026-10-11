@@ -260,11 +260,14 @@ impl<'a> Model<'a> {
             .or_else(|| self.config.networks.first().map(|n| n.interface.as_str()))
     }
 
-    /// Any template sends all DNS to the shim, so it needs a catch-all resolver.
+    /// Some client may send all DNS to the shim, so it needs a catch-all resolver.
+    /// A WireGuard `split` template counts: its mobile export falls back to
+    /// tunnel-wide, because the official mobile apps cannot split DNS.
     pub fn needs_catch_all_resolver(&self) -> bool {
-        self.config.templates.iter().any(|t| {
-            t.dns.wireguard == DnsMode::TunnelWide || t.dns.tailscale == DnsMode::TunnelWide
-        })
+        self.config
+            .templates
+            .iter()
+            .any(|t| t.dns.wireguard != DnsMode::None || t.dns.tailscale == DnsMode::TunnelWide)
     }
 
     /// Any template grants internet egress.
@@ -852,5 +855,21 @@ mod tests {
         assert_eq!(m.active_peers().count(), 2);
         let m = Model::resolve(&cfg, Date::new(2025, 12, 31).unwrap()).unwrap();
         assert_eq!(m.active_peers().count(), 3);
+    }
+
+    #[test]
+    fn split_templates_need_catch_all_for_mobile_exports() {
+        let mut cfg = canonical_config();
+        for t in &mut cfg.templates {
+            t.dns.wireguard = DnsMode::Split;
+            t.dns.tailscale = DnsMode::Split;
+        }
+        let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
+        assert!(m.needs_catch_all_resolver());
+        for t in &mut cfg.templates {
+            t.dns.wireguard = DnsMode::None;
+        }
+        let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
+        assert!(!m.needs_catch_all_resolver());
     }
 }

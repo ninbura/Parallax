@@ -35,7 +35,7 @@ interface = "tailscale0"
 # The shim listens on the WireGuard gateway address unless overridden.
 # listen = "10.8.0.1"
 port = 53
-# Catch-all for tunnel-wide-fallback templates only (mobile WireGuard apps).
+# Catch-all for tunnel-wide clients: mobile WireGuard exports send every query here.
 public_resolver = "1.1.1.1"
 
 [server.firewall]

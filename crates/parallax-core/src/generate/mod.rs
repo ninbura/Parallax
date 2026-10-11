@@ -97,16 +97,5 @@ pub fn generate_all(model: &Model<'_>, fs: &dyn FileSystem) -> Result<Bundle> {
     bundle.artifacts.push(dnsmasq::render(model)?);
     bundle.artifacts.extend(nginx::render(model)?);
     bundle.artifacts.sort_by(|a, b| a.path.cmp(&b.path));
-    if !model.needs_catch_all_resolver() {
-        for t in &model.config().templates {
-            if t.dns.wireguard == crate::model::DnsMode::Split {
-                bundle.warnings.push(format!(
-                    "template '{}': mobile WireGuard exports fall back to tunnel-wide DNS, but no template enables the shim's catch-all resolver; set dns.wireguard = \"tunnel_wide\" on a template or use the Tailscale transport for phones",
-                    t.name
-                ));
-                break;
-            }
-        }
-    }
     Ok(bundle)
 }

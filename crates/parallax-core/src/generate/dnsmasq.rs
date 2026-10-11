@@ -70,14 +70,15 @@ pub fn render(model: &Model<'_>) -> Result<Artifact> {
 
     if model.needs_catch_all_resolver() {
         s.push('\n');
-        s.push_str("# Catch-all for tunnel-wide-fallback templates (mobile WireGuard clients cannot split DNS)\n");
+        s.push_str("# Catch-all for tunnel-wide clients (mobile WireGuard apps cannot split DNS, so their\n");
+        s.push_str("# exports send every query here, even under a split template)\n");
         let _ = writeln!(s, "server={}", dns.public_resolver);
     } else {
         s.push('\n');
         s.push_str(
-            "# No catch-all resolver: every template uses split DNS, so queries outside the home\n",
+            "# No catch-all resolver: no WireGuard client is configured to use this shim, and\n",
         );
-        s.push_str("# zones never reach this shim.\n");
+        s.push_str("# Tailscale clients split DNS natively, so queries outside the home zones never arrive.\n");
     }
     Ok(Artifact::public(ArtifactKind::Dnsmasq, PATH, s))
 }
