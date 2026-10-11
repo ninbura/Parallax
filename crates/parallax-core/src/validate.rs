@@ -302,6 +302,20 @@ impl<'a> Model<'a> {
 }
 
 /// Run every check. Returns `(errors, warnings)`.
+/// Ranges a virtual prefix may live in: RFC 1918 private space, or the RFC 2544
+/// benchmarking block that no home or office LAN hands out.
+fn is_virtual_space(net: Ipv4Net) -> bool {
+    const ALLOWED: [&str; 4] = [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+    ];
+    ALLOWED
+        .iter()
+        .any(|r| r.parse::<Ipv4Net>().is_ok_and(|r| r.contains(&net)))
+}
+
 pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -425,6 +439,11 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                     if overlaps(v, TAILSCALE_CGNAT) {
                         errors.push(format!(
                             "{ctx}: mapped_to {v} overlaps the Tailscale range {TAILSCALE_CGNAT}"
+                        ));
+                    }
+                    if !is_virtual_space(v) {
+                        errors.push(format!(
+                            "{ctx}: mapped_to {v} is public address space; clients would lose the real hosts there. Use 198.18.0.0/15 (reserved, recommended) or a private range"
                         ));
                     }
                     for other in &config.networks {
@@ -871,5 +890,13 @@ mod tests {
         }
         let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
         assert!(!m.needs_catch_all_resolver());
+    }
+
+    #[test]
+    fn mapped_to_must_avoid_public_space() {
+        let e = errors_of(|c| c.networks[0].mapped_to = Some("192.18.1.0/24".parse().unwrap()));
+        assert!(has(&e, "public address space"), "{e:?}");
+        let e = errors_of(|c| c.networks[0].mapped_to = Some("198.19.1.0/24".parse().unwrap()));
+        assert!(!has(&e, "public address space"), "{e:?}");
     }
 }
