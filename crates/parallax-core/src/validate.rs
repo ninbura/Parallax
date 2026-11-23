@@ -99,9 +99,10 @@ fn in_zone(name: &str, zone: &str) -> bool {
 }
 
 /// Would `grant` let a template reach web ports on `host` directly, past the
-/// proxy? Plain HTTP on port 80 usually serves every site on the box too.
+/// proxy? Plain HTTP on tcp/80 and HTTP/3 on udp/443 often serve every site
+/// on the box too.
 fn reaches_web_directly(config: &Config, grant: &Grant, host: Ipv4Addr) -> bool {
-    let web = |proto: Proto, port: u16| proto == Proto::Tcp && (port == 80 || port == 443);
+    let web = |proto: Proto, port: u16| port == 443 || (proto == Proto::Tcp && port == 80);
     match grant {
         Grant::AllNetworks => true,
         Grant::Network { name } => config
@@ -113,6 +114,20 @@ fn reaches_web_directly(config: &Config, grant: &Grant, host: Ipv4Addr) -> bool 
             .service(name)
             .is_some_and(|s| !s.is_proxied() && s.host == host && web(s.proto, s.port)),
         Grant::Internet => false,
+    }
+}
+
+/// A grant as written in the config, for messages.
+fn describe_grant(grant: &Grant) -> String {
+    match grant {
+        Grant::AllNetworks => "all_networks".into(),
+        Grant::Network { name } => format!("network '{name}'"),
+        Grant::Host { ip } => format!("host {ip}"),
+        Grant::HostPort { ip, proto, port } => {
+            format!("host_port {ip} {}/{port}", proto.as_str())
+        }
+        Grant::Service { name } => format!("service '{name}'"),
+        Grant::Internet => "internet".into(),
     }
 }
 
@@ -279,9 +294,12 @@ impl<'a> Model<'a> {
         out
     }
 
-    /// Does `template` reach `service` (directly or through a wider grant)?
+    /// Does `template` reach `service` directly (or through a wider grant)?
+    /// Proxied reaches don't count: the proxy connects from the gateway, and
+    /// sibling sites on the same address and port must not inherit them.
     pub fn reaches_service(&self, template: &Template, service: &Service) -> bool {
         self.reaches(template).iter().any(|r| match &r.kind {
+            ReachKind::Lan { proxied: true, .. } => false,
             ReachKind::Lan { real, port, .. } => {
                 real.contains(&service.host)
                     && port.is_none_or(|(pr, po)| pr == service.proto && po == service.port)
@@ -718,13 +736,16 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
             let Some(s) = config.service(name).filter(|s| s.is_proxied()) else {
                 continue;
             };
-            if t.grants
+            for o in t
+                .grants
                 .iter()
-                .any(|o| reaches_web_directly(config, o, s.host))
+                .filter(|o| reaches_web_directly(config, o, s.host))
             {
                 warnings.push(format!(
-                    "{ctx}: another grant reaches {} directly, so the proxy for service '{}' limits nothing; every site on that host stays reachable (plain HTTP on port 80 included)",
-                    s.host, s.name
+                    "{ctx}: grant {} reaches {} directly, which can bypass the hostname check for service '{}': other sites on that host may answer there",
+                    describe_grant(o),
+                    s.host,
+                    s.name
                 ));
             }
         }
@@ -1008,6 +1029,23 @@ mod tests {
     }
 
     #[test]
+    fn proxied_reach_does_not_count_as_direct_for_siblings() {
+        let mut cfg = canonical_config();
+        proxy_immich(&mut cfg);
+        let mut photos = cfg.services[0].clone();
+        photos.name = "photos".into();
+        photos.hostnames = Vec::new();
+        cfg.services.push(photos);
+        let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
+        let family = m.template("family").unwrap();
+        let personal = m.template("personal").unwrap();
+        for s in &cfg.services {
+            assert!(!m.reaches_service(family, s), "{}", s.name);
+            assert!(m.reaches_service(personal, s), "{}", s.name);
+        }
+    }
+
+    #[test]
     fn hostnames_must_be_valid_unique_and_under_a_domain() {
         for bad in [
             "Immich.mydomain.com",
@@ -1070,6 +1108,11 @@ mod tests {
                 proto: Proto::Tcp,
                 port: 80,
             },
+            Grant::HostPort {
+                ip: host,
+                proto: Proto::Udp,
+                port: 443,
+            },
         ];
         for g in bypasses {
             let mut cfg = canonical_config();
@@ -1080,7 +1123,10 @@ mod tests {
             assert!(
                 has(
                     &warnings,
-                    "template 'family': another grant reaches 192.168.1.5 directly"
+                    &format!(
+                        "template 'family': grant {} reaches 192.168.1.5 directly",
+                        describe_grant(&g)
+                    )
                 ),
                 "{g:?}: {warnings:?}"
             );

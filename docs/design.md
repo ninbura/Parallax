@@ -159,8 +159,11 @@ Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
 clients couldn't resolve them through the shim), and only on `tcp/443`. A
 template with another grant that reaches the same host's web ports directly
-(`all_networks`, its network, `host`, or port 80/443) gets a warning, since
-the proxy then limits nothing.
+(`all_networks`, its network, `host`, tcp/80, or 443 on either protocol)
+gets a warning naming that grant, since it can bypass the hostname check.
+Proxied reaches also don't count toward nginx `allow` snippets: the proxy
+connects from the gateway, and sibling sites on the same address mustn't
+inherit the tier.
 
 Parallax never issues certificates. The proxy will read PEM certificates
 and keys from one folder the operator mounts (certbot's layout works) and
