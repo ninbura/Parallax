@@ -190,7 +190,7 @@ impl<'a> Model<'a> {
                             label: format!("host {ip}"),
                             kind: ReachKind::Lan {
                                 network: n,
-                                real: Ipv4Net::new(*ip, 32).expect("/32"),
+                                real: Ipv4Net::from(*ip),
                                 port: None,
                             },
                         });
@@ -202,7 +202,7 @@ impl<'a> Model<'a> {
                             label: format!("host {ip} {}/{port}", proto.as_str()),
                             kind: ReachKind::Lan {
                                 network: n,
-                                real: Ipv4Net::new(*ip, 32).expect("/32"),
+                                real: Ipv4Net::from(*ip),
                                 port: Some((*proto, *port)),
                             },
                         });
@@ -215,7 +215,7 @@ impl<'a> Model<'a> {
                                 label: format!("service {}", s.name),
                                 kind: ReachKind::Lan {
                                     network: n,
-                                    real: Ipv4Net::new(s.host, 32).expect("/32"),
+                                    real: Ipv4Net::from(s.host),
                                     port: Some((s.proto, s.port)),
                                 },
                             });

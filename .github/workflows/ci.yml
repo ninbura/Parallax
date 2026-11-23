@@ -8,9 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - run: rustup show active-toolchain # installs the version in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -21,7 +19,7 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup show active-toolchain # installs the version in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y nftables wireguard-tools dnsmasq-base dnsutils curl
       - run: cargo build -p parallax-cli
