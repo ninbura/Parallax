@@ -1,6 +1,7 @@
 # Pinned so every agent, every machine and CI run the same rustc and clippy.
 # Bump deliberately, in its own PR, and fix any new lints there.
-# CI installs it from here; docker/Dockerfile pins the same version.
+# CI installs it from here (`rustup install`).
+# docker/Dockerfile pins the same version.
 [toolchain]
 channel = "1.100.0"
 components = ["rustfmt", "clippy"]
