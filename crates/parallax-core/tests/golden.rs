@@ -120,6 +120,22 @@ fn internet_grant_and_masquerade_match_golden() {
 }
 
 #[test]
+fn proxied_service_gets_no_direct_accept() {
+    let mut cfg = canonical_config();
+    cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
+    cfg.networks[0].gateway_address = Some("192.168.1.5".parse().unwrap());
+    let bundle = bundle_for(&cfg);
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    check_golden("variants/proxied-service.nft", &fw.contents);
+    assert!(
+        !fw.contents.contains("service immich"),
+        "family must not reach immich directly, not even on the gateway host:\n{}",
+        fw.contents
+    );
+    assert!(fw.contents.contains("family/wireguard: default deny"));
+}
+
+#[test]
 fn gateway_address_turns_grants_into_input_accepts() {
     let mut cfg = canonical_config();
     cfg.networks[0].gateway_address = Some("192.168.1.5".parse().unwrap());

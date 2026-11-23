@@ -17,6 +17,8 @@
 //!   the same source and port constraints. Everything else from a tunnel
 //!   interface to the host (beyond the DNS shim and ICMP echo) is dropped, so
 //!   a host-networked gateway does not expose its other services to peers.
+//! - Services with `hostnames` get no direct accept: they're reached only
+//!   through the HTTPS proxy, which checks the hostname on every request.
 
 use std::fmt::Write as _;
 
@@ -206,6 +208,7 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                 network,
                 real,
                 port,
+                proxied: false,
             } = r.kind
             else {
                 continue;
@@ -265,10 +268,14 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
             let tag = format!("{}/{}", t.name, tr.kind());
             for r in &reaches {
                 match &r.kind {
+                    // The proxy checks the hostname and connects from the
+                    // gateway itself; a direct accept would skip that check.
+                    ReachKind::Lan { proxied: true, .. } => {}
                     ReachKind::Lan {
                         network,
                         real,
                         port,
+                        proxied: false,
                     } => rs.rules.push(
                         Rule::new(
                             Chain::Forward,

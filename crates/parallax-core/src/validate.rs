@@ -37,6 +37,9 @@ pub enum ReachKind<'a> {
         /// Real-space destination prefix (a /32 for hosts).
         real: Ipv4Net,
         port: Option<(Proto, u16)>,
+        /// Reached only through the HTTPS proxy (a service with hostnames),
+        /// never forwarded directly.
+        proxied: bool,
     },
     Internet,
 }
@@ -71,6 +74,66 @@ fn valid_zone(s: &str) -> bool {
                 && l.chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         })
+}
+
+/// A lower-case DNS host name. Stricter than a zone: certificates and the
+/// proxy's `Host` check compare names exactly, so no upper case or `_`.
+/// The last label needs a letter, so an IP address never passes as a name
+/// (SNI forbids literal addresses).
+fn valid_hostname(s: &str) -> bool {
+    s.len() <= 253
+        && s.rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.chars().any(|c| c.is_ascii_lowercase()))
+        && s.split('.').all(|l| {
+            (1..=63).contains(&l.len())
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+}
+
+/// `name` is `zone` itself or a name under it.
+fn in_zone(name: &str, zone: &str) -> bool {
+    let zone = zone.to_ascii_lowercase();
+    name == zone
+        || name
+            .strip_suffix(&zone)
+            .is_some_and(|rest| rest.ends_with('.'))
+}
+
+/// Would `grant` let a template reach web ports on `host` directly, past the
+/// proxy? Plain HTTP on tcp/80 and HTTP/3 on udp/443 often serve every site
+/// on the box too.
+fn reaches_web_directly(config: &Config, grant: &Grant, host: Ipv4Addr) -> bool {
+    let web = |proto: Proto, port: u16| port == 443 || (proto == Proto::Tcp && port == 80);
+    match grant {
+        Grant::AllNetworks => true,
+        Grant::Network { name } => config
+            .network(name)
+            .is_some_and(|n| n.subnet.contains(&host)),
+        Grant::Host { ip } => *ip == host,
+        Grant::HostPort { ip, proto, port } => *ip == host && web(*proto, *port),
+        Grant::Service { name } => config
+            .service(name)
+            .is_some_and(|s| !s.is_proxied() && s.host == host && web(s.proto, s.port)),
+        Grant::Internet => false,
+    }
+}
+
+/// A grant as written in the config, for messages.
+fn describe_grant(grant: &Grant) -> String {
+    match grant {
+        Grant::AllNetworks => "all_networks".into(),
+        Grant::Network { name } => format!("network '{name}'"),
+        Grant::Host { ip } => format!("host {ip}"),
+        Grant::HostPort { ip, proto, port } => {
+            format!("host_port {ip} {}/{port}", proto.as_str())
+        }
+        Grant::Service { name } => format!("service '{name}'"),
+        Grant::Internet => "internet".into(),
+    }
 }
 
 fn overlaps(a: Ipv4Net, b: Ipv4Net) -> bool {
@@ -168,6 +231,7 @@ impl<'a> Model<'a> {
                                 network: n,
                                 real: n.subnet.trunc(),
                                 port: None,
+                                proxied: false,
                             },
                         });
                     }
@@ -180,6 +244,7 @@ impl<'a> Model<'a> {
                                 network: n,
                                 real: n.subnet.trunc(),
                                 port: None,
+                                proxied: false,
                             },
                         });
                     }
@@ -192,6 +257,7 @@ impl<'a> Model<'a> {
                                 network: n,
                                 real: Ipv4Net::from(*ip),
                                 port: None,
+                                proxied: false,
                             },
                         });
                     }
@@ -204,6 +270,7 @@ impl<'a> Model<'a> {
                                 network: n,
                                 real: Ipv4Net::from(*ip),
                                 port: Some((*proto, *port)),
+                                proxied: false,
                             },
                         });
                     }
@@ -217,6 +284,7 @@ impl<'a> Model<'a> {
                                     network: n,
                                     real: Ipv4Net::from(s.host),
                                     port: Some((s.proto, s.port)),
+                                    proxied: s.is_proxied(),
                                 },
                             });
                         }
@@ -231,9 +299,12 @@ impl<'a> Model<'a> {
         out
     }
 
-    /// Does `template` reach `service` (directly or through a wider grant)?
+    /// Does `template` reach `service` directly (or through a wider grant)?
+    /// Proxied reaches don't count: the proxy connects from the gateway, and
+    /// sibling sites on the same address and port must not inherit them.
     pub fn reaches_service(&self, template: &Template, service: &Service) -> bool {
         self.reaches(template).iter().any(|r| match &r.kind {
+            ReachKind::Lan { proxied: true, .. } => false,
             ReachKind::Lan { real, port, .. } => {
                 real.contains(&service.host)
                     && port.is_none_or(|(pr, po)| pr == service.proto && po == service.port)
@@ -518,6 +589,7 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
 
     // --- services -------------------------------------------------------
     let mut seen_services: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_hostnames: BTreeMap<&str, &str> = BTreeMap::new();
     for s in &config.services {
         let ctx = format!("service '{}'", s.name);
         if !valid_ident(&s.name) {
@@ -534,6 +606,37 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         }
         if s.port == 0 {
             errors.push(format!("{ctx}: port must not be 0"));
+        }
+        if s.is_proxied() && (s.proto != Proto::Tcp || s.port != 443) {
+            errors.push(format!(
+                "{ctx}: hostnames are for HTTPS services; set proto = \"tcp\" and port = 443"
+            ));
+        }
+        let network = config.networks.iter().find(|n| n.subnet.contains(&s.host));
+        for h in &s.hostnames {
+            if !valid_hostname(h) {
+                errors.push(format!(
+                    "{ctx}: hostname '{h}' is not a valid lower-case DNS name"
+                ));
+                continue;
+            }
+            match seen_hostnames.insert(h, &s.name) {
+                Some(other) if other == s.name => {
+                    errors.push(format!("{ctx}: hostname '{h}' is listed twice"));
+                }
+                Some(other) => errors.push(format!(
+                    "{ctx}: hostname '{h}' is already used by service '{other}'"
+                )),
+                None => {}
+            }
+            if let Some(n) = network {
+                if !n.domains.iter().any(|z| in_zone(h, z)) {
+                    errors.push(format!(
+                        "{ctx}: hostname '{h}' is not under any domain of network '{}' ({:?}), so clients can't resolve it through the DNS shim",
+                        n.name, n.domains
+                    ));
+                }
+            }
         }
     }
 
@@ -635,6 +738,24 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                         ));
                     }
                 }
+            }
+        }
+        for g in &t.grants {
+            let Grant::Service { name } = g else { continue };
+            let Some(s) = config.service(name).filter(|s| s.is_proxied()) else {
+                continue;
+            };
+            for o in t
+                .grants
+                .iter()
+                .filter(|o| reaches_web_directly(config, o, s.host))
+            {
+                warnings.push(format!(
+                    "{ctx}: grant {} reaches {} directly, which can bypass the hostname check for service '{}': other sites on that host may answer there",
+                    describe_grant(o),
+                    s.host,
+                    s.name
+                ));
             }
         }
         if t.client.allowed_ips == AllowedIpsStrategy::FullTunnel
@@ -890,6 +1011,177 @@ mod tests {
         }
         let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
         assert!(!m.needs_catch_all_resolver());
+    }
+
+    fn proxy_immich(c: &mut Config) {
+        c.services[0].hostnames = vec!["immich.mydomain.com".into()];
+    }
+
+    #[test]
+    fn proxied_service_is_valid_and_reached_through_the_proxy() {
+        let mut cfg = canonical_config();
+        proxy_immich(&mut cfg);
+        let (errors, warnings) = check(&cfg);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!has(&warnings, "proxy"), "{warnings:?}");
+        let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
+        let family = m.reaches(m.template("family").unwrap());
+        assert!(
+            matches!(family[0].kind, ReachKind::Lan { proxied: true, .. }),
+            "{family:?}"
+        );
+        let personal = m.reaches(m.template("personal").unwrap());
+        assert!(
+            matches!(personal[0].kind, ReachKind::Lan { proxied: false, .. }),
+            "{personal:?}"
+        );
+    }
+
+    #[test]
+    fn proxied_reach_does_not_count_as_direct_for_siblings() {
+        let mut cfg = canonical_config();
+        proxy_immich(&mut cfg);
+        let mut photos = cfg.services[0].clone();
+        photos.name = "photos".into();
+        photos.hostnames = Vec::new();
+        cfg.services.push(photos);
+        let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
+        let family = m.template("family").unwrap();
+        let personal = m.template("personal").unwrap();
+        for s in &cfg.services {
+            assert!(!m.reaches_service(family, s), "{}", s.name);
+            assert!(m.reaches_service(personal, s), "{}", s.name);
+        }
+    }
+
+    #[test]
+    fn hostnames_must_be_valid_unique_and_under_a_domain() {
+        let e = errors_of(|c| {
+            c.services[0].hostnames =
+                vec!["immich.mydomain.com".into(), "immich.mydomain.com".into()]
+        });
+        assert!(
+            has(&e, "hostname 'immich.mydomain.com' is listed twice"),
+            "{e:?}"
+        );
+        for bad in [
+            "192.168.1.5",
+            "Immich.mydomain.com",
+            "imm_ich.mydomain.com",
+            "-x.mydomain.com",
+            "a..mydomain.com",
+        ] {
+            let e = errors_of(|c| c.services[0].hostnames = vec![bad.into()]);
+            assert!(has(&e, "not a valid lower-case DNS name"), "{bad}: {e:?}");
+        }
+        for outside in ["immich.otherdomain.com", "notmydomain.com"] {
+            let e = errors_of(|c| c.services[0].hostnames = vec![outside.into()]);
+            assert!(
+                has(&e, "is not under any domain of network 'home'"),
+                "{outside}: {e:?}"
+            );
+        }
+        let e = errors_of(|c| c.services[0].hostnames = vec!["mydomain.com".into()]);
+        assert!(e.is_empty(), "{e:?}");
+        let e = errors_of(|c| {
+            proxy_immich(c);
+            let mut other = c.services[0].clone();
+            other.name = "photos".into();
+            c.services.push(other);
+        });
+        assert!(
+            has(
+                &e,
+                "hostname 'immich.mydomain.com' is already used by service 'immich'"
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn hostnames_need_https() {
+        let e = errors_of(|c| {
+            proxy_immich(c);
+            c.services[0].port = 8443;
+        });
+        assert!(has(&e, "hostnames are for HTTPS services"), "{e:?}");
+        let e = errors_of(|c| {
+            proxy_immich(c);
+            c.services[0].proto = Proto::Udp;
+        });
+        assert!(has(&e, "hostnames are for HTTPS services"), "{e:?}");
+    }
+
+    #[test]
+    fn warns_when_another_grant_bypasses_the_proxy() {
+        let host = "192.168.1.5".parse().unwrap();
+        let bypasses = [
+            Grant::AllNetworks,
+            Grant::Network {
+                name: "home".into(),
+            },
+            Grant::Host { ip: host },
+            Grant::HostPort {
+                ip: host,
+                proto: Proto::Tcp,
+                port: 80,
+            },
+            Grant::HostPort {
+                ip: host,
+                proto: Proto::Udp,
+                port: 443,
+            },
+            Grant::HostPort {
+                ip: host,
+                proto: Proto::Tcp,
+                port: 443,
+            },
+            Grant::Service {
+                name: "plain-web".into(),
+            },
+        ];
+        let with_services = || {
+            let mut cfg = canonical_config();
+            proxy_immich(&mut cfg);
+            let mut plain = cfg.services[0].clone();
+            plain.name = "plain-web".into();
+            plain.port = 80;
+            plain.hostnames = Vec::new();
+            let mut photos = cfg.services[0].clone();
+            photos.name = "photos".into();
+            photos.hostnames = vec!["photos.mydomain.com".into()];
+            cfg.services.extend([plain, photos]);
+            cfg
+        };
+        for g in bypasses {
+            let mut cfg = with_services();
+            cfg.templates[1].grants.push(g.clone());
+            let (errors, warnings) = check(&cfg);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(
+                has(
+                    &warnings,
+                    &format!(
+                        "template 'family': grant {} reaches 192.168.1.5 directly",
+                        describe_grant(&g)
+                    )
+                ),
+                "{g:?}: {warnings:?}"
+            );
+        }
+        // Neither another port nor a second proxied site on the same box bypasses.
+        let mut cfg = with_services();
+        cfg.templates[1].grants.push(Grant::HostPort {
+            ip: host,
+            proto: Proto::Tcp,
+            port: 22,
+        });
+        cfg.templates[1].grants.push(Grant::Service {
+            name: "photos".into(),
+        });
+        let (errors, warnings) = check(&cfg);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!has(&warnings, "directly"), "{warnings:?}");
     }
 
     #[test]

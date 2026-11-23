@@ -65,7 +65,8 @@ pub struct Network {
     pub masquerade: bool,
 }
 
-pub struct Service { name, host: Ipv4Addr, proto: Proto, port: u16, nginx_vhost: bool }
+pub struct Service { name, host: Ipv4Addr, proto: Proto, port: u16, nginx_vhost: bool,
+                     hostnames: Vec<String> }
 
 pub struct Template {
     pub name: String,
@@ -103,7 +104,7 @@ Two additions relative to the handoff, both small and flagged:
   tier but split DNS through the Tailscale client.
 
 Grants are written against real addresses. `Model::reaches(template)` resolves
-them to `Reach { label, kind: Lan { network, real, port } | Internet }` and
+them to `Reach { label, kind: Lan { network, real, port, proxied } | Internet }` and
 `Reach::client_net()` translates to virtual space for clients, nginx and (M2)
 Headscale ACLs. The nftables FORWARD chain matches real addresses because it
 runs after PREROUTING NETMAP.
@@ -141,6 +142,32 @@ exposes every published container port and its SSH to guest peers. With
 `gateway_address` set, services on the gateway box itself are reachable
 through the mapping exactly like any other LAN host, tier by tier. LAN-side
 INPUT is untouched (policy accept).
+
+## Proxied HTTPS services
+
+One address and port often serves many sites (an nginx with several
+virtual hosts), so a firewall rule on `host:443` lets a template reach all
+of them. A service with `hostnames` closes that gap: `service` grants reach
+it only through Parallax's own HTTPS proxy, which terminates TLS, checks
+SNI, `Host` and HTTP/2 `:authority` on every request, and forwards only the
+listed names to the service. The firewall gives such grants no direct
+accept (`ReachKind::Lan { proxied: true }`); the redirect into the proxy
+and the proxy itself are still to come, and until then the grant reaches
+nothing, which fails closed.
+
+Validation keeps it honest: hostnames are lower-case DNS names, unique
+across services, inside a `domains` zone of the service's network (or
+clients couldn't resolve them through the shim), and only on `tcp/443`. A
+template with another grant that reaches the same host's web ports directly
+(`all_networks`, its network, `host`, tcp/80, or 443 on either protocol)
+gets a warning naming that grant, since it can bypass the hostname check.
+Proxied reaches also don't count toward nginx `allow` snippets: the proxy
+connects from the gateway, and sibling sites on the same address mustn't
+inherit the tier.
+
+Parallax never issues certificates. The proxy will read PEM certificates
+and keys from one folder the operator mounts (certbot's layout works) and
+use whichever certificate covers each hostname.
 
 Docker note: a Docker-published port on the gateway host is reached through
 `docker-proxy` listening on the host address, because the NETMAP DNAT and
