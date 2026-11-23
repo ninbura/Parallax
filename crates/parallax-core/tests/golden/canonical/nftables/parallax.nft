@@ -55,7 +55,7 @@ table inet parallax {
 	}
 
 	chain prerouting {
-		type nat hook prerouting priority dstnat; policy accept;
+		type nat hook prerouting priority dstnat - 10; policy accept;
 		iifname { "wg0", "tailscale0" } ip daddr 198.18.1.0/24 dnat ip prefix to ip daddr map { 198.18.1.0/24 : 192.168.1.0/24 } comment "netmap home: virtual -> real"
 	}
 

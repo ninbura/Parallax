@@ -149,30 +149,54 @@ fn apply_firewall(
         FirewallBackend::IptablesNft => {
             use crate::generate::firewall::iptables::CHAINS;
             let rs = crate::generate::firewall::build(model)?;
+            // Fill a fresh set and swap it in: flushing the live one would
+            // briefly leave `! --match-set not_public` matching everything.
             for set in &rs.sets {
-                sys.runner.run_checked(
-                    "ipset",
-                    &["create", "-exist", &set.name, "hash:net"],
-                    None,
-                )?;
-                sys.runner
-                    .run_checked("ipset", &["flush", &set.name], None)?;
-                for e in &set.elements {
+                let next = format!("{}-next", set.name);
+                for name in [&set.name, &next] {
                     sys.runner.run_checked(
                         "ipset",
-                        &["add", "-exist", &set.name, &e.to_string()],
+                        &["create", "-exist", name, "hash:net"],
                         None,
                     )?;
                 }
-            }
-            for (table, _, own) in CHAINS {
+                sys.runner.run_checked("ipset", &["flush", &next], None)?;
+                for e in &set.elements {
+                    sys.runner.run_checked(
+                        "ipset",
+                        &["add", "-exist", &next, &e.to_string()],
+                        None,
+                    )?;
+                }
                 sys.runner
-                    .run("iptables", &["-t", table, "-N", own], None)?;
-                sys.runner
-                    .run_checked("iptables", &["-t", table, "-F", own], None)?;
+                    .run_checked("ipset", &["swap", &next, &set.name], None)?;
+                sys.runner.run_checked("ipset", &["destroy", &next], None)?;
             }
+            // The restore file declares every PARALLAX_* chain, which creates
+            // it or flushes it in the same transaction as the refill: no
+            // window with empty chains, and a failed restore changes nothing.
             sys.runner
                 .run_checked("iptables-restore", &["--noflush", &main_str], None)?;
+            // Chains of templates that no longer exist: nothing jumps to them
+            // since the restore, so they can go.
+            let listing = sys
+                .runner
+                .run_checked("iptables", &["-t", "filter", "-S"], None)?;
+            for chain in listing
+                .stdout
+                .lines()
+                .filter_map(|l| l.strip_prefix("-N "))
+                .filter(|c| {
+                    c.strip_prefix("PARALLAX_T")
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .is_some_and(|n| n >= rs.tiers.len())
+                })
+            {
+                sys.runner
+                    .run_checked("iptables", &["-t", "filter", "-F", chain], None)?;
+                sys.runner
+                    .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
+            }
             for (table, builtin, own) in CHAINS {
                 let present = sys
                     .runner

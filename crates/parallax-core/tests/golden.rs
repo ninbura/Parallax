@@ -414,3 +414,46 @@ fn apply_preflight_names_missing_tools() {
         .to_string();
     assert!(err.contains("`nft` is not available"), "{err}");
 }
+
+#[test]
+fn iptables_apply_refills_chains_in_one_restore() {
+    let mut cfg = canonical_config();
+    cfg.server.firewall.backend = FirewallBackend::IptablesNft;
+    cfg.templates[1].grants.push(Grant::Internet);
+    let model = Model::resolve(&cfg, today()).unwrap();
+    let fs = fs_with_server_key();
+    let bundle = generate::generate_all(&model, &fs).unwrap();
+    let runner = RecordingRunner::new();
+    // A template was removed since the last apply: its chain is still there.
+    runner.respond_to(
+        "iptables",
+        &["-t", "filter", "-S"],
+        parallax_core::io::Output {
+            status: 0,
+            stdout: "-P INPUT ACCEPT\n-N PARALLAX_FORWARD\n-N PARALLAX_T0\n-N PARALLAX_T1\n-N PARALLAX_T2\n".into(),
+            stderr: String::new(),
+        },
+    );
+    let sys = System {
+        fs: &fs,
+        runner: &runner,
+    };
+    parallax_core::apply::apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+    let lines = runner.command_lines();
+    let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
+    let restore = pos("iptables-restore --noflush").unwrap();
+    // No flush of live chains before the restore: that left a window with
+    // empty chains, and empty ones if the restore failed.
+    assert!(
+        !lines[..restore].iter().any(|l| l.contains(" -F ")),
+        "{lines:#?}"
+    );
+    // Sets are filled aside and swapped in, never flushed while in use.
+    assert!(pos("ipset swap not_public-next not_public").unwrap() < restore);
+    assert!(!lines.iter().any(|l| l == "ipset flush not_public"));
+    // Only the stale template chain goes.
+    assert!(lines
+        .iter()
+        .any(|l| l == "iptables -t filter -X PARALLAX_T2"));
+    assert!(!lines.iter().any(|l| l.contains("-X PARALLAX_T1")));
+}

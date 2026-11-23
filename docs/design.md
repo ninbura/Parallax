@@ -190,7 +190,11 @@ service's address, as clients see it (virtual where mapped), to the proxy
 since NAT takes the first match. A tier that already reaches that host's 443
 directly (`all_networks`, its network, `host`, a matching `host_port`) gets
 no redirect: the proxy would add nothing. Only tiers with a redirect may
-reach the proxy port in INPUT.
+reach the proxy port in INPUT. The firewall works per tier and the proxy per
+hostname: when a tier loses one of several proxied hostnames, its other
+redirects keep the proxy port open to it, and the proxy closes the revoked
+hostname's connections when it reloads. So whatever runs `apply` also sends
+the proxy SIGHUP (the Docker entrypoint does).
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
@@ -249,7 +253,9 @@ Docker note: a Docker-published port on the gateway host is reached through
 `docker-proxy` listening on the host address, because the NETMAP DNAT and
 Docker's DNAT cannot both apply to one connection. That is Docker's default
 (`userland-proxy: true`); with it disabled, published ports are not reachable
-via the virtual address.
+via the virtual address. Parallax's prerouting chain runs at `dstnat - 10`,
+ahead of Docker's DNAT: the first NAT binding wins, so a tier's redirect to
+the proxy can't lose to a port Docker publishes on the gateway.
 
 ## Generated artifacts (output directory layout)
 

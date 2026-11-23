@@ -58,7 +58,7 @@ table inet parallax {
 	}
 
 	chain prerouting {
-		type nat hook prerouting priority dstnat; policy accept;
+		type nat hook prerouting priority dstnat - 10; policy accept;
 		iifname "wg0" ip saddr 10.8.2.0/24 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443 comment "family/wireguard: service immich via the https proxy"
 		iifname "tailscale0" ip saddr @ts_family ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443 comment "family/tailscale: service immich via the https proxy"
 		iifname { "wg0", "tailscale0" } ip daddr 198.18.1.0/24 dnat ip prefix to ip daddr map { 198.18.1.0/24 : 192.168.1.0/24 } comment "netmap home: virtual -> real"
