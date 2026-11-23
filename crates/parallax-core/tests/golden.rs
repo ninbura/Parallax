@@ -2,6 +2,12 @@
 //! frozen under `tests/golden/`. Run with `UPDATE_GOLDEN=1` to refresh after
 //! an intentional change, then review the diff.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers: failures should panic loudly"
+)]
+
 use std::path::{Path, PathBuf};
 
 use parallax_core::generate::{self, ArtifactKind, Bundle};

@@ -1,5 +1,11 @@
 //! End-to-end tests of the harness against a scratch copy of the example.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers: failures should panic loudly"
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

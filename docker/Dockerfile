@@ -2,7 +2,8 @@
 # Parallax gateway image: the engine binary plus everything that touches packets.
 # Runs host-networked with NET_ADMIN (see docker-compose.yml).
 
-FROM rust:1-alpine AS build
+# Keep in sync with rust-toolchain.toml.
+FROM rust:1.100.0-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

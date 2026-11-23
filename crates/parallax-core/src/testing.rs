@@ -1,6 +1,12 @@
 //! Fixtures shared by unit, golden and CLI tests. Public so downstream crates
 //! can reuse the canonical scenario.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test fixtures: a broken fixture should panic loudly"
+)]
+
 use std::net::Ipv4Addr;
 
 use crate::date::Date;

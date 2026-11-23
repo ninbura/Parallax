@@ -16,3 +16,6 @@ clap.workspace = true
 anyhow.workspace = true
 toml_edit.workspace = true
 toml.workspace = true
+
+[lints]
+workspace = true

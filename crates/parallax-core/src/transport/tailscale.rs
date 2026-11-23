@@ -43,7 +43,7 @@ impl Transport for TailscaleTransport {
         model
             .peers_on(TransportKind::Tailscale, Some(&template.name))
             .filter_map(|p| p.tailscale.as_ref().and_then(|t| t.address))
-            .map(|a| Ipv4Net::new(a, 32).expect("/32"))
+            .map(Ipv4Net::from)
             .collect()
     }
 

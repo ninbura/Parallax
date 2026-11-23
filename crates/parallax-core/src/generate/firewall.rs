@@ -193,7 +193,7 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         rs.rules.push(
             Rule::new(Chain::Input, Action::Accept, "dns shim")
                 .iifs(&ingress)
-                .dst(Match::Cidr(Ipv4Net::new(shim, 32).expect("/32")))
+                .dst(Match::Cidr(Ipv4Net::from(shim)))
                 .l4(Some((proto, server.dns.port))),
         );
     }
@@ -231,7 +231,7 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                     )
                     .iif(tr.ingress_interface(server))
                     .src(src)
-                    .dst(Match::Cidr(Ipv4Net::new(g, 32).expect("/32")))
+                    .dst(Match::Cidr(Ipv4Net::from(g)))
                     .l4(port),
                 );
             }

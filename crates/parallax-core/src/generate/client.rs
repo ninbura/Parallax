@@ -13,6 +13,9 @@ use crate::model::{AllowedIpsStrategy, DnsMode, Peer, Platform, Template, Transp
 use crate::validate::{Model, ReachKind};
 use crate::{Error, Result};
 
+/// `0.0.0.0/0`: route everything through the tunnel.
+const DEFAULT_ROUTE: Ipv4Net = Ipv4Net::new_assert(std::net::Ipv4Addr::UNSPECIFIED, 0);
+
 /// The DNS mode a platform actually gets, given the template's wish.
 pub fn effective_dns_mode(template: &Template, platform: Platform) -> DnsMode {
     match (template.dns.wireguard, platform) {
@@ -32,7 +35,7 @@ pub fn allowed_ips(model: &Model<'_>, template: &Template, platform: Platform) -
     };
     match template.client.allowed_ips {
         AllowedIpsStrategy::FullTunnel => {
-            push("0.0.0.0/0".parse().expect("cidr"));
+            push(DEFAULT_ROUTE);
             return out;
         }
         AllowedIpsStrategy::MappedSubnets => {
@@ -43,7 +46,7 @@ pub fn allowed_ips(model: &Model<'_>, template: &Template, platform: Platform) -
         AllowedIpsStrategy::GrantsOnly => {
             for r in model.reaches(template) {
                 match r.kind {
-                    ReachKind::Internet => push("0.0.0.0/0".parse().expect("cidr")),
+                    ReachKind::Internet => push(DEFAULT_ROUTE),
                     ReachKind::Lan { .. } => {
                         if let Some(n) = r.client_net() {
                             push(n);
@@ -54,7 +57,7 @@ pub fn allowed_ips(model: &Model<'_>, template: &Template, platform: Platform) -
         }
     }
     if effective_dns_mode(template, platform) != DnsMode::None {
-        push(Ipv4Net::new(model.shim_address(), 32).expect("/32"));
+        push(Ipv4Net::from(model.shim_address()));
     }
     out
 }
