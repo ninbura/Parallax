@@ -1,0 +1,28 @@
+# Parallax staging gateway. Driven by staging.sh; see README.md.
+# Same image and entrypoint as docker/compose.yml, with its own project, container
+# and state, and no headscale (M2 will add one).
+name: parallax-staging
+
+services:
+  parallax:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    image: parallax:staging
+    container_name: parallax-staging
+    restart: "no"
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./state/config:/etc/parallax
+      - ./state/out:/var/lib/parallax
+      - tailscale-state:/var/lib/tailscale
+    environment:
+      PARALLAX_CONFIG: /etc/parallax/parallax.toml
+      PARALLAX_OUT: /var/lib/parallax
+
+volumes:
+  tailscale-state:
