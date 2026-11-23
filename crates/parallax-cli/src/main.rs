@@ -14,6 +14,7 @@ use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
 use parallax_core::model::{Peer, Platform, TransportKind};
 use parallax_core::transport::{self, ProvisionOptions};
+use parallax_core::validate::ReachKind;
 use parallax_core::{Config, Model};
 
 #[derive(Parser)]
@@ -361,7 +362,11 @@ fn peer_command(config_path: &Path, command: PeerCommand) -> anyhow::Result<()> 
                         .client_net()
                         .map(|n| format!(" as {n}"))
                         .unwrap_or_default();
-                    println!("    reaches {}{via}", r.label);
+                    let proxied = match r.kind {
+                        ReachKind::Lan { proxied: true, .. } => " through the HTTPS proxy",
+                        _ => "",
+                    };
+                    println!("    reaches {}{via}{proxied}", r.label);
                 }
                 println!(
                     "    dns: wireguard={} tailscale={}; allowed_ips={:?}",

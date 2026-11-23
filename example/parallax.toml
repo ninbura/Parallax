@@ -76,6 +76,11 @@ host = "192.168.1.5"
 proto = "tcp"
 port = 443
 nginx_vhost = true
+# HTTPS names this service answers to. With them set, `service` grants reach
+# it only through Parallax's HTTPS proxy, which lets these names through and
+# nothing else, so a template can't use the other sites on the same box.
+# (The proxy isn't built yet: until it is, such grants reach nothing.)
+# hostnames = ["immich.mydomain.com"]
 
 # Templates are the policy classes. The WireGuard pool *is* the trust tier:
 # firewall and nginx rules match the pool, so adding a peer needs no new rule.

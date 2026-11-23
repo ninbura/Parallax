@@ -199,3 +199,19 @@ fn validation_errors_are_specific() {
     assert!(err.contains("same prefix length"), "{err}");
     assert!(err.contains("unknown service 'plex'"), "{err}");
 }
+
+#[test]
+fn peer_show_marks_proxied_services() {
+    let s = Scratch::new("proxied");
+    let text = std::fs::read_to_string(s.config()).unwrap().replace(
+        "nginx_vhost = true\n",
+        "nginx_vhost = true\nhostnames = [\"immich.mydomain.com\"]\n",
+    );
+    std::fs::write(s.config(), text).unwrap();
+    let (ok, out, err) = s.run(&["peer", "show", "sister-phone"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("reaches service immich as 198.18.1.5/32 through the HTTPS proxy"),
+        "{out}"
+    );
+}

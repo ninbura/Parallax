@@ -18,4 +18,17 @@ pub struct Service {
     /// per-service `allow/deny` snippet for the operator to `include`.
     #[serde(default)]
     pub nginx_vhost: bool,
+    /// HTTPS names this service answers to. When set, a `service` grant
+    /// reaches it only through Parallax's HTTPS proxy, which lets these names
+    /// through and nothing else. One address and port often serves many
+    /// sites, so the firewall alone can't limit a template to one of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hostnames: Vec<String>,
+}
+
+impl Service {
+    /// Reached through the HTTPS proxy rather than forwarded directly.
+    pub fn is_proxied(&self) -> bool {
+        !self.hostnames.is_empty()
+    }
 }

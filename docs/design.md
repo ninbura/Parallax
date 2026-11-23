@@ -65,7 +65,8 @@ pub struct Network {
     pub masquerade: bool,
 }
 
-pub struct Service { name, host: Ipv4Addr, proto: Proto, port: u16, nginx_vhost: bool }
+pub struct Service { name, host: Ipv4Addr, proto: Proto, port: u16, nginx_vhost: bool,
+                     hostnames: Vec<String> }
 
 pub struct Template {
     pub name: String,
@@ -141,6 +142,29 @@ exposes every published container port and its SSH to guest peers. With
 `gateway_address` set, services on the gateway box itself are reachable
 through the mapping exactly like any other LAN host, tier by tier. LAN-side
 INPUT is untouched (policy accept).
+
+## Proxied HTTPS services
+
+One address and port often serves many sites (an nginx with several
+virtual hosts), so a firewall rule on `host:443` lets a template reach all
+of them. A service with `hostnames` closes that gap: `service` grants reach
+it only through Parallax's own HTTPS proxy, which terminates TLS, checks
+SNI, `Host` and HTTP/2 `:authority` on every request, and forwards only the
+listed names to the service. The firewall gives such grants no direct
+accept (`ReachKind::Lan { proxied: true }`); the redirect into the proxy
+and the proxy itself are still to come, and until then the grant reaches
+nothing, which fails closed.
+
+Validation keeps it honest: hostnames are lower-case DNS names, unique
+across services, inside a `domains` zone of the service's network (or
+clients couldn't resolve them through the shim), and only on `tcp/443`. A
+template with another grant that reaches the same host's web ports directly
+(`all_networks`, its network, `host`, or port 80/443) gets a warning, since
+the proxy then limits nothing.
+
+Parallax never issues certificates. The proxy will read PEM certificates
+and keys from one folder the operator mounts (certbot's layout works) and
+use whichever certificate covers each hostname.
 
 Docker note: a Docker-published port on the gateway host is reached through
 `docker-proxy` listening on the host address, because the NETMAP DNAT and

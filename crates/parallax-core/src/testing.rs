@@ -67,6 +67,7 @@ pub fn canonical_config() -> Config {
             proto: Proto::Tcp,
             port: 443,
             nginx_vhost: true,
+            hostnames: Vec::new(),
         }],
         templates: vec![
             Template {
