@@ -5,23 +5,28 @@
 # Usage: sudo dev/staging/staging.sh <command>
 #   up                         fake LANs, config (first run), build, start the container
 #   down                       stop the container and remove the fake LANs (state is kept)
-#   reset                      down, then delete state/ (server key, peers, config)
-#   apply                      re-apply state/config/parallax.toml (SIGHUP the container)
+#   reset                      down, then delete the state directory (server key, peers, config)
+#   apply                      re-apply $STAGING_STATE/config/parallax.toml (SIGHUP the container)
 #   peer NAME TEMPLATE [PLAT]  add a peer (private key kept), re-apply, show its QR
-#   qr NAME [PLATFORM]         write state/qr/NAME-PLATFORM.png and print the QR
+#   qr NAME [PLATFORM]         write $STAGING_STATE/qr/NAME-PLATFORM.png and print the QR
 #   smoke                      end-to-end checks from a client namespace through the tunnel
 #   status                     container, WireGuard and firewall summary
 #   logs                       follow the container log
 #
-# Environment (read on the first `up`, when the config is rendered):
+# Environment:
+#   STAGING_STATE            state directory (default /var/lib/parallax-staging). Outside the
+#                            checkout, so every worktree drives the same gateway with the same keys.
+# Read on the first `up`, when the config is rendered:
 #   STAGING_ENDPOINT         address clients dial (default: this host's default-route source)
 #   STAGING_PORT             WireGuard listen port (default 51814)
 #   STAGING_PUBLIC_RESOLVER  catch-all resolver for the shim (default: the default-route gateway)
 set -euo pipefail
-umask 077   # state/ holds the server key and exported client configs with private keys
+umask 077   # the state directory holds the server key and exported client configs with private keys
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-STATE="$DIR/state"
+STATE="${STAGING_STATE:-/var/lib/parallax-staging}"
+case "$STATE" in /*/*) ;; *) echo "staging: STAGING_STATE must be an absolute path below /, got '$STATE'" >&2; exit 1 ;; esac
+export STAGING_STATE="$STATE"   # compose.yml mounts from it
 CONFIG="$STATE/config/parallax.toml"
 CONTAINER=parallax-staging
 COMPOSE=(docker compose -f "$DIR/compose.yml")
@@ -32,7 +37,8 @@ inns() { ip netns exec "$@"; }
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo $0 $*)"
 
-# Keep state/ owned by whoever ran sudo, so agents and editors can read it.
+# Keep the state directory owned by whoever ran sudo, so agents and editors can read it
+# (QR codes, logs) without root. It stays mode 0700.
 own_state() { [ -n "${SUDO_UID:-}" ] && [ -d "$STATE" ] && chown -R "$SUDO_UID:$SUDO_GID" "$STATE" || true; }
 trap own_state EXIT
 

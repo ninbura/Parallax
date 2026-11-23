@@ -1,5 +1,5 @@
 # Parallax staging configuration. `staging.sh up` renders this into
-# state/config/parallax.toml on first run, filling the @...@ placeholders; after
+# $STAGING_STATE/config/parallax.toml on first run, filling the @...@ placeholders; after
 # that the rendered file is the source of truth (peers get appended to it).
 #
 # Two fake LANs live in network namespaces behind veth pairs (see staging.sh):

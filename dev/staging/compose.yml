@@ -17,8 +17,8 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
-      - ./state/config:/etc/parallax
-      - ./state/out:/var/lib/parallax
+      - ${STAGING_STATE:?run through staging.sh}/config:/etc/parallax
+      - ${STAGING_STATE:?run through staging.sh}/out:/var/lib/parallax
       - tailscale-state:/var/lib/tailscale
     environment:
       PARALLAX_CONFIG: /etc/parallax/parallax.toml
