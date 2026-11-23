@@ -25,6 +25,13 @@ PIDS=()
 cleanup() {
     set +e
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+    # $! above is the backgrounded `inns` subshell, not the server it starts, and the
+    # shim daemonizes: kill whatever still runs in each namespace, or they outlive the
+    # test and keep the caller's stdout open.
+    for ns in home gw client foreign; do
+        ip netns pids $ns 2>/dev/null | xargs -r kill 2>/dev/null
+    done
+    sleep 0.2
     for ns in home gw client foreign; do ip netns del $ns 2>/dev/null; done
     rm -rf "$WORK"
 }
