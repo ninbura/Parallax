@@ -25,7 +25,7 @@ proptest = "1"
 # cleanly on Alpine/musl, where aws-lc-rs needs cmake and more.
 tokio = { version = "1.47", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
 hyper = { version = "1.7", features = ["http1", "http2", "server", "client"] }
-hyper-util = { version = "0.1.17", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
+hyper-util = { version = "0.1.17", features = ["tokio", "client-legacy", "http1"] }
 http-body-util = "0.1.3"
 bytes = "1"
 tower-service = "0.3"

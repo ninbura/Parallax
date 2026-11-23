@@ -40,16 +40,17 @@ apply() {
 teardown() {
     echo "parallax: shutting down"
     [ -f "$OUT/dnsmasq/dnsmasq.pid" ] && kill "$(cat "$OUT/dnsmasq/dnsmasq.pid")" 2>/dev/null || true
-    kill "$TAILSCALED_PID" "${PROXY_PID:-}" "${SLEEP_PID:-}" 2>/dev/null || true
+    kill "$TAILSCALED_PID" "${PROXY_PID:-}" 2>/dev/null || true
     nft delete table inet parallax 2>/dev/null || true
     ip link del "$(sed -n 's/^interface *= *"\(wg[0-9]*\)"/\1/p' "$CONFIG" | head -n1)" 2>/dev/null || true
-    exit 0
+    exit "${1:-0}"
 }
 
 reload() {
     echo "parallax: SIGHUP, re-applying"
     if apply; then
-        # The proxy re-reads its routes (and certificates) on SIGHUP.
+        # The proxy re-reads its routes on SIGHUP. If it can't, it refuses
+        # everything until a reload succeeds rather than keep the old grants.
         kill -HUP "$PROXY_PID" 2>/dev/null || true
         echo "parallax: re-applied"
     else
@@ -63,11 +64,20 @@ apply
 # After apply: the proxy listens on the gateway address, which wg0 now carries.
 parallax -c "$CONFIG" proxy -o "$OUT" &
 PROXY_PID=$!
+# Most proxy failures (port taken, unreadable CA bundle) happen at once.
+sleep 1
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "parallax: the HTTPS proxy did not start; see above" >&2
+    teardown 1
+fi
 echo "parallax: gateway up; send SIGHUP to re-apply after editing $CONFIG"
-# A trapped signal makes `wait` return >128, which `set -e` would treat as fatal.
+# Wait on the proxy. A trapped signal makes `wait` return >128 while it still
+# runs (and `set -e` would treat that as fatal). If the proxy exits, so does
+# the container, and Docker's restart policy takes over.
 while :; do
-    sleep 3600 &
-    SLEEP_PID=$!
-    wait "$SLEEP_PID" || true
-    kill "$SLEEP_PID" 2>/dev/null || true
+    wait "$PROXY_PID" || true
+    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+        echo "parallax: the HTTPS proxy exited; stopping" >&2
+        teardown 1
+    fi
 done

@@ -1,12 +1,18 @@
 //! The running proxy: accept, pick the site from SNI before any certificate
 //! is sent, check the caller's tunnel address, then serve HTTP/1.1 or HTTP/2
 //! and forward each checked request to the site's upstream over TLS.
+//!
+//! The routes live in a `watch` channel. A reload sends a new state; every
+//! request looks its site up in the current one, and open connections and
+//! WebSocket relays re-check theirs on every change, so revoking a grant
+//! cuts off connections that were already open.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -14,6 +20,7 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::header::UPGRADE;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -21,35 +28,35 @@ use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto;
 use parallax_core::generate::proxy::{ProxyRoutes, ProxySite};
-use rustls::crypto::CryptoProvider;
 use rustls::server::Acceptor;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::CertificateDer;
+use rustls::{ClientConfig, ServerConfig};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{watch, Notify};
 use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
 
 use crate::{certs, http, Error, Result};
 
-/// Time allowed for a TLS handshake, and for HTTP/1 request headers.
+/// Time allowed for a TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time allowed for HTTP/1 request headers, idle time between requests included.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// HTTP/2 pings, so connections to vanished peers don't linger.
+const KEEPALIVE: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the certificate folder is checked for renewals.
 const CERT_REFRESH: Duration = Duration::from_secs(60);
+/// Open connections one tunnel address may hold. Browsers open about six per
+/// site over HTTP/1.1 and one over HTTP/2; this bounds what one peer can
+/// take from everyone else.
+const MAX_PER_SOURCE: usize = 64;
 
 type Body = BoxBody<Bytes, hyper::Error>;
 type Upstream = Client<HttpsConnector<HttpConnector<FixedResolver>>, Incoming>;
 
 fn log(msg: impl std::fmt::Display) {
     eprintln!("parallax proxy: {msg}");
-}
-
-fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
 }
 
 /// Resolves every name to the site's configured upstream: the proxy never
@@ -72,7 +79,7 @@ impl tower_service::Service<Name> for FixedResolver {
 
 struct Site {
     route: ProxySite,
-    /// `None` when no certificate covers the hostname: connections are refused.
+    /// `None` when no usable certificate covers the hostname: refused.
     tls: Option<Arc<ServerConfig>>,
     upstream: Upstream,
 }
@@ -84,11 +91,23 @@ struct State {
     certs_fingerprint: u64,
 }
 
+impl State {
+    /// The site for `hostname`, if `client` may use it right now.
+    fn authorized(&self, hostname: &str, client: Ipv4Addr) -> Option<&Arc<Site>> {
+        self.sites
+            .get(hostname)
+            .filter(|site| site.route.allows(client))
+    }
+}
+
+type Shared = watch::Receiver<Arc<State>>;
+
 /// A loaded proxy, ready to run on a listener.
 pub struct Proxy {
     routes_path: PathBuf,
     state: Arc<State>,
     refresh: Duration,
+    reload: Arc<Notify>,
 }
 
 impl Proxy {
@@ -98,6 +117,7 @@ impl Proxy {
             routes_path: routes_path.to_path_buf(),
             state: Arc::new(load_state(routes_path)?),
             refresh: CERT_REFRESH,
+            reload: Arc::new(Notify::new()),
         })
     }
 
@@ -112,6 +132,11 @@ impl Proxy {
         self
     }
 
+    /// Notifying this re-reads the routes, like SIGHUP does.
+    pub fn reload_trigger(&self) -> Arc<Notify> {
+        Arc::clone(&self.reload)
+    }
+
     /// Serve on `listener` until the process ends. SIGHUP re-reads the routes.
     pub async fn run(self, listener: TcpListener) -> Result<()> {
         let local = listener
@@ -121,17 +146,22 @@ impl Proxy {
             "listening on {local}, {} site(s)",
             self.state.sites.len()
         ));
-        let shared = Arc::new(RwLock::new(self.state));
-        tokio::spawn(reloader(
-            self.routes_path,
-            Arc::clone(&shared),
-            self.refresh,
-        ));
+        let (tx, rx) = watch::channel(self.state);
+        tokio::spawn(reloader(self.routes_path, tx, self.refresh, self.reload));
+        let counts: Arc<Mutex<HashMap<Ipv4Addr, usize>>> = Arc::default();
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    let state = current(&shared);
-                    tokio::spawn(handle(stream, peer, state));
+                    let Some(client) = ipv4(peer.ip()) else {
+                        continue;
+                    };
+                    let Some(slot) = Slot::take(&counts, client) else {
+                        log(format!(
+                            "{client}: refused, already {MAX_PER_SOURCE} open connections"
+                        ));
+                        continue;
+                    };
+                    tokio::spawn(handle(stream, client, rx.clone(), slot));
                 }
                 Err(e) => {
                     // Usually out of file descriptors; back off rather than spin.
@@ -159,17 +189,43 @@ pub fn serve(routes_path: &Path) -> Result<()> {
     })
 }
 
-fn current(shared: &RwLock<Arc<State>>) -> Arc<State> {
-    match shared.read() {
-        Ok(state) => Arc::clone(&state),
-        Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+fn ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
+    match ip {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
     }
 }
 
-fn replace(shared: &RwLock<Arc<State>>, state: State) {
-    match shared.write() {
-        Ok(mut slot) => *slot = Arc::new(state),
-        Err(poisoned) => *poisoned.into_inner() = Arc::new(state),
+/// One open connection counted against its source address.
+struct Slot {
+    counts: Arc<Mutex<HashMap<Ipv4Addr, usize>>>,
+    client: Ipv4Addr,
+}
+
+impl Slot {
+    fn take(counts: &Arc<Mutex<HashMap<Ipv4Addr, usize>>>, client: Ipv4Addr) -> Option<Slot> {
+        let mut map = counts.lock().unwrap_or_else(|p| p.into_inner());
+        let n = map.entry(client).or_insert(0);
+        if *n >= MAX_PER_SOURCE {
+            return None;
+        }
+        *n += 1;
+        Some(Slot {
+            counts: Arc::clone(counts),
+            client,
+        })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = map.get_mut(&self.client) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.client);
+            }
+        }
     }
 }
 
@@ -181,7 +237,11 @@ fn load_state(routes_path: &Path) -> Result<State> {
     let mut sites = HashMap::new();
     // With no sites there is nothing to verify, and no CA bundle is needed.
     if !routes.sites.is_empty() {
-        let client_tls = client_config(&routes.upstream_ca)?;
+        let client_tls = ClientConfig::builder_with_provider(certs::provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::invalid("setting up upstream TLS", e))?
+            .with_root_certificates(certs::upstream_roots(&routes.upstream_ca)?)
+            .with_no_client_auth();
         for route in &routes.sites {
             let site = Site {
                 route: route.clone(),
@@ -198,24 +258,6 @@ fn load_state(routes_path: &Path) -> Result<State> {
     })
 }
 
-fn client_config(ca: &Path) -> Result<ClientConfig> {
-    let context = || format!("reading the upstream CA bundle {}", ca.display());
-    let mut roots = RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(ca).map_err(|e| Error::invalid(context(), e))? {
-        let cert = cert.map_err(|e| Error::invalid(context(), e))?;
-        // Bundles carry the odd certificate webpki can't use; skip those.
-        let _ = roots.add(cert);
-    }
-    if roots.is_empty() {
-        return Err(Error::invalid(context(), "no usable CA certificate in it"));
-    }
-    Ok(ClientConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| Error::invalid("setting up upstream TLS", e))?
-        .with_root_certificates(roots)
-        .with_no_client_auth())
-}
-
 fn upstream_client(upstream: SocketAddrV4, tls: ClientConfig) -> Upstream {
     let mut http = HttpConnector::new_with_resolver(FixedResolver(SocketAddr::V4(upstream)));
     http.enforce_http(false);
@@ -229,8 +271,8 @@ fn upstream_client(upstream: SocketAddrV4, tls: ClientConfig) -> Upstream {
     Client::builder(TokioExecutor::new()).build(https)
 }
 
-/// A server TLS config per hostname (`None` where no certificate covers it),
-/// plus the fingerprint of the folder they came from.
+/// A server TLS config per hostname (`None` where no usable certificate
+/// covers it), plus the fingerprint of the folder they came from.
 fn server_configs(routes: &ProxyRoutes) -> (HashMap<String, Option<Arc<ServerConfig>>>, u64) {
     let fingerprint = certs::fingerprint(&routes.certificates);
     let mut out = HashMap::new();
@@ -250,41 +292,24 @@ fn server_configs(routes: &ProxyRoutes) -> (HashMap<String, Option<Arc<ServerCon
         }
     };
     for site in &routes.sites {
-        let config = match certs::pick(&found, &site.hostname) {
-            None => {
-                log(format!(
-                    "no certificate in {} covers {}; refusing it until one does",
-                    routes.certificates.display(),
-                    site.hostname
-                ));
+        let config = match certs::select(&found, &site.hostname) {
+            Ok((_, config)) => Some(config),
+            Err(why) => {
+                log(format!("{why}; refusing it until one does"));
                 None
             }
-            Some(cert) => match server_config(cert) {
-                Ok(config) => Some(config),
-                Err(e) => {
-                    log(format!("{}: {e}", site.hostname));
-                    None
-                }
-            },
         };
         out.insert(site.hostname.clone(), config);
     }
     (out, fingerprint)
 }
 
-fn server_config(cert: &certs::Certificate) -> Result<Arc<ServerConfig>> {
-    let context = || format!("certificate in {}", cert.dir.display());
-    let mut config = ServerConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| Error::invalid(context(), e))?
-        .with_no_client_auth()
-        .with_single_cert(cert.chain.clone(), cert.private_key()?)
-        .map_err(|e| Error::invalid(context(), e))?;
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
-}
-
-async fn reloader(routes_path: PathBuf, shared: Arc<RwLock<Arc<State>>>, refresh: Duration) {
+async fn reloader(
+    routes_path: PathBuf,
+    tx: watch::Sender<Arc<State>>,
+    refresh: Duration,
+    trigger: Arc<Notify>,
+) {
     use tokio::signal::unix::{signal, SignalKind};
     let mut hangup = match signal(SignalKind::hangup()) {
         Ok(s) => Some(s),
@@ -298,43 +323,66 @@ async fn reloader(routes_path: PathBuf, shared: Arc<RwLock<Arc<State>>>, refresh
     tick.tick().await;
     loop {
         tokio::select! {
-            Some(()) = recv(&mut hangup) => match load_state(&routes_path) {
-                Ok(state) => {
-                    let old = current(&shared);
-                    if state.routes.listen != old.routes.listen {
-                        log(format!(
-                            "the listen address changed to {}; restart the proxy to use it",
-                            state.routes.listen
-                        ));
-                    }
-                    log(format!("routes reloaded, {} site(s)", state.sites.len()));
-                    replace(&shared, state);
-                }
-                Err(e) => log(format!("reload failed, keeping the previous routes: {e}")),
-            },
-            _ = tick.tick() => {
-                let old = current(&shared);
-                if certs::fingerprint(&old.routes.certificates) == old.certs_fingerprint {
-                    continue;
-                }
-                let (tls, certs_fingerprint) = server_configs(&old.routes);
-                let sites = old
-                    .sites
-                    .iter()
-                    .map(|(name, site)| {
-                        let site = Site {
-                            route: site.route.clone(),
-                            tls: tls.get(name).cloned().flatten(),
-                            upstream: site.upstream.clone(),
-                        };
-                        (name.clone(), Arc::new(site))
-                    })
-                    .collect();
-                log("certificates changed, reloaded");
-                replace(&shared, State { routes: old.routes.clone(), sites, certs_fingerprint });
-            }
+            Some(()) = recv(&mut hangup) => reload(&routes_path, &tx),
+            () = trigger.notified() => reload(&routes_path, &tx),
+            _ = tick.tick() => refresh_certificates(&tx),
         }
     }
+}
+
+/// Re-read the routes. On failure, refuse everything until a reload works:
+/// the old routes may grant what the new configuration takes away.
+fn reload(routes_path: &Path, tx: &watch::Sender<Arc<State>>) {
+    let old = Arc::clone(&tx.borrow());
+    match load_state(routes_path) {
+        Ok(state) => {
+            if state.routes.listen != old.routes.listen {
+                log(format!(
+                    "the listen address changed to {}; restart the proxy to use it",
+                    state.routes.listen
+                ));
+            }
+            log(format!("routes reloaded, {} site(s)", state.sites.len()));
+            tx.send_replace(Arc::new(state));
+        }
+        Err(e) => {
+            log(format!(
+                "reload failed, refusing every connection until one succeeds: {e}"
+            ));
+            tx.send_replace(Arc::new(State {
+                routes: old.routes.clone(),
+                sites: HashMap::new(),
+                certs_fingerprint: old.certs_fingerprint,
+            }));
+        }
+    }
+}
+
+fn refresh_certificates(tx: &watch::Sender<Arc<State>>) {
+    let old = Arc::clone(&tx.borrow());
+    if old.sites.is_empty() || certs::fingerprint(&old.routes.certificates) == old.certs_fingerprint
+    {
+        return;
+    }
+    let (tls, certs_fingerprint) = server_configs(&old.routes);
+    let sites = old
+        .sites
+        .iter()
+        .map(|(name, site)| {
+            let site = Site {
+                route: site.route.clone(),
+                tls: tls.get(name).cloned().flatten(),
+                upstream: site.upstream.clone(),
+            };
+            (name.clone(), Arc::new(site))
+        })
+        .collect();
+    log("certificates changed, reloaded");
+    tx.send_replace(Arc::new(State {
+        routes: old.routes.clone(),
+        sites,
+        certs_fingerprint,
+    }));
 }
 
 async fn recv(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
@@ -344,14 +392,28 @@ async fn recv(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
     }
 }
 
-async fn handle(stream: TcpStream, peer: SocketAddr, state: Arc<State>) {
-    let client = match peer.ip() {
-        IpAddr::V4(v4) => v4,
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4,
-            None => return,
-        },
-    };
+/// Drive `work` until it ends or `client` loses `hostname` in a reload.
+async fn while_authorized<F: Future>(work: F, mut state: Shared, hostname: &str, client: Ipv4Addr) {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            _ = &mut work => return,
+            changed = state.changed() => {
+                if changed.is_err() {
+                    // The reloader is gone; the last state stays in force.
+                    work.await;
+                    return;
+                }
+                if state.borrow_and_update().authorized(hostname, client).is_none() {
+                    log(format!("{client}: {hostname}: access revoked, closing"));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot) {
     let start = match timeout(
         HANDSHAKE_TIMEOUT,
         LazyConfigAcceptor::new(Acceptor::default(), stream),
@@ -366,14 +428,18 @@ async fn handle(stream: TcpStream, peer: SocketAddr, state: Arc<State>) {
         .client_hello()
         .server_name()
         .map(str::to_ascii_lowercase);
-    let Some(site) = sni.as_deref().and_then(|n| state.sites.get(n)) else {
-        log(format!(
-            "{client}: refused, no site for {}",
-            sni.as_deref().unwrap_or("a connection without SNI")
-        ));
-        return;
+    let site = {
+        let current = state.borrow();
+        let Some(site) = sni.as_deref().and_then(|n| current.sites.get(n)) else {
+            log(format!(
+                "{client}: refused, no site for {}",
+                sni.as_deref().unwrap_or("a connection without SNI")
+            ));
+            return;
+        };
+        Arc::clone(site)
     };
-    let hostname = &site.route.hostname;
+    let hostname = site.route.hostname.clone();
     if !site.route.allows(client) {
         log(format!(
             "{client}: refused {hostname}: not allowed from this address"
@@ -390,16 +456,28 @@ async fn handle(stream: TcpStream, peer: SocketAddr, state: Arc<State>) {
         Ok(Ok(stream)) => stream,
         _ => return,
     };
-    let site = Arc::clone(site);
-    let service = service_fn(move |req| forward(req, Arc::clone(&site), client));
-    let mut builder = auto::Builder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_TIMEOUT);
-    let _ = builder
-        .serve_connection_with_upgrades(TokioIo::new(stream), service)
-        .await;
+    let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+    let io = TokioIo::new(stream);
+    let service = {
+        let (hostname, state) = (hostname.clone(), state.clone());
+        service_fn(move |req| forward(req, hostname.clone(), client, state.clone()))
+    };
+    // The protocol comes from ALPN, so the HTTP/1 header timeout runs from the
+    // first byte: an idle peer can't hold the socket.
+    if h2 {
+        let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .keep_alive_interval(KEEPALIVE)
+            .serve_connection(io, service);
+        while_authorized(conn, state, &hostname, client).await;
+    } else {
+        let conn = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(HEADER_TIMEOUT)
+            .serve_connection(io, service)
+            .with_upgrades();
+        while_authorized(conn, state, &hostname, client).await;
+    }
 }
 
 fn reply(status: StatusCode, message: &str) -> Response<Body> {
@@ -426,16 +504,20 @@ fn chain(e: &dyn std::error::Error) -> String {
 
 async fn forward(
     mut req: Request<Incoming>,
-    site: Arc<Site>,
+    hostname: String,
     client: Ipv4Addr,
+    state: Shared,
 ) -> std::result::Result<Response<Body>, Infallible> {
-    let hostname = &site.route.hostname;
-    if let Err(r) = http::check(&req, hostname) {
+    // Look the site up per request: a reload may have revoked or moved it.
+    let Some(site) = state.borrow().authorized(&hostname, client).cloned() else {
+        return Ok(reply(StatusCode::FORBIDDEN, "access was revoked"));
+    };
+    if let Err(r) = http::check(&req, &hostname) {
         log(format!("{client}: {hostname}: {}", r.message()));
         return Ok(reply(r.status(), r.message()));
     }
     let downstream_upgrade = http::upgrade(&req).map(|_| hyper::upgrade::on(&mut req));
-    let up = match http::upstream_request(req, hostname, site.route.upstream.port(), client) {
+    let up = match http::upstream_request(req, &hostname, site.route.upstream.port(), client) {
         Ok(up) => up,
         Err(r) => return Ok(reply(r.status(), r.message())),
     };
@@ -453,20 +535,31 @@ async fn forward(
             ));
         }
     };
-    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-        let Some(downstream) = downstream_upgrade else {
-            return Ok(reply(StatusCode::BAD_GATEWAY, "unexpected protocol switch"));
-        };
-        let upstream = hyper::upgrade::on(&mut resp);
-        tokio::spawn(async move {
-            if let (Ok(down), Ok(up)) = tokio::join!(downstream, upstream) {
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        http::strip_hop_by_hop(resp.headers_mut(), None);
+        return Ok(resp.map(BodyExt::boxed));
+    }
+    // Only a WebSocket switch we asked for: another protocol on the raw
+    // stream would carry requests the checks above never see.
+    let confirmed = resp
+        .headers()
+        .get(UPGRADE)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let (Some(downstream), true) = (downstream_upgrade, confirmed) else {
+        return Ok(reply(StatusCode::BAD_GATEWAY, "unexpected protocol switch"));
+    };
+    let upgrade = resp.headers().get(UPGRADE).cloned();
+    http::strip_hop_by_hop(resp.headers_mut(), upgrade);
+    let upstream = hyper::upgrade::on(&mut resp);
+    tokio::spawn(async move {
+        if let (Ok(down), Ok(up)) = tokio::join!(downstream, upstream) {
+            let relay = async move {
                 let _ =
                     tokio::io::copy_bidirectional(&mut TokioIo::new(down), &mut TokioIo::new(up))
                         .await;
-            }
-        });
-    } else {
-        http::strip_hop_by_hop(resp.headers_mut(), None);
-    }
+            };
+            while_authorized(relay, state, &hostname, client).await;
+        }
+    });
     Ok(resp.map(BodyExt::boxed))
 }

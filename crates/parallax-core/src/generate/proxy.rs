@@ -52,7 +52,10 @@ pub struct ProxySite {
 
 impl ProxyRoutes {
     pub fn from_toml(text: &str) -> Result<Self> {
-        toml::from_str(text).map_err(|e| Error::Parse(format!("proxy routes: {}", e.message())))
+        toml::from_str(text).map_err(|e| Error::Malformed {
+            what: "proxy routes",
+            detail: e.message().trim().to_string(),
+        })
     }
 
     /// The site for `hostname`, if the proxy serves it.

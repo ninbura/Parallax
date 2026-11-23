@@ -188,13 +188,25 @@ absolute-form targets get `400`. Checked requests go to the site's
 upstream over HTTP/1.1 and TLS, verified against the hostname; the
 upstream address comes from the routes, never from a client-supplied name.
 Forwarding headers are replaced, not appended (`X-Forwarded-For` is the
-tunnel address). WebSocket upgrades pass through.
+tunnel address). WebSocket upgrades pass through; other upgrades (`h2c`)
+are dropped, since after a switch the proxy only relays bytes. HTTP/1 vs
+HTTP/2 comes from ALPN, so the header timeout runs from the first byte, and
+one tunnel address may hold at most 64 connections.
+
+Reloads (SIGHUP) swap the routes whole. Every request looks its site up in
+the current routes, and open connections and WebSocket relays are closed
+when a reload takes their hostname away from their address. A reload that
+fails (unreadable routes or CA bundle) refuses everything until one
+succeeds: the old routes may grant what the new configuration took away.
 
 Certificates: every directory under the folder holding `fullchain.pem` and
 `privkey.pem` is one certificate. An exact name beats a wildcard; ties go to
 path order. The folder is re-checked every minute, so renewals need no
-restart; SIGHUP re-reads the routes. `plan` and `apply` fail, naming the
-hostname, when a site has no covering certificate.
+restart. A certificate whose key is missing or doesn't match is skipped.
+`plan` and `apply` make the same choice and fail, naming the hostname, when
+a site has no usable certificate or the upstream CA bundle doesn't load, so
+the proxy isn't handed routes it would refuse. In Docker, the container
+stops if the proxy does, and the restart policy takes over.
 
 Docker note: a Docker-published port on the gateway host is reached through
 `docker-proxy` listening on the host address, because the NETMAP DNAT and

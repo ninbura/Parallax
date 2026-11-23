@@ -29,6 +29,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -154,6 +155,8 @@ struct Env {
     ca: Ca,
     proxy: SocketAddr,
     roots: RootCertStore,
+    routes: ProxyRoutes,
+    reload: Arc<Notify>,
 }
 
 impl Drop for Env {
@@ -193,6 +196,7 @@ impl Env {
         let proxy = Proxy::load(&routes_path)
             .unwrap()
             .refresh_every(Duration::from_millis(100));
+        let reload = proxy.reload_trigger();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(proxy.run(listener));
@@ -203,7 +207,23 @@ impl Env {
             ca,
             proxy: addr,
             roots,
+            routes,
+            reload,
         }
+    }
+
+    /// Write `text` as the routes file and have the proxy re-read it.
+    async fn reload_with(&self, text: &str) {
+        std::fs::write(self.dir.join("routes.toml"), text).unwrap();
+        self.reload.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    /// Reload with IMMICH granted to another tier only.
+    async fn revoke_immich(&self) {
+        let mut routes = self.routes.clone();
+        routes.sites[0].allowed = vec!["10.0.0.0/8".parse().unwrap()];
+        self.reload_with(&toml::to_string(&routes).unwrap()).await;
     }
 
     async fn connect(&self, sni: &str, alpn: &[u8]) -> std::io::Result<TlsStream<TcpStream>> {
@@ -322,21 +342,7 @@ async fn upstream_certificate_must_name_the_hostname() {
 #[tokio::test(flavor = "multi_thread")]
 async fn websocket_upgrades_pass_through() {
     let env = Env::start().await;
-    let tls = env.connect(IMMICH, b"http/1.1").await.unwrap();
-    let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-        .await
-        .unwrap();
-    tokio::spawn(conn.with_upgrades());
-    let req = Request::builder()
-        .uri("/api/socket.io/")
-        .header(HOST, IMMICH)
-        .header(CONNECTION, "Upgrade")
-        .header(UPGRADE, "websocket")
-        .body(Empty::<Bytes>::new())
-        .unwrap();
-    let resp = send.send_request(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-    let mut io = TokioIo::new(hyper::upgrade::on(resp).await.unwrap());
+    let mut io = websocket(&env).await;
     io.write_all(b"ping").await.unwrap();
     let mut buf = [0u8; 4];
     io.read_exact(&mut buf).await.unwrap();
@@ -373,21 +379,122 @@ fn exact_names_win_over_wildcards_and_gaps_are_reported() {
     let (found, problems) = certs::scan(&dir).unwrap();
     assert!(problems.is_empty(), "{problems:?}");
     assert_eq!(found.len(), 2);
-    assert_eq!(
-        certs::pick(&found, IMMICH).unwrap().dir,
-        dir.join("b-immich")
-    );
-    assert_eq!(
-        certs::pick(&found, "photos.example.test").unwrap().dir,
-        dir.join("a-wildcard")
-    );
-    assert_eq!(
-        certs::uncovered(
-            &found,
-            &[IMMICH, "photos.example.test", "immich.other.test"]
-        ),
-        vec!["immich.other.test"]
-    );
+    let chosen = |name: &str| certs::select(&found, name).map(|(c, _)| c.dir.clone());
+    assert_eq!(chosen(IMMICH), Ok(dir.join("b-immich")));
+    assert_eq!(chosen("photos.example.test"), Ok(dir.join("a-wildcard")));
+    assert!(chosen("immich.other.test")
+        .unwrap_err()
+        .contains("no certificate covers immich.other.test"));
     assert!(certs::scan(&dir.join("missing")).is_err());
+
+    // A key that doesn't match its certificate is skipped, not served.
+    let (chain, _) = ca.leaf(&[IMMICH]);
+    let (_, other_key) = ca.leaf(&[IMMICH]);
+    write_cert(&dir.join("b-immich"), &(chain, other_key));
+    let (found, _) = certs::scan(&dir).unwrap();
+    assert_eq!(chosen_in(&found, IMMICH), Some(dir.join("a-wildcard")));
+    std::fs::remove_dir_all(dir.join("a-wildcard")).unwrap();
+    let (found, _) = certs::scan(&dir).unwrap();
+    let why = certs::select(&found, IMMICH).unwrap_err();
+    assert!(why.contains("no usable certificate covers"), "{why}");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn chosen_in(found: &[certs::Certificate], name: &str) -> Option<PathBuf> {
+    certs::select(found, name).ok().map(|(c, _)| c.dir.clone())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_grant_closes_open_connections() {
+    let env = Env::start().await;
+    // An HTTP/2 connection and a WebSocket, both open before the change.
+    let tls = env.connect(IMMICH, b"h2").await.unwrap();
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let req = || {
+        Request::builder()
+            .uri(format!("https://{IMMICH}/"))
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    assert_eq!(
+        h2.send_request(req()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let mut ws = websocket(&env).await;
+
+    env.revoke_immich().await;
+    assert!(
+        h2.send_request(req()).await.is_err(),
+        "the HTTP/2 connection must be closed"
+    );
+    let mut buf = [0u8; 4];
+    let _ = ws.write_all(b"ping").await;
+    assert!(
+        !matches!(ws.read(&mut buf).await, Ok(n) if n > 0),
+        "the WebSocket must be closed"
+    );
+    assert!(env.connect(IMMICH, b"http/1.1").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_reload_refuses_everything() {
+    let env = Env::start().await;
+    assert!(env.connect(IMMICH, b"http/1.1").await.is_ok());
+    env.reload_with("not toml").await;
+    assert!(env.connect(IMMICH, b"http/1.1").await.is_err());
+    env.reload_with(&toml::to_string(&env.routes).unwrap())
+        .await;
+    assert!(env.connect(IMMICH, b"http/1.1").await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_websocket_upgrades_are_forwarded() {
+    let env = Env::start().await;
+    let req = Request::builder()
+        .uri("/")
+        .header(HOST, IMMICH)
+        .header(CONNECTION, "Upgrade, HTTP2-Settings")
+        .header(UPGRADE, "h2c")
+        .header("http2-settings", "AAMAAABkAAQAAP__")
+        .body(Empty::new())
+        .unwrap();
+    // The fake upstream switches whenever it sees `Upgrade`; it must not see one.
+    let (status, body) = env.h1(IMMICH, req).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_address_cannot_take_every_connection() {
+    let env = Env::start().await;
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(env.connect(IMMICH, b"http/1.1").await.unwrap());
+    }
+    assert!(env.connect(IMMICH, b"http/1.1").await.is_err());
+    held.pop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(env.connect(IMMICH, b"http/1.1").await.is_ok());
+}
+
+/// An open WebSocket through the proxy, already switched.
+async fn websocket(env: &Env) -> TokioIo<hyper::upgrade::Upgraded> {
+    let tls = env.connect(IMMICH, b"http/1.1").await.unwrap();
+    let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(conn.with_upgrades());
+    let req = Request::builder()
+        .uri("/api/socket.io/")
+        .header(HOST, IMMICH)
+        .header(CONNECTION, "Upgrade")
+        .header(UPGRADE, "websocket")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = send.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+    TokioIo::new(hyper::upgrade::on(resp).await.unwrap())
 }

@@ -97,18 +97,19 @@ fn names(value: &str, hostname: &str) -> bool {
     port.is_none_or(|p| p == "443") && host.eq_ignore_ascii_case(hostname)
 }
 
-/// An HTTP/1.1 protocol upgrade (WebSocket): `Connection: upgrade` plus an
-/// `Upgrade` header. Returns the `Upgrade` value to pass on.
+/// An HTTP/1.1 WebSocket upgrade: `Connection: upgrade` plus `Upgrade:
+/// websocket`. Returns the `Upgrade` value to pass on. Other upgrades (h2c,
+/// say) are dropped: after a switch the proxy only relays bytes, so a
+/// protocol that carries requests would get past the checks.
 pub fn upgrade<B>(req: &Request<B>) -> Option<HeaderValue> {
     if req.version() != Version::HTTP_11 {
         return None;
     }
     let wants = connection_tokens(req.headers()).any(|t| t.eq_ignore_ascii_case("upgrade"));
-    if wants {
-        req.headers().get(header::UPGRADE).cloned()
-    } else {
-        None
-    }
+    req.headers()
+        .get(header::UPGRADE)
+        .filter(|v| wants && v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        .cloned()
 }
 
 fn connection_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
@@ -337,5 +338,22 @@ mod tests {
         assert_eq!(up.headers()[header::CONNECTION], "upgrade");
         assert_eq!(up.headers()[header::UPGRADE], "websocket");
         assert_eq!(up.headers()[header::COOKIE], "a=1; b=2");
+    }
+
+    #[test]
+    fn only_websocket_upgrades_pass() {
+        let req = Request::builder()
+            .uri("/")
+            .version(Version::HTTP_11)
+            .header(header::HOST, SITE)
+            .header(header::CONNECTION, "Upgrade, HTTP2-Settings")
+            .header(header::UPGRADE, "h2c")
+            .header("http2-settings", "AAMAAABkAAQAAP__")
+            .body(())
+            .unwrap();
+        assert!(upgrade(&req).is_none());
+        let up = upstream_request(req, SITE, 443, "10.8.2.1".parse().unwrap()).unwrap();
+        assert!(up.headers().get(header::UPGRADE).is_none());
+        assert!(up.headers().get("http2-settings").is_none());
     }
 }

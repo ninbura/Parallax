@@ -154,26 +154,12 @@ fn print_export(export: &Export) {
     print!("{}", export.contents);
 }
 
-/// Every hostname the proxy will serve needs a certificate in the folder.
-/// Parallax never issues one, so say plainly what's missing.
+/// Every hostname the proxy will serve needs a usable certificate, and the
+/// upstream CA bundle must load. Parallax never issues certificates, so say
+/// plainly what's missing before the proxy is handed routes it would refuse.
 fn check_certificates(model: &Model<'_>) -> anyhow::Result<()> {
-    let routes = generate::proxy::build(model);
-    if routes.sites.is_empty() {
-        return Ok(());
-    }
-    let dir = routes.certificates.display();
-    let (found, problems) = parallax_proxy::certs::scan(&routes.certificates).map_err(|e| {
-        anyhow!("{e} (server.proxy.certificates; proxied hostnames need their certificates there)")
-    })?;
-    print_warnings(&problems);
-    let names: Vec<&str> = routes.sites.iter().map(|s| s.hostname.as_str()).collect();
-    let missing = parallax_proxy::certs::uncovered(&found, &names);
-    if !missing.is_empty() {
-        bail!(
-            "no certificate in {dir} covers {}: put one in a directory under it (fullchain.pem and privkey.pem, as certbot writes them)",
-            missing.join(", ")
-        );
-    }
+    let warnings = parallax_proxy::preflight(&generate::proxy::build(model))?;
+    print_warnings(&warnings);
     Ok(())
 }
 
