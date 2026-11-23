@@ -40,6 +40,18 @@ pub fn preflight(backend: FirewallBackend, sys: System<'_>) -> Vec<String> {
             }
         ));
     }
+    if backend == FirewallBackend::IptablesNft {
+        for (tool, package) in [("iptables-restore", "iptables"), ("ipset", "ipset")] {
+            if sys
+                .runner
+                .run(tool, &["--version"], None)
+                .map(|o| !o.ok())
+                .unwrap_or(true)
+            {
+                missing.push(format!("`{tool}` is not available: install {package}"));
+            }
+        }
+    }
     if sys
         .runner
         .run("wg", &["--version"], None)

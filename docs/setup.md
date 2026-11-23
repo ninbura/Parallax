@@ -2,7 +2,8 @@
 
 ## What you need on the host
 
-- Linux with nftables >= 0.9.4 (any current distribution) and **rootful
+- Linux with a current nftables and kernel that support prefix NAT (NETMAP;
+  any current distribution, and `parallax doctor` checks it) and **rootful
   Docker** with Compose (see below; rootless Docker is not supported).
 - The `wireguard` kernel module, loaded on the host at boot. The container
   can't load modules (it has no `SYS_MODULE`):
@@ -49,18 +50,18 @@
 ## Rootful Docker, not rootless
 
 Parallax creates `wg0`, loads an nftables table and runs the DNS shim in the
-host's own network namespace, with `CAP_NET_ADMIN` over it. Rootless Docker
-can't give it that:
-
-- Its "host network" is a private namespace behind a userspace proxy. The
-  host's LAN interfaces aren't there, every incoming connection appears to
-  come from the proxy, LAN devices can't reach tunnel peers, and throughput
-  drops.
-- Root inside a user namespace has no power over the host's network.
+host's own network namespace, and needs `CAP_NET_ADMIN` over it. Under
+rootless Docker, the container's root is your unprivileged user on the host:
+its capabilities only cover namespaces the rootless daemon created, never the
+host's real network. Usually its "host network" is also a private namespace
+behind a userspace proxy, so the host's LAN interfaces aren't there, every
+incoming connection appears to come from the proxy, LAN devices can't reach
+tunnel peers, and throughput drops.
 
 `parallax doctor` checks `/proc/self/uid_map` and refuses to start in a user
-namespace, so this fails at startup instead of half working. The same goes
-for a rootful daemon with `userns-remap` enabled.
+namespace, so this fails at startup instead of half working. A rootful daemon
+with `userns-remap` enabled refuses host networking on its own; give the
+Parallax service `userns_mode: host` there.
 
 ### Next to a rootless daemon
 

@@ -152,9 +152,10 @@ fn check_user_namespace(sys: System<'_>) -> Result<String, String> {
         None => "uid 0 is not mapped".into(),
     };
     Err(format!(
-        "running in a user namespace ({root}). Rootless Docker and userns-remap are not \
-         supported: Parallax needs root over the host's own network. Run it on a rootful \
-         Docker daemon or install it natively; see {SETUP_DOC}"
+        "running in a user namespace ({root}). Rootless Docker is not supported: Parallax \
+         needs root over the host's own network. Run it on a rootful Docker daemon (with \
+         userns-remap, set `userns_mode: host` for this service) or install it natively; \
+         see {SETUP_DOC}"
     ))
 }
 
@@ -213,7 +214,15 @@ fn check_interface(name: &str, sys: System<'_>) -> Result<String, String> {
         .runner
         .run("ip", &["-o", "link", "show", "dev", name], None)
     {
-        Ok(out) if out.ok() => Ok("present".into()),
+        Ok(out) if out.ok() => match primary_name(&out.stdout) {
+            Some(primary) if primary == name => Ok("present".into()),
+            // `ip` resolves alternative names, but nftables matches only the primary one.
+            Some(primary) => Err(format!(
+                "{name} is an alternative name of {primary}; the firewall matches primary \
+                 names only, so use {primary} in the configuration"
+            )),
+            None => Err(format!("unexpected `ip link` output for {name}")),
+        },
         _ => Err(format!(
             "not found in this network namespace. Check the name with `ip link`; under \
              rootless Docker the host's interfaces are never visible (see {SETUP_DOC})"
@@ -221,11 +230,14 @@ fn check_interface(name: &str, sys: System<'_>) -> Result<String, String> {
     }
 }
 
+/// The name in `ip -o link show` output: `2: eth0@if3: <...>` gives `eth0`.
+fn primary_name(line: &str) -> Option<&str> {
+    let name = line.split(": ").nth(1)?;
+    Some(name.split('@').next().unwrap_or(name))
+}
+
 fn check_wireguard(sys: System<'_>) -> Result<String, String> {
-    // A probe left over from an interrupted run would make `add` fail.
-    let _ = sys
-        .runner
-        .run("ip", &["link", "del", PROBE_INTERFACE], None);
+    // Never delete first: an interface with this name that isn't ours must survive.
     let added = sys.runner.run(
         "ip",
         &["link", "add", PROBE_INTERFACE, "type", "wireguard"],
@@ -239,6 +251,10 @@ fn check_wireguard(sys: System<'_>) -> Result<String, String> {
             Ok("can create interfaces".into())
         }
         Ok(out) if not_permitted(&out.stderr) => Err(NOT_PERMITTED.into()),
+        Ok(out) if out.stderr.contains("File exists") => Err(format!(
+            "an interface named {PROBE_INTERFACE} already exists, so the probe can't run; \
+             if a previous check left it behind, remove it with `ip link del {PROBE_INTERFACE}`"
+        )),
         Ok(out) => Err(format!(
             "cannot create a WireGuard interface ({}). Load the module on the host: \
              `modprobe wireguard`, and to load it at boot put `wireguard` in \
@@ -257,8 +273,8 @@ fn check_netmap(sys: System<'_>) -> Result<String, String> {
         Ok(out) if out.ok() => Ok("prefix NAT supported".into()),
         Ok(out) if not_permitted(&out.stderr) => Err(NOT_PERMITTED.into()),
         Ok(out) => Err(format!(
-            "the kernel or nft rejects NETMAP (prefix NAT); needs nftables >= 0.9.4 and a \
-             kernel with nf_nat prefix mapping. nft said: {}",
+            "the kernel or nft rejects NETMAP (prefix NAT); it needs a newer nftables, \
+             or a kernel with nf_nat prefix mapping. nft said: {}",
             one_line(&out.stderr)
         )),
         Err(e) => Err(format!("cannot run nft: {e}")),
@@ -318,7 +334,18 @@ mod tests {
         }
     }
 
+    /// Runs the checks. Answers queued by a test take precedence over the
+    /// healthy `ip link show` answer queued here.
     fn run(fs: &MemoryFs, runner: &RecordingRunner) -> Vec<Check> {
+        runner.respond_to(
+            "ip",
+            &["-o", "link", "show", "dev", "eth0"],
+            Output {
+                status: 0,
+                stdout: "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n".into(),
+                stderr: String::new(),
+            },
+        );
         diagnose(Path::new(CONFIG), System { fs, runner })
     }
 
@@ -369,7 +396,7 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0, "user namespace");
         assert!(p[0].1.contains("uid 0 here is uid 1000 on the host"));
-        assert!(p[0].1.contains("Rootless Docker"));
+        assert!(p[0].1.contains("Rootless Docker is not supported"));
     }
 
     #[test]
@@ -434,6 +461,40 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0, "interface eth0");
         assert!(p[0].1.contains("rootless Docker"));
+    }
+
+    #[test]
+    fn alternative_interface_name_is_refused() {
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "ip",
+            &["-o", "link", "show", "dev", "eth0"],
+            Output {
+                status: 0,
+                stdout: "2: eno1: <BROADCAST,MULTICAST,UP> mtu 1500\\    altname eth0\n".into(),
+                stderr: String::new(),
+            },
+        );
+        let checks = run(&healthy_fs(), &runner);
+        let p = problems(&checks);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].1.contains("use eno1"), "{}", p[0].1);
+    }
+
+    #[test]
+    fn probe_never_deletes_an_interface_it_did_not_create() {
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "ip",
+            &["link", "add", PROBE_INTERFACE, "type", "wireguard"],
+            failed(2, "RTNETLINK answers: File exists"),
+        );
+        let checks = run(&healthy_fs(), &runner);
+        assert!(!runner
+            .command_lines()
+            .iter()
+            .any(|l| l.starts_with("ip link del")));
+        assert!(problems(&checks)[0].1.contains("already exists"));
     }
 
     #[test]
