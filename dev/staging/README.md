@@ -30,7 +30,9 @@ must not be in use on your real network.
 ## Requirements
 
 Rootful Docker with Compose, `wireguard-tools`, `dnsmasq`, `python3`, `dig`,
-`curl`, `qrencode`, the `wireguard` kernel module. Everything runs as root.
+`curl`, `qrencode`, the `wireguard` kernel module. Everything runs as root,
+through `sudo` or `pkexec` (one prompt per command; `up` starts Docker if it's
+stopped).
 
 If the host runs a firewall such as ufw, allow the WireGuard port and the
 shim, as for any Parallax install (`docs/setup.md`):

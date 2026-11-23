@@ -8,6 +8,7 @@ masqueraded one (the gateway's LAN address).
 """
 
 import http.server
+import socketserver
 import sys
 
 name, address, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -26,4 +27,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-http.server.ThreadingHTTPServer((address, port), Handler).serve_forever()
+# A plain TCP server: HTTPServer's bind does a reverse lookup of the address
+# (socket.getfqdn), which can hang for seconds on a host with real DNS.
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer.daemon_threads = True
+socketserver.ThreadingTCPServer((address, port), Handler).serve_forever()

@@ -20,6 +20,11 @@ PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
 for t in nft wg ip dnsmasq dig curl python3; do command -v $t >/dev/null || { echo "missing $t"; exit 2; }; done
 
+# Cleanup kills everything in these namespaces, so never adopt ones that already exist.
+for ns in home gw client foreign; do
+    ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
+done
+
 WORK=$(mktemp -d /tmp/parallax-it.XXXXXX)
 PIDS=()
 cleanup() {

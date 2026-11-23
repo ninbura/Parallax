@@ -2,7 +2,7 @@
 # Parallax staging gateway: the real container on a development machine, routing
 # into fake LANs, driven end to end from this script. See README.md.
 #
-# Usage: sudo dev/staging/staging.sh <command>
+# Usage: sudo dev/staging/staging.sh <command>   (or pkexec with the absolute path)
 #   up                         fake LANs, config (first run), build, start the container
 #   down                       stop the container and remove the fake LANs (state is kept)
 #   reset                      down, then delete the state directory (server key, peers, config)
@@ -24,7 +24,7 @@ set -euo pipefail
 umask 077   # the state directory holds the server key and exported client configs with private keys
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-STATE="${STAGING_STATE:-/var/lib/parallax-staging}"
+STATE="$(realpath -m -- "${STAGING_STATE:-/var/lib/parallax-staging}")"
 case "$STATE" in /*/*) ;; *) echo "staging: STAGING_STATE must be an absolute path below /, got '$STATE'" >&2; exit 1 ;; esac
 export STAGING_STATE="$STATE"   # compose.yml mounts from it
 CONFIG="$STATE/config/parallax.toml"
@@ -35,11 +35,21 @@ say() { echo "staging: $*"; }
 die() { echo "staging: $*" >&2; exit 1; }
 inns() { ip netns exec "$@"; }
 
-[ "$(id -u)" = 0 ] || die "run as root (sudo $0 $*)"
+[ "$(id -u)" = 0 ] || die "run as root (sudo $0 $*, or pkexec $DIR/staging.sh $*)"
 
-# Keep the state directory owned by whoever ran sudo, so agents and editors can read it
+# Recursive chown and rm only ever touch a directory `up` created: it holds this marker.
+MARKER="$STATE/.parallax-staging"
+if [ -d "$STATE" ] && [ ! -f "$MARKER" ] && [ -n "$(ls -A "$STATE")" ]; then
+    die "$STATE is not empty and is not a staging state directory (no $(basename "$MARKER")); check STAGING_STATE"
+fi
+
+# Keep the state directory owned by whoever ran sudo or pkexec, so agents and editors can read it
 # (QR codes, logs) without root. It stays mode 0700.
-own_state() { [ -n "${SUDO_UID:-}" ] && [ -d "$STATE" ] && chown -R "$SUDO_UID:$SUDO_GID" "$STATE" || true; }
+CALLER_UID="${SUDO_UID:-${PKEXEC_UID:-}}"   # sudo or pkexec
+own_state() {
+    [ -n "$CALLER_UID" ] && [ -f "$MARKER" ] || return 0
+    chown -R "$CALLER_UID:$(id -g "$CALLER_UID")" "$STATE" || true
+}
 trap own_state EXIT
 
 # ------------------------------------------------------------------ fake LANs
@@ -65,18 +75,23 @@ lan_up() {
         >>"$STATE/log/$ns.log" 2>&1 </dev/null
     if [ "$n" = 1 ]; then
         inns "$ns" ip addr add "$net.53/24" dev eth0
-        inns "$ns" dnsmasq --no-resolv --no-hosts --bind-interfaces --listen-address="$net.53" \
+        inns "$ns" dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --bind-interfaces --listen-address="$net.53" \
             --user=root --pid-file="$STATE/log/$ns-dns.pid" \
             --address=/immich.staging.test/192.168.201.5 \
             --address=/nas.staging.test/192.168.202.5
     fi
 }
 
+kill_ns() { # TERM everything in a namespace, then KILL what's left
+    ip netns pids "$1" 2>/dev/null | xargs -r kill 2>/dev/null || true
+    sleep 0.2
+    ip netns pids "$1" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+}
+
 lan_down() {
     local ns=pxs-lan$1
     ip netns list | grep -qx "$ns\( .*\)\?" || return 0
-    ip netns pids "$ns" | xargs -r kill 2>/dev/null || true
-    sleep 0.2
+    kill_ns "$ns"
     ip netns del "$ns"
 }
 
@@ -97,7 +112,7 @@ render_config() {
     say "rendered $CONFIG (endpoint $endpoint:$port, wan $wan, public resolver $resolver)"
 }
 
-cfg() { sed -n "s/^$1 *= *\"\{0,1\}\([^\"]*\)\"\{0,1\}/\1/p" "$CONFIG" | head -n1; }
+cfg() { sed -n "/^$1 *= */{s/^$1 *= *\"\{0,1\}\([^\"]*\)\"\{0,1\}/\1/p;q}" "$CONFIG"; }
 
 # ------------------------------------------------------------------ container
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; }
@@ -136,9 +151,25 @@ reapply() {
 }
 
 up() {
-    lan_up 1
-    lan_up 2
+    mkdir -p "$STATE"
+    chmod 700 "$STATE"
+    touch "$MARKER"
+    # Always rebuild the fake LANs, so a half-finished earlier `up` can't pass for a good one.
+    lan_down 1; lan_down 2
+    lan_up 1; lan_up 2
     render_config
+    # Docker may be stopped between sessions; starting it here saves a second root prompt.
+    systemctl is-active -q docker || systemctl start docker
+    if running; then
+        reapply
+        say "gateway already up; fake LANs rebuilt and config re-applied"
+        return 0
+    fi
+    # Staging uses the same nft table as any Parallax gateway; never take over another one.
+    if nft list table inet parallax >/dev/null 2>&1 || ip link show "$(cfg interface)" >/dev/null 2>&1; then
+        die "nft table inet parallax or $(cfg interface) already exists: another Parallax gateway runs on this host"
+    fi
+    rm -f "$STATE/out/dnsmasq/dnsmasq.pid"   # wait_applied must see this run's shim
     "${COMPOSE[@]}" up -d --build
     wait_applied
     say "gateway up: $(cfg endpoint) on $(cfg interface)"
@@ -150,24 +181,28 @@ down() {
     fi
     # The entrypoint removes the nft table and the WireGuard interface; DOCKER-USER
     # rules stay behind (harmless, but remove them so the host is as we found it).
-    if iptables -S DOCKER-USER >/dev/null 2>&1; then
-        iptables -S DOCKER-USER | grep -- '--comment "\?parallax"\?' | sed 's/^-A/-D/' |
-            while read -r rule; do eval "iptables $rule"; done
-    fi
+    # Same match as apply.rs: exact comment "parallax", deleted by handle.
+    local h
+    for h in $(nft -a list chain ip filter DOCKER-USER 2>/dev/null |
+               sed -n 's/.*comment "parallax" # handle \([0-9]*\)$/\1/p'); do
+        nft delete rule ip filter DOCKER-USER handle "$h" || true
+    done
+    smoke_cleanup
     lan_down 1
     lan_down 2
     say "down (state kept in $STATE)"
 }
 
-has_peer() { grep -q "^name = \"$1\"" "$CONFIG"; }
+has_peer() { px peer show "$1" >/dev/null 2>&1; }
 
+# Adds the peer if it's missing. Callers re-apply afterwards, also when it already
+# existed, so a peer saved by an earlier run whose re-apply failed still goes live.
 add_peer() { # name template platform
     running || die "gateway not running (staging.sh up)"
     if has_peer "$1"; then
         say "peer $1 already exists"
     else
         px peer add "$1" --template "$2" --platform "$3" --keep-private-key >/dev/null
-        reapply
         say "added peer $1 ($2)"
     fi
 }
@@ -193,10 +228,11 @@ status() {
 # A client namespace on its own veth dials the real endpoint with exported
 # configs, so this exercises the same path a phone on the LAN does.
 CLIENT=pxs-client
+LISTENER=
 smoke_cleanup() {
-    ip netns pids "$CLIENT" 2>/dev/null | xargs -r kill 2>/dev/null || true
+    kill_ns "$CLIENT"
     ip netns del "$CLIENT" 2>/dev/null || true
-    pkill -f "fakehost.py gateway-host" 2>/dev/null || true
+    [ -n "$LISTENER" ] && kill "$LISTENER" 2>/dev/null || true
     own_state
 }
 
@@ -220,6 +256,7 @@ smoke() {
     running || die "gateway not running (staging.sh up)"
     add_peer smoke-personal personal linux
     add_peer smoke-guest guest linux
+    reapply
     trap 'smoke_cleanup' EXIT
     smoke_cleanup
     local endpoint ok=1 port gw
@@ -235,20 +272,34 @@ smoke() {
     inns "$CLIENT" ip route add "$endpoint/32" via 192.168.209.1
     # Something listening on the gateway host itself, which no tunnel peer may reach.
     port=18099
-    setsid -f python3 "$DIR/fakehost.py" gateway-host 0.0.0.0 "$port" >/dev/null 2>&1 </dev/null
-    sleep 0.3
+    python3 "$DIR/fakehost.py" gateway-host 0.0.0.0 "$port" >/dev/null 2>&1 </dev/null &
+    LISTENER=$!
 
     pass() { echo "PASS: $*"; }
     fail() { echo "FAIL: $*"; ok=0; }
     get() { inns "$CLIENT" curl -s --max-time 3 "$@"; }
-    resolve() { inns "$CLIENT" dig +short +time=2 +tries=1 @"$gw" "$1" A | tail -n1; }
-    expect() { # description, expected substring, curl args...
-        local d=$1 want=$2 out; shift 2
-        out="$(get "$@" || true)"
-        if [ -n "$want" ] && [[ "$out" == *"$want"* ]]; then pass "$d ($out)"
-        elif [ -z "$want" ] && [ -z "$out" ]; then pass "$d (blocked)"
-        else fail "$d: got '${out:-nothing}', wanted '${want:-nothing}'"; fi
+    resolve() { inns "$CLIENT" dig +short +time=2 +tries=1 @"$gw" "$1" A | tail -n1 || true; }
+    expect() { # description, expected substring ("" = must be blocked), curl args...
+        local d=$1 want=$2 out rc=0; shift 2
+        out="$(get "$@")" || rc=$?
+        if [ -n "$want" ]; then
+            if [[ "$out" == *"$want"* ]]; then pass "$d ($out)"
+            else fail "$d: got '${out:-nothing}' (curl exit $rc), wanted '$want'"; fi
+        # Blocked means refused (7) or timed out (28); an empty reply or other error is not.
+        elif [ "$rc" = 7 ] || [ "$rc" = 28 ]; then pass "$d (blocked, curl exit $rc)"
+        else fail "$d: wanted blocked, got curl exit $rc '${out}'"; fi
     }
+    # The isolation checks below mean nothing unless the host listener really answers.
+    local up=0
+    for _ in $(seq 1 20); do
+        curl -s --max-time 1 "http://127.0.0.1:$port/" | grep -q gateway-host && { up=1; break; }
+        sleep 0.25
+    done
+    if [ "$up" = 1 ]; then
+        pass "gateway host listener answers locally on :$port"
+    else
+        fail "gateway host listener on :$port is not answering; isolation checks would be vacuous"
+    fi
 
     echo "--- personal"
     local me; me="$(client_iface smoke-personal wgp)"
@@ -289,11 +340,12 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
     up) up ;;
     down) down ;;
-    reset) down; rm -rf "$STATE"; "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true; say "state removed" ;;
+    reset) down; [ -f "$MARKER" ] && rm -rf "$STATE"; "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true; say "state removed" ;;
     apply) reapply; say "re-applied" ;;
     peer)
         [ $# -ge 2 ] || die "usage: staging.sh peer NAME TEMPLATE [PLATFORM]"
         add_peer "$1" "$2" "${3:-mobile}"
+        reapply
         qr "$1" "${3:-mobile}"
         ;;
     qr) [ $# -ge 1 ] || die "usage: staging.sh qr NAME [PLATFORM]"; qr "$1" "${2:-mobile}" ;;
