@@ -40,6 +40,8 @@ struct Cli {
 enum Command {
     /// Check the configuration and report every problem.
     Validate,
+    /// Check this host can run the gateway: privileges, kernel features, tools, interfaces.
+    Doctor,
     /// Generate everything and show what would change under the output directory.
     Plan(OutArgs),
     /// Generate everything into the output directory without touching the system.
@@ -166,6 +168,7 @@ fn run() -> anyhow::Result<()> {
                 model.active_peers().count()
             );
         }
+        Command::Doctor => doctor(&cli.config)?,
         Command::Plan(out) => {
             let config = load(&cli.config)?;
             let model = resolve(&config)?;
@@ -236,6 +239,30 @@ fn run() -> anyhow::Result<()> {
             print_export(&export);
         }
     }
+    Ok(())
+}
+
+fn doctor(config: &Path) -> anyhow::Result<()> {
+    let runner = RealRunner;
+    let sys = System {
+        fs: &RealFs,
+        runner: &runner,
+    };
+    let checks = parallax_core::doctor::diagnose(config, sys);
+    let mut failed = 0;
+    for check in &checks {
+        match &check.result {
+            Ok(detail) => println!("ok    {}: {detail}", check.name),
+            Err(problem) => {
+                failed += 1;
+                println!("FAIL  {}: {problem}", check.name);
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {} checks failed", checks.len());
+    }
+    println!("all {} checks passed", checks.len());
     Ok(())
 }
 

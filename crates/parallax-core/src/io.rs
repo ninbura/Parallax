@@ -276,7 +276,9 @@ pub mod real {
         fn run(&self, program: &str, args: &[&str], stdin: Option<&str>) -> Result<Output> {
             use std::process::{Command, Stdio};
             let mut cmd = Command::new(program);
-            cmd.args(args)
+            // Callers match error text (e.g. EPERM), so keep it untranslated.
+            cmd.env("LC_ALL", "C")
+                .args(args)
                 .stdin(if stdin.is_some() {
                     Stdio::piped()
                 } else {

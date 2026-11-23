@@ -22,11 +22,12 @@ crates/parallax-core/           pure library, no I/O of its own
   src/transport/{mod,wireguard,tailscale}.rs
   src/generate/{firewall,dnsmasq,client,nginx,wg_server}.rs
   src/plan.rs, src/apply.rs
+  src/doctor.rs                 host checks run before apply (`parallax doctor`)
   src/testing.rs                canonical fixture shared by all tests
   tests/golden.rs + tests/golden/   frozen outputs for every generator
   tests/example.rs              example/parallax.toml == canonical fixture
 crates/parallax-cli/            `parallax` binary (validate, plan, generate, apply,
-                                keygen, peer add/remove/show/allocate, export)
+                                keygen, peer add/remove/show/allocate, export, doctor)
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)
 example/parallax.toml           fully commented canonical scenario
 tests/integration/netns.sh      Linux network-namespace integration test (CI)

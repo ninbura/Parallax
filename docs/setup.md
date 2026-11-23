@@ -2,11 +2,26 @@
 
 ## What you need on the host
 
-- Linux with the `wireguard` kernel module (5.6+ has it built in) and
-  nftables >= 0.9.4 (any current distribution).
+- Linux with a current nftables and kernel that support prefix NAT (NETMAP;
+  any current distribution, and `parallax doctor` checks it) and **rootful
+  Docker** with Compose (see below; rootless Docker is not supported).
+- The `wireguard` kernel module, loaded on the host at boot. The container
+  can't load modules (it has no `SYS_MODULE`):
+
+  ```sh
+  echo wireguard | sudo tee /etc/modules-load.d/wireguard.conf
+  sudo modprobe wireguard
+  ```
+
+  On kernels with WireGuard built in rather than as a module, `modprobe`
+  succeeds and does nothing; that's fine.
 - `net.ipv4.ip_forward = 1` in `/etc/sysctl.d/`. The container shares the
-  host network namespace and cannot set it for you; the entrypoint fails
-  loudly if it is off.
+  host network namespace and cannot set it for you:
+
+  ```sh
+  echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/90-parallax.conf
+  sudo sysctl --system
+  ```
 - A UDP port forward from your internet router to the host for the WireGuard
   listen port (default 51820). Test it from outside your network (a phone on
   cellular): clients on an isolated VLAN or behind your own router depend on
@@ -31,6 +46,60 @@
 
   The shim runs in the host network namespace, so ufw sees tunnel DNS as
   incoming traffic to the host.
+
+## Rootful Docker, not rootless
+
+Parallax creates `wg0`, loads an nftables table and runs the DNS shim in the
+host's own network namespace, and needs `CAP_NET_ADMIN` over it. Under
+rootless Docker, the container's root is your unprivileged user on the host:
+its capabilities only cover namespaces the rootless daemon created, never the
+host's real network. Usually its "host network" is also a private namespace
+behind a userspace proxy, so the host's LAN interfaces aren't there, every
+incoming connection appears to come from the proxy, LAN devices can't reach
+tunnel peers, and throughput drops.
+
+`parallax doctor` checks `/proc/self/uid_map` and refuses to start in a user
+namespace, so this fails at startup instead of half working. A rootful daemon
+with `userns-remap` enabled refuses host networking on its own; give the
+Parallax service `userns_mode: host` there.
+
+### Next to a rootless daemon
+
+A host can run both. Parallax uses the rootful system daemon; everything
+else can stay on the rootless one:
+
+```sh
+sudo systemctl enable --now docker.service
+cd docker && sudo docker compose up -d
+```
+
+`sudo docker` talks to the rootful daemon's socket (`/var/run/docker.sock`);
+your user's `docker` keeps talking to the rootless one through `DOCKER_HOST`.
+Keep the rootless user **out of the `docker` group**: membership gives full
+access to the rootful daemon, which is root on the host. Without it (and
+without sudo), the rootless side has no path to root.
+
+## Checking the host: `parallax doctor`
+
+The container runs `parallax doctor` on every start and refuses to apply if
+any check fails. Run it by hand to see every problem at once:
+
+```sh
+cd docker && sudo docker compose run --rm --no-deps parallax doctor
+```
+
+It checks:
+
+| Check | Fails when | Fix |
+|---|---|---|
+| configuration | the file is missing, unparsable or invalid | the listed errors |
+| user namespace | running under rootless Docker or `userns-remap` | a rootful daemon (above) |
+| CAP_NET_ADMIN | the container lacks the capability | `cap_add: [NET_ADMIN]` |
+| ip_forward | `net.ipv4.ip_forward` is 0 | `/etc/sysctl.d/` (above) |
+| tools | `nft`, `wg`, `ip` or `dnsmasq` is missing | the image ships them; natively, install them |
+| interface \<name\> | a configured LAN or WAN interface doesn't exist | the name in `parallax.toml` (`ip link`) |
+| wireguard | a WireGuard interface can't be created | `/etc/modules-load.d/` (above) |
+| NETMAP | the kernel or `nft` rejects prefix NAT (`nftables` backend only) | a newer kernel or nftables |
 
 ## Choosing the endpoint
 
@@ -79,20 +148,21 @@ public_resolver = "192.168.1.1"
 ```sh
 mkdir -p docker/config
 cp example/parallax.toml docker/config/parallax.toml   # edit to taste
-cd docker && docker compose up -d
-docker compose logs -f parallax
+cd docker && sudo docker compose up -d
+sudo docker compose logs -f parallax
 ```
 
-On first start the entrypoint generates `wg-server.key` (mode 0600) next to
-the config and writes the public key into it. Then it applies the firewall,
-brings up `wg0`, starts the DNS shim and `tailscaled` (idle until M2).
+On every start the entrypoint runs `parallax doctor` first. On first start it
+then generates `wg-server.key` (mode 0600) next to the config and writes the
+public key into it. Then it applies the firewall, brings up `wg0`, starts the
+DNS shim and `tailscaled` (idle until M2).
 
 ## Adding a device
 
 ```sh
-docker compose exec parallax parallax peer add laptop --template personal --platform linux
-docker compose exec parallax parallax peer add sister-phone --template family --platform mobile
-docker compose kill -s HUP parallax    # re-apply
+sudo docker compose exec parallax parallax peer add laptop --template personal --platform linux
+sudo docker compose exec parallax parallax peer add sister-phone --template family --platform mobile
+sudo docker compose kill -s HUP parallax    # re-apply
 ```
 
 `peer add` prints the client config once, with the private key, and stores

@@ -138,6 +138,15 @@ $P keygen --write-config >/dev/null
 $P peer add laptop --template personal --keep-private-key --platform linux > "$WORK/laptop.conf" 2>/dev/null
 $P peer add guest --template family --keep-private-key --platform mobile > "$WORK/guest.conf" 2>/dev/null
 $P validate >/dev/null
+inns gw $P doctor > "$WORK/doctor" || { cat "$WORK/doctor"; fail "doctor rejects the gateway namespace"; }
+# Root in a user namespace (as under rootless Docker) must be refused. That root
+# maps only uid 0, so run a copy it can reach (not one under someone's home).
+cp "$PARALLAX" "$WORK/parallax"
+if inns gw unshare -U -r "$WORK/parallax" -c "$WORK/parallax.toml" doctor > "$WORK/doctor-userns" 2>&1; then
+    fail "doctor accepted a user namespace"
+fi
+grep -q "^FAIL  user namespace" "$WORK/doctor-userns" || fail "doctor did not name the user namespace"
+pass "doctor passes on the gateway and refuses a user namespace"
 inns gw $P apply -o "$WORK/out" >/dev/null
 GW_PUB=$(sed -n 's/^public_key = "\(.*\)"/\1/p' "$WORK/parallax.toml")
 [ -f "$WORK/out/dnsmasq/dnsmasq.pid" ] || fail "shim did not start"

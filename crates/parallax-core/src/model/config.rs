@@ -18,8 +18,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// Parse a configuration. Errors give a line and column but never quote
+    /// the source: the offending line may hold a private or preshared key.
     pub fn from_toml(text: &str) -> crate::Result<Self> {
-        toml::from_str(text).map_err(|e| crate::Error::Parse(e.to_string()))
+        toml::from_str(text).map_err(|e| {
+            let at = e
+                .span()
+                .and_then(|span| text.get(..span.start))
+                .map(|before| {
+                    let line = before.matches('\n').count() + 1;
+                    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                    format!("line {line}, column {column}: ")
+                })
+                .unwrap_or_default();
+            crate::Error::Parse(format!("{at}{}", e.message().trim()))
+        })
     }
 
     pub fn to_toml(&self) -> crate::Result<String> {
@@ -40,5 +53,18 @@ impl Config {
     }
     pub fn peer_mut(&mut self, name: &str) -> Option<&mut Peer> {
         self.peers.iter_mut().find(|p| p.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_errors_locate_without_quoting_the_source() {
+        let text = "[server.wireguard]\nprivate_key = \"SYNTHETIC-SECRET-VALUE\" oops\n";
+        let err = Config::from_toml(text).unwrap_err().to_string();
+        assert!(err.contains("line 2, column"), "{err}");
+        assert!(!err.contains("SYNTHETIC-SECRET-VALUE"), "{err}");
     }
 }

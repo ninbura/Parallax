@@ -25,7 +25,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y nftables wireguard-tools dnsmasq-base dnsutils curl
       - run: cargo build -p parallax-cli
-      - run: sudo -E env PATH="$PATH" ./tests/integration/netns.sh
+      - run: sudo env PATH="$PATH" ./tests/integration/netns.sh
 
   docker:
     runs-on: ubuntu-latest
@@ -35,4 +35,7 @@ jobs:
       - run: docker build -f docker/Dockerfile -t parallax:ci .
       - run: docker run --rm --entrypoint parallax parallax:ci --version
       - run: sudo modprobe wireguard
-      - run: docker run --rm --network host --cap-add NET_ADMIN -v "$PWD/example/parallax.toml:/etc/parallax/parallax.toml:ro" parallax:ci check
+      - run: sudo sysctl -w net.ipv4.ip_forward=1
+      # The example config names eth0; give the runner one if it has none.
+      - run: ip link show eth0 || sudo ip link add eth0 type dummy
+      - run: docker run --rm --network host --cap-add NET_ADMIN -v "$PWD/example/parallax.toml:/etc/parallax/parallax.toml:ro" parallax:ci doctor

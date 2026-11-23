@@ -1,47 +1,22 @@
 #!/bin/sh
 # Parallax container entrypoint.
-#   run       apply the configuration, start tailscaled, stay up; SIGHUP re-applies
-#   check     run the startup checks only, then exit (used by CI)
-#   <other>   pass through to the parallax binary (e.g. `peer add ...`)
+#   run       check the host (`parallax doctor`), apply the configuration,
+#             start tailscaled, stay up; SIGHUP re-applies
+#   <other>   pass through to the parallax binary (e.g. `doctor`, `peer add ...`)
 set -eu
 
 CONFIG="${PARALLAX_CONFIG:-/etc/parallax/parallax.toml}"
 OUT="${PARALLAX_OUT:-/var/lib/parallax}"
 
 MODE="${1:-run}"
-if [ "$MODE" != "run" ] && [ "$MODE" != "check" ]; then
+if [ "$MODE" != "run" ]; then
     exec parallax -c "$CONFIG" "$@"
 fi
 
-fail() { echo "parallax: $*" >&2; exit 1; }
-
-# --- startup checks: fail loudly, naming what is missing ------------------
-[ -f "$CONFIG" ] || fail "no configuration at $CONFIG (mount your parallax.toml into /etc/parallax)"
-command -v nft >/dev/null || fail "nft is missing from the image"
-command -v wg >/dev/null || fail "wg is missing from the image"
-command -v dnsmasq >/dev/null || fail "dnsmasq is missing from the image"
-[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] \
-    || fail "net.ipv4.ip_forward is 0 on the host; set 'net.ipv4.ip_forward = 1' in /etc/sysctl.d and reload (the container shares the host network namespace)"
-if ! ip link add parallax-probe type wireguard 2>/dev/null; then
-    fail "cannot create a WireGuard interface: the host kernel lacks the wireguard module (modprobe wireguard on the host, or use a kernel >= 5.6)"
-fi
-ip link del parallax-probe
-if ! NFT_ERR="$(nft -c -f - 2>&1 <<'NFT'
-table inet parallax_probe {
-    chain pre {
-        type nat hook prerouting priority dstnat;
-        ip daddr 192.0.2.0/24 dnat ip prefix to ip daddr map { 192.0.2.0/24 : 198.51.100.0/24 }
-    }
-}
-NFT
-)"
-then
-    fail "the kernel or nft rejects NETMAP (prefix nat); needs nftables >= 0.9.4 and kernel nf_nat with prefix mapping. nft said:
-$NFT_ERR"
-fi
-if [ "$MODE" = "check" ]; then
-    echo "parallax: startup checks passed"
-    exit 0
+# --- startup checks: privileges, kernel features, tools, interfaces --------
+if ! parallax -c "$CONFIG" doctor; then
+    echo "parallax: not starting; fix the problems above (docs/setup.md explains each)" >&2
+    exit 1
 fi
 
 # --- private key bootstrap -------------------------------------------------
