@@ -1,0 +1,30 @@
+[package]
+name = "parallax-proxy"
+description = "Parallax HTTPS proxy: per-hostname, per-tier access to services that share an address"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+parallax-core = { path = "../parallax-core" }
+thiserror.workspace = true
+ipnet.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tower-service.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
+tokio-rustls.workspace = true
+hyper-rustls.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

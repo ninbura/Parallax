@@ -49,6 +49,8 @@ enum Command {
     Generate(OutArgs),
     /// Generate, write, and reconcile the live gateway (firewall, WireGuard, DNS shim).
     Apply(OutArgs),
+    /// Run the HTTPS proxy from the routes `apply` wrote. SIGHUP re-reads them.
+    Proxy(OutArgs),
     /// Create the gateway's WireGuard private key file and print its public key.
     Keygen {
         /// Also record the public key in the configuration file.
@@ -152,6 +154,15 @@ fn print_export(export: &Export) {
     print!("{}", export.contents);
 }
 
+/// Every hostname the proxy will serve needs a usable certificate, and the
+/// upstream CA bundle must load. Parallax never issues certificates, so say
+/// plainly what's missing before the proxy is handed routes it would refuse.
+fn check_certificates(model: &Model<'_>) -> anyhow::Result<()> {
+    let warnings = parallax_proxy::preflight(&generate::proxy::build(model))?;
+    print_warnings(&warnings);
+    Ok(())
+}
+
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let fs = RealFs;
@@ -174,6 +185,7 @@ fn run() -> anyhow::Result<()> {
             let config = load(&cli.config)?;
             let model = resolve(&config)?;
             let bundle = generate::generate_all(&model, &fs)?;
+            check_certificates(&model)?;
             let plan = parallax_core::plan::plan(&bundle, &out.out, &fs)?;
             print!("{}", plan.render());
         }
@@ -192,6 +204,7 @@ fn run() -> anyhow::Result<()> {
             let model = resolve(&config)?;
             let bundle = generate::generate_all(&model, &fs)?;
             print_warnings(&bundle.warnings);
+            check_certificates(&model)?;
             let runner = RealRunner;
             let sys = System {
                 fs: &fs,
@@ -201,6 +214,9 @@ fn run() -> anyhow::Result<()> {
             for line in report.log {
                 println!("{line}");
             }
+        }
+        Command::Proxy(out) => {
+            parallax_proxy::serve(&out.out.join(generate::proxy::PATH))?;
         }
         Command::Keygen { write_config } => {
             let config = load(&cli.config)?;

@@ -12,4 +12,5 @@ nftables/parallax.nft
 nginx/snippets/parallax-family.conf
 nginx/snippets/parallax-personal.conf
 nginx/snippets/parallax-service-immich.conf
+proxy/routes.toml
 wireguard/wg0.conf (secret)

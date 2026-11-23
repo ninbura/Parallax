@@ -322,6 +322,15 @@ impl<'a> Model<'a> {
             .unwrap_or_else(|| self.config.server.wireguard.gateway_address())
     }
 
+    /// Address the HTTPS proxy listens on.
+    pub fn proxy_address(&self) -> Ipv4Addr {
+        self.config
+            .server
+            .proxy
+            .listen
+            .unwrap_or_else(|| self.config.server.wireguard.gateway_address())
+    }
+
     /// Interface carrying the default route.
     pub fn wan_interface(&self) -> Option<&'a str> {
         self.config
@@ -450,6 +459,26 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         }
     }
     let shim = server.dns.listen.unwrap_or_else(|| wg.gateway_address());
+    let proxy = server.proxy.listen.unwrap_or_else(|| wg.gateway_address());
+    if server.proxy.port == 0 {
+        errors.push("server.proxy.port must not be 0".into());
+    }
+    if proxy == shim && server.proxy.port == server.dns.port {
+        errors.push(format!(
+            "server.proxy and the DNS shim both listen on {proxy}:{}; change server.proxy.port",
+            server.proxy.port
+        ));
+    }
+    if let Some(listen) = server.proxy.listen {
+        for t in &config.templates {
+            if t.wireguard.pool.contains(&listen) {
+                errors.push(format!(
+                    "server.proxy.listen {listen} lies inside the pool {} of template '{}'; pick an address outside every pool",
+                    t.wireguard.pool, t.name
+                ));
+            }
+        }
+    }
 
     // --- networks -------------------------------------------------------
     let mut seen_names: BTreeSet<&str> = BTreeSet::new();
@@ -914,6 +943,19 @@ mod tests {
         assert!(has(&e, "overlapping pools"), "{e:?}");
         let e = errors_of(|c| c.templates[1].wireguard.pool = "10.9.1.0/24".parse().unwrap());
         assert!(has(&e, "not inside the supernet"), "{e:?}");
+    }
+
+    #[test]
+    fn proxy_must_not_collide_with_the_shim_or_a_pool() {
+        let e = errors_of(|c| c.server.proxy.port = 53);
+        assert!(has(&e, "both listen on 10.8.0.1:53"), "{e:?}");
+        let e = errors_of(|c| c.server.proxy.port = 0);
+        assert!(has(&e, "server.proxy.port must not be 0"), "{e:?}");
+        let e = errors_of(|c| c.server.proxy.listen = Some("10.8.2.9".parse().unwrap()));
+        assert!(
+            has(&e, "lies inside the pool 10.8.2.0/24 of template 'family'"),
+            "{e:?}"
+        );
     }
 
     #[test]

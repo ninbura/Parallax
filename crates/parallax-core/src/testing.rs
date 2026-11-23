@@ -49,6 +49,7 @@ pub fn canonical_config() -> Config {
                 backend: FirewallBackend::Nftables,
                 docker_coexistence: true,
             },
+            proxy: ProxyServer::default(),
             wan_interface: None,
         },
         networks: vec![Network {

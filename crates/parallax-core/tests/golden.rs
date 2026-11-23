@@ -127,6 +127,8 @@ fn proxied_service_gets_no_direct_accept() {
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     check_golden("variants/proxied-service.nft", &fw.contents);
+    let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
+    check_golden("variants/proxied-service-routes.toml", &routes.contents);
     assert!(
         !fw.contents.contains("service immich"),
         "family must not reach immich directly, not even on the gateway host:\n{}",
