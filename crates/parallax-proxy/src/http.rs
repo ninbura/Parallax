@@ -102,7 +102,7 @@ fn names(value: &str, hostname: &str) -> bool {
 /// say) are dropped: after a switch the proxy only relays bytes, so a
 /// protocol that carries requests would get past the checks.
 pub fn upgrade<B>(req: &Request<B>) -> Option<HeaderValue> {
-    if req.version() != Version::HTTP_11 {
+    if req.version() != Version::HTTP_11 || req.method() != Method::GET {
         return None;
     }
     let wants = connection_tokens(req.headers()).any(|t| t.eq_ignore_ascii_case("upgrade"));
@@ -181,14 +181,14 @@ pub fn upstream_request<B>(
     let headers = &mut parts.headers;
     strip_hop_by_hop(headers, upgrade);
     // HTTP/2 may split cookies across headers; HTTP/1.1 wants one (RFC 9113 §8.2.3).
-    let cookies: Vec<&str> = headers
+    let cookies: Vec<&[u8]> = headers
         .get_all(header::COOKIE)
         .iter()
-        .filter_map(|v| v.to_str().ok())
+        .map(HeaderValue::as_bytes)
         .collect();
     if cookies.len() > 1 {
         let joined =
-            HeaderValue::from_str(&cookies.join("; ")).map_err(|_| Rejection::BadTarget)?;
+            HeaderValue::from_bytes(&cookies.join(&b"; "[..])).map_err(|_| Rejection::BadTarget)?;
         headers.insert(header::COOKIE, joined);
     }
     for name in [

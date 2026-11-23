@@ -44,6 +44,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 /// HTTP/2 pings, so connections to vanished peers don't linger.
 const KEEPALIVE: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Concurrent requests on one HTTP/2 connection; each may open an upstream
+/// connection, so this bounds what one connection can fan out to.
+const MAX_STREAMS: u32 = 100;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the certificate folder is checked for renewals.
 const CERT_REFRESH: Duration = Duration::from_secs(60);
@@ -147,7 +151,21 @@ impl Proxy {
             self.state.sites.len()
         ));
         let (tx, rx) = watch::channel(self.state);
-        tokio::spawn(reloader(self.routes_path, tx, self.refresh, self.reload));
+        // Before spawning: until a handler is installed, SIGHUP would kill the process.
+        let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log(format!("cannot watch SIGHUP, routes won't reload: {e}"));
+                None
+            }
+        };
+        tokio::spawn(reloader(
+            self.routes_path,
+            tx,
+            self.refresh,
+            self.reload,
+            hangup,
+        ));
         let counts: Arc<Mutex<HashMap<Ipv4Addr, usize>>> = Arc::default();
         loop {
             match listener.accept().await {
@@ -309,15 +327,8 @@ async fn reloader(
     tx: watch::Sender<Arc<State>>,
     refresh: Duration,
     trigger: Arc<Notify>,
+    mut hangup: Option<tokio::signal::unix::Signal>,
 ) {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut hangup = match signal(SignalKind::hangup()) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            log(format!("cannot watch SIGHUP, routes won't reload: {e}"));
-            None
-        }
-    };
     let mut tick = tokio::time::interval(refresh);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
@@ -358,30 +369,54 @@ fn reload(routes_path: &Path, tx: &watch::Sender<Arc<State>>) {
     }
 }
 
+/// Pick up renewed certificates. A renewal caught halfway (certbot swaps the
+/// chain and the key one after the other) or a folder that can't be read
+/// keeps the working certificate, and the next tick tries again.
 fn refresh_certificates(tx: &watch::Sender<Arc<State>>) {
     let old = Arc::clone(&tx.borrow());
-    if old.sites.is_empty() || certs::fingerprint(&old.routes.certificates) == old.certs_fingerprint
-    {
+    let dir = &old.routes.certificates;
+    let fingerprint = certs::fingerprint(dir);
+    if old.sites.is_empty() || fingerprint == old.certs_fingerprint {
         return;
     }
-    let (tls, certs_fingerprint) = server_configs(&old.routes);
-    let sites = old
-        .sites
-        .iter()
-        .map(|(name, site)| {
-            let site = Site {
-                route: site.route.clone(),
-                tls: tls.get(name).cloned().flatten(),
-                upstream: site.upstream.clone(),
-            };
-            (name.clone(), Arc::new(site))
-        })
-        .collect();
-    log("certificates changed, reloaded");
+    let found = match certs::scan(dir) {
+        Ok((found, _)) => found,
+        Err(e) => {
+            log(format!("{e}; keeping the current certificates"));
+            return;
+        }
+    };
+    let mut settled = true;
+    let mut sites = HashMap::new();
+    for (name, site) in &old.sites {
+        let tls = match certs::select(&found, name) {
+            Ok((_, config)) => Some(config),
+            Err(why) if site.tls.is_some() => {
+                log(format!("{why}; keeping the current one for now"));
+                settled = false;
+                site.tls.clone()
+            }
+            Err(_) => None,
+        };
+        let site = Site {
+            route: site.route.clone(),
+            tls,
+            upstream: site.upstream.clone(),
+        };
+        sites.insert(name.clone(), Arc::new(site));
+    }
+    if settled {
+        log("certificates changed, reloaded");
+    }
     tx.send_replace(Arc::new(State {
         routes: old.routes.clone(),
         sites,
-        certs_fingerprint,
+        // Unsettled: stay on the old fingerprint so the next tick retries.
+        certs_fingerprint: if settled {
+            fingerprint
+        } else {
+            old.certs_fingerprint
+        },
     }));
 }
 
@@ -468,6 +503,8 @@ async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot)
         let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .timer(TokioTimer::new())
             .keep_alive_interval(KEEPALIVE)
+            .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+            .max_concurrent_streams(MAX_STREAMS)
             .serve_connection(io, service);
         while_authorized(conn, state, &hostname, client).await;
     } else {

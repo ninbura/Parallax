@@ -51,7 +51,8 @@ reload() {
     if apply; then
         # The proxy re-reads its routes on SIGHUP. If it can't, it refuses
         # everything until a reload succeeds rather than keep the old grants.
-        kill -HUP "$PROXY_PID" 2>/dev/null || true
+        # Unset during the first apply: the proxy starts after it.
+        [ -n "${PROXY_PID:-}" ] && kill -HUP "$PROXY_PID" 2>/dev/null || true
         echo "parallax: re-applied"
     else
         echo "parallax: re-apply failed; fix $CONFIG and send SIGHUP again" >&2

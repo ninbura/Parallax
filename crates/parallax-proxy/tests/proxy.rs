@@ -498,3 +498,30 @@ async fn websocket(env: &Env) -> TokioIo<hyper::upgrade::Upgraded> {
     assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
     TokioIo::new(hyper::upgrade::on(resp).await.unwrap())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewal_caught_halfway_keeps_the_working_certificate() {
+    let env = Env::start().await;
+    let served =
+        |tls: &TlsStream<TcpStream>| tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+    let before = served(&env.connect(IMMICH, b"http/1.1").await.unwrap());
+    // certbot has swapped the chain but not yet the key.
+    let dir = env.dir.join("certs/live/sites");
+    let (chain, key) = env.ca.leaf(&[IMMICH, OTHER, BAD]);
+    std::fs::write(dir.join(certs::CHAIN_FILE), &chain).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let during = served(&env.connect(IMMICH, b"http/1.1").await.unwrap());
+    assert_eq!(
+        during, before,
+        "the working certificate must stay in service"
+    );
+    // The key lands: the new certificate is served.
+    std::fs::write(dir.join(certs::KEY_FILE), &key).unwrap();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if served(&env.connect(IMMICH, b"http/1.1").await.unwrap()) != before {
+            return;
+        }
+    }
+    panic!("the completed renewal was never served");
+}
