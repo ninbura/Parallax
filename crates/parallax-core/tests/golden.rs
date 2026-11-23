@@ -100,6 +100,9 @@ fn iptables_backend_matches_golden() {
     let mut cfg = canonical_config();
     cfg.server.firewall.backend = FirewallBackend::IptablesNft;
     cfg.templates[0].grants.push(Grant::Internet);
+    // A guest with internet and a proxied service: not_public and the DNAT.
+    cfg.templates[1].grants.push(Grant::Internet);
+    cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
     let bundle = bundle_for(&cfg);
     for a in bundle
         .of_kind(ArtifactKind::Firewall)
@@ -449,7 +452,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
         "{lines:#?}"
     );
     // Sets are filled aside and swapped in, never flushed while in use.
-    assert!(pos("ipset swap not_public-next not_public").unwrap() < restore);
+    assert!(pos("ipset swap parallax-swap not_public").unwrap() < restore);
     assert!(!lines.iter().any(|l| l == "ipset flush not_public"));
     // Only the stale template chain goes.
     assert!(lines

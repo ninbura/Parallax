@@ -34,6 +34,7 @@ case "$MODE" in
     udp) IPERF_MODE=(-u -b 0 -l 1200) ;;
     *) echo "MODE is tcp or udp"; exit 2 ;;
 esac
+[ "$PADDING" -le 200 ] || { echo "PADDING is at most 200 (one /24 each from 10.8.11.0)"; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
 for t in nft wg ip dnsmasq iperf3 python3; do command -v $t >/dev/null || { echo "missing $t"; exit 2; }; done
 for build in "$@"; do

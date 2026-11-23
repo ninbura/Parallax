@@ -482,6 +482,18 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         ));
     }
     if let Some(listen) = server.proxy.listen {
+        // Tunnel tiers' HTTPS is DNATed to this address, so it must be a
+        // real unicast address on the gateway (loopback would be dropped as
+        // martian after the DNAT).
+        if listen.is_unspecified()
+            || listen.is_loopback()
+            || listen.is_multicast()
+            || listen.is_broadcast()
+        {
+            errors.push(format!(
+                "server.proxy.listen {listen} is not a unicast address the gateway's tunnel peers can be redirected to; leave it unset (the WireGuard gateway address) or use one of the gateway's own addresses"
+            ));
+        }
         for t in &config.templates {
             if t.wireguard.pool.contains(&listen) {
                 errors.push(format!(
@@ -963,6 +975,13 @@ mod tests {
         assert!(has(&e, "both listen on 10.8.0.1:53"), "{e:?}");
         let e = errors_of(|c| c.server.proxy.port = 0);
         assert!(has(&e, "server.proxy.port must not be 0"), "{e:?}");
+        for bad in ["0.0.0.0", "127.0.0.1", "224.0.0.5", "255.255.255.255"] {
+            let e = errors_of(|c| c.server.proxy.listen = Some(bad.parse().unwrap()));
+            assert!(
+                has(&e, &format!("server.proxy.listen {bad} is not a unicast")),
+                "{e:?}"
+            );
+        }
         let e = errors_of(|c| c.server.proxy.listen = Some("10.8.2.9".parse().unwrap()));
         assert!(
             has(&e, "lies inside the pool 10.8.2.0/24 of template 'family'"),

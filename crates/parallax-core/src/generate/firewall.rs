@@ -167,7 +167,7 @@ impl Rule {
     }
 }
 
-/// A named address set (only Tailscale tiers and the LAN set in M1).
+/// A named address set: Tailscale tiers, configured networks, non-public space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressSet {
     pub name: String,
@@ -238,7 +238,8 @@ fn proxy_redirects(model: &Model<'_>, template: &Template) -> Vec<ProxyRedirect>
         else {
             continue;
         };
-        if model.reaches_directly(template, real.addr(), Proto::Tcp, 443) {
+        // Proxied services are validated to be tcp/443.
+        if port.is_some_and(|(proto, p)| model.reaches_directly(template, real.addr(), proto, p)) {
             continue;
         }
         if let Some(client) = r.client_net() {
@@ -324,15 +325,15 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
             .iifs(&ingress)
             .ipv6(),
     );
-    rs.rules
-        .push(Rule::new(Chain::Input, Action::Accept, "replies").ct(Ct::Reply));
-    rs.rules
-        .push(Rule::new(Chain::Input, Action::Accept, "related (ICMP errors)").ct(Ct::Related));
     rs.rules.push(
         Rule::new(Chain::Input, Action::Drop, "invalid state")
             .iifs(&ingress)
             .ct(Ct::Invalid),
     );
+    rs.rules
+        .push(Rule::new(Chain::Input, Action::Accept, "replies").ct(Ct::Reply));
+    rs.rules
+        .push(Rule::new(Chain::Input, Action::Accept, "related (ICMP errors)").ct(Ct::Related));
     rs.rules.push(
         Rule::new(Chain::Input, Action::Accept, "wireguard listen port")
             .l4(Some((Proto::Udp, server.wireguard.listen_port))),

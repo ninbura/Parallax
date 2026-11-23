@@ -151,26 +151,27 @@ fn apply_firewall(
             let rs = crate::generate::firewall::build(model)?;
             // Fill a fresh set and swap it in: flushing the live one would
             // briefly leave `! --match-set not_public` matching everything.
+            // One short scratch name: ipset names stop at 31 characters.
+            let next = "parallax-swap";
             for set in &rs.sets {
-                let next = format!("{}-next", set.name);
-                for name in [&set.name, &next] {
+                for name in [set.name.as_str(), next] {
                     sys.runner.run_checked(
                         "ipset",
                         &["create", "-exist", name, "hash:net"],
                         None,
                     )?;
                 }
-                sys.runner.run_checked("ipset", &["flush", &next], None)?;
+                sys.runner.run_checked("ipset", &["flush", next], None)?;
                 for e in &set.elements {
                     sys.runner.run_checked(
                         "ipset",
-                        &["add", "-exist", &next, &e.to_string()],
+                        &["add", "-exist", next, &e.to_string()],
                         None,
                     )?;
                 }
                 sys.runner
-                    .run_checked("ipset", &["swap", &next, &set.name], None)?;
-                sys.runner.run_checked("ipset", &["destroy", &next], None)?;
+                    .run_checked("ipset", &["swap", next, &set.name], None)?;
+                sys.runner.run_checked("ipset", &["destroy", next], None)?;
             }
             // The restore file declares every PARALLAX_* chain, which creates
             // it or flushes it in the same transaction as the refill: no
