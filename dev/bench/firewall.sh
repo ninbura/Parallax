@@ -46,6 +46,14 @@ for ns in $NAMESPACES; do
     ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
 done
 WORK=$(mktemp -d /tmp/parallax-bench.XXXXXX)
+# Ubuntu 25.10+ confines `wg` with AppArmor: it reads configs only under
+# /etc/wireguard, so apply's output goes there on such hosts.
+if [ -e /etc/apparmor.d/wg ]; then
+    mkdir -p /etc/wireguard
+    OUT=$(mktemp -d /etc/wireguard/parallax-bench.XXXXXX)
+else
+    OUT="$WORK/out"
+fi
 GOVERNORS=()
 cleanup() {
     set +e
@@ -53,7 +61,7 @@ cleanup() {
     for ns in $NAMESPACES; do ip netns pids $ns 2>/dev/null | xargs -r kill 2>/dev/null; done
     sleep 0.2
     for ns in $NAMESPACES; do ip netns del $ns 2>/dev/null; done
-    rm -rf "$WORK"
+    rm -rf "$WORK" "$OUT"
 }
 trap cleanup EXIT
 inns() { ip netns exec "$@"; }
@@ -133,7 +141,7 @@ scenario() { # label, binary, padding
     fi
     "$bin" -c "$cfg" peer add bench --template bench --keep-private-key --platform linux \
         > "$WORK/$label.conf" 2>/dev/null
-    inns bgw "$bin" -c "$cfg" apply -o "$WORK/out" >/dev/null
+    inns bgw "$bin" -c "$cfg" apply -o "$OUT" >/dev/null
     local rules
     # Forward rules in all, including each template's chain: what a packet
     # would walk without the per-template chains.
