@@ -99,7 +99,7 @@ It checks:
 | tools | `nft`, `wg`, `ip` or `dnsmasq` is missing | the image ships them; natively, install them |
 | interface \<name\> | a configured LAN or WAN interface doesn't exist | the name in `parallax.toml` (`ip link`) |
 | wireguard | a WireGuard interface can't be created | `/etc/modules-load.d/` (above) |
-| NETMAP | the kernel or `nft` rejects prefix NAT | a newer kernel or nftables |
+| NETMAP | the kernel or `nft` rejects prefix NAT (`nftables` backend only) | a newer kernel or nftables |
 
 ## Choosing the endpoint
 

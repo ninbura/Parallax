@@ -131,7 +131,11 @@ fn check_config(path: &Path, sys: System<'_>) -> (Check, Option<Config>) {
 /// owns, and rootless Docker's "host network" is a private namespace anyway.
 fn check_user_namespace(sys: System<'_>) -> Result<String, String> {
     let path = Path::new("/proc/self/uid_map");
-    let text = read(sys, path)?;
+    let text = match sys.fs.read(path) {
+        // The file only exists on kernels built with user namespaces.
+        Ok(None) => return Ok("user namespaces not built into this kernel".into()),
+        _ => read(sys, path)?,
+    };
     let mappings: Vec<(u64, u64, u64)> = text
         .lines()
         .filter_map(|line| {
@@ -148,6 +152,7 @@ fn check_user_namespace(sys: System<'_>) -> Result<String, String> {
         return Ok("not in a user namespace".into());
     }
     let root = match mappings.iter().find(|(inside, _, _)| *inside == 0) {
+        Some((_, 0, count)) => format!("only {count} uid(s) mapped"),
         Some((_, outside, _)) => format!("uid 0 here is uid {outside} on the host"),
         None => "uid 0 is not mapped".into(),
     };
@@ -223,7 +228,8 @@ fn check_interface(name: &str, sys: System<'_>) -> Result<String, String> {
             )),
             None => Err(format!("unexpected `ip link` output for {name}")),
         },
-        _ => Err(format!(
+        Err(e) => Err(format!("cannot check: {e}")),
+        Ok(_) => Err(format!(
             "not found in this network namespace. Check the name with `ip link`; under \
              rootless Docker the host's interfaces are never visible (see {SETUP_DOC})"
         )),
@@ -403,7 +409,9 @@ mod tests {
     fn a_partial_root_mapping_is_still_a_user_namespace() {
         let fs = healthy_fs().with_file("/proc/self/uid_map", "0 0 1\n");
         let checks = run(&fs, &RecordingRunner::new());
-        assert_eq!(problems(&checks)[0].0, "user namespace");
+        let p = problems(&checks);
+        assert_eq!(p[0].0, "user namespace");
+        assert!(p[0].1.contains("only 1 uid(s) mapped"), "{}", p[0].1);
     }
 
     #[test]
@@ -560,6 +568,29 @@ mod tests {
             ["wireguard", "NETMAP"]
         );
         assert!(p.iter().all(|p| p.1 == NOT_PERMITTED));
+    }
+
+    #[test]
+    fn kernel_without_user_namespaces_passes() {
+        let fs = MemoryFs::new()
+            .with_file(CONFIG, canonical_config().to_toml().unwrap())
+            .with_file("/proc/self/status", ROOT_STATUS)
+            .with_file("/proc/sys/net/ipv4/ip_forward", "1\n");
+        assert_eq!(problems(&run(&fs, &RecordingRunner::new())), vec![]);
+    }
+
+    #[test]
+    fn iptables_backend_needs_ipset_and_skips_the_nft_probe() {
+        let mut cfg = canonical_config();
+        cfg.server.firewall.backend = FirewallBackend::IptablesNft;
+        let fs = healthy_fs().with_file(CONFIG, cfg.to_toml().unwrap());
+        let runner = RecordingRunner::new();
+        runner.respond("ipset", failed(127, "not found"));
+        let checks = run(&fs, &runner);
+        let p = problems(&checks);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].1.contains("`ipset` is not available"), "{}", p[0].1);
+        assert!(!checks.iter().any(|c| c.name == "NETMAP"));
     }
 
     #[test]

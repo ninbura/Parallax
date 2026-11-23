@@ -43,7 +43,7 @@ $parallax -c /tmp/parallax.toml peer show
 - `crates/parallax-core`: model, validation, allocation, transports,
   generators, plan/apply. UI-agnostic; all I/O behind traits.
 - `crates/parallax-cli`: `validate`, `plan`, `generate`, `apply`, `keygen`,
-  `peer add|remove|show|allocate`, `export`.
+  `peer add|remove|show|allocate`, `export`, `doctor`.
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
 - `example/parallax.toml`: the canonical scenario, fully commented.
 - `tests/integration/netns.sh`: Linux namespace test of the six M1 assertions.
