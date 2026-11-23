@@ -1,0 +1,85 @@
+# Parallax staging configuration. `staging.sh up` renders this into
+# $STAGING_STATE/config/parallax.toml on first run, filling the @...@ placeholders; after
+# that the rendered file is the source of truth (peers get appended to it).
+#
+# Two fake LANs live in network namespaces behind veth pairs (see staging.sh):
+#   lan1  192.168.201.0/24 -> 198.19.201.0/24  routed (LAN hosts see tunnel addresses)
+#   lan2  192.168.202.0/24 -> 198.19.202.0/24  masqueraded
+# Tunnel addresses come from 10.9.0.0/16 and mapped ranges from 198.19.0.0/16, so
+# staging can share a LAN with a production gateway on 10.8.0.0/16 / 198.18.x.
+
+[server]
+wan_interface = "@WAN@"
+
+[server.wireguard]
+interface = "wg1"
+listen_port = @PORT@
+supernet = "10.9.0.0/16"
+endpoint = "@ENDPOINT@:@PORT@"
+# Placeholder; the container's first start generates the key and records it here.
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+private_key_file = "/etc/parallax/wg-server.key"
+
+[server.headscale]
+server_url = "https://headscale.staging.test"
+subnet_router_node = "parallax-staging"
+
+[server.dns]
+port = 53
+public_resolver = "@PUBLIC_RESOLVER@"
+
+[server.firewall]
+backend = "nftables"
+docker_coexistence = true
+
+[[network]]
+name = "lan1"
+interface = "pxs-lan1"
+subnet = "192.168.201.0/24"
+mapped_to = "198.19.201.0/24"
+upstream_dns = ["192.168.201.53"]
+domains = ["staging.test"]
+masquerade = false
+
+[[network]]
+name = "lan2"
+interface = "pxs-lan2"
+subnet = "192.168.202.0/24"
+mapped_to = "198.19.202.0/24"
+masquerade = true
+
+[[service]]
+name = "immich"
+host = "192.168.201.5"
+proto = "tcp"
+port = 80
+
+# Reaches every network.
+[[template]]
+name = "personal"
+grants = [{ kind = "all_networks" }]
+[template.wireguard]
+pool = "10.9.1.0/24"
+[template.headscale]
+user = "staging"
+[template.dns]
+wireguard = "split"
+tailscale = "split"
+[template.client]
+allowed_ips = "mapped_subnets"
+persistent_keepalive = 25
+
+# Reaches exactly one service.
+[[template]]
+name = "guest"
+grants = [{ kind = "service", name = "immich" }]
+[template.wireguard]
+pool = "10.9.2.0/24"
+[template.headscale]
+tag = "tag:guest"
+[template.dns]
+wireguard = "tunnel_wide"
+tailscale = "split"
+[template.client]
+allowed_ips = "grants_only"
+persistent_keepalive = 25

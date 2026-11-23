@@ -73,7 +73,11 @@ teardown() {
 
 reload() {
     echo "parallax: SIGHUP, re-applying"
-    apply || echo "parallax: re-apply failed; fix $CONFIG and send SIGHUP again" >&2
+    if apply; then
+        echo "parallax: re-applied"
+    else
+        echo "parallax: re-apply failed; fix $CONFIG and send SIGHUP again" >&2
+    fi
 }
 
 trap teardown TERM INT

@@ -47,6 +47,8 @@ $parallax -c /tmp/parallax.toml peer show
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
 - `example/parallax.toml`: the canonical scenario, fully commented.
 - `tests/integration/netns.sh`: Linux namespace test of the six M1 assertions.
+- `dev/staging/`: a real gateway on a dev machine with fake LANs, for
+  end-to-end checks and phone tests ([README](dev/staging/README.md)).
 - `docs/`: design and ADRs (`docs/design.md` is the review artifact).
 
 ## Tests
@@ -55,4 +57,5 @@ $parallax -c /tmp/parallax.toml peer show
 cargo test --workspace            # unit, property, golden, CLI end-to-end
 UPDATE_GOLDEN=1 cargo test -p parallax-core --test golden   # refresh goldens after an intended change
 sudo ./tests/integration/netns.sh # Linux only, needs root
+sudo dev/staging/staging.sh up && sudo dev/staging/staging.sh smoke   # staging gateway, see dev/staging/README.md
 ```
