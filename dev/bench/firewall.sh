@@ -67,10 +67,12 @@ cleanup() {
 trap cleanup EXIT
 inns() { ip netns exec "$@"; }
 if [ -n "${GOVERNOR:-}" ]; then
-    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    # One file per cpufreq policy; cores often share one (all four on a Pi 5),
+    # so save every setting before changing any.
+    for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
         GOVERNORS+=("$f=$(cat "$f")")
-        echo "$GOVERNOR" > "$f"
     done
+    for g in "${GOVERNORS[@]}"; do echo "$GOVERNOR" > "${g%%=*}"; done
 fi
 
 # ---------------------------------------------------------------- topology
