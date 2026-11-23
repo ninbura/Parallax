@@ -20,20 +20,27 @@ table inet parallax {
 
 	chain input {
 		type filter hook input priority filter; policy accept;
-		ct state established,related accept comment "established flows"
+		meta nfproto ipv6 iifname { "wg0", "tailscale0" } drop comment "tunnel peers are IPv4-only"
+		ct direction reply accept comment "replies"
+		ct state related accept comment "related (ICMP errors)"
+		ct state invalid iifname { "wg0", "tailscale0" } drop comment "invalid state"
 		udp dport 51820 accept comment "wireguard listen port"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 udp dport 53 accept comment "dns shim"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 tcp dport 53 accept comment "dns shim"
 		iifname { "wg0", "tailscale0" } icmp type echo-request accept comment "ping the gateway"
 		iifname "wg0" ip saddr 10.8.1.0/24 ip daddr 192.168.1.5 accept comment "personal/wireguard: network home (on the gateway host)"
 		iifname "tailscale0" ip saddr @ts_personal ip daddr 192.168.1.5 accept comment "personal/tailscale: network home (on the gateway host)"
+		iifname "wg0" ip saddr 10.8.2.0/24 ip daddr 10.8.0.1 tcp dport 8443 accept comment "family/wireguard: https proxy"
+		iifname "tailscale0" ip saddr @ts_family ip daddr 10.8.0.1 tcp dport 8443 accept comment "family/tailscale: https proxy"
 		iifname { "wg0", "tailscale0" } drop comment "tunnel peers may not reach anything else on the gateway host"
 	}
 
 	chain forward {
 		type filter hook forward priority filter; policy accept;
-		ct state established,related accept comment "established flows"
+		meta nfproto ipv6 iifname { "wg0", "tailscale0" } drop comment "tunnel peers are IPv4-only"
 		ct state invalid drop comment "invalid state"
+		ct direction reply accept comment "replies"
+		ct state related accept comment "related (ICMP errors)"
 		iifname "wg0" oifname "eth0" ip saddr 10.8.1.0/24 ip daddr 192.168.1.0/24 accept comment "personal/wireguard: network home"
 		iifname "wg0" ip saddr 10.8.1.0/24 drop comment "personal/wireguard: default deny"
 		iifname "tailscale0" oifname "eth0" ip saddr @ts_personal ip daddr 192.168.1.0/24 accept comment "personal/tailscale: network home"
@@ -46,6 +53,8 @@ table inet parallax {
 
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
+		iifname "wg0" ip saddr 10.8.2.0/24 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443 comment "family/wireguard: service immich via the https proxy"
+		iifname "tailscale0" ip saddr @ts_family ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443 comment "family/tailscale: service immich via the https proxy"
 		iifname { "wg0", "tailscale0" } ip daddr 198.18.1.0/24 dnat ip prefix to ip daddr map { 198.18.1.0/24 : 192.168.1.0/24 } comment "netmap home: virtual -> real"
 	}
 

@@ -46,7 +46,9 @@ $parallax -c /tmp/parallax.toml peer show
   `peer add|remove|show|allocate`, `export`, `doctor`.
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
 - `example/parallax.toml`: the canonical scenario, fully commented.
-- `tests/integration/netns.sh`: Linux namespace test of the six M1 assertions.
+- `tests/integration/netns.sh`: Linux namespace test: mapping, DNS, per-tier access, the HTTPS proxy and the bypass matrix.
+- `dev/bench/firewall.sh`: what the firewall costs a WireGuard upload
+  (iperf3 on namespaces), comparing two builds and padded rulesets.
 - `dev/staging/`: a real gateway on a dev machine with fake LANs, for
   end-to-end checks and phone tests ([README](dev/staging/README.md)).
 - `docs/`: design and ADRs (`docs/design.md` is the review artifact).

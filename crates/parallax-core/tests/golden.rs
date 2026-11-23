@@ -113,10 +113,25 @@ fn iptables_backend_matches_golden() {
 fn internet_grant_and_masquerade_match_golden() {
     let mut cfg = canonical_config();
     cfg.templates[0].grants.push(Grant::Internet);
+    cfg.templates[1].grants.push(Grant::Internet);
     cfg.networks[0].masquerade = true;
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     check_golden("variants/internet-masquerade.nft", &fw.contents);
+    let rule = |tag: &str| {
+        fw.contents
+            .lines()
+            .find(|l| l.contains(&format!("\"{tag}: internet")))
+            .unwrap()
+    };
+    // The owner's all_networks template still reaches private space beyond
+    // the configured networks; a guest reaches only public addresses.
+    assert!(rule("personal/wireguard").contains("ip daddr != @lan_real"));
+    assert!(rule("family/wireguard").contains("ip daddr != @not_public"));
+    // Merged, since nft rejects overlapping intervals: the configured
+    // 192.168.1.0/24 sits inside 192.168.0.0/16.
+    assert!(fw.contents.contains("192.168.0.0/16"));
+    assert!(!fw.contents.contains("192.168.1.0/24,"));
 }
 
 #[test]
@@ -130,11 +145,65 @@ fn proxied_service_gets_no_direct_accept() {
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     check_golden("variants/proxied-service-routes.toml", &routes.contents);
     assert!(
-        !fw.contents.contains("service immich"),
+        !fw.contents
+            .lines()
+            .any(|l| l.contains("service immich") && l.contains(" accept ")),
         "family must not reach immich directly, not even on the gateway host:\n{}",
         fw.contents
     );
     assert!(fw.contents.contains("family/wireguard: default deny"));
+    // Family's HTTPS to Immich's client address goes to the proxy, before
+    // NETMAP would send it to the real host; only family may reach the proxy.
+    let pre: Vec<&str> = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("chain prerouting"))
+        .collect();
+    assert!(pre[2].contains(
+        "iifname \"wg0\" ip saddr 10.8.2.0/24 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
+    ), "{pre:#?}");
+    assert!(pre.iter().any(|l| l.contains("netmap home")));
+    assert!(!fw.contents.contains("personal/wireguard: https proxy"));
+    assert!(fw
+        .contents
+        .contains("iifname \"wg0\" ip saddr 10.8.2.0/24 ip daddr 10.8.0.1 tcp dport 8443 accept"));
+}
+
+#[test]
+fn no_proxy_redirect_where_a_grant_reaches_the_host_directly() {
+    let mut cfg = canonical_config();
+    cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
+    cfg.templates[1].grants.push(Grant::HostPort {
+        ip: "192.168.1.5".parse().unwrap(),
+        proto: parallax_core::model::Proto::Tcp,
+        port: 443,
+    });
+    let bundle = bundle_for(&cfg);
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    assert!(!fw.contents.contains("dnat ip to"), "{}", fw.contents);
+    assert!(!fw.contents.contains("https proxy"), "{}", fw.contents);
+}
+
+#[test]
+fn tunnel_peers_are_checked_on_every_packet() {
+    let bundle = bundle_for(&canonical_config());
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // No blanket "established" accept: a removed grant cuts open flows.
+    assert!(!fw.contents.contains("established"), "{}", fw.contents);
+    for chain in ["chain input", "chain forward"] {
+        let body: Vec<&str> = fw
+            .contents
+            .lines()
+            .skip_while(|l| !l.contains(chain))
+            .take_while(|l| !l.trim().starts_with('}'))
+            .collect();
+        assert!(
+            body[2].contains("meta nfproto ipv6 iifname { \"wg0\", \"tailscale0\" } drop"),
+            "{body:#?}"
+        );
+        assert!(body.iter().any(|l| l.contains("ct direction reply accept")));
+        assert!(body.iter().any(|l| l.contains("ct state related accept")));
+    }
 }
 
 #[test]

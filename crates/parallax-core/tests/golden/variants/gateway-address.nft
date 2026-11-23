@@ -20,7 +20,10 @@ table inet parallax {
 
 	chain input {
 		type filter hook input priority filter; policy accept;
-		ct state established,related accept comment "established flows"
+		meta nfproto ipv6 iifname { "wg0", "tailscale0" } drop comment "tunnel peers are IPv4-only"
+		ct direction reply accept comment "replies"
+		ct state related accept comment "related (ICMP errors)"
+		ct state invalid iifname { "wg0", "tailscale0" } drop comment "invalid state"
 		udp dport 51820 accept comment "wireguard listen port"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 udp dport 53 accept comment "dns shim"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 tcp dport 53 accept comment "dns shim"
@@ -34,8 +37,10 @@ table inet parallax {
 
 	chain forward {
 		type filter hook forward priority filter; policy accept;
-		ct state established,related accept comment "established flows"
+		meta nfproto ipv6 iifname { "wg0", "tailscale0" } drop comment "tunnel peers are IPv4-only"
 		ct state invalid drop comment "invalid state"
+		ct direction reply accept comment "replies"
+		ct state related accept comment "related (ICMP errors)"
 		iifname "wg0" oifname "eth0" ip saddr 10.8.1.0/24 ip daddr 192.168.1.0/24 accept comment "personal/wireguard: network home"
 		iifname "wg0" ip saddr 10.8.1.0/24 drop comment "personal/wireguard: default deny"
 		iifname "tailscale0" oifname "eth0" ip saddr @ts_personal ip daddr 192.168.1.0/24 accept comment "personal/tailscale: network home"

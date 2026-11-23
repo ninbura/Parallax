@@ -7,7 +7,10 @@
 *filter
 :PARALLAX_INPUT - [0:0]
 :PARALLAX_FORWARD - [0:0]
--A PARALLAX_INPUT -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "established flows" -j ACCEPT
+-A PARALLAX_INPUT -m conntrack --ctdir REPLY -m comment --comment "replies" -j ACCEPT
+-A PARALLAX_INPUT -m conntrack --ctstate RELATED -m comment --comment "related (ICMP errors)" -j ACCEPT
+-A PARALLAX_INPUT -i wg0 -m conntrack --ctstate INVALID -m comment --comment "invalid state" -j DROP
+-A PARALLAX_INPUT -i tailscale0 -m conntrack --ctstate INVALID -m comment --comment "invalid state" -j DROP
 -A PARALLAX_INPUT -p udp --dport 51820 -m comment --comment "wireguard listen port" -j ACCEPT
 -A PARALLAX_INPUT -i wg0 -d 10.8.0.1/32 -p udp --dport 53 -m comment --comment "dns shim" -j ACCEPT
 -A PARALLAX_INPUT -i tailscale0 -d 10.8.0.1/32 -p udp --dport 53 -m comment --comment "dns shim" -j ACCEPT
@@ -17,8 +20,9 @@
 -A PARALLAX_INPUT -i tailscale0 -p icmp --icmp-type echo-request -m comment --comment "ping the gateway" -j ACCEPT
 -A PARALLAX_INPUT -i wg0 -m comment --comment "tunnel peers may not reach anything else on the gateway host" -j DROP
 -A PARALLAX_INPUT -i tailscale0 -m comment --comment "tunnel peers may not reach anything else on the gateway host" -j DROP
--A PARALLAX_FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "established flows" -j ACCEPT
 -A PARALLAX_FORWARD -m conntrack --ctstate INVALID -m comment --comment "invalid state" -j DROP
+-A PARALLAX_FORWARD -m conntrack --ctdir REPLY -m comment --comment "replies" -j ACCEPT
+-A PARALLAX_FORWARD -m conntrack --ctstate RELATED -m comment --comment "related (ICMP errors)" -j ACCEPT
 -A PARALLAX_FORWARD -i wg0 -o eth0 -s 10.8.1.0/24 -d 192.168.1.0/24 -m comment --comment "personal/wireguard: network home" -j ACCEPT
 -A PARALLAX_FORWARD -i wg0 -o eth0 -s 10.8.1.0/24 -m set ! --match-set lan_real dst -m comment --comment "personal/wireguard: internet" -j ACCEPT
 -A PARALLAX_FORWARD -i wg0 -s 10.8.1.0/24 -m comment --comment "personal/wireguard: default deny" -j DROP

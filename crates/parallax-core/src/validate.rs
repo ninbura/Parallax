@@ -303,11 +303,23 @@ impl<'a> Model<'a> {
     /// Proxied reaches don't count: the proxy connects from the gateway, and
     /// sibling sites on the same address and port must not inherit them.
     pub fn reaches_service(&self, template: &Template, service: &Service) -> bool {
+        self.reaches_directly(template, service.host, service.proto, service.port)
+    }
+
+    /// Does `template` reach `proto/port` on `host` directly, without the
+    /// proxy? Only LAN grants count; `internet` never covers a configured
+    /// network.
+    pub fn reaches_directly(
+        &self,
+        template: &Template,
+        host: Ipv4Addr,
+        proto: Proto,
+        port: u16,
+    ) -> bool {
         self.reaches(template).iter().any(|r| match &r.kind {
             ReachKind::Lan { proxied: true, .. } => false,
-            ReachKind::Lan { real, port, .. } => {
-                real.contains(&service.host)
-                    && port.is_none_or(|(pr, po)| pr == service.proto && po == service.port)
+            ReachKind::Lan { real, port: p, .. } => {
+                real.contains(&host) && p.is_none_or(|(pr, po)| pr == proto && po == port)
             }
             ReachKind::Internet => false,
         })

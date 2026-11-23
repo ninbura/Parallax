@@ -136,12 +136,35 @@ with a catch-all deny. `TailscaleTransport` implements those five methods
 today and returns `NotImplemented` for provision/export.
 
 The INPUT chain is locked down too: from a tunnel interface only the shim
-(UDP/TCP 53 to the shim address), ICMP echo, and grants that cover a network's
-`gateway_address` are accepted, then drop. A host-networked gateway otherwise
+(UDP/TCP 53 to the shim address), ICMP echo, grants that cover a network's
+`gateway_address`, and the HTTPS proxy for tiers with a proxied grant are
+accepted, then drop. A host-networked gateway otherwise
 exposes every published container port and its SSH to guest peers. With
 `gateway_address` set, services on the gateway box itself are reachable
 through the mapping exactly like any other LAN host, tier by tier. LAN-side
 INPUT is untouched (policy accept).
+
+Every packet a tunnel peer sends is checked against its tier's grants, not
+only the first packet of a flow. Only reply-direction packets (`ct direction
+reply`) and related ones (ICMP errors) skip the check, and invalid ones are
+dropped, in both INPUT and FORWARD. So removing a grant cuts already-open
+connections on their next packet, with no conntrack flush on apply (which
+would drop everyone's sessions, or need a diff of what changed). The cost is
+a walk past earlier tiers' rules for every packet; `dev/bench/firewall.sh`
+measures it.
+
+`internet` reaches public addresses only: FORWARD to the WAN interface
+excludes private, shared (CGNAT), loopback, link-local, multicast, reserved,
+documentation and benchmarking ranges as well as the configured networks
+(the `not_public` set). Otherwise a guest with full tunnel could reach
+subnets the router knows but Parallax doesn't, such as other VLANs. A
+template that also has `all_networks` is the owner's own and keeps
+"everything outside the configured networks" (`lan_real`).
+
+Tunnel peers are IPv4-only: WireGuard's AllowedIPs already refuses IPv6, and
+an explicit drop for IPv6 from a tunnel interface in INPUT and FORWARD keeps
+it that way for transports that might carry it (Tailscale). The
+`iptables-nft` backend renders IPv4 tables only, so it has no such rule.
 
 ## Proxied HTTPS services
 
@@ -151,9 +174,14 @@ of them. A service with `hostnames` closes that gap: `service` grants reach
 it only through Parallax's own HTTPS proxy, which terminates TLS, checks
 SNI, `Host` and HTTP/2 `:authority` on every request, and forwards only the
 listed names to the service. The firewall gives such grants no direct
-accept (`ReachKind::Lan { proxied: true }`); the redirect into the proxy is
-still to come, and until then the grant reaches nothing, which fails
-closed.
+accept (`ReachKind::Lan { proxied: true }`). Instead, for each tier with a
+`service` grant on a proxied service, PREROUTING sends its `tcp/443` to that
+service's address, as clients see it (virtual where mapped), to the proxy
+(`server.proxy`, `10.8.0.1:8443` by default). The rule comes before NETMAP,
+since NAT takes the first match. A tier that already reaches that host's 443
+directly (`all_networks`, its network, `host`, a matching `host_port`) gets
+no redirect: the proxy would add nothing. Only tiers with a redirect may
+reach the proxy port in INPUT.
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
