@@ -19,10 +19,9 @@ pub struct ApplyReport {
     pub log: Vec<String>,
 }
 
-/// Check the host has what apply needs. Returns one message per missing piece.
-pub fn preflight(model: &Model<'_>, sys: System<'_>) -> Vec<String> {
+/// Check the host has the tools apply runs. Returns one message per missing tool.
+pub fn preflight(backend: FirewallBackend, sys: System<'_>) -> Vec<String> {
     let mut missing = Vec::new();
-    let backend = model.server().firewall.backend;
     let fw_bin = match backend {
         FirewallBackend::Nftables => "nft",
         FirewallBackend::IptablesNft => "iptables",
@@ -34,7 +33,7 @@ pub fn preflight(model: &Model<'_>, sys: System<'_>) -> Vec<String> {
         .unwrap_or(true)
     {
         missing.push(format!(
-            "`{fw_bin}` is not available: install {} in the gateway container",
+            "`{fw_bin}` is not available: install {}",
             match backend {
                 FirewallBackend::Nftables => "nftables",
                 FirewallBackend::IptablesNft => "iptables (nft variant)",
@@ -254,7 +253,7 @@ pub fn apply(
     out_dir: &Path,
     sys: System<'_>,
 ) -> Result<ApplyReport> {
-    let missing = preflight(model, sys);
+    let missing = preflight(model.server().firewall.backend, sys);
     if !missing.is_empty() {
         return Err(Error::Invalid(missing));
     }

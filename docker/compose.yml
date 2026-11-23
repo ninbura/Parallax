@@ -12,16 +12,16 @@ services:
     # Host networking: wg0 and tailscale0 live next to the LAN interface, and
     # the nftables table sees real interface names. Requires ip_forward=1 on the host.
     network_mode: host
+    # Rootful Docker only: `parallax doctor` refuses to start in a user namespace.
+    # The wireguard module is loaded on the host (docs/setup.md), not from here.
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE   # only needed if the host has not loaded the wireguard module yet
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./config:/etc/parallax          # parallax.toml + wg-server.key (0600)
       - parallax-state:/var/lib/parallax
       - tailscale-state:/var/lib/tailscale
-      - /lib/modules:/lib/modules:ro
     environment:
       PARALLAX_CONFIG: /etc/parallax/parallax.toml
       PARALLAX_OUT: /var/lib/parallax

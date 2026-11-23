@@ -15,6 +15,7 @@
 pub mod alloc;
 pub mod apply;
 pub mod date;
+pub mod doctor;
 pub mod error;
 pub mod generate;
 pub mod io;
