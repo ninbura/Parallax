@@ -2,8 +2,9 @@
 //! and which tunnel addresses may use it. The proxy process reads this file
 //! and nothing else from the configuration.
 //!
-//! A site is listed only when some template has a `service` grant on it, so
-//! the proxy holds no certificate nobody may use. Its `allowed` list is the
+//! A site is listed only when some template has a `service` grant on it and
+//! doesn't already reach the service directly, so the proxy holds no
+//! certificate nobody comes through it for. Its `allowed` list is the
 //! tier members of exactly those templates: every proxied tier lands on the
 //! same proxy, and the source address is what keeps one tier off another
 //! tier's hostnames.
@@ -81,7 +82,11 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
             name: svc.name.clone(),
         };
         let mut allowed: Vec<Ipv4Net> = Vec::new();
-        for t in cfg.templates.iter().filter(|t| t.grants.contains(&grant)) {
+        // A template that reaches the service directly gets no redirect
+        // (see the firewall), so it never comes through the proxy.
+        for t in cfg.templates.iter().filter(|t| {
+            t.grants.contains(&grant) && !model.reaches_directly(t, svc.host, svc.proto, svc.port)
+        }) {
             for tr in &transports {
                 for m in tr.tier_members(model, t) {
                     if !allowed.contains(&m) {

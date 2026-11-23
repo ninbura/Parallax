@@ -303,11 +303,23 @@ impl<'a> Model<'a> {
     /// Proxied reaches don't count: the proxy connects from the gateway, and
     /// sibling sites on the same address and port must not inherit them.
     pub fn reaches_service(&self, template: &Template, service: &Service) -> bool {
+        self.reaches_directly(template, service.host, service.proto, service.port)
+    }
+
+    /// Does `template` reach `proto/port` on `host` directly, without the
+    /// proxy? Only LAN grants count; `internet` never covers a configured
+    /// network.
+    pub fn reaches_directly(
+        &self,
+        template: &Template,
+        host: Ipv4Addr,
+        proto: Proto,
+        port: u16,
+    ) -> bool {
         self.reaches(template).iter().any(|r| match &r.kind {
             ReachKind::Lan { proxied: true, .. } => false,
-            ReachKind::Lan { real, port, .. } => {
-                real.contains(&service.host)
-                    && port.is_none_or(|(pr, po)| pr == service.proto && po == service.port)
+            ReachKind::Lan { real, port: p, .. } => {
+                real.contains(&host) && p.is_none_or(|(pr, po)| pr == proto && po == port)
             }
             ReachKind::Internet => false,
         })
@@ -470,6 +482,18 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         ));
     }
     if let Some(listen) = server.proxy.listen {
+        // Tunnel tiers' HTTPS is DNATed to this address, so it must be a
+        // real unicast address on the gateway (loopback would be dropped as
+        // martian after the DNAT).
+        if listen.is_unspecified()
+            || listen.is_loopback()
+            || listen.is_multicast()
+            || listen.is_broadcast()
+        {
+            errors.push(format!(
+                "server.proxy.listen {listen} is not a unicast address the gateway's tunnel peers can be redirected to; leave it unset (the WireGuard gateway address) or use one of the gateway's own addresses"
+            ));
+        }
         for t in &config.templates {
             if t.wireguard.pool.contains(&listen) {
                 errors.push(format!(
@@ -951,6 +975,13 @@ mod tests {
         assert!(has(&e, "both listen on 10.8.0.1:53"), "{e:?}");
         let e = errors_of(|c| c.server.proxy.port = 0);
         assert!(has(&e, "server.proxy.port must not be 0"), "{e:?}");
+        for bad in ["0.0.0.0", "127.0.0.1", "224.0.0.5", "255.255.255.255"] {
+            let e = errors_of(|c| c.server.proxy.listen = Some(bad.parse().unwrap()));
+            assert!(
+                has(&e, &format!("server.proxy.listen {bad} is not a unicast")),
+                "{e:?}"
+            );
+        }
         let e = errors_of(|c| c.server.proxy.listen = Some("10.8.2.9".parse().unwrap()));
         assert!(
             has(&e, "lies inside the pool 10.8.2.0/24 of template 'family'"),

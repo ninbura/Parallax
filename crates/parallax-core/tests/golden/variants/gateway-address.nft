@@ -20,7 +20,10 @@ table inet parallax {
 
 	chain input {
 		type filter hook input priority filter; policy accept;
-		ct state established,related accept comment "established flows"
+		meta nfproto ipv6 iifname { "wg0", "tailscale0" } drop comment "tunnel peers are IPv4-only"
+		ct state invalid iifname { "wg0", "tailscale0" } drop comment "invalid state"
+		ct direction reply accept comment "replies"
+		ct state related accept comment "related (ICMP errors)"
 		udp dport 51820 accept comment "wireguard listen port"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 udp dport 53 accept comment "dns shim"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 tcp dport 53 accept comment "dns shim"
@@ -34,22 +37,29 @@ table inet parallax {
 
 	chain forward {
 		type filter hook forward priority filter; policy accept;
-		ct state established,related accept comment "established flows"
+		meta nfproto ipv6 iifname { "wg0", "tailscale0" } drop comment "tunnel peers are IPv4-only"
 		ct state invalid drop comment "invalid state"
-		iifname "wg0" oifname "eth0" ip saddr 10.8.1.0/24 ip daddr 192.168.1.0/24 accept comment "personal/wireguard: network home"
-		iifname "wg0" ip saddr 10.8.1.0/24 drop comment "personal/wireguard: default deny"
-		iifname "tailscale0" oifname "eth0" ip saddr @ts_personal ip daddr 192.168.1.0/24 accept comment "personal/tailscale: network home"
-		iifname "tailscale0" ip saddr @ts_personal drop comment "personal/tailscale: default deny"
-		iifname "wg0" oifname "eth0" ip saddr 10.8.2.0/24 ip daddr 192.168.1.5 tcp dport 443 accept comment "family/wireguard: service immich"
-		iifname "wg0" ip saddr 10.8.2.0/24 drop comment "family/wireguard: default deny"
-		iifname "tailscale0" oifname "eth0" ip saddr @ts_family ip daddr 192.168.1.5 tcp dport 443 accept comment "family/tailscale: service immich"
-		iifname "tailscale0" ip saddr @ts_family drop comment "family/tailscale: default deny"
+		ct direction reply accept comment "replies"
+		ct state related accept comment "related (ICMP errors)"
+		iifname "wg0" ip saddr vmap { 10.8.1.0/24 : jump tier_personal, 10.8.2.0/24 : jump tier_family } comment "wireguard: each template's chain, by source address"
+		iifname "tailscale0" ip saddr @ts_personal jump tier_personal comment "personal/tailscale"
+		iifname "tailscale0" ip saddr @ts_family jump tier_family comment "family/tailscale"
 		iifname "wg0" drop comment "wireguard: unknown source"
 		iifname "tailscale0" drop comment "tailscale: unknown source"
 	}
 
+	chain tier_personal {
+		oifname "eth0" ip daddr 192.168.1.0/24 accept comment "personal: network home"
+		drop comment "personal: default deny"
+	}
+
+	chain tier_family {
+		oifname "eth0" ip daddr 192.168.1.5 tcp dport 443 accept comment "family: service immich"
+		drop comment "family: default deny"
+	}
+
 	chain prerouting {
-		type nat hook prerouting priority dstnat; policy accept;
+		type nat hook prerouting priority dstnat - 10; policy accept;
 		iifname { "wg0", "tailscale0" } ip daddr 198.18.1.0/24 dnat ip prefix to ip daddr map { 198.18.1.0/24 : 192.168.1.0/24 } comment "netmap home: virtual -> real"
 	}
 

@@ -136,12 +136,44 @@ with a catch-all deny. `TailscaleTransport` implements those five methods
 today and returns `NotImplemented` for provision/export.
 
 The INPUT chain is locked down too: from a tunnel interface only the shim
-(UDP/TCP 53 to the shim address), ICMP echo, and grants that cover a network's
-`gateway_address` are accepted, then drop. A host-networked gateway otherwise
+(UDP/TCP 53 to the shim address), ICMP echo, grants that cover a network's
+`gateway_address`, and the HTTPS proxy for tiers with a proxied grant are
+accepted, then drop. A host-networked gateway otherwise
 exposes every published container port and its SSH to guest peers. With
 `gateway_address` set, services on the gateway box itself are reachable
 through the mapping exactly like any other LAN host, tier by tier. LAN-side
 INPUT is untouched (policy accept).
+
+Every packet a tunnel peer sends is checked against its tier's grants, not
+only the first packet of a flow. Only reply-direction packets (`ct direction
+reply`) and related ones (ICMP errors) skip the check, and invalid ones are
+dropped, in both INPUT and FORWARD. So removing a grant cuts already-open
+connections on their next packet, with no conntrack flush on apply (which
+would drop everyone's sessions, or need a diff of what changed).
+
+Checking every packet is only cheap if a packet doesn't walk past every
+other template's rules first (with 200 rules ahead of it, small-packet UDP
+through WireGuard ran at a quarter of the speed; `dev/bench/firewall.sh`
+measures this). So each template's FORWARD rules live in their own chain
+(`tier_<template>`, ending in its default deny), and FORWARD picks the
+chain with one verdict-map lookup on the source address:
+`iifname "wg0" ip saddr vmap { 10.8.1.0/24 : jump tier_personal, ... }`.
+Tailscale tiers are sets of node addresses, so they get one `jump` rule per
+template for now. The `iptables-nft` backend has no verdict maps: it jumps
+to numbered chains (`PARALLAX_T<n>`) with one rule per template.
+
+`internet` reaches public addresses only: FORWARD to the WAN interface
+excludes private, shared (CGNAT), loopback, link-local, multicast, reserved,
+documentation and benchmarking ranges as well as the configured networks
+(the `not_public` set). Otherwise a guest with full tunnel could reach
+subnets the router knows but Parallax doesn't, such as other VLANs. A
+template that also has `all_networks` is the owner's own and keeps
+"everything outside the configured networks" (`lan_real`).
+
+Tunnel peers are IPv4-only: WireGuard's AllowedIPs already refuses IPv6, and
+an explicit drop for IPv6 from a tunnel interface in INPUT and FORWARD keeps
+it that way for transports that might carry it (Tailscale). The
+`iptables-nft` backend renders IPv4 tables only, so it has no such rule.
 
 ## Proxied HTTPS services
 
@@ -151,9 +183,18 @@ of them. A service with `hostnames` closes that gap: `service` grants reach
 it only through Parallax's own HTTPS proxy, which terminates TLS, checks
 SNI, `Host` and HTTP/2 `:authority` on every request, and forwards only the
 listed names to the service. The firewall gives such grants no direct
-accept (`ReachKind::Lan { proxied: true }`); the redirect into the proxy is
-still to come, and until then the grant reaches nothing, which fails
-closed.
+accept (`ReachKind::Lan { proxied: true }`). Instead, for each tier with a
+`service` grant on a proxied service, PREROUTING sends its `tcp/443` to that
+service's address, as clients see it (virtual where mapped), to the proxy
+(`server.proxy`, `10.8.0.1:8443` by default). The rule comes before NETMAP,
+since NAT takes the first match. A tier that already reaches that host's 443
+directly (`all_networks`, its network, `host`, a matching `host_port`) gets
+no redirect: the proxy would add nothing. Only tiers with a redirect may
+reach the proxy port in INPUT. The firewall works per tier and the proxy per
+hostname: when a tier loses one of several proxied hostnames, its other
+redirects keep the proxy port open to it, and the proxy closes the revoked
+hostname's connections when it reloads. So whatever runs `apply` also sends
+the proxy SIGHUP (the Docker entrypoint does).
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
@@ -212,7 +253,9 @@ Docker note: a Docker-published port on the gateway host is reached through
 `docker-proxy` listening on the host address, because the NETMAP DNAT and
 Docker's DNAT cannot both apply to one connection. That is Docker's default
 (`userland-proxy: true`); with it disabled, published ports are not reachable
-via the virtual address.
+via the virtual address. Parallax's prerouting chain runs at `dstnat - 10`,
+ahead of Docker's DNAT: the first NAT binding wins, so a tier's redirect to
+the proxy can't lose to a port Docker publishes on the gateway.
 
 ## Generated artifacts (output directory layout)
 

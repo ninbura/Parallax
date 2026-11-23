@@ -100,6 +100,9 @@ fn iptables_backend_matches_golden() {
     let mut cfg = canonical_config();
     cfg.server.firewall.backend = FirewallBackend::IptablesNft;
     cfg.templates[0].grants.push(Grant::Internet);
+    // A guest with internet and a proxied service: not_public and the DNAT.
+    cfg.templates[1].grants.push(Grant::Internet);
+    cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
     let bundle = bundle_for(&cfg);
     for a in bundle
         .of_kind(ArtifactKind::Firewall)
@@ -113,10 +116,25 @@ fn iptables_backend_matches_golden() {
 fn internet_grant_and_masquerade_match_golden() {
     let mut cfg = canonical_config();
     cfg.templates[0].grants.push(Grant::Internet);
+    cfg.templates[1].grants.push(Grant::Internet);
     cfg.networks[0].masquerade = true;
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     check_golden("variants/internet-masquerade.nft", &fw.contents);
+    let rule = |tag: &str| {
+        fw.contents
+            .lines()
+            .find(|l| l.contains(&format!("\"{tag}: internet")))
+            .unwrap()
+    };
+    // The owner's all_networks template still reaches private space beyond
+    // the configured networks; a guest reaches only public addresses.
+    assert!(rule("personal").contains("ip daddr != @lan_real"));
+    assert!(rule("family").contains("ip daddr != @not_public"));
+    // Merged, since nft rejects overlapping intervals: the configured
+    // 192.168.1.0/24 sits inside 192.168.0.0/16.
+    assert!(fw.contents.contains("192.168.0.0/16"));
+    assert!(!fw.contents.contains("192.168.1.0/24,"));
 }
 
 #[test]
@@ -130,11 +148,85 @@ fn proxied_service_gets_no_direct_accept() {
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     check_golden("variants/proxied-service-routes.toml", &routes.contents);
     assert!(
-        !fw.contents.contains("service immich"),
+        !fw.contents
+            .lines()
+            .any(|l| l.contains("service immich") && l.contains(" accept ")),
         "family must not reach immich directly, not even on the gateway host:\n{}",
         fw.contents
     );
-    assert!(fw.contents.contains("family/wireguard: default deny"));
+    assert!(fw
+        .contents
+        .contains("drop comment \"family: default deny\""));
+    // Family's HTTPS to Immich's client address goes to the proxy, before
+    // NETMAP would send it to the real host; only family may reach the proxy.
+    let pre: Vec<&str> = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("chain prerouting"))
+        .collect();
+    assert!(pre[2].contains(
+        "iifname \"wg0\" ip saddr 10.8.2.0/24 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
+    ), "{pre:#?}");
+    assert!(pre.iter().any(|l| l.contains("netmap home")));
+    assert!(!fw.contents.contains("personal/wireguard: https proxy"));
+    assert!(fw
+        .contents
+        .contains("iifname \"wg0\" ip saddr 10.8.2.0/24 ip daddr 10.8.0.1 tcp dport 8443 accept"));
+}
+
+#[test]
+fn no_proxy_redirect_where_a_grant_reaches_the_host_directly() {
+    let mut cfg = canonical_config();
+    cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
+    cfg.templates[1].grants.push(Grant::HostPort {
+        ip: "192.168.1.5".parse().unwrap(),
+        proto: parallax_core::model::Proto::Tcp,
+        port: 443,
+    });
+    let bundle = bundle_for(&cfg);
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    assert!(!fw.contents.contains("dnat ip to"), "{}", fw.contents);
+    assert!(!fw.contents.contains("https proxy"), "{}", fw.contents);
+}
+
+#[test]
+fn tunnel_peers_are_checked_on_every_packet() {
+    let bundle = bundle_for(&canonical_config());
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // No blanket "established" accept: a removed grant cuts open flows.
+    assert!(!fw.contents.contains("established"), "{}", fw.contents);
+    for chain in ["chain input", "chain forward"] {
+        let body: Vec<&str> = fw
+            .contents
+            .lines()
+            .skip_while(|l| !l.contains(chain))
+            .take_while(|l| !l.trim().starts_with('}'))
+            .collect();
+        assert!(
+            body[2].contains("meta nfproto ipv6 iifname { \"wg0\", \"tailscale0\" } drop"),
+            "{body:#?}"
+        );
+        assert!(body.iter().any(|l| l.contains("ct direction reply accept")));
+        assert!(body.iter().any(|l| l.contains("ct state related accept")));
+    }
+    // A packet sees its own template's rules only: one lookup by source
+    // address picks the chain, however many templates come before it.
+    assert!(fw.contents.contains(
+        "iifname \"wg0\" ip saddr vmap { 10.8.1.0/24 : jump tier_personal, 10.8.2.0/24 : jump tier_family }"
+    ));
+    assert!(fw
+        .contents
+        .contains("iifname \"tailscale0\" ip saddr @ts_family jump tier_family"));
+    let family: Vec<&str> = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("chain tier_family {"))
+        .take_while(|l| !l.trim().starts_with('}'))
+        .collect();
+    assert_eq!(
+        family.last().map(|l| l.trim()),
+        Some("drop comment \"family: default deny\"")
+    );
 }
 
 #[test]
@@ -324,4 +416,47 @@ fn apply_preflight_names_missing_tools() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("`nft` is not available"), "{err}");
+}
+
+#[test]
+fn iptables_apply_refills_chains_in_one_restore() {
+    let mut cfg = canonical_config();
+    cfg.server.firewall.backend = FirewallBackend::IptablesNft;
+    cfg.templates[1].grants.push(Grant::Internet);
+    let model = Model::resolve(&cfg, today()).unwrap();
+    let fs = fs_with_server_key();
+    let bundle = generate::generate_all(&model, &fs).unwrap();
+    let runner = RecordingRunner::new();
+    // A template was removed since the last apply: its chain is still there.
+    runner.respond_to(
+        "iptables",
+        &["-t", "filter", "-S"],
+        parallax_core::io::Output {
+            status: 0,
+            stdout: "-P INPUT ACCEPT\n-N PARALLAX_FORWARD\n-N PARALLAX_T0\n-N PARALLAX_T1\n-N PARALLAX_T2\n".into(),
+            stderr: String::new(),
+        },
+    );
+    let sys = System {
+        fs: &fs,
+        runner: &runner,
+    };
+    parallax_core::apply::apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+    let lines = runner.command_lines();
+    let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
+    let restore = pos("iptables-restore --noflush").unwrap();
+    // No flush of live chains before the restore: that left a window with
+    // empty chains, and empty ones if the restore failed.
+    assert!(
+        !lines[..restore].iter().any(|l| l.contains(" -F ")),
+        "{lines:#?}"
+    );
+    // Sets are filled aside and swapped in, never flushed while in use.
+    assert!(pos("ipset swap parallax-swap not_public").unwrap() < restore);
+    assert!(!lines.iter().any(|l| l == "ipset flush not_public"));
+    // Only the stale template chain goes.
+    assert!(lines
+        .iter()
+        .any(|l| l == "iptables -t filter -X PARALLAX_T2"));
+    assert!(!lines.iter().any(|l| l.contains("-X PARALLAX_T1")));
 }

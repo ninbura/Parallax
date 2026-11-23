@@ -44,7 +44,9 @@ pub enum Grant {
     /// A named [`super::Service`].
     Service { name: String },
     /// Egress to the internet through the gateway's WAN interface
-    /// (masqueraded). Required for the `full_tunnel` AllowedIPs strategy to be
-    /// useful.
+    /// (masqueraded): public addresses only, so private subnets the router
+    /// knows but Parallax doesn't stay out of reach. With `all_networks` it
+    /// covers everything outside the configured networks. Required for the
+    /// `full_tunnel` AllowedIPs strategy to be useful.
     Internet,
 }

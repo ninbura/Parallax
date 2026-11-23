@@ -19,13 +19,25 @@
 //!   a host-networked gateway does not expose its other services to peers.
 //! - Services with `hostnames` get no direct accept: they're reached only
 //!   through the HTTPS proxy, which checks the hostname on every request.
+//!   Prerouting sends a granted tier's `tcp/443` for that address to the
+//!   proxy (before NETMAP), and INPUT lets only those tiers reach the proxy.
+//! - Every packet a tunnel peer sends is checked against its grants, not just
+//!   the first of a flow: only reply-direction and related packets skip the
+//!   check. Removing a grant cuts open connections on their next packet.
+//!   To keep that cheap, each template's forward rules are their own chain,
+//!   picked by one source-address lookup, so a packet never walks past
+//!   other templates' rules.
+//! - `internet` reaches public addresses only, unless the template also has
+//!   `all_networks` (then it's everything outside the configured networks).
+//! - Tunnel peers are IPv4-only: IPv6 from a tunnel interface is dropped.
 
 use std::fmt::Write as _;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use ipnet::Ipv4Net;
 
 use super::{Artifact, ArtifactKind};
-use crate::model::{FirewallBackend, Proto};
+use crate::model::{FirewallBackend, Grant, Proto, Template};
 use crate::transport::{self, TierSource};
 use crate::validate::{Model, ReachKind};
 use crate::Result;
@@ -36,6 +48,8 @@ pub enum Chain {
     Forward,
     Prerouting,
     Postrouting,
+    /// One template's forward rules, by index into [`Ruleset::tiers`].
+    Tier(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,10 +61,29 @@ pub enum Match {
     NotSet(String),
 }
 
+/// A connection-tracking condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ct {
+    /// A packet travelling in the reply direction of a tracked flow.
+    Reply,
+    /// The first packet of a flow related to a tracked one (ICMP errors).
+    Related,
+    Invalid,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Accept,
     Drop,
+    /// Rewrite the destination to one address and port.
+    Dnat {
+        to: SocketAddrV4,
+    },
+    /// Continue in a template's chain (index into [`Ruleset::tiers`]).
+    Jump(usize),
+    /// Jump to the template chain whose prefix holds the source address:
+    /// one lookup, however many templates there are.
+    SourceVmap(Vec<(Ipv4Net, usize)>),
     /// 1:1 prefix translation of the destination.
     NetmapDst {
         from: Ipv4Net,
@@ -71,8 +104,9 @@ pub struct Rule {
     pub oif: Vec<String>,
     pub src: Match,
     pub dst: Match,
-    pub ct_established: bool,
-    pub ct_invalid: bool,
+    pub ct: Option<Ct>,
+    /// Match IPv6 packets only (all other matches here are IPv4).
+    pub ipv6: bool,
     pub icmp_echo: bool,
     pub l4: Option<(Proto, u16)>,
     pub action: Action,
@@ -87,8 +121,8 @@ impl Rule {
             oif: Vec::new(),
             src: Match::Any,
             dst: Match::Any,
-            ct_established: false,
-            ct_invalid: false,
+            ct: None,
+            ipv6: false,
             icmp_echo: false,
             l4: None,
             action,
@@ -123,9 +157,17 @@ impl Rule {
         self.l4 = l4;
         self
     }
+    fn ct(mut self, ct: Ct) -> Self {
+        self.ct = Some(ct);
+        self
+    }
+    fn ipv6(mut self) -> Self {
+        self.ipv6 = true;
+        self
+    }
 }
 
-/// A named address set (only Tailscale tiers and the LAN set in M1).
+/// A named address set: Tailscale tiers, configured networks, non-public space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressSet {
     pub name: String,
@@ -138,12 +180,86 @@ pub struct AddressSet {
 pub struct Ruleset {
     pub sets: Vec<AddressSet>,
     pub rules: Vec<Rule>,
+    /// Template names, one chain each ([`Chain::Tier`]).
+    pub tiers: Vec<String>,
     /// DOCKER-USER accepts, if Docker coexistence is on.
     pub docker_user: Vec<Rule>,
 }
 
 pub const TABLE: &str = "parallax";
 pub const LAN_SET: &str = "lan_real";
+pub const NOT_PUBLIC_SET: &str = "not_public";
+
+const fn net(a: u8, b: u8, c: u8, d: u8, len: u8) -> Ipv4Net {
+    Ipv4Net::new_assert(Ipv4Addr::new(a, b, c, d), len)
+}
+
+/// Destinations that aren't the public internet (RFC 6890 and friends): an
+/// `internet` grant never reaches these, so a guest with full tunnel can't
+/// use the gateway's router to reach private subnets Parallax doesn't know
+/// about.
+pub const NOT_PUBLIC: [Ipv4Net; 15] = [
+    net(0, 0, 0, 0, 8),       // "this network"
+    net(10, 0, 0, 0, 8),      // private
+    net(100, 64, 0, 0, 10),   // shared address space (CGNAT, Tailscale)
+    net(127, 0, 0, 0, 8),     // loopback
+    net(169, 254, 0, 0, 16),  // link-local
+    net(172, 16, 0, 0, 12),   // private
+    net(192, 0, 0, 0, 24),    // IETF protocol assignments
+    net(192, 0, 2, 0, 24),    // documentation (TEST-NET-1)
+    net(192, 88, 99, 0, 24),  // deprecated 6to4 relay anycast
+    net(192, 168, 0, 0, 16),  // private
+    net(198, 18, 0, 0, 15),   // benchmarking, and Parallax's mapped space
+    net(198, 51, 100, 0, 24), // documentation (TEST-NET-2)
+    net(203, 0, 113, 0, 24),  // documentation (TEST-NET-3)
+    net(224, 0, 0, 0, 4),     // multicast
+    net(240, 0, 0, 0, 4),     // reserved, broadcast
+];
+
+/// `internet` for a template that also has `all_networks` keeps reaching
+/// private space through the router (other VLANs): it already reaches every
+/// configured network, so it's the owner's own template.
+fn internet_is_public_only(template: &Template) -> bool {
+    !template.grants.contains(&Grant::AllNetworks)
+}
+
+/// Client-side addresses (virtual where mapped) whose `tcp/443` this
+/// template's tiers send to the HTTPS proxy: each proxied service it's
+/// granted, unless another grant already reaches that host's 443 directly.
+fn proxy_redirects(model: &Model<'_>, template: &Template) -> Vec<ProxyRedirect> {
+    let mut out: Vec<ProxyRedirect> = Vec::new();
+    for r in model.reaches(template) {
+        let ReachKind::Lan {
+            real,
+            port,
+            proxied: true,
+            ..
+        } = r.kind
+        else {
+            continue;
+        };
+        // Proxied services are validated to be tcp/443.
+        if port.is_some_and(|(proto, p)| model.reaches_directly(template, real.addr(), proto, p)) {
+            continue;
+        }
+        if let Some(client) = r.client_net() {
+            if !out.iter().any(|p| p.client == client) {
+                out.push(ProxyRedirect {
+                    client,
+                    port,
+                    label: r.label,
+                });
+            }
+        }
+    }
+    out
+}
+
+struct ProxyRedirect {
+    client: Ipv4Net,
+    port: Option<(Proto, u16)>,
+    label: String,
+}
 
 /// Build the backend-independent ruleset.
 pub fn build(model: &Model<'_>) -> Result<Ruleset> {
@@ -156,6 +272,11 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         .collect();
     let source_ranges: Vec<Ipv4Net> = transports.iter().map(|t| t.source_range(server)).collect();
     let shim = model.shim_address();
+    let proxy = SocketAddrV4::new(model.proxy_address(), server.proxy.port);
+    let tier_src = |tr: &dyn transport::Transport, t: &Template| match tr.tier_source(server, t) {
+        TierSource::Cidr(c) => Match::Cidr(c),
+        TierSource::Set(s) => Match::Set(s),
+    };
     let mut rs = Ruleset::default();
 
     // Sets
@@ -174,19 +295,45 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
             }
         }
     }
+    let configured: Vec<Ipv4Net> = cfg.networks.iter().map(|n| n.subnet.trunc()).collect();
     let internet = model.any_internet_grant();
     if internet {
         rs.sets.push(AddressSet {
             name: LAN_SET.into(),
-            elements: cfg.networks.iter().map(|n| n.subnet.trunc()).collect(),
+            elements: configured.clone(),
             comment: "real prefixes of every configured network".into(),
         });
     }
+    if cfg
+        .templates
+        .iter()
+        .any(|t| t.grants.contains(&Grant::Internet) && internet_is_public_only(t))
+    {
+        // nft rejects overlapping intervals, so merge first.
+        let all: Vec<Ipv4Net> = NOT_PUBLIC.iter().chain(&configured).copied().collect();
+        rs.sets.push(AddressSet {
+            name: NOT_PUBLIC_SET.into(),
+            elements: Ipv4Net::aggregate(&all),
+            comment: "private, reserved and configured prefixes: not the internet".into(),
+        });
+    }
 
-    // Input: the WireGuard port from anywhere; from tunnels only the shim and ping.
-    let mut est_in = Rule::new(Chain::Input, Action::Accept, "established flows");
-    est_in.ct_established = true;
-    rs.rules.push(est_in);
+    // Input: the WireGuard port from anywhere; from tunnels only the shim,
+    // ping, granted services on the gateway host and the proxy.
+    rs.rules.push(
+        Rule::new(Chain::Input, Action::Drop, "tunnel peers are IPv4-only")
+            .iifs(&ingress)
+            .ipv6(),
+    );
+    rs.rules.push(
+        Rule::new(Chain::Input, Action::Drop, "invalid state")
+            .iifs(&ingress)
+            .ct(Ct::Invalid),
+    );
+    rs.rules
+        .push(Rule::new(Chain::Input, Action::Accept, "replies").ct(Ct::Reply));
+    rs.rules
+        .push(Rule::new(Chain::Input, Action::Accept, "related (ICMP errors)").ct(Ct::Related));
     rs.rules.push(
         Rule::new(Chain::Input, Action::Accept, "wireguard listen port")
             .l4(Some((Proto::Udp, server.wireguard.listen_port))),
@@ -217,10 +364,6 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                 continue;
             };
             for tr in &transports {
-                let src = match tr.tier_source(server, t) {
-                    TierSource::Cidr(c) => Match::Cidr(c),
-                    TierSource::Set(s) => Match::Set(s),
-                };
                 rs.rules.push(
                     Rule::new(
                         Chain::Input,
@@ -233,11 +376,29 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                         ),
                     )
                     .iif(tr.ingress_interface(server))
-                    .src(src)
+                    .src(tier_src(tr.as_ref(), t))
                     .dst(Match::Cidr(Ipv4Net::from(g)))
                     .l4(port),
                 );
             }
+        }
+    }
+    for t in &cfg.templates {
+        if proxy_redirects(model, t).is_empty() {
+            continue;
+        }
+        for tr in &transports {
+            rs.rules.push(
+                Rule::new(
+                    Chain::Input,
+                    Action::Accept,
+                    format!("{}/{}: https proxy", t.name, tr.kind()),
+                )
+                .iif(tr.ingress_interface(server))
+                .src(tier_src(tr.as_ref(), t))
+                .dst(Match::Cidr(Ipv4Net::from(*proxy.ip())))
+                .l4(Some((Proto::Tcp, proxy.port()))),
+            );
         }
     }
     rs.rules.push(
@@ -250,65 +411,94 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
     );
 
     // Forward
-    let mut est = Rule::new(Chain::Forward, Action::Accept, "established flows");
-    est.ct_established = true;
-    rs.rules.push(est);
-    let mut inv = Rule::new(Chain::Forward, Action::Drop, "invalid state");
-    inv.ct_invalid = true;
-    rs.rules.push(inv);
+    rs.rules.push(
+        Rule::new(Chain::Forward, Action::Drop, "tunnel peers are IPv4-only")
+            .iifs(&ingress)
+            .ipv6(),
+    );
+    rs.rules
+        .push(Rule::new(Chain::Forward, Action::Drop, "invalid state").ct(Ct::Invalid));
+    rs.rules
+        .push(Rule::new(Chain::Forward, Action::Accept, "replies").ct(Ct::Reply));
+    rs.rules
+        .push(Rule::new(Chain::Forward, Action::Accept, "related (ICMP errors)").ct(Ct::Related));
 
-    for t in &cfg.templates {
-        let reaches = model.reaches(t);
-        for tr in &transports {
-            let iif = tr.ingress_interface(server);
-            let src = match tr.tier_source(server, t) {
-                TierSource::Cidr(c) => Match::Cidr(c),
-                TierSource::Set(s) => Match::Set(s),
-            };
-            let tag = format!("{}/{}", t.name, tr.kind());
-            for r in &reaches {
-                match &r.kind {
-                    // The proxy checks the hostname and connects from the
-                    // gateway itself; a direct accept would skip that check.
-                    ReachKind::Lan { proxied: true, .. } => {}
-                    ReachKind::Lan {
-                        network,
-                        real,
-                        port,
-                        proxied: false,
-                    } => rs.rules.push(
-                        Rule::new(
-                            Chain::Forward,
-                            Action::Accept,
-                            format!("{tag}: {}", r.label),
-                        )
-                        .iif(&iif)
-                        .src(src.clone())
-                        .oif(&network.interface)
-                        .dst(Match::Cidr(*real))
-                        .l4(*port),
-                    ),
-                    ReachKind::Internet => {
-                        if let Some(wan) = model.wan_interface() {
-                            rs.rules.push(
-                                Rule::new(
-                                    Chain::Forward,
-                                    Action::Accept,
-                                    format!("{tag}: internet"),
-                                )
-                                .iif(&iif)
-                                .src(src.clone())
-                                .oif(wan)
-                                .dst(Match::NotSet(LAN_SET.into())),
-                            );
-                        }
+    // Each template's grants live in its own chain, entered by source
+    // address, so a packet is checked against its own grants only, not
+    // walked past every other template's.
+    for (i, t) in cfg.templates.iter().enumerate() {
+        rs.tiers.push(t.name.clone());
+        for r in model.reaches(t) {
+            match &r.kind {
+                // The proxy checks the hostname and connects from the
+                // gateway itself; a direct accept would skip that check.
+                ReachKind::Lan { proxied: true, .. } => {}
+                ReachKind::Lan {
+                    network,
+                    real,
+                    port,
+                    proxied: false,
+                } => rs.rules.push(
+                    Rule::new(
+                        Chain::Tier(i),
+                        Action::Accept,
+                        format!("{}: {}", t.name, r.label),
+                    )
+                    .oif(&network.interface)
+                    .dst(Match::Cidr(*real))
+                    .l4(*port),
+                ),
+                ReachKind::Internet => {
+                    if let Some(wan) = model.wan_interface() {
+                        let (not, label) = if internet_is_public_only(t) {
+                            (NOT_PUBLIC_SET, "internet (public addresses)")
+                        } else {
+                            (LAN_SET, "internet")
+                        };
+                        rs.rules.push(
+                            Rule::new(
+                                Chain::Tier(i),
+                                Action::Accept,
+                                format!("{}: {label}", t.name),
+                            )
+                            .oif(wan)
+                            .dst(Match::NotSet(not.into())),
+                        );
                     }
                 }
             }
-            rs.rules.push(
-                Rule::new(Chain::Forward, Action::Drop, format!("{tag}: default deny"))
+        }
+        rs.rules.push(Rule::new(
+            Chain::Tier(i),
+            Action::Drop,
+            format!("{}: default deny", t.name),
+        ));
+    }
+    for tr in &transports {
+        let iif = tr.ingress_interface(server);
+        let mut prefixes = Vec::new();
+        for (i, t) in cfg.templates.iter().enumerate() {
+            match tr.tier_source(server, t) {
+                TierSource::Cidr(c) => prefixes.push((c, i)),
+                TierSource::Set(set) => rs.rules.push(
+                    Rule::new(
+                        Chain::Forward,
+                        Action::Jump(i),
+                        format!("{}/{}", t.name, tr.kind()),
+                    )
                     .iif(&iif)
-                    .src(src),
+                    .src(Match::Set(set)),
+                ),
+            }
+        }
+        if !prefixes.is_empty() {
+            rs.rules.push(
+                Rule::new(
+                    Chain::Forward,
+                    Action::SourceVmap(prefixes),
+                    format!("{}: each template's chain, by source address", tr.kind()),
+                )
+                .iif(&iif),
             );
         }
     }
@@ -323,7 +513,28 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         );
     }
 
-    // NAT: NETMAP per mapped network, both directions.
+    // NAT: granted tiers' HTTPS to proxied services goes to the proxy. NAT
+    // takes the first matching rule, so these precede NETMAP.
+    for t in &cfg.templates {
+        let redirects = proxy_redirects(model, t);
+        for tr in &transports {
+            for p in &redirects {
+                rs.rules.push(
+                    Rule::new(
+                        Chain::Prerouting,
+                        Action::Dnat { to: proxy },
+                        format!("{}/{}: {} via the https proxy", t.name, tr.kind(), p.label),
+                    )
+                    .iif(tr.ingress_interface(server))
+                    .src(tier_src(tr.as_ref(), t))
+                    .dst(Match::Cidr(p.client))
+                    .l4(p.port),
+                );
+            }
+        }
+    }
+
+    // NETMAP per mapped network, both directions.
     for n in &cfg.networks {
         if let Some(m) = n.mapping() {
             rs.rules.push(
@@ -474,13 +685,20 @@ pub mod nft {
         }
     }
 
-    pub fn rule(r: &Rule) -> String {
+    fn tier_chain(rs: &Ruleset, i: usize) -> String {
+        format!("tier_{}", rs.tiers.get(i).map_or("", String::as_str))
+    }
+
+    pub fn rule(rs: &Ruleset, r: &Rule) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if r.ct_established {
-            parts.push("ct state established,related".into());
+        if r.ipv6 {
+            parts.push("meta nfproto ipv6".into());
         }
-        if r.ct_invalid {
-            parts.push("ct state invalid".into());
+        match r.ct {
+            Some(Ct::Reply) => parts.push("ct direction reply".into()),
+            Some(Ct::Related) => parts.push("ct state related".into()),
+            Some(Ct::Invalid) => parts.push("ct state invalid".into()),
+            None => {}
         }
         if !r.iif.is_empty() {
             parts.push(format!("iifname {}", iface_list(&r.iif)));
@@ -503,6 +721,16 @@ pub mod nft {
         parts.push(match &r.action {
             Action::Accept => "accept".into(),
             Action::Drop => "drop".into(),
+            Action::Dnat { to } => format!("dnat ip to {to}"),
+            Action::Jump(i) => format!("jump {}", tier_chain(rs, *i)),
+            Action::SourceVmap(entries) => format!(
+                "ip saddr vmap {{ {} }}",
+                entries
+                    .iter()
+                    .map(|(net, i)| format!("{} : jump {}", cidr(net), tier_chain(rs, *i)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Action::NetmapDst { from, to } => {
                 format!("dnat ip prefix to ip daddr map {{ {from} : {to} }}")
             }
@@ -517,24 +745,29 @@ pub mod nft {
         parts.join(" ")
     }
 
-    fn chain_header(c: Chain) -> (&'static str, &'static str) {
+    /// Name and base-chain header (none for a template's regular chain).
+    fn chain_header(rs: &Ruleset, c: Chain) -> (String, Option<&'static str>) {
         match c {
             Chain::Input => (
-                "input",
-                "type filter hook input priority filter; policy accept;",
+                "input".into(),
+                Some("type filter hook input priority filter; policy accept;"),
             ),
             Chain::Forward => (
-                "forward",
-                "type filter hook forward priority filter; policy accept;",
+                "forward".into(),
+                Some("type filter hook forward priority filter; policy accept;"),
             ),
             Chain::Prerouting => (
-                "prerouting",
-                "type nat hook prerouting priority dstnat; policy accept;",
+                "prerouting".into(),
+                // Ahead of Docker's DNAT (plain dstnat): the first NAT binding
+                // wins, so a tier's redirect to the proxy can't lose to a port
+                // Docker publishes on the gateway.
+                Some("type nat hook prerouting priority dstnat - 10; policy accept;"),
             ),
             Chain::Postrouting => (
-                "postrouting",
-                "type nat hook postrouting priority srcnat; policy accept;",
+                "postrouting".into(),
+                Some("type nat hook postrouting priority srcnat; policy accept;"),
             ),
+            Chain::Tier(i) => (tier_chain(rs, i), None),
         }
     }
 
@@ -561,17 +794,18 @@ pub mod nft {
             }
             s.push_str("\t}\n\n");
         }
-        for chain in [
-            Chain::Input,
-            Chain::Forward,
-            Chain::Prerouting,
-            Chain::Postrouting,
-        ] {
-            let (name, header) = chain_header(chain);
+        let chains = [Chain::Input, Chain::Forward]
+            .into_iter()
+            .chain((0..rs.tiers.len()).map(Chain::Tier))
+            .chain([Chain::Prerouting, Chain::Postrouting]);
+        for chain in chains {
+            let (name, header) = chain_header(rs, chain);
             let _ = writeln!(s, "\tchain {name} {{");
-            let _ = writeln!(s, "\t\t{header}");
+            if let Some(header) = header {
+                let _ = writeln!(s, "\t\t{header}");
+            }
             for r in rs.rules.iter().filter(|r| r.chain == chain) {
-                let _ = writeln!(s, "\t\t{}", rule(r));
+                let _ = writeln!(s, "\t\t{}", rule(rs, r));
             }
             s.push_str("\t}\n\n");
         }
@@ -590,14 +824,14 @@ pub mod nft {
         s.push_str("# Generated by Parallax. Rules for Docker's DOCKER-USER chain (only when Docker runs on the gateway host).\n");
         s.push_str("# Apply removes previous rules commented \"parallax\" before inserting these, so re-applying is idempotent.\n");
         for r in &rs.docker_user {
-            let _ = writeln!(s, "insert rule ip filter DOCKER-USER {}", rule(r));
+            let _ = writeln!(s, "insert rule ip filter DOCKER-USER {}", rule(rs, r));
         }
         s
     }
 }
 
 /// iptables-restore renderer for hosts without a usable `nft` binary. Uses
-/// dedicated PARALLAX_* chains that apply flushes and re-jumps to.
+/// dedicated PARALLAX_* chains, refilled in one restore transaction.
 pub mod iptables {
     use super::*;
 
@@ -608,16 +842,36 @@ pub mod iptables {
         ("nat", "POSTROUTING", "PARALLAX_POSTROUTING"),
     ];
 
-    fn own_chain(c: Chain) -> &'static str {
+    /// Template chains are numbered: iptables chain names stop at 28
+    /// characters, template names don't. The restore file declares them,
+    /// which creates or flushes each one.
+    fn own_chain(c: Chain) -> String {
         match c {
-            Chain::Input => "PARALLAX_INPUT",
-            Chain::Forward => "PARALLAX_FORWARD",
-            Chain::Prerouting => "PARALLAX_PREROUTING",
-            Chain::Postrouting => "PARALLAX_POSTROUTING",
+            Chain::Input => "PARALLAX_INPUT".into(),
+            Chain::Forward => "PARALLAX_FORWARD".into(),
+            Chain::Prerouting => "PARALLAX_PREROUTING".into(),
+            Chain::Postrouting => "PARALLAX_POSTROUTING".into(),
+            Chain::Tier(i) => format!("PARALLAX_T{i}"),
         }
     }
 
     fn expand(r: &Rule) -> Vec<String> {
+        // These tables are IPv4-only: an IPv6 rule has nothing to match.
+        if r.ipv6 {
+            return Vec::new();
+        }
+        // No verdict maps: one jump per prefix.
+        if let Action::SourceVmap(entries) = &r.action {
+            return entries
+                .iter()
+                .flat_map(|(net, i)| {
+                    let mut one = r.clone();
+                    one.src = Match::Cidr(*net);
+                    one.action = Action::Jump(*i);
+                    expand(&one)
+                })
+                .collect();
+        }
         // iptables has no interface lists or anonymous sets: expand to one rule each.
         let iifs: Vec<Option<&String>> = if r.iif.is_empty() {
             vec![None]
@@ -661,11 +915,15 @@ pub mod iptables {
                         if let Some(d) = dst {
                             parts.push(d.clone());
                         }
-                        if r.ct_established {
-                            parts.push("-m conntrack --ctstate ESTABLISHED,RELATED".into());
-                        }
-                        if r.ct_invalid {
-                            parts.push("-m conntrack --ctstate INVALID".into());
+                        match r.ct {
+                            Some(Ct::Reply) => parts.push("-m conntrack --ctdir REPLY".into()),
+                            Some(Ct::Related) => {
+                                parts.push("-m conntrack --ctstate RELATED".into())
+                            }
+                            Some(Ct::Invalid) => {
+                                parts.push("-m conntrack --ctstate INVALID".into())
+                            }
+                            None => {}
                         }
                         if r.icmp_echo {
                             parts.push("-p icmp --icmp-type echo-request".into());
@@ -679,6 +937,10 @@ pub mod iptables {
                         parts.push(match &r.action {
                             Action::Accept => "-j ACCEPT".into(),
                             Action::Drop => "-j DROP".into(),
+                            Action::Dnat { to } => format!("-j DNAT --to-destination {to}"),
+                            Action::Jump(i) => format!("-j {}", own_chain(Chain::Tier(*i))),
+                            // Expanded into jumps above.
+                            Action::SourceVmap(_) => String::new(),
                             Action::NetmapDst { to, .. } | Action::NetmapSrc { to, .. } => {
                                 format!("-j NETMAP --to {to}")
                             }
@@ -695,7 +957,7 @@ pub mod iptables {
     pub fn render(rs: &Ruleset) -> String {
         let mut s = String::new();
         s.push_str("# Generated by Parallax for iptables-restore --noflush. Do not edit.\n");
-        s.push_str("# Apply flushes the PARALLAX_* chains, restores this file, and ensures the jumps from the built-in chains exist.\n");
+        s.push_str("# Declaring each PARALLAX_* chain creates or flushes it within the restore; apply then ensures the jumps from the built-in chains exist.\n");
         if !rs.sets.is_empty() {
             s.push_str("# Named sets are ipsets created by apply:\n");
             for set in &rs.sets {
@@ -711,8 +973,12 @@ pub mod iptables {
                 );
             }
         }
+        let filter: Vec<Chain> = [Chain::Input, Chain::Forward]
+            .into_iter()
+            .chain((0..rs.tiers.len()).map(Chain::Tier))
+            .collect();
         for (table, chains) in [
-            ("filter", [Chain::Input, Chain::Forward].as_slice()),
+            ("filter", filter.as_slice()),
             ("nat", [Chain::Prerouting, Chain::Postrouting].as_slice()),
         ] {
             let _ = writeln!(s, "*{table}");

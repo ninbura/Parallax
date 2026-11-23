@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup install # the version in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y nftables wireguard-tools dnsmasq-base dnsutils curl
+      - run: sudo apt-get update && sudo apt-get install -y nftables wireguard-tools dnsmasq-base dnsutils curl openssl iputils-ping
       - run: cargo build -p parallax-cli
       - run: sudo env PATH="$PATH" ./tests/integration/netns.sh
 
