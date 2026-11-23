@@ -1,6 +1,6 @@
 # Working on Parallax
 
-For humans and agents. `CLAUDE.md` and `GEMINI.md` are symlinks to this file.
+For humans and agents (Claude Code, Codex and Antigravity all read this file).
 Design lives in `docs/design.md` and `docs/adr/`; read those before changing
 the model or a generator.
 
