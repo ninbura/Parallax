@@ -17,6 +17,8 @@ pub struct ServerConfig {
     pub dns: DnsServer,
     #[serde(default)]
     pub firewall: FirewallServer,
+    #[serde(default)]
+    pub proxy: ProxyServer,
     /// Interface with the default route, used by `internet` grants. Defaults
     /// to the first network's interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +164,47 @@ impl Default for FirewallServer {
             docker_coexistence: false,
         }
     }
+}
+
+/// The HTTPS proxy that services with `hostnames` are reached through.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyServer {
+    /// Address the proxy listens on. Defaults to the WireGuard gateway
+    /// address, like the DNS shim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<Ipv4Addr>,
+    #[serde(default = "default_proxy_port")]
+    pub port: u16,
+    /// Folder of PEM certificates the operator keeps current (Parallax never
+    /// issues any). Every directory under it holding `fullchain.pem` and
+    /// `privkey.pem` is one certificate, so certbot's `live/<name>` works.
+    #[serde(default = "default_proxy_certificates")]
+    pub certificates: PathBuf,
+    /// CA bundle that upstream certificates are verified against.
+    #[serde(default = "default_upstream_ca")]
+    pub upstream_ca: PathBuf,
+}
+
+impl Default for ProxyServer {
+    fn default() -> Self {
+        ProxyServer {
+            listen: None,
+            port: default_proxy_port(),
+            certificates: default_proxy_certificates(),
+            upstream_ca: default_upstream_ca(),
+        }
+    }
+}
+
+fn default_proxy_port() -> u16 {
+    8443
+}
+fn default_proxy_certificates() -> PathBuf {
+    PathBuf::from("/etc/parallax/certs")
+}
+fn default_upstream_ca() -> PathBuf {
+    PathBuf::from("/etc/ssl/certs/ca-certificates.crt")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

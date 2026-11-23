@@ -151,9 +151,9 @@ of them. A service with `hostnames` closes that gap: `service` grants reach
 it only through Parallax's own HTTPS proxy, which terminates TLS, checks
 SNI, `Host` and HTTP/2 `:authority` on every request, and forwards only the
 listed names to the service. The firewall gives such grants no direct
-accept (`ReachKind::Lan { proxied: true }`); the redirect into the proxy
-and the proxy itself are still to come, and until then the grant reaches
-nothing, which fails closed.
+accept (`ReachKind::Lan { proxied: true }`); the redirect into the proxy is
+still to come, and until then the grant reaches nothing, which fails
+closed.
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
@@ -165,9 +165,36 @@ Proxied reaches also don't count toward nginx `allow` snippets: the proxy
 connects from the gateway, and sibling sites on the same address mustn't
 inherit the tier.
 
-Parallax never issues certificates. The proxy will read PEM certificates
+Parallax never issues certificates. The proxy reads PEM certificates
 and keys from one folder the operator mounts (certbot's layout works) and
-use whichever certificate covers each hostname.
+uses whichever certificate covers each hostname.
+
+### The proxy (`parallax proxy`, crate `parallax-proxy`)
+
+`apply` writes `proxy/routes.toml`: the listen address, the certificate
+folder, the upstream CA bundle, and one site per hostname with its upstream
+(the service's real `host:port`) and the tier members allowed to use it.
+A site exists only when some template has a `service` grant on it, and
+only that template's members are allowed: every proxied tier lands on the
+same proxy, so the source address is what keeps one tier off another
+tier's hostnames. The proxy reads nothing else from the configuration.
+
+Per connection, before any certificate is sent: the SNI must name a site,
+the tunnel source address must be in that site's `allowed` list, and a
+certificate must cover the name. Anything else gets no handshake. Then, on
+every request (HTTP/1.1 or HTTP/2): `Host` and `:authority` must name the
+SNI hostname (port 443 or none), or `421`; `CONNECT` gets `405`; HTTP/1
+absolute-form targets get `400`. Checked requests go to the site's
+upstream over HTTP/1.1 and TLS, verified against the hostname; the
+upstream address comes from the routes, never from a client-supplied name.
+Forwarding headers are replaced, not appended (`X-Forwarded-For` is the
+tunnel address). WebSocket upgrades pass through.
+
+Certificates: every directory under the folder holding `fullchain.pem` and
+`privkey.pem` is one certificate. An exact name beats a wildcard; ties go to
+path order. The folder is re-checked every minute, so renewals need no
+restart; SIGHUP re-reads the routes. `plan` and `apply` fail, naming the
+hostname, when a site has no covering certificate.
 
 Docker note: a Docker-published port on the gateway host is reached through
 `docker-proxy` listening on the host address, because the NETMAP DNAT and
@@ -184,6 +211,7 @@ nftables/docker-user.nft           DOCKER-USER accepts (docker_coexistence)
 dnsmasq/parallax.conf              domain-scoped shim
 nginx/snippets/parallax-<t>.conf   allow lines per tier
 nginx/snippets/parallax-service-<s>.conf   allow lines + deny all per vhost
+proxy/routes.toml                  sites for `parallax proxy`
 clients/<peer>/<platform>.conf     only for peers that retain their private key (0600)
 ```
 

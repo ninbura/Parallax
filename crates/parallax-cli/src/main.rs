@@ -49,6 +49,8 @@ enum Command {
     Generate(OutArgs),
     /// Generate, write, and reconcile the live gateway (firewall, WireGuard, DNS shim).
     Apply(OutArgs),
+    /// Run the HTTPS proxy from the routes `apply` wrote. SIGHUP re-reads them.
+    Proxy(OutArgs),
     /// Create the gateway's WireGuard private key file and print its public key.
     Keygen {
         /// Also record the public key in the configuration file.
@@ -152,6 +154,29 @@ fn print_export(export: &Export) {
     print!("{}", export.contents);
 }
 
+/// Every hostname the proxy will serve needs a certificate in the folder.
+/// Parallax never issues one, so say plainly what's missing.
+fn check_certificates(model: &Model<'_>) -> anyhow::Result<()> {
+    let routes = generate::proxy::build(model);
+    if routes.sites.is_empty() {
+        return Ok(());
+    }
+    let dir = routes.certificates.display();
+    let (found, problems) = parallax_proxy::certs::scan(&routes.certificates).map_err(|e| {
+        anyhow!("{e} (server.proxy.certificates; proxied hostnames need their certificates there)")
+    })?;
+    print_warnings(&problems);
+    let names: Vec<&str> = routes.sites.iter().map(|s| s.hostname.as_str()).collect();
+    let missing = parallax_proxy::certs::uncovered(&found, &names);
+    if !missing.is_empty() {
+        bail!(
+            "no certificate in {dir} covers {}: put one in a directory under it (fullchain.pem and privkey.pem, as certbot writes them)",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let fs = RealFs;
@@ -174,6 +199,7 @@ fn run() -> anyhow::Result<()> {
             let config = load(&cli.config)?;
             let model = resolve(&config)?;
             let bundle = generate::generate_all(&model, &fs)?;
+            check_certificates(&model)?;
             let plan = parallax_core::plan::plan(&bundle, &out.out, &fs)?;
             print!("{}", plan.render());
         }
@@ -192,6 +218,7 @@ fn run() -> anyhow::Result<()> {
             let model = resolve(&config)?;
             let bundle = generate::generate_all(&model, &fs)?;
             print_warnings(&bundle.warnings);
+            check_certificates(&model)?;
             let runner = RealRunner;
             let sys = System {
                 fs: &fs,
@@ -201,6 +228,9 @@ fn run() -> anyhow::Result<()> {
             for line in report.log {
                 println!("{line}");
             }
+        }
+        Command::Proxy(out) => {
+            parallax_proxy::serve(&out.out.join(generate::proxy::PATH))?;
         }
         Command::Keygen { write_config } => {
             let config = load(&cli.config)?;

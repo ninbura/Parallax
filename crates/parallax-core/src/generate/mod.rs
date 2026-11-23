@@ -5,6 +5,7 @@ pub mod client;
 pub mod dnsmasq;
 pub mod firewall;
 pub mod nginx;
+pub mod proxy;
 pub mod wg_server;
 
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ pub enum ArtifactKind {
     FirewallDockerUser,
     Dnsmasq,
     NginxSnippet,
+    ProxyRoutes,
     ClientConfig,
 }
 
@@ -96,6 +98,7 @@ pub fn generate_all(model: &Model<'_>, fs: &dyn FileSystem) -> Result<Bundle> {
     bundle.artifacts.extend(firewall::render(model)?);
     bundle.artifacts.push(dnsmasq::render(model)?);
     bundle.artifacts.extend(nginx::render(model)?);
+    bundle.artifacts.push(proxy::render(model)?);
     bundle.artifacts.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(bundle)
 }

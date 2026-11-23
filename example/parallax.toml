@@ -44,6 +44,18 @@ backend = "nftables"
 # Set when the gateway runs host-networked next to Docker: adds DOCKER-USER accepts.
 docker_coexistence = true
 
+[server.proxy]
+# The HTTPS proxy for services with `hostnames`. Listens on the WireGuard
+# gateway address unless overridden.
+# listen = "10.8.0.1"
+port = 8443
+# Parallax never issues certificates. Every directory under this folder with
+# fullchain.pem and privkey.pem is one certificate (certbot's live/<name>
+# works); each proxied hostname needs one that covers it.
+certificates = "/etc/parallax/certs"
+# Upstream certificates are verified against this CA bundle.
+upstream_ca = "/etc/ssl/certs/ca-certificates.crt"
+
 # A physical network the gateway reaches. `mapped_to` is the collision-free
 # prefix clients see; host bits are preserved (192.168.1.5 -> 198.18.1.5).
 # 198.18.0.0/15 is reserved for benchmarking (RFC 2544), so no home or office
@@ -79,7 +91,8 @@ nginx_vhost = true
 # HTTPS names this service answers to. With them set, `service` grants reach
 # it only through Parallax's HTTPS proxy, which lets these names through and
 # nothing else, so a template can't use the other sites on the same box.
-# (The proxy isn't built yet: until it is, such grants reach nothing.)
+# (The firewall redirect into the proxy isn't built yet: until it is, such
+# grants reach nothing.)
 # hostnames = ["immich.mydomain.com"]
 
 # Templates are the policy classes. The WireGuard pool *is* the trust tier:

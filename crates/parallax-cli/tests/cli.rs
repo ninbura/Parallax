@@ -215,3 +215,41 @@ fn peer_show_marks_proxied_services() {
         "{out}"
     );
 }
+
+#[test]
+fn plan_needs_a_certificate_for_every_proxied_hostname() {
+    let s = Scratch::new("certs");
+    let certs = s.dir.join("certs");
+    std::fs::create_dir_all(&certs).unwrap();
+    let text = std::fs::read_to_string(s.config())
+        .unwrap()
+        .replace(
+            "nginx_vhost = true\n",
+            "nginx_vhost = true\nhostnames = [\"immich.mydomain.com\"]\n",
+        )
+        .replace(
+            "certificates = \"/etc/parallax/certs\"",
+            &format!("certificates = {:?}", certs),
+        );
+    std::fs::write(s.config(), text).unwrap();
+    let (ok, _, err) = s.run(&["keygen", "--write-config"]);
+    assert!(ok, "{err}");
+    let out = s.dir.join("out").to_string_lossy().into_owned();
+
+    let (ok, _, err) = s.run(&["plan", "-o", &out]);
+    assert!(!ok);
+    assert!(err.contains("covers immich.mydomain.com"), "{err}");
+
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["*.mydomain.com".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let live = certs.join("live/mydomain.com");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("fullchain.pem"), cert.pem()).unwrap();
+    std::fs::write(live.join("privkey.pem"), key.serialize_pem()).unwrap();
+    let (ok, out, err) = s.run(&["plan", "-o", &out]);
+    assert!(ok, "{err}");
+    assert!(out.contains("proxy/routes.toml"), "{out}");
+}

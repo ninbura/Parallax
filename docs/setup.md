@@ -155,7 +155,7 @@ sudo docker compose logs -f parallax
 On every start the entrypoint runs `parallax doctor` first. On first start it
 then generates `wg-server.key` (mode 0600) next to the config and writes the
 public key into it. Then it applies the firewall, brings up `wg0`, starts the
-DNS shim and `tailscaled` (idle until M2).
+DNS shim and `tailscaled` (idle until M2), and starts the HTTPS proxy.
 
 ## Adding a device
 
@@ -184,6 +184,30 @@ holds `allow` lines for a tier; `nginx/snippets/parallax-service-<name>.conf`
 (for services marked `nginx_vhost = true`) holds every tier that reaches the
 service, the local LAN, and `deny all`. Parallax does not reload nginx; copy
 the snippets (or bind-mount the output directory) and reload yourself.
+
+## Proxied HTTPS services and certificates
+
+A service with `hostnames` is reached only through Parallax's HTTPS proxy
+(`[server.proxy]`, port 8443 on the gateway address by default), which lets
+those names through to the service and nothing else. The proxy terminates
+TLS, so it needs a certificate for each such hostname. Parallax never issues
+one: point `server.proxy.certificates` at a folder you keep current.
+
+- Every directory under the folder holding `fullchain.pem` and `privkey.pem`
+  is one certificate. certbot's `live/<name>` directories work as they are.
+- Mount only what Parallax should hold. All of `/etc/letsencrypt` hands it
+  every key there, wildcards included. For one certificate, mount
+  `live/<name>` and `archive/<name>` read-only at the same paths (the files
+  in `live/` link into `archive/`) and set
+  `certificates = "/etc/letsencrypt/live"`. `docker/compose.yml` has the
+  lines, commented out.
+- Renewals are picked up within a minute; no restart.
+- `parallax plan` and `apply` fail, naming the hostname, when no certificate
+  covers a proxied hostname some template is granted.
+
+The proxy verifies the upstream's certificate against the hostname, using
+`server.proxy.upstream_ca` (the system bundle by default). An nginx with a
+publicly trusted certificate for the name needs nothing more.
 
 ## Split DNS on clients
 

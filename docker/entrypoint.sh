@@ -1,7 +1,7 @@
 #!/bin/sh
 # Parallax container entrypoint.
 #   run       check the host (`parallax doctor`), apply the configuration,
-#             start tailscaled, stay up; SIGHUP re-applies
+#             start tailscaled and the HTTPS proxy, stay up; SIGHUP re-applies
 #   <other>   pass through to the parallax binary (e.g. `doctor`, `peer add ...`)
 set -eu
 
@@ -40,7 +40,7 @@ apply() {
 teardown() {
     echo "parallax: shutting down"
     [ -f "$OUT/dnsmasq/dnsmasq.pid" ] && kill "$(cat "$OUT/dnsmasq/dnsmasq.pid")" 2>/dev/null || true
-    kill "$TAILSCALED_PID" "${SLEEP_PID:-}" 2>/dev/null || true
+    kill "$TAILSCALED_PID" "${PROXY_PID:-}" "${SLEEP_PID:-}" 2>/dev/null || true
     nft delete table inet parallax 2>/dev/null || true
     ip link del "$(sed -n 's/^interface *= *"\(wg[0-9]*\)"/\1/p' "$CONFIG" | head -n1)" 2>/dev/null || true
     exit 0
@@ -49,6 +49,8 @@ teardown() {
 reload() {
     echo "parallax: SIGHUP, re-applying"
     if apply; then
+        # The proxy re-reads its routes (and certificates) on SIGHUP.
+        kill -HUP "$PROXY_PID" 2>/dev/null || true
         echo "parallax: re-applied"
     else
         echo "parallax: re-apply failed; fix $CONFIG and send SIGHUP again" >&2
@@ -58,6 +60,9 @@ reload() {
 trap teardown TERM INT
 trap reload HUP
 apply
+# After apply: the proxy listens on the gateway address, which wg0 now carries.
+parallax -c "$CONFIG" proxy -o "$OUT" &
+PROXY_PID=$!
 echo "parallax: gateway up; send SIGHUP to re-apply after editing $CONFIG"
 # A trapped signal makes `wait` return >128, which `set -e` would treat as fatal.
 while :; do
