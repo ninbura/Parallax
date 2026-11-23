@@ -149,9 +149,18 @@ only the first packet of a flow. Only reply-direction packets (`ct direction
 reply`) and related ones (ICMP errors) skip the check, and invalid ones are
 dropped, in both INPUT and FORWARD. So removing a grant cuts already-open
 connections on their next packet, with no conntrack flush on apply (which
-would drop everyone's sessions, or need a diff of what changed). The cost is
-a walk past earlier tiers' rules for every packet; `dev/bench/firewall.sh`
-measures it.
+would drop everyone's sessions, or need a diff of what changed).
+
+Checking every packet is only cheap if a packet doesn't walk past every
+other template's rules first (with 200 rules ahead of it, small-packet UDP
+through WireGuard ran at a quarter of the speed; `dev/bench/firewall.sh`
+measures this). So each template's FORWARD rules live in their own chain
+(`tier_<template>`, ending in its default deny), and FORWARD picks the
+chain with one verdict-map lookup on the source address:
+`iifname "wg0" ip saddr vmap { 10.8.1.0/24 : jump tier_personal, ... }`.
+Tailscale tiers are sets of node addresses, so they get one `jump` rule per
+template for now. The `iptables-nft` backend has no verdict maps: it jumps
+to numbered chains (`PARALLAX_T<n>`) with one rule per template.
 
 `internet` reaches public addresses only: FORWARD to the WAN interface
 excludes private, shared (CGNAT), loopback, link-local, multicast, reserved,

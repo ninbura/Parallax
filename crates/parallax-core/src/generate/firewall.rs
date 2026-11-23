@@ -24,6 +24,9 @@
 //! - Every packet a tunnel peer sends is checked against its grants, not just
 //!   the first of a flow: only reply-direction and related packets skip the
 //!   check. Removing a grant cuts open connections on their next packet.
+//!   To keep that cheap, each template's forward rules are their own chain,
+//!   picked by one source-address lookup, so a packet never walks past
+//!   other templates' rules.
 //! - `internet` reaches public addresses only, unless the template also has
 //!   `all_networks` (then it's everything outside the configured networks).
 //! - Tunnel peers are IPv4-only: IPv6 from a tunnel interface is dropped.
@@ -45,6 +48,8 @@ pub enum Chain {
     Forward,
     Prerouting,
     Postrouting,
+    /// One template's forward rules, by index into [`Ruleset::tiers`].
+    Tier(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +79,11 @@ pub enum Action {
     Dnat {
         to: SocketAddrV4,
     },
+    /// Continue in a template's chain (index into [`Ruleset::tiers`]).
+    Jump(usize),
+    /// Jump to the template chain whose prefix holds the source address:
+    /// one lookup, however many templates there are.
+    SourceVmap(Vec<(Ipv4Net, usize)>),
     /// 1:1 prefix translation of the destination.
     NetmapDst {
         from: Ipv4Net,
@@ -170,6 +180,8 @@ pub struct AddressSet {
 pub struct Ruleset {
     pub sets: Vec<AddressSet>,
     pub rules: Vec<Rule>,
+    /// Template names, one chain each ([`Chain::Tier`]).
+    pub tiers: Vec<String>,
     /// DOCKER-USER accepts, if Docker coexistence is on.
     pub docker_user: Vec<Rule>,
 }
@@ -409,60 +421,82 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
     rs.rules
         .push(Rule::new(Chain::Forward, Action::Accept, "related (ICMP errors)").ct(Ct::Related));
 
-    for t in &cfg.templates {
-        let reaches = model.reaches(t);
-        for tr in &transports {
-            let iif = tr.ingress_interface(server);
-            let src = tier_src(tr.as_ref(), t);
-            let tag = format!("{}/{}", t.name, tr.kind());
-            for r in &reaches {
-                match &r.kind {
-                    // The proxy checks the hostname and connects from the
-                    // gateway itself; a direct accept would skip that check.
-                    ReachKind::Lan { proxied: true, .. } => {}
-                    ReachKind::Lan {
-                        network,
-                        real,
-                        port,
-                        proxied: false,
-                    } => rs.rules.push(
-                        Rule::new(
-                            Chain::Forward,
-                            Action::Accept,
-                            format!("{tag}: {}", r.label),
-                        )
-                        .iif(&iif)
-                        .src(src.clone())
-                        .oif(&network.interface)
-                        .dst(Match::Cidr(*real))
-                        .l4(*port),
-                    ),
-                    ReachKind::Internet => {
-                        if let Some(wan) = model.wan_interface() {
-                            let (not, label) = if internet_is_public_only(t) {
-                                (NOT_PUBLIC_SET, "internet (public addresses)")
-                            } else {
-                                (LAN_SET, "internet")
-                            };
-                            rs.rules.push(
-                                Rule::new(
-                                    Chain::Forward,
-                                    Action::Accept,
-                                    format!("{tag}: {label}"),
-                                )
-                                .iif(&iif)
-                                .src(src.clone())
-                                .oif(wan)
-                                .dst(Match::NotSet(not.into())),
-                            );
-                        }
+    // Each template's grants live in its own chain, entered by source
+    // address, so a packet is checked against its own grants only, not
+    // walked past every other template's.
+    for (i, t) in cfg.templates.iter().enumerate() {
+        rs.tiers.push(t.name.clone());
+        for r in model.reaches(t) {
+            match &r.kind {
+                // The proxy checks the hostname and connects from the
+                // gateway itself; a direct accept would skip that check.
+                ReachKind::Lan { proxied: true, .. } => {}
+                ReachKind::Lan {
+                    network,
+                    real,
+                    port,
+                    proxied: false,
+                } => rs.rules.push(
+                    Rule::new(
+                        Chain::Tier(i),
+                        Action::Accept,
+                        format!("{}: {}", t.name, r.label),
+                    )
+                    .oif(&network.interface)
+                    .dst(Match::Cidr(*real))
+                    .l4(*port),
+                ),
+                ReachKind::Internet => {
+                    if let Some(wan) = model.wan_interface() {
+                        let (not, label) = if internet_is_public_only(t) {
+                            (NOT_PUBLIC_SET, "internet (public addresses)")
+                        } else {
+                            (LAN_SET, "internet")
+                        };
+                        rs.rules.push(
+                            Rule::new(
+                                Chain::Tier(i),
+                                Action::Accept,
+                                format!("{}: {label}", t.name),
+                            )
+                            .oif(wan)
+                            .dst(Match::NotSet(not.into())),
+                        );
                     }
                 }
             }
-            rs.rules.push(
-                Rule::new(Chain::Forward, Action::Drop, format!("{tag}: default deny"))
+        }
+        rs.rules.push(Rule::new(
+            Chain::Tier(i),
+            Action::Drop,
+            format!("{}: default deny", t.name),
+        ));
+    }
+    for tr in &transports {
+        let iif = tr.ingress_interface(server);
+        let mut prefixes = Vec::new();
+        for (i, t) in cfg.templates.iter().enumerate() {
+            match tr.tier_source(server, t) {
+                TierSource::Cidr(c) => prefixes.push((c, i)),
+                TierSource::Set(set) => rs.rules.push(
+                    Rule::new(
+                        Chain::Forward,
+                        Action::Jump(i),
+                        format!("{}/{}", t.name, tr.kind()),
+                    )
                     .iif(&iif)
-                    .src(src),
+                    .src(Match::Set(set)),
+                ),
+            }
+        }
+        if !prefixes.is_empty() {
+            rs.rules.push(
+                Rule::new(
+                    Chain::Forward,
+                    Action::SourceVmap(prefixes),
+                    format!("{}: each template's chain, by source address", tr.kind()),
+                )
+                .iif(&iif),
             );
         }
     }
@@ -649,7 +683,11 @@ pub mod nft {
         }
     }
 
-    pub fn rule(r: &Rule) -> String {
+    fn tier_chain(rs: &Ruleset, i: usize) -> String {
+        format!("tier_{}", rs.tiers.get(i).map_or("", String::as_str))
+    }
+
+    pub fn rule(rs: &Ruleset, r: &Rule) -> String {
         let mut parts: Vec<String> = Vec::new();
         if r.ipv6 {
             parts.push("meta nfproto ipv6".into());
@@ -682,6 +720,15 @@ pub mod nft {
             Action::Accept => "accept".into(),
             Action::Drop => "drop".into(),
             Action::Dnat { to } => format!("dnat ip to {to}"),
+            Action::Jump(i) => format!("jump {}", tier_chain(rs, *i)),
+            Action::SourceVmap(entries) => format!(
+                "ip saddr vmap {{ {} }}",
+                entries
+                    .iter()
+                    .map(|(net, i)| format!("{} : jump {}", cidr(net), tier_chain(rs, *i)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Action::NetmapDst { from, to } => {
                 format!("dnat ip prefix to ip daddr map {{ {from} : {to} }}")
             }
@@ -696,24 +743,26 @@ pub mod nft {
         parts.join(" ")
     }
 
-    fn chain_header(c: Chain) -> (&'static str, &'static str) {
+    /// Name and base-chain header (none for a template's regular chain).
+    fn chain_header(rs: &Ruleset, c: Chain) -> (String, Option<&'static str>) {
         match c {
             Chain::Input => (
-                "input",
-                "type filter hook input priority filter; policy accept;",
+                "input".into(),
+                Some("type filter hook input priority filter; policy accept;"),
             ),
             Chain::Forward => (
-                "forward",
-                "type filter hook forward priority filter; policy accept;",
+                "forward".into(),
+                Some("type filter hook forward priority filter; policy accept;"),
             ),
             Chain::Prerouting => (
-                "prerouting",
-                "type nat hook prerouting priority dstnat; policy accept;",
+                "prerouting".into(),
+                Some("type nat hook prerouting priority dstnat; policy accept;"),
             ),
             Chain::Postrouting => (
-                "postrouting",
-                "type nat hook postrouting priority srcnat; policy accept;",
+                "postrouting".into(),
+                Some("type nat hook postrouting priority srcnat; policy accept;"),
             ),
+            Chain::Tier(i) => (tier_chain(rs, i), None),
         }
     }
 
@@ -740,17 +789,18 @@ pub mod nft {
             }
             s.push_str("\t}\n\n");
         }
-        for chain in [
-            Chain::Input,
-            Chain::Forward,
-            Chain::Prerouting,
-            Chain::Postrouting,
-        ] {
-            let (name, header) = chain_header(chain);
+        let chains = [Chain::Input, Chain::Forward]
+            .into_iter()
+            .chain((0..rs.tiers.len()).map(Chain::Tier))
+            .chain([Chain::Prerouting, Chain::Postrouting]);
+        for chain in chains {
+            let (name, header) = chain_header(rs, chain);
             let _ = writeln!(s, "\tchain {name} {{");
-            let _ = writeln!(s, "\t\t{header}");
+            if let Some(header) = header {
+                let _ = writeln!(s, "\t\t{header}");
+            }
             for r in rs.rules.iter().filter(|r| r.chain == chain) {
-                let _ = writeln!(s, "\t\t{}", rule(r));
+                let _ = writeln!(s, "\t\t{}", rule(rs, r));
             }
             s.push_str("\t}\n\n");
         }
@@ -769,7 +819,7 @@ pub mod nft {
         s.push_str("# Generated by Parallax. Rules for Docker's DOCKER-USER chain (only when Docker runs on the gateway host).\n");
         s.push_str("# Apply removes previous rules commented \"parallax\" before inserting these, so re-applying is idempotent.\n");
         for r in &rs.docker_user {
-            let _ = writeln!(s, "insert rule ip filter DOCKER-USER {}", rule(r));
+            let _ = writeln!(s, "insert rule ip filter DOCKER-USER {}", rule(rs, r));
         }
         s
     }
@@ -787,12 +837,16 @@ pub mod iptables {
         ("nat", "POSTROUTING", "PARALLAX_POSTROUTING"),
     ];
 
-    fn own_chain(c: Chain) -> &'static str {
+    /// Template chains are numbered: iptables chain names stop at 28
+    /// characters, template names don't. The restore file declares them,
+    /// which creates or flushes each one.
+    fn own_chain(c: Chain) -> String {
         match c {
-            Chain::Input => "PARALLAX_INPUT",
-            Chain::Forward => "PARALLAX_FORWARD",
-            Chain::Prerouting => "PARALLAX_PREROUTING",
-            Chain::Postrouting => "PARALLAX_POSTROUTING",
+            Chain::Input => "PARALLAX_INPUT".into(),
+            Chain::Forward => "PARALLAX_FORWARD".into(),
+            Chain::Prerouting => "PARALLAX_PREROUTING".into(),
+            Chain::Postrouting => "PARALLAX_POSTROUTING".into(),
+            Chain::Tier(i) => format!("PARALLAX_T{i}"),
         }
     }
 
@@ -800,6 +854,18 @@ pub mod iptables {
         // These tables are IPv4-only: an IPv6 rule has nothing to match.
         if r.ipv6 {
             return Vec::new();
+        }
+        // No verdict maps: one jump per prefix.
+        if let Action::SourceVmap(entries) = &r.action {
+            return entries
+                .iter()
+                .flat_map(|(net, i)| {
+                    let mut one = r.clone();
+                    one.src = Match::Cidr(*net);
+                    one.action = Action::Jump(*i);
+                    expand(&one)
+                })
+                .collect();
         }
         // iptables has no interface lists or anonymous sets: expand to one rule each.
         let iifs: Vec<Option<&String>> = if r.iif.is_empty() {
@@ -867,6 +933,9 @@ pub mod iptables {
                             Action::Accept => "-j ACCEPT".into(),
                             Action::Drop => "-j DROP".into(),
                             Action::Dnat { to } => format!("-j DNAT --to-destination {to}"),
+                            Action::Jump(i) => format!("-j {}", own_chain(Chain::Tier(*i))),
+                            // Expanded into jumps above.
+                            Action::SourceVmap(_) => String::new(),
                             Action::NetmapDst { to, .. } | Action::NetmapSrc { to, .. } => {
                                 format!("-j NETMAP --to {to}")
                             }
@@ -899,8 +968,12 @@ pub mod iptables {
                 );
             }
         }
+        let filter: Vec<Chain> = [Chain::Input, Chain::Forward]
+            .into_iter()
+            .chain((0..rs.tiers.len()).map(Chain::Tier))
+            .collect();
         for (table, chains) in [
-            ("filter", [Chain::Input, Chain::Forward].as_slice()),
+            ("filter", filter.as_slice()),
             ("nat", [Chain::Prerouting, Chain::Postrouting].as_slice()),
         ] {
             let _ = writeln!(s, "*{table}");

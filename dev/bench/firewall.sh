@@ -4,23 +4,26 @@
 # rulesets. Throughput and CPU are compared to see what re-checking every
 # packet a peer sends (instead of accepting established flows up front) costs.
 #
-# Needs root, nft, wg, ip, dnsmasq, iperf3, python3, and two parallax binaries:
-#   PARALLAX       the build under test (default: this checkout's target/release)
-#   PARALLAX_BASE  the build to compare against, e.g. one built from main
-#                  (optional; without it only the new rules are measured)
-# Tunables: PADDING (templates placed before the peer's, 4 rules each; 50),
+# Needs root, nft, wg, ip, dnsmasq, iperf3 and python3. Arguments are the
+# builds to compare, as label=path (default: new=<this checkout>/target/release/parallax):
+#   dev/bench/firewall.sh main=/tmp/main/parallax new=target/release/parallax
+# Each build runs twice: as configured, and with PADDING templates ahead of
+# the peer's.
+# Tunables: PADDING (templates placed before the peer's; 50),
 # SECONDS_PER_RUN (10), RUNS (3), STREAMS (1), MODE (tcp, or udp: 1200-byte
 # datagrams at full speed). TCP over WireGuard is merged into large packets
 # (GRO) before the firewall sees it, so rules run once per ~64 KB; UDP shows
 # the per-packet worst case.
+#
+# GOVERNOR=performance sets every CPU's frequency governor for the run and
+# restores it afterwards (steadier numbers on boards that scale clocks).
 #
 # Every process shares one kernel, so CPU is the whole machine's: compare
 # cores per Gbit/s between scenarios, not absolute numbers between machines.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-PARALLAX="${PARALLAX:-$ROOT/target/release/parallax}"
-PARALLAX_BASE="${PARALLAX_BASE:-}"
+[ $# -gt 0 ] || set -- "new=$ROOT/target/release/parallax"
 PADDING="${PADDING:-50}"
 SECONDS_PER_RUN="${SECONDS_PER_RUN:-10}"
 RUNS="${RUNS:-3}"
@@ -33,8 +36,9 @@ case "$MODE" in
 esac
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
 for t in nft wg ip dnsmasq iperf3 python3; do command -v $t >/dev/null || { echo "missing $t"; exit 2; }; done
-for b in "$PARALLAX" ${PARALLAX_BASE:+"$PARALLAX_BASE"}; do
-    [ -x "$b" ] || { echo "parallax binary not found at $b"; exit 2; }
+for build in "$@"; do
+    case "$build" in *=*) ;; *) echo "builds are label=path, got '$build'"; exit 2 ;; esac
+    [ -x "${build#*=}" ] || { echo "parallax binary not found at ${build#*=}"; exit 2; }
 done
 
 NAMESPACES="bhome bgw bclient"
@@ -42,8 +46,10 @@ for ns in $NAMESPACES; do
     ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
 done
 WORK=$(mktemp -d /tmp/parallax-bench.XXXXXX)
+GOVERNORS=()
 cleanup() {
     set +e
+    for g in "${GOVERNORS[@]:-}"; do [ -n "$g" ] && echo "${g#*=}" > "${g%%=*}"; done
     for ns in $NAMESPACES; do ip netns pids $ns 2>/dev/null | xargs -r kill 2>/dev/null; done
     sleep 0.2
     for ns in $NAMESPACES; do ip netns del $ns 2>/dev/null; done
@@ -51,6 +57,12 @@ cleanup() {
 }
 trap cleanup EXIT
 inns() { ip netns exec "$@"; }
+if [ -n "${GOVERNOR:-}" ]; then
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        GOVERNORS+=("$f=$(cat "$f")")
+        echo "$GOVERNOR" > "$f"
+    done
+fi
 
 # ---------------------------------------------------------------- topology
 for ns in $NAMESPACES; do ip netns add $ns; inns $ns ip link set lo up; done
@@ -123,7 +135,9 @@ scenario() { # label, binary, padding
         > "$WORK/$label.conf" 2>/dev/null
     inns bgw "$bin" -c "$cfg" apply -o "$WORK/out" >/dev/null
     local rules
-    rules=$(inns bgw nft list chain inet parallax forward | grep -c 'comment')
+    # Forward rules in all, including each template's chain: what a packet
+    # would walk without the per-template chains.
+    rules=$(inns bgw nft list table inet parallax | sed -n '/chain forward/,/chain prerouting/p' | grep -c 'comment')
     inns bclient ip link del wgb 2>/dev/null || true
     inns bclient ip link add wgb type wireguard
     inns bclient ip addr add 10.8.2.1/32 dev wgb
@@ -156,9 +170,7 @@ PY
 
 echo "mode $MODE, $STREAMS stream(s), $SECONDS_PER_RUN s per run, $(nproc) CPUs"
 printf '%-14s %6s %4s %8s %7s %11s\n' scenario rules run Gbit/s cores cores/Gbit
-if [ -n "$PARALLAX_BASE" ]; then
-    scenario base "$PARALLAX_BASE" 0
-    scenario base+padding "$PARALLAX_BASE" "$PADDING"
-fi
-scenario new "$PARALLAX" 0
-scenario new+padding "$PARALLAX" "$PADDING"
+for build in "$@"; do
+    scenario "${build%%=*}" "${build#*=}" 0
+    scenario "${build%%=*}+padding" "${build#*=}" "$PADDING"
+done

@@ -126,8 +126,8 @@ fn internet_grant_and_masquerade_match_golden() {
     };
     // The owner's all_networks template still reaches private space beyond
     // the configured networks; a guest reaches only public addresses.
-    assert!(rule("personal/wireguard").contains("ip daddr != @lan_real"));
-    assert!(rule("family/wireguard").contains("ip daddr != @not_public"));
+    assert!(rule("personal").contains("ip daddr != @lan_real"));
+    assert!(rule("family").contains("ip daddr != @not_public"));
     // Merged, since nft rejects overlapping intervals: the configured
     // 192.168.1.0/24 sits inside 192.168.0.0/16.
     assert!(fw.contents.contains("192.168.0.0/16"));
@@ -151,7 +151,9 @@ fn proxied_service_gets_no_direct_accept() {
         "family must not reach immich directly, not even on the gateway host:\n{}",
         fw.contents
     );
-    assert!(fw.contents.contains("family/wireguard: default deny"));
+    assert!(fw
+        .contents
+        .contains("drop comment \"family: default deny\""));
     // Family's HTTPS to Immich's client address goes to the proxy, before
     // NETMAP would send it to the real host; only family may reach the proxy.
     let pre: Vec<&str> = fw
@@ -204,6 +206,24 @@ fn tunnel_peers_are_checked_on_every_packet() {
         assert!(body.iter().any(|l| l.contains("ct direction reply accept")));
         assert!(body.iter().any(|l| l.contains("ct state related accept")));
     }
+    // A packet sees its own template's rules only: one lookup by source
+    // address picks the chain, however many templates come before it.
+    assert!(fw.contents.contains(
+        "iifname \"wg0\" ip saddr vmap { 10.8.1.0/24 : jump tier_personal, 10.8.2.0/24 : jump tier_family }"
+    ));
+    assert!(fw
+        .contents
+        .contains("iifname \"tailscale0\" ip saddr @ts_family jump tier_family"));
+    let family: Vec<&str> = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("chain tier_family {"))
+        .take_while(|l| !l.trim().starts_with('}'))
+        .collect();
+    assert_eq!(
+        family.last().map(|l| l.trim()),
+        Some("drop comment \"family: default deny\"")
+    );
 }
 
 #[test]
