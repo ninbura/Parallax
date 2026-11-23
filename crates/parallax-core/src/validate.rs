@@ -78,8 +78,13 @@ fn valid_zone(s: &str) -> bool {
 
 /// A lower-case DNS host name. Stricter than a zone: certificates and the
 /// proxy's `Host` check compare names exactly, so no upper case or `_`.
+/// The last label needs a letter, so an IP address never passes as a name
+/// (SNI forbids literal addresses).
 fn valid_hostname(s: &str) -> bool {
     s.len() <= 253
+        && s.rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.chars().any(|c| c.is_ascii_lowercase()))
         && s.split('.').all(|l| {
             (1..=63).contains(&l.len())
                 && !l.starts_with('-')
@@ -615,10 +620,14 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                 ));
                 continue;
             }
-            if let Some(other) = seen_hostnames.insert(h, &s.name) {
-                errors.push(format!(
+            match seen_hostnames.insert(h, &s.name) {
+                Some(other) if other == s.name => {
+                    errors.push(format!("{ctx}: hostname '{h}' is listed twice"));
+                }
+                Some(other) => errors.push(format!(
                     "{ctx}: hostname '{h}' is already used by service '{other}'"
-                ));
+                )),
+                None => {}
             }
             if let Some(n) = network {
                 if !n.domains.iter().any(|z| in_zone(h, z)) {
@@ -1047,7 +1056,16 @@ mod tests {
 
     #[test]
     fn hostnames_must_be_valid_unique_and_under_a_domain() {
+        let e = errors_of(|c| {
+            c.services[0].hostnames =
+                vec!["immich.mydomain.com".into(), "immich.mydomain.com".into()]
+        });
+        assert!(
+            has(&e, "hostname 'immich.mydomain.com' is listed twice"),
+            "{e:?}"
+        );
         for bad in [
+            "192.168.1.5",
             "Immich.mydomain.com",
             "imm_ich.mydomain.com",
             "-x.mydomain.com",
@@ -1113,10 +1131,30 @@ mod tests {
                 proto: Proto::Udp,
                 port: 443,
             },
+            Grant::HostPort {
+                ip: host,
+                proto: Proto::Tcp,
+                port: 443,
+            },
+            Grant::Service {
+                name: "plain-web".into(),
+            },
         ];
-        for g in bypasses {
+        let with_services = || {
             let mut cfg = canonical_config();
             proxy_immich(&mut cfg);
+            let mut plain = cfg.services[0].clone();
+            plain.name = "plain-web".into();
+            plain.port = 80;
+            plain.hostnames = Vec::new();
+            let mut photos = cfg.services[0].clone();
+            photos.name = "photos".into();
+            photos.hostnames = vec!["photos.mydomain.com".into()];
+            cfg.services.extend([plain, photos]);
+            cfg
+        };
+        for g in bypasses {
+            let mut cfg = with_services();
             cfg.templates[1].grants.push(g.clone());
             let (errors, warnings) = check(&cfg);
             assert!(errors.is_empty(), "{errors:?}");
@@ -1131,14 +1169,19 @@ mod tests {
                 "{g:?}: {warnings:?}"
             );
         }
-        let mut cfg = canonical_config();
-        proxy_immich(&mut cfg);
+        // Neither another port nor a second proxied site on the same box bypasses.
+        let mut cfg = with_services();
         cfg.templates[1].grants.push(Grant::HostPort {
             ip: host,
             proto: Proto::Tcp,
             port: 22,
         });
-        assert!(!has(&check(&cfg).1, "directly"));
+        cfg.templates[1].grants.push(Grant::Service {
+            name: "photos".into(),
+        });
+        let (errors, warnings) = check(&cfg);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!has(&warnings, "directly"), "{warnings:?}");
     }
 
     #[test]

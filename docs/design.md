@@ -104,7 +104,7 @@ Two additions relative to the handoff, both small and flagged:
   tier but split DNS through the Tailscale client.
 
 Grants are written against real addresses. `Model::reaches(template)` resolves
-them to `Reach { label, kind: Lan { network, real, port } | Internet }` and
+them to `Reach { label, kind: Lan { network, real, port, proxied } | Internet }` and
 `Reach::client_net()` translates to virtual space for clients, nginx and (M2)
 Headscale ACLs. The nftables FORWARD chain matches real addresses because it
 runs after PREROUTING NETMAP.
