@@ -166,7 +166,9 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
                             .collect::<Vec<_>>()
                             .join(" ")
                     );
-                    s.push_str("PostDown = resolvectl revert %i\n");
+                    // PreDown, not PostDown: wg-quick deletes the interface before
+                    // PostDown runs, so `resolvectl revert` would fail on a missing link.
+                    s.push_str("PreDown = resolvectl revert %i\n");
                 }
                 Platform::Macos => {
                     let _ = writeln!(
@@ -180,6 +182,16 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
                             "#   printf 'nameserver {shim}\\n' | sudo tee /etc/resolver/{d}"
                         );
                     }
+                    // The resolver files are system-wide and outlive the tunnel.
+                    let files = domains
+                        .iter()
+                        .map(|d| format!("/etc/resolver/{d}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let _ = writeln!(
+                        s,
+                        "# These files stay in force while the tunnel is down: home names then fail, even at home.\n# Remove them when you stop using this tunnel: sudo rm {files}"
+                    );
                     s.push_str("# Leave the DNS line unset so all other names keep using the local network's resolver.\n");
                 }
                 Platform::Windows => {
@@ -191,6 +203,15 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
                         let _ = writeln!(
                             s,
                             "#   Add-DnsClientNrptRule -Namespace \".{d}\" -NameServers \"{shim}\""
+                        );
+                    }
+                    // NRPT rules are system-wide and outlive the tunnel. A rule's
+                    // Namespace is an array, so `-eq` filters it (non-empty = match).
+                    s.push_str("# These rules stay in force while the tunnel is down: home names then fail, even at home.\n# Remove them when you stop using this tunnel:\n");
+                    for d in &domains {
+                        let _ = writeln!(
+                            s,
+                            "#   Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -eq \".{d}\" }} | Remove-DnsClientNrptRule -Force"
                         );
                     }
                     s.push_str("# Leave the DNS line unset so all other names keep using the local network's resolver.\n");
