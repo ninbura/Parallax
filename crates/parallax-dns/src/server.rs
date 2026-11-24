@@ -369,12 +369,12 @@ impl Handler {
             Ok(lookup) => {
                 let records = match kind {
                     Kind::Home { whole_zone: true } => {
-                        answer::home(lookup.answers(), &state.mappings)
+                        answer::home(lookup.answers(), &state.mappings, &state.routes.unmapped)
                     }
                     // A tier that may see only this name gets the addresses
                     // under it, not the CNAMEs that would name others.
                     Kind::Home { whole_zone: false } => answer::flatten(
-                        answer::home(lookup.answers(), &state.mappings),
+                        answer::home(lookup.answers(), &state.mappings, &state.routes.unmapped),
                         &name,
                         qtype,
                     ),

@@ -35,6 +35,12 @@ pub struct DnsRoutes {
     pub listen: SocketAddrV4,
     /// Where public names go, for tiers with `public`.
     pub public_resolver: Ipv4Addr,
+    /// Real subnets of configured networks without `mapped_to`: home answers
+    /// there pass unchanged. Any other private or reserved address in a home
+    /// answer is dropped, since off-site it would mean a host on the visited
+    /// network.
+    #[serde(default)]
+    pub unmapped: Vec<Ipv4Net>,
     #[serde(default, rename = "zone")]
     pub zones: Vec<DnsZone>,
     #[serde(default, rename = "mapping")]
@@ -192,6 +198,12 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
             virt: m.virt(),
         })
         .collect();
+    let unmapped = cfg
+        .networks
+        .iter()
+        .filter(|n| n.mapped_to.is_none())
+        .map(|n| n.subnet.trunc())
+        .collect();
     let transports = transport::all();
     let mut tiers = Vec::new();
     for t in &cfg.templates {
@@ -246,6 +258,7 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
     DnsRoutes {
         listen: SocketAddrV4::new(model.shim_address(), dns.port),
         public_resolver: dns.public_resolver,
+        unmapped,
         zones,
         mappings,
         tiers,
@@ -275,6 +288,16 @@ mod tests {
         let mut cfg = canonical_config();
         cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
         cfg
+    }
+
+    #[test]
+    fn unmapped_networks_are_listed_with_their_real_subnet() {
+        let mut cfg = canonical_config();
+        cfg.networks[0].mapped_to = None;
+        let model = Model::resolve(&cfg, today()).unwrap();
+        let routes = build(&model);
+        assert!(routes.mappings.is_empty());
+        assert_eq!(routes.unmapped, vec!["192.168.1.0/24".parse().unwrap()]);
     }
 
     #[test]

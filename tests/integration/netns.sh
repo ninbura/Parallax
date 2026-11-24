@@ -28,7 +28,8 @@
 # hostname, Host/SNI/:authority checked, (h) internet means public addresses,
 # (i) nothing else on the gateway, its Docker bridge or the public address,
 # (j) IPv6 from a peer is dropped, (k) a revoked grant cuts open connections,
-# (l) DNS answers each tier only its names, (m) large DNS answers.
+# (l) DNS answers each tier only its names, and no private address outside the
+# configured networks, (m) large DNS answers.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -171,6 +172,7 @@ BIG=()
 for i in $(seq 10 49); do BIG+=(--host-record=big.mydomain.com,192.168.1.$i); done
 inns home dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
     --address=/immich.mydomain.com/192.168.1.5 --address=/other.mydomain.com/192.168.1.5 \
+    --host-record=vlan.mydomain.com,10.99.0.5 --host-record=vlan.mydomain.com,192.168.1.6 \
     "${BIG[@]}" >/dev/null 2>&1 &
 PIDS+=($!)
 inns net dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=9.9.9.9 --bind-interfaces \
@@ -515,6 +517,8 @@ short_as() { # src, name, [dig args...]
 [ "$(status_as $LAPTOP rebind.example.org)" = NOERROR ] || fail "(l) rebind.example.org: wanted an empty NOERROR"
 [ "$(status_as $LAPTOP immich.mydomain.com AAAA)" = NOERROR ] && [ -z "$(short_as $LAPTOP immich.mydomain.com AAAA)" ] \
     || fail "(l) a home name answered AAAA"
+[ "$(short_as $LAPTOP vlan.mydomain.com)" = 198.18.1.6 ] \
+    || fail "(l) vlan.mydomain.com: wanted only 198.18.1.6, not the address on no configured network"
 [ "$(status_as $GUEST other.mydomain.com)" = REFUSED ] || fail "(l) guest looked up a sibling vhost's name"
 [ "$(status_as $GUEST example.org)" = REFUSED ] || fail "(l) guest (dns.public off) looked up a public name"
 [ "$(status_as $GUEST example.org +tcp)" = REFUSED ] || fail "(l) guest looked up a public name over TCP"
@@ -522,7 +526,7 @@ short_as() { # src, name, [dig args...]
 [ "$(status_as $FRIEND immich.mydomain.com)" = REFUSED ] || fail "(l) friend looked up a home name"
 ST=$(inns gw dig +time=2 +tries=1 @10.8.0.1 immich.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
 [ "$ST" = REFUSED ] || fail "(l) a source outside every tier got '$ST'"
-pass "(l) DNS: personal gets home and public names; guest only its hostname; friend nothing; rebinding answers dropped"
+pass "(l) DNS: personal gets home and public names; guest only its hostname; friend nothing; rebinding answers and unknown private addresses dropped"
 
 # (m) large answers: truncated over plain UDP, then complete over TCP (dig retries itself)
 BIG_ANS=$(short_as $LAPTOP big.mydomain.com +noedns)

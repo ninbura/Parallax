@@ -6,16 +6,21 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use hickory_server::proto::rr::rdata::svcb::{SvcParamValue, SVCB};
 use hickory_server::proto::rr::rdata::{A, AAAA};
 use hickory_server::proto::rr::{Name, RData, Record, RecordType};
+use ipnet::Ipv4Net;
 use parallax_core::generate::firewall::NOT_PUBLIC;
 use parallax_core::netmap::Mapping;
 
 /// Answers from a home resolver. A records in a mapped network move into
-/// its virtual prefix (the DNS mirror of the NETMAP rule). AAAA records are
+/// its virtual prefix (the DNS mirror of the NETMAP rule). Public addresses
+/// and those in an `unmapped` network pass unchanged. Any other private or
+/// reserved address is dropped: Parallax can't route it, and on a visited
+/// network that uses the same prefix it would send the client to a stranger's
+/// host. AAAA records are
 /// dropped: tunnel peers can't send IPv6, and a home address on a prefix the
 /// visited network also uses would send the client somewhere else.
 /// SVCB/HTTPS records go too: their address hints would carry real,
 /// unmapped addresses.
-pub fn home(records: &[Record], mappings: &[Mapping]) -> Vec<Record> {
+pub fn home(records: &[Record], mappings: &[Mapping], unmapped: &[Ipv4Net]) -> Vec<Record> {
     records
         .iter()
         .filter_map(|r| match &r.data {
@@ -23,6 +28,8 @@ pub fn home(records: &[Record], mappings: &[Mapping]) -> Vec<Record> {
                 let mut r = r.clone();
                 if let Some(v) = mappings.iter().find_map(|m| m.to_virtual(*addr)) {
                     r.data = RData::A(A(v));
+                } else if !is_public_v4(*addr) && !unmapped.iter().any(|n| n.contains(addr)) {
+                    return None;
                 }
                 Some(r)
             }
@@ -143,6 +150,8 @@ mod tests {
             cname,
             a("192.168.1.5"),
             a("192.168.7.7"),
+            a("10.20.0.4"),
+            a("127.0.0.1"),
             a("9.9.9.9"),
             aaaa("fd00::5"),
             Record::from_rdata(
@@ -151,13 +160,16 @@ mod tests {
                 RData::HTTPS(HTTPS(SVCB::new(1, Name::root(), Vec::new()))),
             ),
         ];
-        let out = home(&records, &home_mapping());
+        let unmapped = ["10.20.0.0/24".parse().unwrap()];
+        let out = home(&records, &home_mapping(), &unmapped);
+        // 192.168.7.7 is on no configured network: off-site it would be a
+        // host on the visited network, so it goes.
         assert_eq!(
             addrs(&out),
             [
                 "cname x.mydomain.com.",
                 "198.18.1.5",
-                "192.168.7.7",
+                "10.20.0.4",
                 "9.9.9.9"
             ]
         );
@@ -175,7 +187,7 @@ mod tests {
             ),
             a("192.168.1.5"),
         ];
-        let out = flatten(home(&records, &home_mapping()), &photos, RecordType::A);
+        let out = flatten(home(&records, &home_mapping(), &[]), &photos, RecordType::A);
         assert_eq!(addrs(&out), ["198.18.1.5"]);
         assert_eq!(out[0].name, photos);
     }
