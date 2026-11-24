@@ -33,7 +33,11 @@ impl Scratch {
     /// The backups written so far, oldest first.
     fn backups(&self) -> Vec<PathBuf> {
         let mut found: Vec<PathBuf> = std::fs::read_dir(self.dir.join("backups"))
-            .map(|d| d.map(|e| e.unwrap().path()).collect())
+            .map(|d| {
+                d.map(|e| e.unwrap().path())
+                    .filter(|p| p.extension().is_some_and(|e| e == "tar"))
+                    .collect()
+            })
             .unwrap_or_default();
         found.sort();
         found
@@ -583,15 +587,24 @@ fn automatic_backups_skip_when_not_due_or_unchanged() {
     let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
     assert!(ok && out.is_empty(), "{out}{err}");
 
-    // Due, but nothing changed.
+    // Due, but nothing changed: nothing written, and the next look is a
+    // whole interval later.
     let file = s.backups().pop().unwrap();
     let old = file.with_file_name("parallax-backup-20200101T000000Z.tar");
     std::fs::rename(&file, &old).unwrap();
     let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
     assert!(ok && out.is_empty(), "{out}{err}");
     assert_eq!(s.backups(), std::slice::from_ref(&old));
+    let last_check = s.dir.join("backups/.last-check");
+    assert!(last_check.exists());
 
+    // A change within the interval waits for the next look.
     s.run(&["peer", "remove", "laptop"]);
+    let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
+    assert!(ok && out.is_empty(), "{out}{err}");
+
+    // A day later (2020 here) it's due again, and the change is backed up.
+    std::fs::write(&last_check, "1577836800\n").unwrap();
     let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
     assert!(ok && out.contains("wrote"), "{out}{err}");
     assert_eq!(s.backups().len(), 2);

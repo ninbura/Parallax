@@ -43,9 +43,13 @@ key. `parallax backup restore <file>` puts both back. How to use them:
   SHA-256, so an automatic backup with nothing new isn't written. The
   checksum reveals nothing: the payload includes the server's private key.
 - **Automatic backups:** `[server.backup] automatic, interval, keep`.
-  `backup create --if-due` backs up when the newest backup is older than
-  `interval` and something changed, then deletes the oldest past `keep`. The
-  container calls it every ten minutes; the daemon (step 7) takes over.
+  `backup create --if-due` looks at the database once per `interval`: when
+  that long has passed since the last backup, or since the last look that
+  found nothing new (`.last-check` in the backup directory). It backs up if
+  something changed, then deletes the oldest past `keep`. The container calls
+  it every ten minutes, which costs nothing until a look is due; the daemon
+  (step 7) takes over. A change between looks waits for the next one, as it
+  would after a backup.
 
 ## Why
 

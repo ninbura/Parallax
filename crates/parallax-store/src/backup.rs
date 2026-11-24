@@ -29,6 +29,8 @@ use crate::{Error, Result, Store, TempDir, MIGRATIONS};
 /// The layout described above. A backup in a newer format is refused.
 pub const FORMAT: u32 = 1;
 const PREFIX: &str = "parallax-backup-";
+/// When an automatic backup last found nothing new (Unix seconds).
+const LAST_CHECK: &str = ".last-check";
 const MANIFEST: &str = "manifest.toml";
 const PAYLOAD: &str = "payload.tar";
 const PAYLOAD_ENCRYPTED: &str = "payload.tar.age";
@@ -365,6 +367,25 @@ pub fn list(directory: &Path) -> Result<Vec<Listed>> {
         .into_iter()
         .map(|((created, _), path)| Listed { path, created })
         .collect())
+}
+
+/// When an automatic backup last found nothing new to back up in
+/// `directory` (Unix seconds); `None` if never, or if the record is unreadable
+/// (then the next check just runs).
+pub fn last_check(directory: &Path) -> Option<u64> {
+    std::fs::read_to_string(directory.join(LAST_CHECK))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Record that an automatic backup found nothing new at `now`, so the next
+/// look is a whole interval later.
+pub fn record_check(directory: &Path, now: SystemTime) -> Result<()> {
+    let path = directory.join(LAST_CHECK);
+    std::fs::write(&path, format!("{}\n", unix_secs(now)))
+        .map_err(|e| Error::io(format!("writing {}", path.display()), e))
 }
 
 /// Delete all but the newest `keep` backups in `directory`, never

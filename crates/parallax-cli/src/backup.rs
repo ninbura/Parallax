@@ -22,8 +22,9 @@ pub enum BackupCommand {
     /// Back up the database and the server key into server.backup.directory,
     /// then delete the oldest past server.backup.keep.
     Create {
-        /// Only when automatic backups are on, the newest backup is at least
-        /// server.backup.interval old, and something changed since (for a timer).
+        /// Only when automatic backups are on, a whole server.backup.interval
+        /// has passed since the last backup or the last look that found
+        /// nothing new, and something changed (for a timer).
         #[arg(long)]
         if_due: bool,
     },
@@ -118,10 +119,18 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
         if !settings.automatic {
             return Ok(());
         }
-        if let Some(newest) = &newest {
-            if newest.created <= now && now - newest.created < settings.interval.as_secs() {
-                return Ok(());
-            }
+        // Look at the database once per interval: since the newest backup,
+        // or since a look that found nothing new, whichever is later. Times
+        // from the future (the clock was ahead) don't count.
+        let last = newest
+            .as_ref()
+            .map(|n| n.created)
+            .into_iter()
+            .chain(backup::last_check(&settings.directory))
+            .filter(|&t| t <= now)
+            .max();
+        if last.is_some_and(|t| now - t < settings.interval.as_secs()) {
+            return Ok(());
         }
     }
     let passphrase = backup_passphrase(settings)?;
@@ -151,6 +160,7 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
                         && m.encrypted == passphrase.is_some()
                 });
             if unchanged {
+                backup::record_check(&settings.directory, SystemTime::now())?;
                 return Ok(None);
             }
         }

@@ -90,7 +90,7 @@ need a `parallax.toml`.
 | Setting | Default | |
 |---|---|---|
 | `directory` | `/var/lib/parallax/backups` | where backups are written |
-| `automatic` | `true` | back up every `interval` when something changed |
+| `automatic` | `true` | once per `interval`, back up if something changed |
 | `interval` | `"1d"` | `30m`, `6h`, `1d`, ... |
 | `keep` | `14` | the oldest are deleted past this many |
 | `encrypt` | `true` | encrypt with the passphrase in `passphrase_file` |
