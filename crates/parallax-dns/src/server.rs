@@ -26,6 +26,7 @@ use hickory_server::Server;
 use parallax_core::generate::dns::{DnsRoutes, Route};
 use parallax_core::netmap::Mapping;
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::Notify;
 
 use crate::{answer, Error, Result};
@@ -40,6 +41,8 @@ const CACHE_SIZE: u64 = 1024;
 /// Lookups one tunnel address may have in flight; more are refused, so one
 /// peer can't flood the upstreams.
 const MAX_PER_SOURCE: usize = 64;
+/// Largest UDP answer, whatever the client offers.
+const MAX_UDP_PAYLOAD: u16 = 1232;
 /// Responses queued per TCP connection (hickory's default).
 const TCP_QUEUE: usize = 32;
 
@@ -110,6 +113,9 @@ pub struct Dns {
     upstream_port: u16,
     state: Arc<State>,
     reload: Arc<Notify>,
+    /// Registered by `serve` before anything else, so a SIGHUP during
+    /// startup is a reload, not the default action (exit).
+    hangup: Option<Signal>,
 }
 
 impl Dns {
@@ -121,6 +127,7 @@ impl Dns {
             upstream_port,
             state: Arc::new(load_state(routes_path, upstream_port)?),
             reload: Arc::new(Notify::new()),
+            hangup: None,
         })
     }
 
@@ -144,16 +151,14 @@ impl Dns {
             self.state.routes.zones.len(),
             self.state.routes.tiers.len()
         ));
+        let listening = self.state.routes.listen;
         let shared: Shared = Arc::new(RwLock::new(Some(self.state)));
-        // Before spawning: until a handler is installed, SIGHUP would kill the process.
-        let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                log(format!("cannot watch SIGHUP, routes won't reload: {e}"));
-                None
-            }
+        let hangup = match self.hangup {
+            Some(h) => Some(h),
+            None => watch_hangup(),
         };
         tokio::spawn(reloader(
+            listening,
             self.routes_path,
             self.upstream_port,
             Arc::clone(&shared),
@@ -173,6 +178,17 @@ impl Dns {
     }
 }
 
+/// Until a handler is installed, SIGHUP kills the process.
+fn watch_hangup() -> Option<Signal> {
+    match signal(SignalKind::hangup()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log(format!("cannot watch SIGHUP, routes won't reload: {e}"));
+            None
+        }
+    }
+}
+
 /// Load the routes at `routes_path` and serve until the process ends.
 pub fn serve(routes_path: &Path) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -180,7 +196,9 @@ pub fn serve(routes_path: &Path) -> Result<()> {
         .build()
         .map_err(|e| Error::io("starting the async runtime", e))?;
     runtime.block_on(async {
-        let dns = Dns::load(routes_path, 53)?;
+        let hangup = watch_hangup();
+        let mut dns = Dns::load(routes_path, 53)?;
+        dns.hangup = hangup;
         let listen = dns.listen();
         let udp = UdpSocket::bind(listen)
             .await
@@ -193,11 +211,12 @@ pub fn serve(routes_path: &Path) -> Result<()> {
 }
 
 async fn reloader(
+    listening: SocketAddrV4,
     routes_path: PathBuf,
     upstream_port: u16,
     shared: Shared,
     reload: Arc<Notify>,
-    mut hangup: Option<tokio::signal::unix::Signal>,
+    mut hangup: Option<Signal>,
 ) {
     loop {
         tokio::select! {
@@ -211,6 +230,12 @@ async fn reloader(
         }
         let next = match load_state(&routes_path, upstream_port) {
             Ok(state) => {
+                if state.routes.listen != listening {
+                    log(format!(
+                        "the routes now say to listen on {}, but this process stays on {listening}; restart it to move",
+                        state.routes.listen
+                    ));
+                }
                 log(format!(
                     "routes reloaded: {} zone(s), {} tier(s)",
                     state.routes.zones.len(),
@@ -269,6 +294,13 @@ impl Drop for Slot {
     }
 }
 
+/// How an answer is filtered.
+#[derive(Clone, Copy)]
+enum Kind {
+    Home { whole_zone: bool },
+    Public,
+}
+
 struct Handler {
     state: Shared,
     inflight: Arc<Mutex<HashMap<Ipv4Addr, usize>>>,
@@ -307,32 +339,46 @@ impl Handler {
         let Some(state) = self.current() else {
             return reply(ResponseCode::Refused);
         };
-        let asked = query.name().to_string();
-        let (resolver, home, upstream) = match state.routes.route(client, &asked) {
+        let mut name: Name = query.name().clone().into();
+        name.set_fqdn(true);
+        // ASCII (punycode), as the zones are written: displaying a `Name`
+        // would turn `xn--` labels into Unicode and miss the zone.
+        let asked = name.to_ascii();
+        let (resolver, kind, upstream) = match state.routes.route(client, &asked) {
             Route::Refused => return reply(ResponseCode::Refused),
             // No IPv6 through the tunnel: say the name has no AAAA.
-            Route::Home(_) if qtype == RecordType::AAAA => return reply(ResponseCode::NoError),
-            Route::Home(zone) => match state.home.get(&zone.name) {
-                Some(r) => (r, true, format!("zone {} ({})", zone.name, zone.network)),
+            Route::Home { .. } if qtype == RecordType::AAAA => return reply(ResponseCode::NoError),
+            Route::Home { zone, whole_zone } => match state.home.get(&zone.name) {
+                Some(r) => (
+                    r,
+                    Kind::Home { whole_zone },
+                    format!("zone {} ({})", zone.name, zone.network),
+                ),
                 None => return reply(ResponseCode::ServFail),
             },
             Route::Public => (
                 &state.public,
-                false,
+                Kind::Public,
                 format!("public resolver {}", state.routes.public_resolver),
             ),
         };
         let Some(_slot) = Slot::take(&self.inflight, client) else {
             return reply(ResponseCode::Refused);
         };
-        let mut name: Name = query.name().clone().into();
-        name.set_fqdn(true);
-        match resolver.lookup(name, qtype).await {
+        match resolver.lookup(name.clone(), qtype).await {
             Ok(lookup) => {
-                let records = if home {
-                    answer::home(lookup.answers(), &state.mappings)
-                } else {
-                    answer::public(lookup.answers())
+                let records = match kind {
+                    Kind::Home { whole_zone: true } => {
+                        answer::home(lookup.answers(), &state.mappings)
+                    }
+                    // A tier that may see only this name gets the addresses
+                    // under it, not the CNAMEs that would name others.
+                    Kind::Home { whole_zone: false } => answer::flatten(
+                        answer::home(lookup.answers(), &state.mappings),
+                        &name,
+                        qtype,
+                    ),
+                    Kind::Public => answer::public(lookup.answers()),
                 };
                 (ResponseCode::NoError, records)
             }
@@ -354,16 +400,22 @@ impl RequestHandler for Handler {
         request: &Request,
         mut response_handle: R,
     ) -> ResponseInfo {
-        let (code, answers) = self.answer(request).await;
+        // Only EDNS version 0 exists; anything newer gets BADVERS so the
+        // client can fall back (RFC 6891).
+        let (code, answers) = match &request.edns {
+            Some(e) if e.version() > 0 => reply(ResponseCode::BADVERS),
+            _ => self.answer(request).await,
+        };
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
         metadata.response_code = code;
         let mut builder = MessageResponseBuilder::from_message_request(request);
-        // Echo EDNS so UDP answers may use the client's buffer size;
-        // anything bigger is truncated and the client retries over TCP.
+        // Echo EDNS so UDP answers may use the client's buffer size, up to
+        // 1232 bytes (DNS Flag Day 2020): bigger would fragment inside the
+        // tunnel. Anything larger is truncated and the client retries over TCP.
         let edns = request.edns.as_ref().map(|req| {
             let mut e = Edns::new();
-            e.set_max_payload(req.max_payload().max(512));
+            e.set_max_payload(req.max_payload().clamp(512, MAX_UDP_PAYLOAD));
             e.set_version(0);
             e
         });

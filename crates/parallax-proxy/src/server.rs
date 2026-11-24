@@ -112,6 +112,9 @@ pub struct Proxy {
     state: Arc<State>,
     refresh: Duration,
     reload: Arc<Notify>,
+    /// Registered by `serve` before anything else, so a SIGHUP during
+    /// startup is a reload, not the default action (exit).
+    hangup: Option<tokio::signal::unix::Signal>,
 }
 
 impl Proxy {
@@ -122,6 +125,7 @@ impl Proxy {
             state: Arc::new(load_state(routes_path)?),
             refresh: CERT_REFRESH,
             reload: Arc::new(Notify::new()),
+            hangup: None,
         })
     }
 
@@ -151,13 +155,9 @@ impl Proxy {
             self.state.sites.len()
         ));
         let (tx, rx) = watch::channel(self.state);
-        // Before spawning: until a handler is installed, SIGHUP would kill the process.
-        let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                log(format!("cannot watch SIGHUP, routes won't reload: {e}"));
-                None
-            }
+        let hangup = match self.hangup {
+            Some(h) => Some(h),
+            None => watch_hangup(),
         };
         tokio::spawn(reloader(
             self.routes_path,
@@ -191,6 +191,17 @@ impl Proxy {
     }
 }
 
+/// Until a handler is installed, SIGHUP kills the process.
+fn watch_hangup() -> Option<tokio::signal::unix::Signal> {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log(format!("cannot watch SIGHUP, routes won't reload: {e}"));
+            None
+        }
+    }
+}
+
 /// Load the routes at `routes_path` and serve until the process ends.
 pub fn serve(routes_path: &Path) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -198,7 +209,9 @@ pub fn serve(routes_path: &Path) -> Result<()> {
         .build()
         .map_err(|e| Error::io("starting the async runtime", e))?;
     runtime.block_on(async {
-        let proxy = Proxy::load(routes_path)?;
+        let hangup = watch_hangup();
+        let mut proxy = Proxy::load(routes_path)?;
+        proxy.hangup = hangup;
         let listen = proxy.listen();
         let listener = TcpListener::bind(listen)
             .await

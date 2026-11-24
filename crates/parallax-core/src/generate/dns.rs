@@ -85,8 +85,10 @@ pub struct DnsTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route<'a> {
     /// A name in one of the operator's zones: ask its home resolvers and
-    /// rewrite the answer into mapped space.
-    Home(&'a DnsZone),
+    /// rewrite the answer into mapped space. `whole_zone` is false when the
+    /// tier may see just this name (a service hostname): the answer must
+    /// not reveal other names in the zone, such as a CNAME's target.
+    Home { zone: &'a DnsZone, whole_zone: bool },
     /// A public name: ask the public resolver, drop non-public answers.
     Public,
     /// Not this tier's business, or not a tier at all.
@@ -140,18 +142,26 @@ impl DnsRoutes {
         let Some(tier) = self.tier(client) else {
             return Route::Refused;
         };
+        // A backslash is an escaped character inside a label (`a\.b` is one
+        // label): text matching would misread its labels, and no host name
+        // has one.
+        if name.contains('\\') {
+            return Route::Refused;
+        }
         let name = name.trim_end_matches('.').to_ascii_lowercase();
         match self.zone_of(&name) {
             // A name in a zone never goes to the public resolver, even when
             // the tier may not see it: that would leak the operator's names
             // and could return the home's public address.
-            Some(zone) => {
-                if tier.zones.contains(&zone.name) || tier.names.contains(&name) {
-                    Route::Home(zone)
-                } else {
-                    Route::Refused
-                }
-            }
+            Some(zone) if tier.zones.contains(&zone.name) => Route::Home {
+                zone,
+                whole_zone: true,
+            },
+            Some(zone) if tier.names.contains(&name) => Route::Home {
+                zone,
+                whole_zone: false,
+            },
+            Some(_) => Route::Refused,
             None if tier.public => Route::Public,
             None => Route::Refused,
         }
@@ -222,8 +232,6 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
                 }
             }
         }
-        // A name already covered by a granted zone needs no entry of its own.
-        names.retain(|n| !tier_zones.iter().any(|z| in_zone(n, z)));
         if members.is_empty() {
             continue;
         }
@@ -303,17 +311,26 @@ mod tests {
         let model = Model::resolve(&cfg, today()).unwrap();
         let routes = build(&model);
         let (laptop, sister, stranger) = (addr("10.8.1.2"), addr("10.8.2.1"), addr("10.8.9.9"));
-        let home = &routes.zones[0];
-        assert_eq!(routes.route(laptop, "nas.mydomain.com."), Route::Home(home));
-        assert_eq!(routes.route(laptop, "MyDomain.com"), Route::Home(home));
+        let zone = &routes.zones[0];
+        let whole = Route::Home {
+            zone,
+            whole_zone: true,
+        };
+        assert_eq!(routes.route(laptop, "nas.mydomain.com."), whole);
+        assert_eq!(routes.route(laptop, "MyDomain.com"), whole);
         assert_eq!(routes.route(laptop, "example.org."), Route::Public);
         assert_eq!(
             routes.route(sister, "Immich.MyDomain.com."),
-            Route::Home(home)
+            Route::Home {
+                zone,
+                whole_zone: false
+            }
         );
         assert_eq!(routes.route(sister, "other.mydomain.com."), Route::Refused);
         assert_eq!(routes.route(sister, "mydomain.com."), Route::Refused);
         assert_eq!(routes.route(sister, "example.org."), Route::Refused);
+        // An escaped dot makes one label of `evil.mydomain`: not in the zone.
+        assert_eq!(routes.route(laptop, "evil\\.mydomain.com."), Route::Refused);
         // Not a zone, though it ends in one's letters.
         assert_eq!(routes.route(laptop, "notmydomain.com."), Route::Public);
         assert_eq!(routes.route(sister, "notmydomain.com."), Route::Refused);
@@ -364,22 +381,47 @@ mod tests {
             "lab"
         );
         assert!(
-            matches!(routes.route(laptop, "nas.mydomain.com"), Route::Home(z) if z.network == "home")
+            matches!(routes.route(laptop, "nas.mydomain.com"), Route::Home { zone, .. } if zone.network == "home")
         );
         // Granted home, not lab: lab's names stay hidden.
         assert_eq!(routes.route(laptop, "pi.lab.mydomain.com"), Route::Refused);
     }
 
     #[test]
-    fn names_inside_a_granted_zone_are_not_repeated() {
+    fn a_service_hostname_survives_a_grant_on_an_enclosing_zone() {
+        // The service lives in lab.mydomain.com; the tier also gets the home
+        // network (mydomain.com) but not lab. Its hostname must still resolve.
         let mut cfg = proxied();
+        cfg.networks.push(Network {
+            name: "lab".into(),
+            interface: "eth1".into(),
+            gateway_address: None,
+            subnet: "192.168.50.0/24".parse().unwrap(),
+            mapped_to: Some("198.18.50.0/24".parse().unwrap()),
+            upstream_dns: vec![addr("192.168.50.1")],
+            domains: vec!["lab.mydomain.com".into()],
+            masquerade: false,
+        });
+        cfg.services[0].host = addr("192.168.50.5");
+        cfg.services[0].hostnames = vec!["immich.lab.mydomain.com".into()];
         cfg.templates[1].grants.push(Grant::Network {
             name: "home".into(),
         });
         let model = Model::resolve(&cfg, today()).unwrap();
-        let family = &build(&model).tiers[1];
-        assert_eq!(family.zones, vec!["mydomain.com"]);
-        assert!(family.names.is_empty());
+        let routes = build(&model);
+        let sister = addr("10.8.2.1");
+        assert!(matches!(
+            routes.route(sister, "immich.lab.mydomain.com"),
+            Route::Home { zone, whole_zone: false } if zone.network == "lab"
+        ));
+        assert_eq!(routes.route(sister, "pi.lab.mydomain.com"), Route::Refused);
+        assert!(matches!(
+            routes.route(sister, "nas.mydomain.com"),
+            Route::Home {
+                whole_zone: true,
+                ..
+            }
+        ));
     }
 
     #[test]

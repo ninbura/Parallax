@@ -9,7 +9,6 @@ rust-version.workspace = true
 [dependencies]
 parallax-core = { path = "../parallax-core" }
 thiserror.workspace = true
-ipnet.workspace = true
 tokio.workspace = true
 hickory-server.workspace = true
 async-trait.workspace = true

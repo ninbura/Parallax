@@ -3,8 +3,9 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use hickory_server::proto::rr::rdata::svcb::{SvcParamValue, SVCB};
 use hickory_server::proto::rr::rdata::{A, AAAA};
-use hickory_server::proto::rr::{RData, Record};
+use hickory_server::proto::rr::{Name, RData, Record, RecordType};
 use parallax_core::generate::firewall::NOT_PUBLIC;
 use parallax_core::netmap::Mapping;
 
@@ -31,19 +32,43 @@ pub fn home(records: &[Record], mappings: &[Mapping]) -> Vec<Record> {
         .collect()
 }
 
+/// Only the records of the asked type, as if they sat under `name`: drops
+/// the CNAME chain, whose targets are names the tier may not see.
+pub fn flatten(records: Vec<Record>, name: &Name, qtype: RecordType) -> Vec<Record> {
+    records
+        .into_iter()
+        .filter(|r| r.record_type() == qtype)
+        .map(|mut r| {
+            r.name = name.clone();
+            r
+        })
+        .collect()
+}
+
 /// Answers from the public resolver, without private, reserved or mapped
 /// addresses: a public name must not point a client's browser at the home
-/// network or the gateway (DNS rebinding).
+/// network or the gateway (DNS rebinding). That includes the address hints
+/// in SVCB/HTTPS records.
 pub fn public(records: &[Record]) -> Vec<Record> {
     records
         .iter()
         .filter(|r| match &r.data {
             RData::A(A(addr)) => is_public_v4(*addr),
             RData::AAAA(AAAA(addr)) => is_public_v6(*addr),
+            RData::SVCB(svcb) => public_hints(svcb),
+            RData::HTTPS(https) => public_hints(&https.0),
             _ => true,
         })
         .cloned()
         .collect()
+}
+
+fn public_hints(svcb: &SVCB) -> bool {
+    svcb.svc_params.iter().all(|(_, value)| match value {
+        SvcParamValue::Ipv4Hint(hint) => hint.0.iter().all(|A(a)| is_public_v4(*a)),
+        SvcParamValue::Ipv6Hint(hint) => hint.0.iter().all(|AAAA(a)| is_public_v6(*a)),
+        _ => true,
+    })
 }
 
 fn is_public_v4(addr: Ipv4Addr) -> bool {
@@ -72,7 +97,7 @@ fn is_public_v6(addr: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_server::proto::rr::rdata::CNAME;
+    use hickory_server::proto::rr::rdata::{CNAME, HTTPS};
     use hickory_server::proto::rr::Name;
 
     fn name(s: &str) -> Name {
@@ -120,6 +145,11 @@ mod tests {
             a("192.168.7.7"),
             a("9.9.9.9"),
             aaaa("fd00::5"),
+            Record::from_rdata(
+                name("x.mydomain.com."),
+                60,
+                RData::HTTPS(HTTPS(SVCB::new(1, Name::root(), Vec::new()))),
+            ),
         ];
         let out = home(&records, &home_mapping());
         assert_eq!(
@@ -132,6 +162,43 @@ mod tests {
             ]
         );
         assert_eq!(out[1].ttl, 60);
+    }
+
+    #[test]
+    fn flattening_keeps_only_the_asked_type_under_the_asked_name() {
+        let photos = name("photos.mydomain.com.");
+        let records = vec![
+            Record::from_rdata(
+                photos.clone(),
+                60,
+                RData::CNAME(CNAME(name("x.mydomain.com."))),
+            ),
+            a("192.168.1.5"),
+        ];
+        let out = flatten(home(&records, &home_mapping()), &photos, RecordType::A);
+        assert_eq!(addrs(&out), ["198.18.1.5"]);
+        assert_eq!(out[0].name, photos);
+    }
+
+    #[test]
+    fn public_https_records_lose_inward_hints() {
+        use hickory_server::proto::rr::rdata::svcb::{IpHint, SvcParamKey};
+        let https = |hint: &str| {
+            Record::from_rdata(
+                name("example.org."),
+                60,
+                RData::HTTPS(HTTPS(SVCB::new(
+                    1,
+                    Name::root(),
+                    vec![(
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![A(hint.parse().unwrap())])),
+                    )],
+                ))),
+            )
+        };
+        assert_eq!(public(&[https("9.9.9.9")]).len(), 1);
+        assert!(public(&[https("192.168.1.5")]).is_empty());
     }
 
     #[test]

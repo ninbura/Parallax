@@ -119,12 +119,14 @@ cfg() { sed -n "/^$1 *= */{s/^$1 *= *\"\{0,1\}\([^\"]*\)\"\{0,1\}/\1/p;q}" "$CON
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; }
 px() { docker exec "$CONTAINER" parallax "$@"; }
 
-# Wait until the container has applied the config and started its servers: wg1 up and
-# the DNS server listening on the gateway address (it starts after apply).
+# Wait until the container has applied the config and started its servers: wg1 up, and
+# the DNS server and the HTTPS proxy listening on the gateway address (they start after apply).
 wait_applied() {
     local iface; iface="$(cfg interface)"
     for _ in $(seq 1 60); do
-        if ip link show "$iface" >/dev/null 2>&1 && ss -Hltn 'sport = :53' | grep -qF "$GATEWAY:53"; then
+        if ip link show "$iface" >/dev/null 2>&1 \
+            && ss -Hltn 'sport = :53' | grep -qF "$GATEWAY:53" \
+            && ss -Hltn 'sport = :8443' | grep -qF "$GATEWAY:8443"; then
             return 0
         fi
         running || { docker logs --tail 30 "$CONTAINER" >&2; die "container exited"; }

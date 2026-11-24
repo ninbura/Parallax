@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hickory_server::proto::op::{Edns, Message, OpCode, Query, ResponseCode};
-use hickory_server::proto::rr::rdata::{A, AAAA};
+use hickory_server::proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_server::proto::rr::{Name, RData, Record, RecordType};
 use parallax_dns::Dns;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,6 +40,7 @@ fn upstream_answer(name: &str, qtype: RecordType) -> Result<Vec<RData>, Response
             .collect()),
         ("missing.mydomain.com.", _) => Err(ResponseCode::NXDomain),
         ("broken.mydomain.com.", _) => Err(ResponseCode::ServFail),
+        ("www.xn--bcher-kva.ch.", RecordType::A) => Ok(vec![a("192.168.1.7")]),
         ("example.org.", RecordType::A) => Ok(vec![a("9.9.9.9")]),
         ("rebind.example.org.", RecordType::A) => Ok(vec![a("192.168.1.5"), a("10.8.0.1")]),
         ("v6.example.org.", RecordType::AAAA) => {
@@ -73,6 +74,21 @@ fn respond(request: &Message, over_udp: bool) -> Option<Message> {
     response.metadata.recursion_desired = request.metadata.recursion_desired;
     response.metadata.recursion_available = true;
     response.add_query(query.clone());
+    // An alias: a granted hostname that is a CNAME for a sibling's name.
+    if name == "photos.mydomain.com." && query.query_type() == RecordType::A {
+        let other = Name::from_ascii("other.mydomain.com.").unwrap();
+        response.add_answer(Record::from_rdata(
+            query.name().clone(),
+            300,
+            RData::CNAME(CNAME(other.clone())),
+        ));
+        response.add_answer(Record::from_rdata(
+            other,
+            300,
+            RData::A(A("192.168.1.5".parse().unwrap())),
+        ));
+        return Some(response);
+    }
     match upstream_answer(&name, query.query_type()) {
         Ok(data) if over_udp && data.len() > 20 => response.metadata.truncation = true,
         Ok(data) => {
@@ -167,6 +183,11 @@ name = "mydomain.com"
 network = "home"
 upstream = ["{UPSTREAM}"]
 
+[[zone]]
+name = "xn--bcher-kva.ch"
+network = "home"
+upstream = ["{UPSTREAM}"]
+
 [[mapping]]
 real = "192.168.1.0/24"
 virtual = "198.18.1.0/24"
@@ -174,13 +195,13 @@ virtual = "198.18.1.0/24"
 [[tier]]
 template = "personal"
 members = ["{PERSONAL}/32"]
-zones = ["mydomain.com"]
+zones = ["mydomain.com", "xn--bcher-kva.ch"]
 public = true
 
 [[tier]]
 template = "family"
 members = ["{FAMILY}/32"]
-names = ["immich.mydomain.com"]
+names = ["immich.mydomain.com", "photos.mydomain.com"]
 public = {family_public}
 "#
     )
@@ -220,13 +241,18 @@ async fn start() -> Running {
 }
 
 fn query(name: &str, qtype: RecordType, edns: bool) -> Vec<u8> {
+    query_with_edns(name, qtype, edns.then_some(0))
+}
+
+fn query_with_edns(name: &str, qtype: RecordType, edns_version: Option<u8>) -> Vec<u8> {
     let mut m = Message::query();
     m.metadata.id = 4242;
     m.metadata.recursion_desired = true;
     m.add_query(Query::query(Name::from_ascii(name).unwrap(), qtype));
-    if edns {
+    if let Some(version) = edns_version {
         let mut e = Edns::new();
         e.set_max_payload(1232);
+        e.set_version(version);
         m.set_edns(e);
     }
     m.to_vec().unwrap()
@@ -312,12 +338,69 @@ async fn a_tier_gets_only_its_names() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_single_name_grant_does_not_reveal_its_alias() {
+    let s = start().await;
+    // The whole zone: the CNAME chain as the home resolver gave it.
+    let m = ask(PERSONAL, s.addr, "photos.mydomain.com.", RecordType::A).await;
+    assert_eq!(m.answers.len(), 2);
+    assert_eq!(addresses(&m), ["198.18.1.5"]);
+    // Just the name: its address, under its own name, and nothing that
+    // names the sibling it points at.
+    let m = ask(FAMILY, s.addr, "photos.mydomain.com.", RecordType::A).await;
+    assert_eq!(addresses(&m), ["198.18.1.5"]);
+    assert_eq!(m.answers.len(), 1);
+    assert_eq!(m.answers[0].name.to_ascii(), "photos.mydomain.com.");
+    assert!(!m.answers.iter().any(|r| matches!(r.data, RData::CNAME(_))));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn punycode_zones_stay_home() {
+    let s = start().await;
+    // Answered by the home zone (rewritten), not sent to the public resolver
+    // (which would drop the private address).
+    let m = ask(PERSONAL, s.addr, "www.xn--bcher-kva.ch.", RecordType::A).await;
+    assert_eq!(addresses(&m), ["198.18.1.7"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_edns_versions_get_badvers() {
+    let s = start().await;
+    let socket = UdpSocket::bind((PERSONAL, 0)).await.unwrap();
+    socket
+        .send_to(
+            &query_with_edns("immich.mydomain.com.", RecordType::A, Some(1)),
+            s.addr,
+        )
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(8), socket.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let m = Message::from_vec(&buf[..n]).unwrap();
+    // 16 on the wire; hickory decodes it as BADSIG, which shares the number.
+    assert_eq!(u16::from(m.metadata.response_code), 16);
+    assert!(m.answers.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn addresses_outside_every_tier_are_refused() {
     let s = start().await;
     let m = ask(STRANGER, s.addr, "immich.mydomain.com.", RecordType::A).await;
     assert_eq!(m.metadata.response_code, ResponseCode::Refused);
     let m = ask_tcp(STRANGER, s.addr, "example.org.", RecordType::A).await;
     assert_eq!(m.metadata.response_code, ResponseCode::Refused);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zone_transfers_and_any_are_refused() {
+    let s = start().await;
+    for qtype in [RecordType::ANY, RecordType::AXFR] {
+        let m = ask_tcp(PERSONAL, s.addr, "mydomain.com.", qtype).await;
+        assert_eq!(m.metadata.response_code, ResponseCode::Refused, "{qtype}");
+    }
+    assert!(!s.upstream.asked("mydomain.com. AXFR"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

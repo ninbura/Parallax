@@ -283,9 +283,13 @@ WireGuard gateway address), and the answer depends on who asks. `parallax dns`
   zone wins). A records inside a mapped network are rewritten into its
   virtual prefix by the same `Mapping` the NETMAP rules come from, so DNS
   and the firewall can't drift. AAAA, SVCB and HTTPS records are dropped:
-  peers can't send IPv6, and address hints would carry real addresses.
-- **Public answers** lose A/AAAA records in private, reserved or mapped
-  space (DNS rebinding).
+  peers can't send IPv6, and address hints would carry real addresses. A tier
+  that may see a single name (a service hostname) gets only records of the
+  asked type, under the asked name: a CNAME would name the sibling it points
+  at.
+- **Public answers** lose A/AAAA records, and SVCB/HTTPS records with address
+  hints, in private, reserved or mapped space (DNS rebinding).
+- Names are compared in ASCII (punycode), as zones are written.
 - It holds no records and doesn't recurse. One caching resolver per zone,
   2-second upstream timeout, TCP fallback; `SERVFAIL` when the upstream fails.
   UDP answers follow the client's EDNS size, and anything larger is

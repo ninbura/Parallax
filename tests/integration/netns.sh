@@ -492,9 +492,14 @@ for c in guest-lan guest-gateway guest-proxy; do
 done
 grep -q "^laptop-lan ALIVE$" "$WORK/hold.out" || { cat "$WORK/hold.out"; fail "(k) the laptop's connection did not survive an unrelated change"; }
 [ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = BLOCKED ] || fail "(k) guest opened a new connection after the revoke"
+# The DNS server took the same SIGHUP: the name went with the grant.
+ST=$(inns client dig +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
+[ "$ST" = REFUSED ] || fail "(k) guest still looked up immich after the revoke: '$ST'"
 apply   # restore the grants
 [ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(k) guest grant not restored"
-pass "(k) a revoked grant cuts open connections (LAN, gateway host, proxy); others survive"
+ANS=$(inns client dig +short +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
+[ "$ANS" = 198.18.1.5 ] || fail "(k) guest name not restored: '$ANS'"
+pass "(k) a revoked grant cuts open connections (LAN, gateway host, proxy) and the name; others survive"
 
 # (l) DNS answers each tier only the names it may reach
 status_as() { # src, name, [dig args...]  -> the response status, e.g. NOERROR
