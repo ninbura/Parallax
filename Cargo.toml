@@ -45,6 +45,9 @@ async-trait = "0.1"
 # SQLite's file format. Pinned exactly while it's before 1.0. No default
 # features: they add mimalloc (C) and full-text search, neither needed.
 turso = { version = "=0.8.4", default-features = false }
+# The CLI's owner-only umask, so every file Turso creates (WAL, coordination
+# file) is born private. Already in the tree through Turso.
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
 
 # Enforced in CI via `cargo clippy -- -D warnings`. See AGENTS.md.
 [workspace.lints.rust]

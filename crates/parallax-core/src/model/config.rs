@@ -20,7 +20,8 @@ pub struct Config {
 
 impl Config {
     /// Parse a configuration. Errors give a line and column but never quote
-    /// the source: the offending line may hold a private or preshared key.
+    /// the source or a value: the offending line may hold a private or
+    /// preshared key.
     pub fn from_toml(text: &str) -> crate::Result<Self> {
         toml::from_str(text).map_err(|e| {
             let at = e
@@ -32,7 +33,7 @@ impl Config {
                     format!("line {line}, column {column}: ")
                 })
                 .unwrap_or_default();
-            crate::Error::Parse(format!("{at}{}", e.message().trim()))
+            crate::Error::Parse(format!("{at}{}", redact_quoted(e.message().trim())))
         })
     }
 
@@ -57,6 +58,21 @@ impl Config {
     }
 }
 
+/// Replace every double-quoted part of a parser message ("invalid type:
+/// string \"<value>\"") with `"…"`. Field names are quoted with backticks
+/// and stay.
+fn redact_quoted(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    for (i, part) in message.split('"').enumerate() {
+        if i % 2 == 0 {
+            out.push_str(part);
+        } else {
+            out.push_str("\"…\"");
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +80,14 @@ mod tests {
     #[test]
     fn parse_errors_locate_without_quoting_the_source() {
         let text = "[server.wireguard]\nprivate_key = \"SYNTHETIC-SECRET-VALUE\" oops\n";
+        let err = Config::from_toml(text).unwrap_err().to_string();
+        assert!(err.contains("line 2, column"), "{err}");
+        assert!(!err.contains("SYNTHETIC-SECRET-VALUE"), "{err}");
+    }
+
+    #[test]
+    fn parse_errors_never_echo_a_value() {
+        let text = "[server.wireguard]\nlisten_port = \"SYNTHETIC-SECRET-VALUE\"\n";
         let err = Config::from_toml(text).unwrap_err().to_string();
         assert!(err.contains("line 2, column"), "{err}");
         assert!(!err.contains("SYNTHETIC-SECRET-VALUE"), "{err}");

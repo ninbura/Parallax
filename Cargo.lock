@@ -1830,6 +1830,7 @@ dependencies = [
  "parallax-proxy",
  "parallax-store",
  "rcgen",
+ "rustix 1.1.4",
  "tokio",
 ]
 

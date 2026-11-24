@@ -49,8 +49,8 @@ sudo ufw allow in on wg1 to 10.9.0.1 port 53 proto tcp
 sudo dev/staging/staging.sh up        # fake LANs, config on first run, build, start
 sudo dev/staging/staging.sh smoke     # end-to-end checks; prints SMOKE PASS or FAIL
 sudo dev/staging/staging.sh peer phone personal mobile   # add a peer, show its QR
-sudo dev/staging/staging.sh export > /tmp/staging.toml   # the configuration as TOML
-sudo dev/staging/staging.sh import /tmp/staging.toml     # replace it, then re-apply
+sudo dev/staging/staging.sh export    # the configuration as TOML, into $STAGING_STATE/config/export.toml (0600)
+sudo dev/staging/staging.sh import FILE   # replace it with FILE, then re-apply
 sudo dev/staging/staging.sh apply     # re-apply (SIGHUP the container)
 sudo dev/staging/staging.sh status
 sudo dev/staging/staging.sh down      # stop and remove the fake LANs; state is kept

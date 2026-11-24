@@ -25,15 +25,31 @@ a file next to it.
 - **Migrations** are numbered SQL files compiled into the binary, applied in
   order on open, each in its own transaction. A database newer than the binary
   is refused, naming both versions.
-- **One process at a time.** Turso locks the file to one process. Commands
-  open the database, do their work and close it; opening waits up to ten
-  seconds for another holder. `apply` reads the configuration and closes the
-  database before touching the system. Turso's multi-process mode is
-  experimental and stays off. Once the daemon exists (step 7) it holds the
-  database and the CLI talks to it.
-- **Existing installs:** the container imports `/etc/parallax/parallax.toml`
-  on its first start with no database, then renames it to
-  `parallax.toml.imported`.
+- **Many processes at once** (the user, 2026-11-24: concurrency now, as
+  fast as possible). By default Turso locks the file to one process; we open
+  it in its multi-process WAL mode (experimental, a `-tshm` coordination file
+  beside the database), so the gateway, the CLI and anything else read
+  concurrently and never wait for each other's reads. Writers take turns: a
+  write waits up to ten seconds for another to commit. Measured 2026-11-24:
+  4 processes × 300 writes at once, no errors, integrity check passes, and
+  `sqlite3` still reads the file; CI runs 8 concurrent `peer add`s.
+- **Every change is one write transaction.** `Store::update` reads, changes
+  and writes inside the same transaction, so concurrent commands can't lose
+  each other's changes (two `peer add`s can't take the same address).
+  `config edit` saves only if nobody changed the configuration while the
+  editor was open, and keeps the edited file if someone did.
+- **Parallel writers (MVCC, `BEGIN CONCURRENT`) wait for the daemon.** Turso's
+  MVCC refuses multi-process access (its bookkeeping lives in one process's
+  memory), and while it's on `sqlite3` can't open the file. Once the daemon
+  (step 7) is the only process holding the database and the CLI talks to it,
+  MVCC is an option; until then writes are short and rare.
+- **Existing installs:** on its first start the container runs `config
+  import --if-empty` on `/etc/parallax/parallax.toml` (it imports only into a
+  database without a configuration, decided inside the write) and renames the
+  file to `parallax.toml.imported`.
+- **Files are owner-only.** The database, its log and the coordination file
+  hold private keys: the CLI runs with an owner-only umask and the store
+  tightens all three to 0600; generated files get explicit modes.
 
 ## Why
 
@@ -45,7 +61,8 @@ a file next to it.
 - **Turso over SQLite in C:** the user wants to end up on Turso and would
   rather start there than migrate. It reads and writes SQLite's file format
   (the `sqlite3` tool opens a Parallax database), so going back stays cheap.
-  It's pre-1.0, hence the exact version pin and no experimental features.
+  It's pre-1.0, hence the exact version pin; the one experimental feature on
+  is multi-process access, chosen for concurrency and covered by tests.
 
 ## Rejected
 

@@ -325,8 +325,11 @@ alternatives: ADR 0005.
   tables use the id. `save` matches rows by name, so a kept name keeps its id.
 - Migrations: `crates/parallax-store/migrations/NNNN_*.sql`, applied in order
   when the database opens. A newer database than the binary knows is refused.
-- One process at a time: a command opens the database, works, and closes it,
-  waiting up to ten seconds if another holds it.
+- Many processes at once (Turso's multi-process WAL mode): reads never wait;
+  a write waits up to ten seconds for another to commit. Every change is one
+  write transaction (`Store::update`), so concurrent commands don't lose each
+  other's changes.
+- The database, its log and its `-tshm` coordination file are 0600.
 
 The CLI validates before every save, so the database only ever holds a valid
 configuration. `config import` and `config edit` also give WireGuard peers

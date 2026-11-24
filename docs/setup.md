@@ -93,6 +93,9 @@ any check fails. Run it by hand to see every problem at once:
 cd docker && sudo docker compose run --rm --no-deps parallax doctor
 ```
 
+Before the first start there is no database yet, so the configuration check
+fails ("no database at ..."); the host checks still run.
+
 It checks:
 
 | Check | Fails when | Fix |
@@ -210,7 +213,7 @@ The database is the source of truth; TOML is how you read and change it:
 
 ```sh
 sudo docker compose exec parallax parallax config edit   # $EDITOR, then a diff and "save?"
-sudo docker compose exec parallax parallax config export > parallax.toml
+sudo docker compose exec parallax parallax config export -o /etc/parallax/export.toml
 sudo docker compose exec parallax parallax config import /etc/parallax/new.toml
 sudo docker compose kill -s HUP parallax    # re-apply
 ```
@@ -222,8 +225,9 @@ fixed and retried, and nothing is saved until it's valid. `config import`
 replaces the whole configuration with a file (copy it into `docker/config/`
 first, which the container sees as `/etc/parallax`). Both give a WireGuard
 peer without an address the next free one. The export and the database
-hold any retained private keys, so keep exports private (`config export -o
-<file>` writes mode 0600).
+hold any retained private keys, so keep exports private: `config export -o
+<file>` writes mode 0600 (in `docker/config/` here), while a shell
+redirect (`> file`) creates the file with your shell's umask.
 
 Comments and layout don't survive the round trip: an export lists every
 setting, defaults included, in a fixed order.

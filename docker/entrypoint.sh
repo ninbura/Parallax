@@ -13,36 +13,32 @@ export PARALLAX_DB="${PARALLAX_DB:-/var/lib/parallax/parallax.db}"
 OUT="${PARALLAX_OUT:-/var/lib/parallax}"
 
 # --- first start: import the TOML, then rename it ----------------------------
-# Renamed so nobody keeps editing a file Parallax no longer reads.
+# Renamed so nobody keeps editing a file Parallax no longer reads. `--if-empty`
+# decides inside the database's write transaction, so a database left empty by
+# an interrupted import is filled on the next start, and one that already
+# holds a configuration is never overwritten.
 first_start() {
-    if [ -f "$PARALLAX_DB" ]; then
-        if [ -f "$CONFIG" ]; then
-            echo "parallax: warning: $CONFIG is ignored; the configuration lives in $PARALLAX_DB (change it with \`parallax config edit\`)" >&2
-        fi
-        return 0
-    fi
     if [ ! -f "$CONFIG" ]; then
-        echo "parallax: no configuration yet; put a parallax.toml at $CONFIG (start from example/parallax.toml) and start again" >&2
-        return 1
+        return 0   # `parallax doctor` says if the database holds nothing either
     fi
-    parallax config import "$CONFIG"
-    if mv "$CONFIG" "$CONFIG.imported" 2>/dev/null; then
-        echo "parallax: renamed $CONFIG to $CONFIG.imported; from now on change the configuration with \`parallax config edit\`"
-    else
-        echo "parallax: warning: could not rename $CONFIG (read-only?); it is ignored from now on" >&2
-    fi
-}
-
-# The WireGuard interface, for teardown.
-wg_interface() {
-    parallax config export 2>/dev/null | sed -n 's/^interface *= *"\(wg[0-9]*\)"/\1/p' | head -n1
+    out="$(parallax config import --if-empty "$CONFIG")"
+    case "$out" in
+        imported*)
+            echo "parallax: $out"
+            if mv "$CONFIG" "$CONFIG.imported" 2>/dev/null; then
+                echo "parallax: renamed $CONFIG to $CONFIG.imported; from now on change the configuration with \`parallax config edit\`"
+            else
+                echo "parallax: warning: could not rename $CONFIG (read-only?); it is ignored from now on" >&2
+            fi
+            ;;
+        *)
+            echo "parallax: warning: $CONFIG is ignored; the configuration lives in $PARALLAX_DB (change it with \`parallax config edit\`)" >&2
+            ;;
+    esac
 }
 
 MODE="${1:-run}"
 if [ "$MODE" != "run" ]; then
-    if [ ! -f "$PARALLAX_DB" ] && [ -f "$CONFIG" ]; then
-        first_start
-    fi
     exec parallax "$@"
 fi
 
@@ -64,15 +60,24 @@ tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailsca
     --tun=tailscale0 --port=41641 >/var/log/tailscaled.log 2>&1 &
 TAILSCALED_PID=$!
 
+# The WireGuard interface the last successful apply configured, for teardown:
+# apply writes wireguard/<interface>.conf. Not read from the database, which
+# may already hold an edit that isn't applied yet.
+WG_IF=
 apply() {
-    parallax apply -o "$OUT"
+    parallax apply -o "$OUT" || return 1
+    # Newest: a renamed interface leaves its old file behind.
+    conf="$(ls -t "$OUT"/wireguard/*.conf 2>/dev/null | head -n1)"
+    if [ -n "$conf" ]; then
+        WG_IF="$(basename "$conf" .conf)"
+    fi
 }
 
 teardown() {
     echo "parallax: shutting down"
     kill "$TAILSCALED_PID" ${DNS_PID:-} ${PROXY_PID:-} 2>/dev/null || true
     nft delete table inet parallax 2>/dev/null || true
-    ip link del "$(wg_interface)" 2>/dev/null || true
+    [ -n "$WG_IF" ] && ip link del "$WG_IF" 2>/dev/null || true
     exit "${1:-0}"
 }
 

@@ -235,25 +235,29 @@ pub mod real {
             }
         }
 
+        /// Modes are set explicitly, not left to the umask: the CLI runs with
+        /// an owner-only umask, but generated files that aren't secret (nginx
+        /// snippets) stay readable as before.
         fn write(&self, path: &Path, contents: &str, secret: bool) -> Result<()> {
             let ctx = || format!("writing {}", path.display());
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| Error::io(ctx(), e))?;
+                    create_dirs(parent).map_err(|e| Error::io(ctx(), e))?;
                 }
             }
+            let mode = if secret { 0o600 } else { 0o644 };
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(if secret { 0o600 } else { 0o644 });
+                opts.mode(mode);
             }
             let mut f = opts.open(path).map_err(|e| Error::io(ctx(), e))?;
             #[cfg(unix)]
-            if secret {
+            {
                 use std::os::unix::fs::PermissionsExt;
-                f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                f.set_permissions(std::fs::Permissions::from_mode(mode))
                     .map_err(|e| Error::io(ctx(), e))?;
             }
             f.write_all(contents.as_bytes())
@@ -267,6 +271,27 @@ pub mod real {
                 Err(e) => Err(Error::io(format!("removing {}", path.display()), e)),
             }
         }
+    }
+
+    /// `create_dir_all`, with every directory it creates mode 0755.
+    fn create_dirs(dir: &Path) -> std::io::Result<()> {
+        let missing: Vec<&Path> = dir
+            .ancestors()
+            .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
+            .collect();
+        for d in missing.into_iter().rev() {
+            match std::fs::create_dir(d) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        Ok(())
     }
 
     #[derive(Debug, Default, Clone, Copy)]

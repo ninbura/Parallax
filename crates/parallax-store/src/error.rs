@@ -18,12 +18,12 @@ pub enum Error {
     )]
     Empty(PathBuf),
 
-    /// Another process kept the database open for longer than we wait.
-    #[error("database {0} is in use by another Parallax process; try again in a moment")]
+    /// Another process kept writing for longer than we wait.
+    #[error("database {0} is busy with another Parallax process's write; try again in a moment")]
     Locked(PathBuf),
 
-    /// The database was written by a newer Parallax.
-    #[error("database {path} has schema version {found}, but this Parallax knows only up to {known}; upgrade Parallax")]
+    /// The database was written by a newer Parallax (or its version is garbage).
+    #[error("database {path} has schema version {found}, but this Parallax knows only 0 to {known}; upgrade Parallax")]
     TooNew {
         path: PathBuf,
         found: i64,
@@ -39,24 +39,31 @@ pub enum Error {
     #[error("database holds an invalid value: {0}")]
     Stored(String),
 
-    /// The database engine failed.
+    /// The database engine failed. Not a `source`: the message already
+    /// carries it, and `{:#}` would print it twice.
     #[error("database: {0}")]
-    Db(#[from] turso::Error),
+    Db(turso::Error),
 
-    /// A file around the database couldn't be prepared.
-    #[error("{context}: {source}")]
+    /// A file around the database couldn't be prepared. (`error`, not
+    /// `source`, for the same reason as `Db`.)
+    #[error("{context}: {error}")]
     Io {
         context: String,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 }
 
+impl From<turso::Error> for Error {
+    fn from(e: turso::Error) -> Self {
+        Error::Db(e)
+    }
+}
+
 impl Error {
-    pub(crate) fn io(context: impl std::fmt::Display, source: std::io::Error) -> Self {
+    pub(crate) fn io(context: impl std::fmt::Display, error: std::io::Error) -> Self {
         Error::Io {
             context: context.to_string(),
-            source,
+            error,
         }
     }
 }

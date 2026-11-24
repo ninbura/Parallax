@@ -7,7 +7,7 @@
 #   down                       stop the container and remove the fake LANs (state is kept)
 #   reset                      down, then delete the state directory (server key, peers, config)
 #   apply                      re-apply the configuration (SIGHUP the container)
-#   export                     print the configuration (the container's database) as TOML
+#   export                     write the configuration as TOML to $STAGING_STATE/config/export.toml (0600)
 #   import FILE                replace the configuration with a TOML file, then re-apply
 #   peer NAME TEMPLATE [PLAT]  add a peer (private key kept), re-apply, show its QR
 #   qr NAME [PLATFORM]         write $STAGING_STATE/qr/NAME-PLATFORM.png and print the QR
@@ -386,7 +386,11 @@ case "$cmd" in
     down) down ;;
     reset) down; [ -f "$MARKER" ] && rm -rf "$STATE"; "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true; say "state removed" ;;
     apply) reapply; say "re-applied" ;;
-    export) running || die "gateway not running (staging.sh up)"; px config export ;;
+    export)
+        running || die "gateway not running (staging.sh up)"
+        px config export -o /etc/parallax/export.toml >/dev/null 2>&1
+        say "wrote $STATE/config/export.toml"
+        ;;
     import) [ $# -ge 1 ] || die "usage: staging.sh import FILE"; import_config "$1"; reapply; say "imported and re-applied" ;;
     peer)
         [ $# -ge 2 ] || die "usage: staging.sh peer NAME TEMPLATE [PLATFORM]"

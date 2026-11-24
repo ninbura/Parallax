@@ -348,3 +348,104 @@ fn config_diffs_never_show_keys() {
     assert!(stdout.contains("-private_key = (redacted)"), "{stdout}");
     assert!(!stdout.contains("private_key = \""), "{stdout}");
 }
+
+#[test]
+fn concurrent_peer_adds_all_land_with_distinct_addresses() {
+    let s = Scratch::new("concurrent");
+    s.import();
+    let children: Vec<_> = (0..8)
+        .map(|i| {
+            Command::new(env!("CARGO_BIN_EXE_parallax"))
+                .arg("--db")
+                .arg(s.db())
+                .args(["peer", "add", &format!("dev{i}"), "--template", "family"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let (ok, out, err) = s.run(&["peer", "show"]);
+    assert!(ok, "{err}");
+    let mut addresses: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("dev"))
+        .filter_map(|l| l.split("address=").nth(1))
+        .filter_map(|a| a.split_whitespace().next())
+        .collect();
+    assert_eq!(addresses.len(), 8, "{out}");
+    addresses.sort_unstable();
+    addresses.dedup();
+    assert_eq!(addresses.len(), 8, "two peers got one address: {out}");
+}
+
+#[test]
+fn import_if_empty_never_overwrites() {
+    let s = Scratch::new("ifempty");
+    let file = s.config().to_string_lossy().into_owned();
+    let (ok, out, err) = s.run(&["config", "import", "--if-empty", &file]);
+    assert!(ok, "{err}");
+    assert!(out.starts_with("imported"), "{out}");
+    s.run(&["peer", "remove", "router"]);
+
+    // A broken file is not even read once the database holds a configuration.
+    std::fs::write(s.config(), "not toml [").unwrap();
+    let (ok, out, err) = s.run(&["config", "import", "--if-empty", &file]);
+    assert!(ok, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("already holds a configuration"), "{err}");
+    let (_, out, _) = s.run(&["validate"]);
+    assert!(out.contains("2 peers"), "{out}");
+}
+
+#[test]
+fn keygen_finishes_recording_a_key_it_already_wrote() {
+    let s = Scratch::new("keyresume");
+    s.import();
+    // As if an earlier run wrote the key and stopped before recording it.
+    let (ok, out, err) = s.run(&["keygen"]);
+    assert!(ok, "{err}");
+    let public = out
+        .lines()
+        .find_map(|l| l.strip_prefix("public key: "))
+        .unwrap()
+        .to_string();
+    let (ok, out, err) = s.run(&["keygen", "--if-missing", "--write-config"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("recorded the public key"), "{out}");
+    let (_, text, _) = s.run(&["config", "export"]);
+    assert!(
+        text.contains(&format!("public_key = \"{public}\"")),
+        "{text}"
+    );
+    let (ok, out, _) = s.run(&["keygen", "--if-missing", "--write-config"]);
+    assert!(ok && out.is_empty(), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn every_database_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("modes");
+    s.import();
+    s.run(&["peer", "add", "tablet", "--template", "family"]);
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&s.dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("parallax.db") {
+            seen += 1;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
+        }
+    }
+    assert!(seen >= 2, "expected the database and its log");
+}

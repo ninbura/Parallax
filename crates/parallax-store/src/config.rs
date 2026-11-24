@@ -15,7 +15,15 @@ use crate::{Error, Result, Store};
 
 impl Store {
     /// The whole configuration. Fails with [`Error::Empty`] before the first import.
-    pub async fn load(&self) -> Result<Config> {
+    pub async fn load(&mut self) -> Result<Config> {
+        // One read transaction: a snapshot, even while another process writes.
+        self.conn.execute("BEGIN", ()).await?;
+        let result = self.load_inner().await;
+        let _ = self.conn.execute("COMMIT", ()).await;
+        result.map_err(|e| self.busy(e))
+    }
+
+    async fn load_inner(&self) -> Result<Config> {
         let Some(server) = self.load_server().await? else {
             return Err(Error::Empty(self.path.clone()));
         };
@@ -34,13 +42,71 @@ impl Store {
     /// row, a missing name loses its row. Validate `config` first; the store
     /// only refuses what it can't represent (a grant naming an unknown
     /// network, a duplicate name).
-    pub async fn save(&self, config: &Config) -> Result<()> {
-        self.begin().await?;
+    ///
+    /// Takes `&mut self`: one transaction at a time on this connection.
+    pub async fn save(&mut self, config: &Config) -> Result<()> {
+        self.begin().await.map_err(|e| self.busy(e))?;
         let result = self.save_inner(config).await;
-        self.finish(result).await
+        self.finish(result).await.map_err(|e| self.busy(e))?;
+        self.tighten()
+    }
+
+    /// Read, change and write the configuration in one write transaction, so
+    /// no other process writes in between (two `peer add`s can't both take
+    /// the same free address). Nothing is saved if `change` fails.
+    pub async fn update<T, E>(
+        &mut self,
+        change: impl FnOnce(&mut Config) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<Error>,
+    {
+        self.begin().await.map_err(|e| self.busy(e))?;
+        let mut config = match self.load_inner().await {
+            Ok(config) => config,
+            Err(e) => {
+                self.rollback().await;
+                return Err(self.busy(e).into());
+            }
+        };
+        let out = match change(&mut config) {
+            Ok(out) => out,
+            Err(e) => {
+                self.rollback().await;
+                return Err(e);
+            }
+        };
+        let saved = self.save_inner(&config).await;
+        self.finish(saved).await.map_err(|e| self.busy(e))?;
+        self.tighten()?;
+        Ok(out)
+    }
+
+    /// Save `config` only if the database holds no configuration yet, checked
+    /// inside the same transaction. Returns whether it saved.
+    pub async fn save_if_empty(&mut self, config: &Config) -> Result<bool> {
+        self.begin().await.map_err(|e| self.busy(e))?;
+        let result = async {
+            if self.load_server().await?.is_some() {
+                return Ok(false);
+            }
+            self.save_inner(config).await?;
+            Ok(true)
+        }
+        .await;
+        let saved = self.finish(result).await.map_err(|e| self.busy(e))?;
+        self.tighten()?;
+        Ok(saved)
     }
 
     async fn save_inner(&self, config: &Config) -> Result<()> {
+        // Refuse duplicate names before writing anything: a second row with a
+        // kept name would overwrite the first.
+        unique("network", config.networks.iter().map(|n| &n.name))?;
+        unique("service", config.services.iter().map(|s| &s.name))?;
+        unique("template", config.templates.iter().map(|t| &t.name))?;
+        unique("peer", config.peers.iter().map(|p| &p.name))?;
+
         // Grant and visibility rows have no identity of their own; rewrite them
         // all, which also frees networks and services about to be removed.
         self.exec("DELETE FROM template_grants", Vec::new()).await?;
@@ -248,7 +314,7 @@ impl Store {
             .await?;
             self.replace_list("network_domains", "network_id", id, "domain", &n.domains)
                 .await?;
-            insert_unique(&mut ids, "network", &n.name, id)?;
+            ids.insert(n.name.clone(), id);
         }
         Ok(ids)
     }
@@ -309,7 +375,7 @@ impl Store {
                 &s.hostnames,
             )
             .await?;
-            insert_unique(&mut ids, "service", &s.name, id)?;
+            ids.insert(s.name.clone(), id);
         }
         Ok(ids)
     }
@@ -522,7 +588,7 @@ impl Store {
                 )
                 .await?;
             }
-            insert_unique(&mut ids, "template", &t.name, id)?;
+            ids.insert(t.name.clone(), id);
         }
         Ok(ids)
     }
@@ -582,7 +648,6 @@ impl Store {
     }
 
     async fn save_peers(&self, peers: &[Peer], templates: &BTreeMap<String, i64>) -> Result<()> {
-        let mut seen = BTreeMap::new();
         for (position, p) in (0_i64..).zip(peers) {
             let at = format!("peer '{}'", p.name);
             let template = lookup(templates, &at, "refers to unknown template", &p.template)?;
@@ -598,47 +663,45 @@ impl Store {
                     })
                 })
                 .transpose()?;
-            let id = self
-                .upsert(
-                    "peers",
-                    "name",
-                    &[
-                        ("name", text(&p.name)),
-                        ("position", position.into()),
-                        ("template_id", template.into()),
-                        ("transport", variant_text(&p.transport)?),
-                        ("enabled", p.enabled.into()),
-                        ("expires", p.expires.map(|d| d.to_string()).into()),
-                        (
-                            "wireguard_public_key",
-                            wg.map(|w| w.public_key.to_base64()).into(),
-                        ),
-                        (
-                            "wireguard_address",
-                            wg.and_then(|w| w.address).map(|a| a.to_string()).into(),
-                        ),
-                        (
-                            "wireguard_private_key",
-                            wg.and_then(|w| w.private_key.as_ref())
-                                .map(|k| k.expose_base64())
-                                .into(),
-                        ),
-                        (
-                            "wireguard_preshared_key",
-                            wg.and_then(|w| w.preshared_key.as_ref())
-                                .map(|k| k.expose_base64())
-                                .into(),
-                        ),
-                        ("tailscale", ts.is_some().into()),
-                        ("tailscale_node_id", node_id.into()),
-                        (
-                            "tailscale_address",
-                            ts.and_then(|t| t.address).map(|a| a.to_string()).into(),
-                        ),
-                    ],
-                )
-                .await?;
-            insert_unique(&mut seen, "peer", &p.name, id)?;
+            self.upsert(
+                "peers",
+                "name",
+                &[
+                    ("name", text(&p.name)),
+                    ("position", position.into()),
+                    ("template_id", template.into()),
+                    ("transport", variant_text(&p.transport)?),
+                    ("enabled", p.enabled.into()),
+                    ("expires", p.expires.map(|d| d.to_string()).into()),
+                    (
+                        "wireguard_public_key",
+                        wg.map(|w| w.public_key.to_base64()).into(),
+                    ),
+                    (
+                        "wireguard_address",
+                        wg.and_then(|w| w.address).map(|a| a.to_string()).into(),
+                    ),
+                    (
+                        "wireguard_private_key",
+                        wg.and_then(|w| w.private_key.as_ref())
+                            .map(|k| k.expose_base64())
+                            .into(),
+                    ),
+                    (
+                        "wireguard_preshared_key",
+                        wg.and_then(|w| w.preshared_key.as_ref())
+                            .map(|k| k.expose_base64())
+                            .into(),
+                    ),
+                    ("tailscale", ts.is_some().into()),
+                    ("tailscale_node_id", node_id.into()),
+                    (
+                        "tailscale_address",
+                        ts.and_then(|t| t.address).map(|a| a.to_string()).into(),
+                    ),
+                ],
+            )
+            .await?;
         }
         Ok(())
     }
@@ -800,9 +863,12 @@ fn lookup(ids: &BTreeMap<String, i64>, at: &str, problem: &str, name: &str) -> R
         .ok_or_else(|| Error::Invalid(format!("{at}: {problem} '{name}'")))
 }
 
-fn insert_unique(ids: &mut BTreeMap<String, i64>, kind: &str, name: &str, id: i64) -> Result<()> {
-    if ids.insert(name.to_string(), id).is_some() {
-        return Err(Error::Invalid(format!("{kind} '{name}' is defined twice")));
+fn unique<'a>(kind: &str, names: impl Iterator<Item = &'a String>) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(Error::Invalid(format!("{kind} '{name}' is defined twice")));
+        }
     }
     Ok(())
 }

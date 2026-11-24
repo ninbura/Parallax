@@ -37,7 +37,7 @@ impl Drop for TempDir {
 
 async fn round_trip(config: &Config) -> Config {
     let dir = TempDir::new();
-    let store = Store::create(&dir.db()).await.unwrap();
+    let mut store = Store::create(&dir.db()).await.unwrap();
     store.save(config).await.unwrap();
     drop(store);
     Store::open(&dir.db()).await.unwrap().load().await.unwrap()
@@ -179,7 +179,7 @@ async fn id_of(store: &Store, table: &str, name: &str) -> i64 {
 #[tokio::test]
 async fn saving_keeps_ids_and_follows_renames_and_removals() {
     let dir = TempDir::new();
-    let store = Store::create(&dir.db()).await.unwrap();
+    let mut store = Store::create(&dir.db()).await.unwrap();
     let mut config = everything_config();
     store.save(&config).await.unwrap();
     let laptop = id_of(&store, "peers", "laptop").await;
@@ -212,7 +212,7 @@ async fn saving_keeps_ids_and_follows_renames_and_removals() {
 #[tokio::test]
 async fn a_failed_save_changes_nothing() {
     let dir = TempDir::new();
-    let store = Store::create(&dir.db()).await.unwrap();
+    let mut store = Store::create(&dir.db()).await.unwrap();
     let config = canonical_config();
     store.save(&config).await.unwrap();
 
@@ -243,7 +243,7 @@ async fn missing_and_empty_databases_say_what_to_do() {
     assert!(matches!(err, Error::Missing(_)), "{err}");
     assert!(err.to_string().contains("parallax config import"));
 
-    let store = Store::create(&dir.db()).await.unwrap();
+    let mut store = Store::create(&dir.db()).await.unwrap();
     let err = store.load().await.unwrap_err();
     assert!(matches!(err, Error::Empty(_)), "{err}");
 }
@@ -253,7 +253,7 @@ async fn missing_and_empty_databases_say_what_to_do() {
 async fn the_database_and_its_log_are_owner_only() {
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new();
-    let store = Store::create(&dir.db()).await.unwrap();
+    let mut store = Store::create(&dir.db()).await.unwrap();
     store.save(&everything_config()).await.unwrap();
     for file in ["parallax.db", "parallax.db-wal"] {
         let mode = std::fs::metadata(dir.0.join(file))
@@ -301,4 +301,59 @@ async fn reopening_does_not_migrate_twice() {
         .await
         .unwrap();
     assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_names_are_refused_before_anything_is_written() {
+    let dir = TempDir::new();
+    let mut store = Store::create(&dir.db()).await.unwrap();
+    let config = canonical_config();
+    store.save(&config).await.unwrap();
+    let mut twice = config.clone();
+    twice.templates.push(twice.templates[0].clone());
+    let err = store.save(&twice).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Invalid(m) if m == "template 'personal' is defined twice"),
+        "{err}"
+    );
+    assert_eq!(store.load().await.unwrap(), config);
+}
+
+#[tokio::test]
+async fn save_if_empty_saves_only_into_an_empty_database() {
+    let dir = TempDir::new();
+    let mut store = Store::create(&dir.db()).await.unwrap();
+    let config = canonical_config();
+    assert!(store.save_if_empty(&config).await.unwrap());
+    let mut other = config.clone();
+    other.peers.clear();
+    assert!(!store.save_if_empty(&other).await.unwrap());
+    assert_eq!(store.load().await.unwrap(), config);
+}
+
+#[tokio::test]
+async fn update_saves_the_change_or_nothing() {
+    let dir = TempDir::new();
+    let mut store = Store::create(&dir.db()).await.unwrap();
+    store.save(&canonical_config()).await.unwrap();
+
+    let removed = store
+        .update(|c| -> Result<usize, Error> {
+            c.peers.retain(|p| p.name != "router");
+            Ok(c.peers.len())
+        })
+        .await
+        .unwrap();
+    assert_eq!(removed, 2);
+    assert!(store.load().await.unwrap().peer("router").is_none());
+
+    let err = store
+        .update(|c| -> Result<(), Error> {
+            c.peers.clear();
+            Err(Error::Invalid("refused".into()))
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "{err}");
+    assert_eq!(store.load().await.unwrap().peers.len(), 2);
 }

@@ -13,6 +13,7 @@ use parallax_core::generate::{self, Export};
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
 use parallax_core::model::{Peer, Platform, TransportKind};
+use parallax_core::secret::PrivateKey;
 use parallax_core::transport::{self, ProvisionOptions};
 use parallax_core::validate::ReachKind;
 use parallax_core::{Config, Model};
@@ -90,7 +91,13 @@ struct OutArgs {
 #[derive(Subcommand)]
 enum ConfigCommand {
     /// Replace the configuration with a TOML file. Peers without an address get one.
-    Import { file: PathBuf },
+    Import {
+        file: PathBuf,
+        /// Only import into a database that holds no configuration yet (the
+        /// container's first start). Prints `imported ...` when it did.
+        #[arg(long)]
+        if_empty: bool,
+    },
     /// Print the configuration as TOML. It holds any stored private keys.
     Export {
         /// Write to this file (mode 0600) instead of standard output.
@@ -136,6 +143,10 @@ enum PeerCommand {
 }
 
 fn main() {
+    // Owner-only by default: the database and the files Turso creates next to
+    // it (its log, its coordination file) hold private keys. Files Parallax
+    // writes itself get explicit modes (`RealFs`).
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -165,19 +176,21 @@ fn load(db: &Path) -> anyhow::Result<Config> {
     block_on(async { Ok(Store::open(db).await?.load().await?) })
 }
 
-/// Change the configuration under one open database, refusing to save an
+/// Change the configuration in one write transaction, refusing to save an
 /// invalid result.
 fn update<T>(
     db: &Path,
     change: impl FnOnce(&mut Config) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     block_on(async {
-        let store = Store::open(db).await?;
-        let mut config = store.load().await?;
-        let out = change(&mut config)?;
-        check(&config)?;
-        store.save(&config).await?;
-        Ok(out)
+        let mut store = Store::open(db).await?;
+        store
+            .update(|config| {
+                let out = change(config)?;
+                check(config)?;
+                Ok(out)
+            })
+            .await
     })
 }
 
@@ -320,8 +333,29 @@ fn keygen(db: &Path, write_config: bool, if_missing: bool) -> anyhow::Result<()>
     let fs = RealFs;
     let config = load(db)?;
     let path = config.server.wireguard.private_key_file.clone();
-    if fs.read(&path)?.is_some() {
+    if let Some(existing) = fs.read(&path)? {
         if if_missing {
+            // Finish an earlier run that wrote the key but stopped before
+            // recording its public half.
+            if write_config {
+                let public = existing
+                    .trim()
+                    .parse::<PrivateKey>()
+                    .map_err(|_| anyhow!("{} does not hold a valid private key", path.display()))?
+                    .public_key();
+                if public != config.server.wireguard.public_key {
+                    let shown = public.to_base64();
+                    update(db, |c| {
+                        c.server.wireguard.public_key = public;
+                        Ok(())
+                    })?;
+                    println!(
+                        "recorded the public key of {} ({shown}) in {}",
+                        path.display(),
+                        db.display()
+                    );
+                }
+            }
             return Ok(());
         }
         bail!(
@@ -352,38 +386,63 @@ fn keygen(db: &Path, write_config: bool, if_missing: bool) -> anyhow::Result<()>
 /// without an address the next free one.
 fn prepare(text: &str) -> anyhow::Result<Config> {
     let mut config = Config::from_toml(text)?;
-    for (name, addr) in parallax_core::alloc::allocate_missing(&mut config)? {
-        eprintln!("allocated {addr} to peer '{name}'");
-    }
+    let allocated = parallax_core::alloc::allocate_missing(&mut config)?;
     let (errors, warnings) = parallax_core::validate::check(&config);
     if !errors.is_empty() {
         return Err(parallax_core::Error::Invalid(errors).into());
+    }
+    for (name, addr) in allocated {
+        eprintln!("allocated {addr} to peer '{name}'");
     }
     print_warnings(&warnings);
     Ok(config)
 }
 
+/// Whether the database exists and holds a configuration. Any other failure
+/// (unreadable, busy) is an error, never "empty".
+fn holds_configuration(db: &Path) -> anyhow::Result<bool> {
+    match load(db) {
+        Ok(_) => Ok(true),
+        Err(e) => match e.downcast_ref::<parallax_store::Error>() {
+            Some(parallax_store::Error::Missing(_) | parallax_store::Error::Empty(_)) => Ok(false),
+            _ => Err(e),
+        },
+    }
+}
+
 fn config_command(db: &Path, command: ConfigCommand) -> anyhow::Result<()> {
     match command {
-        ConfigCommand::Import { file } => {
+        ConfigCommand::Import { file, if_empty } => {
+            let not_imported = || {
+                eprintln!(
+                    "{} already holds a configuration; {} not imported",
+                    db.display(),
+                    file.display()
+                );
+            };
+            // Before parsing: a file the database already replaced may be stale.
+            if if_empty && holds_configuration(db)? {
+                not_imported();
+                return Ok(());
+            }
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
             let config = prepare(&text).with_context(|| format!("importing {}", file.display()))?;
-            let new = !db.exists();
             let saved = block_on(async {
-                let store = Store::create(db).await?;
-                store.save(&config).await?;
-                Ok(())
-            });
-            if saved.is_err() && new {
-                // Leave no empty database behind: the next start would take it
-                // for an imported one.
-                let _ = std::fs::remove_file(db);
-                let mut wal = db.as_os_str().to_owned();
-                wal.push("-wal");
-                let _ = std::fs::remove_file(wal);
+                let mut store = Store::create(db).await?;
+                if if_empty {
+                    // Checked again inside the write: another process may
+                    // have imported since.
+                    Ok(store.save_if_empty(&config).await?)
+                } else {
+                    store.save(&config).await?;
+                    Ok(true)
+                }
+            })?;
+            if !saved {
+                not_imported();
+                return Ok(());
             }
-            saved?;
             println!(
                 "imported {} into {} ({} networks, {} templates, {} peers); run `parallax apply` to put it into effect",
                 file.display(),
@@ -408,12 +467,46 @@ fn config_command(db: &Path, command: ConfigCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Removes the temporary file holding the configuration, whatever happens.
-struct TempFile(PathBuf);
+/// A private (0700) directory for the file being edited, removed with
+/// everything in it (editor backups and swap files too) unless kept.
+struct TempDir(Option<PathBuf>);
 
-impl Drop for TempFile {
+impl TempDir {
+    fn new() -> anyhow::Result<TempDir> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path =
+            std::env::temp_dir().join(format!("parallax-edit-{}-{nanos:08x}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        // Fails if the name exists, so the guard only ever removes our own.
+        builder
+            .create(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok(TempDir(Some(path)))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_deref().unwrap_or(Path::new(""))
+    }
+
+    /// Leave the directory in place and return it.
+    fn keep(mut self) -> PathBuf {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -422,24 +515,14 @@ fn config_edit(db: &Path, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
     // other commands aren't locked out; a change in the meantime is caught below.
     let before = load(db)?;
     let original = before.to_toml()?;
-    let file = TempFile(std::env::temp_dir().join(format!("parallax-{}.toml", std::process::id())));
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        opts.open(&file.0)
-            .and_then(|mut f| f.write_all(original.as_bytes()))
-            .with_context(|| format!("writing {}", file.0.display()))?;
-    }
+    let dir = TempDir::new()?;
+    let file = dir.path().join("parallax.toml");
+    RealFs.write(&file, &original, true)?;
 
     let edited = loop {
-        run_editor(&file.0)?;
-        let text = std::fs::read_to_string(&file.0)
-            .with_context(|| format!("reading {}", file.0.display()))?;
+        run_editor(&file)?;
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", file.display()))?;
         if text == original {
             println!("no changes");
             return Ok(());
@@ -478,14 +561,28 @@ fn config_edit(db: &Path, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
     if !yes && !confirm("save?", false)? {
         bail!("nothing saved");
     }
-    block_on(async {
-        let store = Store::open(db).await?;
-        if store.load().await? != before {
-            bail!("the configuration changed while you were editing; nothing saved, run `parallax config edit` again");
-        }
-        store.save(&edited).await?;
-        Ok(())
-    })?;
+    let mut changed_meanwhile = false;
+    let saved = block_on(async {
+        let mut store = Store::open(db).await?;
+        store
+            .update(|config| {
+                if *config != before {
+                    changed_meanwhile = true;
+                    bail!("the configuration changed while you were editing");
+                }
+                *config = edited;
+                Ok(())
+            })
+            .await
+    });
+    if changed_meanwhile {
+        let kept = dir.keep();
+        bail!(
+            "the configuration changed while you were editing; nothing saved. Your version is in {}; run `parallax config edit` again",
+            kept.join("parallax.toml").display()
+        );
+    }
+    saved?;
     println!("saved; run `parallax apply` to put it into effect");
     Ok(())
 }

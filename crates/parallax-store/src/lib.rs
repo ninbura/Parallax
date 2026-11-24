@@ -5,9 +5,11 @@
 //! back in a single transaction, row by row: rows keep their ids, so
 //! anything pointing at them (later, the GUI's own tables) survives.
 //!
-//! Turso takes an exclusive lock on the file, so a second process can't open
-//! it while one has it. Commands open the store, do their work and drop it;
-//! opening waits briefly for another holder to finish.
+//! Many processes may use the database at once (Turso's multi-process WAL
+//! mode): readers never wait, and a writer waits up to [`BUSY_TIMEOUT`] for
+//! another writer to commit. Turso's MVCC (parallel writers) refuses
+//! multi-process access, so it waits until one process (the daemon) owns
+//! the database.
 
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
@@ -15,7 +17,7 @@ mod config;
 mod error;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub use error::{Error, Result};
 
@@ -23,9 +25,8 @@ pub use error::{Error, Result};
 /// add the next.
 const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_config.sql")];
 
-/// How long opening waits for another process to release the database.
-const LOCK_WAIT: Duration = Duration::from_secs(10);
-const LOCK_RETRY: Duration = Duration::from_millis(50);
+/// How long a write waits for another process's write to commit.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An open database.
 pub struct Store {
@@ -50,8 +51,10 @@ impl Store {
         Store::open_inner(path).await
     }
 
-    /// Open a database, creating an empty one if there is none.
+    /// Open a database, creating an empty one (and its directory, 0700) if
+    /// there is none.
     pub async fn create(path: &Path) -> Result<Store> {
+        create_file(path)?;
         Store::open_inner(path).await
     }
 
@@ -61,54 +64,73 @@ impl Store {
     }
 
     async fn open_inner(path: &Path) -> Result<Store> {
-        prepare_files(path)?;
         let name = path
             .to_str()
             .ok_or_else(|| Error::Invalid(format!("{} is not valid UTF-8", path.display())))?;
-        let deadline = Instant::now() + LOCK_WAIT;
-        let db = loop {
-            match turso::Builder::new_local(name).build().await {
-                Ok(db) => break db,
-                Err(e) if is_locked(&e) => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::Locked(path.to_path_buf()));
-                    }
-                    tokio::time::sleep(LOCK_RETRY).await;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        };
+        let db = turso::Builder::new_local(name)
+            .experimental_multiprocess_wal(true)
+            .build()
+            .await?;
         let conn = db.connect()?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
         let store = Store {
             path: path.to_path_buf(),
             _db: db,
             conn,
         };
-        store.migrate().await?;
+        store.migrate().await.map_err(|e| store.busy(e))?;
+        store.tighten()?;
         Ok(store)
     }
 
-    /// Apply every migration the database hasn't seen, each in its own transaction.
-    async fn migrate(&self) -> Result<()> {
-        self.conn
-            .execute(
-                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
-                (),
-            )
-            .await?;
-        let found = self.schema_version().await?;
-        let known = MIGRATIONS.len() as i64;
-        if found > known {
-            return Err(Error::TooNew {
-                path: self.path.clone(),
-                found,
-                known,
-            });
+    /// The database, its log and its coordination file hold private keys:
+    /// make whichever exist owner-only. By path, never by opening them:
+    /// closing any descriptor of a file drops this process's locks on it.
+    /// The CLI's owner-only umask covers files Turso creates later.
+    fn tighten(&self) -> Result<()> {
+        #[cfg(unix)]
+        for suffix in ["", "-wal", "-tshm"] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut file = self.path.as_os_str().to_owned();
+            file.push(suffix);
+            let file = Path::new(&file);
+            match std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::io(format!("securing {}", file.display()), e)),
+            }
         }
-        for (version, sql) in (1..).zip(MIGRATIONS).skip(found as usize) {
-            self.begin().await?;
-            let applied = async {
+        Ok(())
+    }
+
+    /// Name the database when another process held it too long.
+    fn busy(&self, e: Error) -> Error {
+        match e {
+            Error::Db(turso::Error::Busy(_)) => Error::Locked(self.path.clone()),
+            e => e,
+        }
+    }
+
+    /// Apply every migration the database hasn't seen. Opening an up-to-date
+    /// database only reads; otherwise one write transaction re-checks the
+    /// version and applies the rest, so processes opening a new database at
+    /// the same time migrate it once.
+    async fn migrate(&self) -> Result<()> {
+        let known = MIGRATIONS.len() as i64;
+        if self.check_version(known).await? == known {
+            return Ok(());
+        }
+        self.begin().await?;
+        let applied = async {
+            self.conn
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
+                    (),
+                )
+                .await?;
+            let found = self.check_version(known).await?;
+            for (version, sql) in (1..).zip(MIGRATIONS).skip(found as usize) {
                 self.conn.execute_batch(*sql).await?;
                 self.conn
                     .execute(
@@ -116,16 +138,43 @@ impl Store {
                         (version,),
                     )
                     .await?;
-                Ok(())
             }
-            .await;
-            self.finish(applied).await?;
+            Ok(())
         }
-        Ok(())
+        .await;
+        self.finish(applied).await
+    }
+
+    /// The schema version, refusing one newer than `known`.
+    async fn check_version(&self, known: i64) -> Result<i64> {
+        let found = self.schema_version().await?;
+        if !(0..=known).contains(&found) {
+            return Err(Error::TooNew {
+                path: self.path.clone(),
+                found,
+                known,
+            });
+        }
+        Ok(found)
     }
 
     /// The highest migration applied; 0 for a new database.
     pub async fn schema_version(&self) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'schema_version'",
+                (),
+            )
+            .await?;
+        let exists = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)? > 0,
+            None => false,
+        };
+        drop(rows);
+        if !exists {
+            return Ok(0);
+        }
         let mut rows = self
             .conn
             .query("SELECT COALESCE(MAX(version), 0) FROM schema_version", ())
@@ -142,50 +191,54 @@ impl Store {
         Ok(())
     }
 
-    /// Commit if `result` is `Ok`, roll back otherwise.
+    /// Commit if `result` is `Ok`, roll back otherwise, including when the
+    /// commit itself fails, so the connection never stays inside a transaction.
     async fn finish<T>(&self, result: Result<T>) -> Result<T> {
-        match result {
-            Ok(value) => {
-                self.conn.execute("COMMIT", ()).await?;
-                Ok(value)
-            }
-            Err(e) => {
-                // The original error matters more than a failed rollback.
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                Err(e)
-            }
-        }
+        let result = match result {
+            Ok(value) => match self.conn.execute("COMMIT", ()).await {
+                Ok(_) => return Ok(value),
+                Err(e) => Err(e.into()),
+            },
+            Err(e) => Err(e),
+        };
+        self.rollback().await;
+        result
+    }
+
+    /// Roll back, ignoring failure: the error that caused it matters more.
+    async fn rollback(&self) {
+        let _ = self.conn.execute("ROLLBACK", ()).await;
     }
 }
 
-/// The database and its write-ahead log hold private keys: create both
-/// owner-only before Turso opens them, and tighten them if they exist.
-fn prepare_files(path: &Path) -> Result<()> {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    for file in [path, Path::new(&wal)] {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let ctx = || format!("preparing {}", file.display());
-        let f = opts.open(file).map_err(|e| Error::io(ctx(), e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| Error::io(ctx(), e))?;
+/// Create the database file owner-only if it doesn't exist, and its
+/// directory (0700) if that's missing too.
+fn create_file(path: &Path) -> Result<()> {
+    let ctx = || format!("creating {}", path.display());
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if !dir.exists() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(dir).map_err(|e| Error::io(ctx(), e))?;
         }
     }
-    Ok(())
-}
-
-/// Turso reports another process's lock as a generic error; its text is the only tell.
-fn is_locked(e: &turso::Error) -> bool {
-    e.to_string().contains("locked by another process")
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(Error::io(ctx(), e)),
+    }
 }
 
 #[cfg(test)]
