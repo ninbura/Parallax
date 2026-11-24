@@ -460,3 +460,43 @@ fn iptables_apply_refills_chains_in_one_restore() {
         .any(|l| l == "iptables -t filter -X PARALLAX_T2"));
     assert!(!lines.iter().any(|l| l.contains("-X PARALLAX_T1")));
 }
+
+/// `config export` writes one canonical layout; freeze it, and check it
+/// parses back to the same configuration.
+#[test]
+fn config_export_layout_matches_golden() {
+    let canonical = canonical_config();
+    let text = canonical.to_toml().unwrap();
+    assert_eq!(Config::from_toml(&text).unwrap(), canonical);
+    check_golden("config/canonical.toml", &text);
+
+    // Several grants go one per line; a section's sub-table that doesn't fit
+    // on one line becomes a header in every entry of that section.
+    let mut busy = canonical_config();
+    busy.server.wan_interface = Some("eth1".into());
+    let t = &mut busy.templates[0];
+    t.grants = vec![
+        Grant::Network {
+            name: "home".into(),
+        },
+        Grant::HostPort {
+            ip: std::net::Ipv4Addr::new(192, 168, 1, 10),
+            proto: parallax_core::model::Proto::Udp,
+            port: 53,
+        },
+        Grant::Internet,
+    ];
+    t.visible_networks = Some(vec!["home".into()]);
+    t.headscale.tag = Some("tag:personal-devices-with-a-long-name".into());
+    t.headscale.user = Some("someone-with-a-long-user-name-for-the-headscale-identity".into());
+    let text = busy.to_toml().unwrap();
+    assert_eq!(Config::from_toml(&text).unwrap(), busy);
+    check_golden("config/busy.toml", &text);
+
+    // A fresh install has no peers: the section is left out, not `peer = []`.
+    let mut empty = canonical_config();
+    empty.peers.clear();
+    let text = empty.to_toml().unwrap();
+    assert!(!text.contains("peer"), "{text}");
+    assert_eq!(Config::from_toml(&text).unwrap(), empty);
+}

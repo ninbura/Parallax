@@ -239,6 +239,12 @@ hold any retained private keys, so keep exports private: `config export -o
 <file>` writes mode 0600 (in `docker/config/` here), while a shell
 redirect (`> file`) creates the file with your shell's umask.
 
+Export and edit always write one layout: sections in order (server,
+networks, services, templates, peers), one block per entry, short settings
+on one line (`dns = { ... }`), and one grant per line. Comments aren't kept:
+the database doesn't store them, so keep notes elsewhere (the GUI will have a
+place for them).
+
 Comments and layout don't survive the round trip: an export lists every
 setting, defaults included, in a fixed order.
 

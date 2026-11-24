@@ -11,7 +11,8 @@ rust-version = "1.100"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-toml = "1"
+# preserve_order: `config export` keeps the model's field order.
+toml = { version = "1", features = ["preserve_order"] }
 ipnet = { version = "2.10", features = ["serde"] }
 thiserror = "2"
 base64 = "0.23"
