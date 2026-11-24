@@ -13,6 +13,9 @@ tokio.workspace = true
 turso.workspace = true
 serde.workspace = true
 toml.workspace = true
+age.workspace = true
+tar.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

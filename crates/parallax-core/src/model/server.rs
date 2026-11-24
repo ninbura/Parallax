@@ -19,6 +19,8 @@ pub struct ServerConfig {
     pub firewall: FirewallServer,
     #[serde(default)]
     pub proxy: ProxyServer,
+    #[serde(default)]
+    pub backup: BackupServer,
     /// Interface with the default route, used by `internet` grants. Defaults
     /// to the first network's interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,6 +210,129 @@ fn default_upstream_ca() -> PathBuf {
     PathBuf::from("/etc/ssl/certs/ca-certificates.crt")
 }
 
+/// Backups of everything Parallax keeps (`parallax backup`): the database and
+/// the server's private key, in one file per backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupServer {
+    /// Where backups are written. Best on another disk than the database.
+    #[serde(default = "default_backup_directory")]
+    pub directory: PathBuf,
+    /// Back up every `interval` when something changed. `parallax backup
+    /// create` works either way.
+    #[serde(default = "default_true")]
+    pub automatic: bool,
+    #[serde(default = "default_backup_interval")]
+    pub interval: Interval,
+    /// How many backups to keep; the oldest are deleted first.
+    #[serde(default = "default_backup_keep")]
+    pub keep: u32,
+    /// Encrypt backups with the passphrase in `passphrase_file`.
+    #[serde(default = "default_true")]
+    pub encrypt: bool,
+    /// 0600 file holding the backup passphrase (`parallax backup
+    /// passphrase`). Never stored in the database, so no backup carries it.
+    #[serde(default = "default_passphrase_file")]
+    pub passphrase_file: PathBuf,
+}
+
+impl Default for BackupServer {
+    fn default() -> Self {
+        BackupServer {
+            directory: default_backup_directory(),
+            automatic: true,
+            interval: default_backup_interval(),
+            keep: default_backup_keep(),
+            encrypt: true,
+            passphrase_file: default_passphrase_file(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_backup_directory() -> PathBuf {
+    PathBuf::from("/var/lib/parallax/backups")
+}
+fn default_backup_interval() -> Interval {
+    Interval::from_secs(Interval::DAY)
+}
+fn default_backup_keep() -> u32 {
+    14
+}
+fn default_passphrase_file() -> PathBuf {
+    PathBuf::from("/etc/parallax/backup.passphrase")
+}
+
+/// A period of whole minutes, written `30m`, `6h` or `1d`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Interval(u64);
+
+impl Interval {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * Interval::MINUTE;
+    const DAY: u64 = 24 * Interval::HOUR;
+
+    /// `secs` should be a whole number of minutes, or it prints as seconds rounded down.
+    pub const fn from_secs(secs: u64) -> Self {
+        Interval(secs)
+    }
+    pub fn as_secs(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::str::FromStr for Interval {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> crate::Result<Self> {
+        let malformed = || crate::Error::Malformed {
+            what: "interval",
+            detail: format!("'{s}' is not a period like 30m, 6h or 1d"),
+        };
+        let s = s.trim();
+        let (number, unit) = s.split_at(s.len().saturating_sub(1));
+        let unit = match unit {
+            "m" => Interval::MINUTE,
+            "h" => Interval::HOUR,
+            "d" => Interval::DAY,
+            _ => return Err(malformed()),
+        };
+        let n: u64 = number.parse().map_err(|_| malformed())?;
+        match n.checked_mul(unit) {
+            Some(secs) if secs > 0 => Ok(Interval(secs)),
+            _ => Err(malformed()),
+        }
+    }
+}
+
+impl TryFrom<String> for Interval {
+    type Error = crate::Error;
+    fn try_from(s: String) -> crate::Result<Self> {
+        s.parse()
+    }
+}
+
+impl From<Interval> for String {
+    fn from(i: Interval) -> String {
+        i.to_string()
+    }
+}
+
+impl std::fmt::Display for Interval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = self.0;
+        if secs.is_multiple_of(Interval::DAY) {
+            write!(f, "{}d", secs / Interval::DAY)
+        } else if secs.is_multiple_of(Interval::HOUR) {
+            write!(f, "{}h", secs / Interval::HOUR)
+        } else {
+            write!(f, "{}m", secs / Interval::MINUTE)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FirewallBackend {
@@ -215,4 +340,37 @@ pub enum FirewallBackend {
     Nftables,
     /// Rendered through `iptables-nft` for hosts without a usable `nft` binary.
     IptablesNft,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intervals_parse_and_print_in_their_largest_unit() {
+        for (text, secs, shown) in [
+            ("30m", 1800, "30m"),
+            ("90m", 5400, "90m"),
+            ("120m", 7200, "2h"),
+            ("6h", 21_600, "6h"),
+            ("48h", 172_800, "2d"),
+            ("1d", 86_400, "1d"),
+        ] {
+            let i: Interval = text.parse().unwrap();
+            assert_eq!(i.as_secs(), secs, "{text}");
+            assert_eq!(i.to_string(), shown, "{text}");
+        }
+        for bad in [
+            "",
+            "0d",
+            "1",
+            "d",
+            "1w",
+            "-1h",
+            "1.5h",
+            "99999999999999999999d",
+        ] {
+            assert!(bad.parse::<Interval>().is_err(), "{bad}");
+        }
+    }
 }

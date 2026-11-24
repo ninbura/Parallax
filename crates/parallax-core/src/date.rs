@@ -56,6 +56,17 @@ impl Date {
             day: d,
         }
     }
+
+    /// Days since the Unix epoch: the inverse of [`Date::from_unix_days`].
+    pub fn to_unix_days(self) -> i64 {
+        let (m, d) = (i64::from(self.month), i64::from(self.day));
+        let y = i64::from(self.year) - i64::from(m <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
 }
 
 impl fmt::Display for Date {
@@ -120,5 +131,8 @@ mod tests {
     fn epoch_conversion() {
         assert_eq!(Date::from_unix_days(0), Date::new(1970, 1, 1).unwrap());
         assert_eq!(Date::from_unix_days(20_702), Date::new(2026, 9, 6).unwrap());
+        for days in [-800_000, -1, 0, 59, 60, 11_016, 20_702, 1_000_000] {
+            assert_eq!(Date::from_unix_days(days).to_unix_days(), days);
+        }
     }
 }

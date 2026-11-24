@@ -1,4 +1,4 @@
-//! Reading and writing the configuration tables (migration 0001).
+//! Reading and writing the configuration tables.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
@@ -145,7 +145,9 @@ impl Store {
                     dns_listen, dns_port, dns_public_resolver,
                     firewall_backend, firewall_docker_coexistence,
                     proxy_listen, proxy_port, proxy_certificates, proxy_upstream_ca,
-                    wan_interface
+                    wan_interface,
+                    backup_directory, backup_automatic, backup_interval, backup_keep,
+                    backup_encrypt, backup_passphrase_file
                  FROM server WHERE id = 1",
                 Vec::new(),
             )
@@ -185,6 +187,19 @@ impl Store {
                 certificates: PathBuf::from(r.get::<String>(18)?),
                 upstream_ca: PathBuf::from(r.get::<String>(19)?),
             },
+            backup: BackupServer {
+                directory: PathBuf::from(r.get::<String>(21)?),
+                automatic: r.get(22)?,
+                interval: parse(at, "backup interval", &r.get::<String>(23)?)?,
+                keep: {
+                    let keep: i64 = r.get(24)?;
+                    u32::try_from(keep).map_err(|_| {
+                        Error::Stored(format!("{at}: backup keep {keep} is out of range"))
+                    })?
+                },
+                encrypt: r.get(25)?,
+                passphrase_file: PathBuf::from(r.get::<String>(26)?),
+            },
             wan_interface: r.get(20)?,
         }))
     }
@@ -192,6 +207,7 @@ impl Store {
     async fn save_server(&self, s: &ServerConfig) -> Result<()> {
         let w = &s.wireguard;
         let h = &s.headscale;
+        let b = &s.backup;
         self.upsert(
             "server",
             "id",
@@ -233,6 +249,18 @@ impl Store {
                     path("server.proxy.upstream_ca", &s.proxy.upstream_ca)?,
                 ),
                 ("wan_interface", s.wan_interface.clone().into()),
+                (
+                    "backup_directory",
+                    path("server.backup.directory", &b.directory)?,
+                ),
+                ("backup_automatic", b.automatic.into()),
+                ("backup_interval", text(b.interval)),
+                ("backup_keep", i64::from(b.keep).into()),
+                ("backup_encrypt", b.encrypt.into()),
+                (
+                    "backup_passphrase_file",
+                    path("server.backup.passphrase_file", &b.passphrase_file)?,
+                ),
             ],
         )
         .await?;

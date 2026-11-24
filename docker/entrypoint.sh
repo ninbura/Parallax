@@ -2,7 +2,7 @@
 # Parallax container entrypoint.
 #   run       on first start import the configuration, check the host
 #             (`parallax doctor`), apply, start tailscaled, the DNS server and
-#             the HTTPS proxy, stay up; SIGHUP re-applies
+#             the HTTPS proxy, stay up, back up when due; SIGHUP re-applies
 #   <other>   pass through to the parallax binary (e.g. `doctor`, `peer add ...`)
 set -eu
 
@@ -96,6 +96,17 @@ reload() {
     fi
 }
 
+# `--if-due` decides: automatic backups on, the newest older than the
+# interval, and something changed. So checking often costs little.
+BACKUP_ROUNDS=300   # rounds of the loop below (2 s each): every 10 minutes
+backup_if_due() {
+    if ! out="$(parallax backup create --if-due 2>&1)"; then
+        echo "parallax: warning: automatic backup failed: $out" >&2
+    elif [ -n "$out" ]; then
+        echo "$out" | sed 's/^/parallax: /'
+    fi
+}
+
 # Running, and not a zombie: a child that exited but isn't reaped yet still
 # answers `kill -0`, and when the shell reaps it varies between shells.
 alive() {
@@ -119,6 +130,8 @@ for name_pid in "DNS server:$DNS_PID" "HTTPS proxy:$PROXY_PID"; do
     fi
 done
 echo "parallax: gateway up; send SIGHUP to re-apply after changing the configuration"
+backup_if_due
+rounds=0
 # Wait on both. A trapped signal makes `wait` return >128 while they still
 # run (and `set -e` would treat that as fatal). If either exits, so does the
 # container, and Docker's restart policy takes over.
@@ -131,4 +144,9 @@ while :; do
             teardown 1
         fi
     done
+    rounds=$((rounds + 1))
+    if [ "$rounds" -ge "$BACKUP_ROUNDS" ]; then
+        rounds=0
+        backup_if_due
+    fi
 done

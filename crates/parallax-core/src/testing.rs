@@ -50,6 +50,7 @@ pub fn canonical_config() -> Config {
                 docker_coexistence: true,
             },
             proxy: ProxyServer::default(),
+            backup: BackupServer::default(),
             wan_interface: None,
         },
         networks: vec![Network {

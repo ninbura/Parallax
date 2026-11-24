@@ -19,12 +19,34 @@ impl Scratch {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/parallax.toml");
-        let text = std::fs::read_to_string(example).unwrap().replace(
-            "/etc/parallax/wg-server.key",
-            &dir.join("wg-server.key").to_string_lossy(),
-        );
+        let mut text = std::fs::read_to_string(example).unwrap();
+        for (from, to) in [
+            ("/etc/parallax/wg-server.key", "wg-server.key"),
+            ("/var/lib/parallax/backups", "backups"),
+            ("/etc/parallax/backup.passphrase", "backup.passphrase"),
+        ] {
+            text = text.replace(from, &dir.join(to).to_string_lossy());
+        }
         std::fs::write(dir.join("parallax.toml"), text).unwrap();
         Scratch { dir }
+    }
+    /// The backups written so far, oldest first.
+    fn backups(&self) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(self.dir.join("backups"))
+            .map(|d| d.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default();
+        found.sort();
+        found
+    }
+    /// Import, create the server key and set a generated backup passphrase.
+    fn gateway(&self) {
+        self.import();
+        let (ok, _, err) = self.run(&["keygen", "--write-config"]);
+        assert!(ok, "{err}");
+        let (ok, out, err) = self.run(&["backup", "passphrase", "--generate"]);
+        assert!(ok, "{err}");
+        assert_eq!(out.trim().len(), 29, "{out}");
+        assert!(err.contains("password manager"), "{err}");
     }
     /// The TOML file tests edit before importing it.
     fn config(&self) -> PathBuf {
@@ -448,4 +470,155 @@ fn every_database_file_is_owner_only() {
         }
     }
     assert!(seen >= 2, "expected the database and its log");
+}
+
+#[test]
+fn a_backup_restores_what_changed_since() {
+    let s = Scratch::new("backup");
+    s.gateway();
+    let (ok, out, err) = s.run(&["backup", "create"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("(encrypted)"), "{out}");
+    let file = s.backups().pop().unwrap();
+    let (ok, out, _) = s.run(&["backup", "list"]);
+    assert!(
+        ok && out.contains("encrypted") && out.contains("schema 2"),
+        "{out}"
+    );
+
+    let key = std::fs::read_to_string(s.dir.join("wg-server.key")).unwrap();
+    s.run(&["peer", "remove", "laptop"]);
+    std::fs::write(s.dir.join("wg-server.key"), "changed\n").unwrap();
+
+    // Without a terminal, only --yes can say yes.
+    let (ok, _, err) = s.run(&["backup", "restore", &file.to_string_lossy()]);
+    assert!(!ok && err.contains("needs a terminal"), "{err}");
+
+    let out_dir = s.dir.join("out");
+    let (ok, out, err) = s.run(&[
+        "backup",
+        "restore",
+        &file.to_string_lossy(),
+        "--yes",
+        "-o",
+        &out_dir.to_string_lossy(),
+    ]);
+    assert!(ok, "{err}");
+    assert!(out.contains("+name = \"laptop\""), "{out}");
+    assert!(out.contains("is replaced with the backup's"), "{out}");
+    assert!(out.contains("saved the current state first"), "{out}");
+    assert!(out.contains("run `parallax apply`"), "{out}");
+    assert!(!out.contains(key.trim()), "the key must never be printed");
+    let (_, out, _) = s.run(&["validate"]);
+    assert!(out.contains("3 peers"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(s.dir.join("wg-server.key")).unwrap(),
+        key
+    );
+    // The original and the state saved before restoring.
+    assert_eq!(s.backups().len(), 2);
+}
+
+#[test]
+fn a_backup_restores_onto_a_fresh_install() {
+    let s = Scratch::new("backup-fresh");
+    s.gateway();
+    s.run(&["backup", "create"]);
+    let file = s.backups().pop().unwrap();
+    let passphrase = s.dir.join("backup.passphrase");
+    let typed = s.dir.join("typed");
+    std::fs::rename(&passphrase, &typed).unwrap();
+    std::fs::remove_file(s.dir.join("wg-server.key")).unwrap();
+
+    let fresh = s.dir.join("fresh/parallax.db");
+    let restore = |pass: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_parallax"))
+            .arg("--db")
+            .arg(&fresh)
+            .args(["backup", "restore", "--yes", "-o"])
+            .arg(s.dir.join("out"))
+            .arg("--passphrase-file")
+            .arg(pass)
+            .arg(&file)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    std::fs::write(s.dir.join("wrong"), "not it\n").unwrap();
+    let out = restore(&s.dir.join("wrong"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("passphrase is wrong"),
+        "{err}"
+    );
+
+    let out = restore(&typed);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("holds no configuration yet"), "{text}");
+    assert!(text.contains("saved the backup passphrase"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&passphrase).unwrap(),
+        std::fs::read_to_string(&typed).unwrap()
+    );
+    assert!(s.dir.join("wg-server.key").exists());
+}
+
+#[test]
+fn automatic_backups_skip_when_not_due_or_unchanged() {
+    let s = Scratch::new("backup-due");
+    s.gateway();
+    let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
+    assert!(ok && out.contains("wrote"), "{out}{err}");
+    // Not due: the newest is younger than the interval.
+    let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
+    assert!(ok && out.is_empty(), "{out}{err}");
+
+    // Due, but nothing changed.
+    let file = s.backups().pop().unwrap();
+    let old = file.with_file_name("parallax-backup-20200101T000000Z.tar");
+    std::fs::rename(&file, &old).unwrap();
+    let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
+    assert!(ok && out.is_empty(), "{out}{err}");
+    assert_eq!(s.backups(), std::slice::from_ref(&old));
+
+    s.run(&["peer", "remove", "laptop"]);
+    let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
+    assert!(ok && out.contains("wrote"), "{out}{err}");
+    assert_eq!(s.backups().len(), 2);
+}
+
+#[test]
+fn backups_rotate_and_need_a_passphrase_when_encrypted() {
+    let s = Scratch::new("backup-rotate");
+    s.import();
+    s.run(&["keygen", "--write-config"]);
+    let (ok, _, err) = s.run(&["backup", "create"]);
+    assert!(!ok && err.contains("`parallax backup passphrase`"), "{err}");
+
+    let edited = std::fs::read_to_string(s.config())
+        .unwrap()
+        .replace("keep = 14", "keep = 2")
+        .replace("encrypt = true", "encrypt = false");
+    std::fs::write(s.config(), edited).unwrap();
+    s.import();
+    for _ in 0..3 {
+        let (ok, out, err) = s.run(&["backup", "create"]);
+        assert!(ok && out.contains("(not encrypted)"), "{out}{err}");
+    }
+    let (_, out, _) = s.run(&["backup", "create"]);
+    assert!(
+        out.contains("deleted") && out.contains("(keeping 2)"),
+        "{out}"
+    );
+    assert_eq!(s.backups().len(), 2);
+
+    let (ok, _, err) = s.run(&["backup", "passphrase", "--generate"]);
+    assert!(ok && err.contains("don't use it yet"), "{err}");
+    let (ok, _, err) = s.run(&["backup", "passphrase", "--generate"]);
+    assert!(!ok && err.contains("--replace"), "{err}");
 }

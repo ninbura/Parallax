@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use crate::io::System;
-use crate::model::{Config, FirewallBackend};
+use crate::model::{BackupServer, Config, FirewallBackend};
 
 /// The kernel's identity mapping: the initial user namespace maps every uid to itself.
 const INIT_USERNS_UID_MAP: (u64, u64, u64) = (0, 0, 4_294_967_295);
@@ -25,18 +25,31 @@ const NETMAP_PROBE: &str = "table inet parallax_probe {
 ";
 const SETUP_DOC: &str = "docs/setup.md";
 
-/// The outcome of one check: `Ok` with what was found, or `Err` with the problem and the fix.
+/// One check and what it found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     pub name: String,
-    pub result: Result<String, String>,
+    pub outcome: Outcome,
+}
+
+/// Each carries what was found, or the problem and the fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Ok(String),
+    /// Worth fixing, but the gateway runs.
+    Warn(String),
+    /// The gateway can't run until it's fixed.
+    Fail(String),
 }
 
 impl Check {
     fn new(name: impl Into<String>, result: Result<String, String>) -> Self {
         Check {
             name: name.into(),
-            result,
+            outcome: match result {
+                Ok(found) => Outcome::Ok(found),
+                Err(problem) => Outcome::Fail(problem),
+            },
         }
     }
 }
@@ -76,7 +89,123 @@ pub fn diagnose(config: Result<&Config, String>, sys: System<'_>) -> Vec<Check> 
     if backend == FirewallBackend::Nftables {
         checks.push(Check::new("NETMAP", check_netmap(sys)));
     }
+    if let Some(config) = config {
+        checks.push(Check {
+            name: "backups".into(),
+            outcome: check_backup(&config.server.backup, sys),
+        });
+    }
     checks
+}
+
+/// Backups are optional, so problems with them only warn. Also the startup
+/// log line saying where they go.
+fn check_backup(backup: &BackupServer, sys: System<'_>) -> Outcome {
+    let dir = &backup.directory;
+    let mut problems = Vec::new();
+    if !backup.automatic {
+        problems.push(
+            "automatic backups are off (server.backup.automatic = false); make one with `parallax backup create`"
+                .to_string(),
+        );
+    }
+    // Writing a file creates the directory too, as a backup would.
+    let probe = dir.join(".parallax-doctor");
+    match sys.fs.write(&probe, "", true) {
+        Ok(()) => {
+            let _ = sys.fs.remove(&probe);
+        }
+        Err(e) => problems.push(format!(
+            "can't write backups to {}: {e}; fix it or change server.backup.directory",
+            dir.display()
+        )),
+    }
+    if backup.encrypt {
+        let set =
+            matches!(sys.fs.read(&backup.passphrase_file), Ok(Some(p)) if !p.trim().is_empty());
+        if !set {
+            problems.push(format!(
+                "backups are encrypted but no passphrase is set ({} is missing); set one with `parallax backup passphrase`",
+                backup.passphrase_file.display()
+            ));
+        }
+    } else if let Some(fstype) = network_filesystem(dir, sys) {
+        problems.push(format!(
+            "backups are not encrypted, and {} is on a network filesystem ({fstype}); anyone who can read it gets every key. Set server.backup.encrypt = true",
+            dir.display()
+        ));
+    }
+    if !problems.is_empty() {
+        return Outcome::Warn(problems.join("; "));
+    }
+    Outcome::Ok(format!(
+        "every {} to {}, keeping {}, {}",
+        backup.interval,
+        dir.display(),
+        backup.keep,
+        if backup.encrypt {
+            "encrypted"
+        } else {
+            "not encrypted"
+        }
+    ))
+}
+
+/// The filesystem type `path` is on, when it's one reached over the network.
+fn network_filesystem(path: &Path, sys: System<'_>) -> Option<String> {
+    const NETWORK: &[&str] = &[
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "smbfs",
+        "ceph",
+        "glusterfs",
+        "afs",
+        "9p",
+        "fuse.sshfs",
+        "fuse.rclone",
+        "fuse.glusterfs",
+        "davfs",
+        "fuse.davfs2",
+    ];
+    let mounts = sys.fs.read(Path::new("/proc/self/mounts")).ok()??;
+    // The longest mount point holding `path` is the one it's on.
+    let (_, fstype) = mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let point = unescape_mount(fields.nth(1)?);
+            let fstype = fields.next()?;
+            path.starts_with(&point)
+                .then(|| (point.len(), fstype.to_string()))
+        })
+        .max_by_key(|(len, _)| *len)?;
+    NETWORK.contains(&fstype.as_str()).then_some(fstype)
+}
+
+/// `/proc/self/mounts` writes a space in a mount point as `\040`, and so on.
+fn unescape_mount(field: &str) -> String {
+    let mut out = String::new();
+    let mut rest = field;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let code = rest
+            .get(i + 1..i + 4)
+            .and_then(|o| u8::from_str_radix(o, 8).ok());
+        match code {
+            Some(c) => {
+                out.push(char::from(c));
+                rest = &rest[i + 4..];
+            }
+            None => {
+                out.push('\\');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Validate. An invalid configuration still names the interfaces to check.
@@ -344,11 +473,9 @@ mod tests {
     fn problems(checks: &[Check]) -> Vec<(&str, &str)> {
         checks
             .iter()
-            .filter_map(|c| {
-                c.result
-                    .as_ref()
-                    .err()
-                    .map(|e| (c.name.as_str(), e.as_str()))
+            .filter_map(|c| match &c.outcome {
+                Outcome::Fail(e) => Some((c.name.as_str(), e.as_str())),
+                _ => None,
             })
             .collect()
     }
@@ -369,12 +496,71 @@ mod tests {
                 "tools",
                 "interface eth0",
                 "wireguard",
-                "NETMAP"
+                "NETMAP",
+                "backups"
             ]
         );
         let lines = runner.command_lines();
         assert!(lines.contains(&"ip link add parallax-probe type wireguard".to_string()));
         assert_eq!(lines.last().map(String::as_str), Some("nft -c -f -"));
+    }
+
+    fn backup_outcome(config: &Config, fs: &MemoryFs) -> Outcome {
+        let checks = run_with(Ok(config), fs, &RecordingRunner::new());
+        let check = checks.iter().find(|c| c.name == "backups").unwrap();
+        check.outcome.clone()
+    }
+
+    #[test]
+    fn backups_report_where_they_go() {
+        let fs = healthy_fs().with_file("/etc/parallax/backup.passphrase", "secret\n");
+        assert_eq!(
+            backup_outcome(&canonical_config(), &fs),
+            Outcome::Ok("every 1d to /var/lib/parallax/backups, keeping 14, encrypted".into())
+        );
+        // The probe file is gone again.
+        assert_eq!(
+            fs.paths()
+                .iter()
+                .filter(|p| p.ends_with(".parallax-doctor"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn backup_problems_warn_without_failing() {
+        let mut config = canonical_config();
+        config.server.backup.automatic = false;
+        let Outcome::Warn(w) = backup_outcome(&config, &healthy_fs()) else {
+            panic!("expected a warning");
+        };
+        assert!(w.contains("automatic backups are off"), "{w}");
+        assert!(w.contains("no passphrase is set"), "{w}");
+        assert!(w.contains("`parallax backup passphrase`"), "{w}");
+    }
+
+    #[test]
+    fn unencrypted_backups_on_a_network_mount_warn() {
+        let mut config = canonical_config();
+        config.server.backup.encrypt = false;
+        config.server.backup.directory = "/mnt/nas share/parallax".into();
+        let mounts = "/dev/sda1 / ext4 rw 0 0\n\
+                      //nas/share /mnt/nas\\040share cifs rw 0 0\n\
+                      /dev/sdb1 /mnt/nas\\040share/local ext4 rw 0 0\n";
+        let fs = healthy_fs().with_file("/proc/self/mounts", mounts);
+        let Outcome::Warn(w) = backup_outcome(&config, &fs) else {
+            panic!("expected a warning");
+        };
+        assert!(w.contains("on a network filesystem (cifs)"), "{w}");
+
+        config.server.backup.directory = "/mnt/nas share/local/parallax".into();
+        assert!(matches!(backup_outcome(&config, &fs), Outcome::Ok(_)));
+        config.server.backup.directory = "/var/backups".into();
+        assert_eq!(
+            backup_outcome(&config, &fs),
+            Outcome::Ok("every 1d to /var/backups, keeping 14, not encrypted".into())
+        );
     }
 
     #[test]

@@ -45,7 +45,8 @@ EDITOR=nvim $parallax config edit -o /tmp/parallax-out
 ```
 
 `apply` needs Linux with `nft`, `wg` and `ip`; use the container (`docker/`)
-or read `docs/setup.md`.
+or read `docs/setup.md`. Backups (automatic, encrypted, one-command restore):
+`docs/backup.md`.
 
 ## Layout
 
@@ -58,7 +59,7 @@ or read `docs/setup.md`.
   home zones rewritten into mapped space.
 - `crates/parallax-cli`: `validate`, `plan`, `generate`, `apply`, `proxy`,
   `dns`, `keygen`, `config import|export|edit`, `peer add|remove|show`,
-  `export`, `doctor`.
+  `export`, `doctor`, `backup create|list|restore|passphrase`.
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
 - `example/parallax.toml`: the canonical scenario, fully commented.
 - `tests/integration/netns.sh`: Linux namespace test: mapping, DNS, per-tier access, the HTTPS proxy and the bypass matrix.

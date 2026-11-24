@@ -17,8 +17,8 @@ pub use grant::{Grant, Proto};
 pub use network::Network;
 pub use peer::{Peer, TailscalePeer, TransportKind, WireGuardPeer};
 pub use server::{
-    DerpMode, DnsServer, FirewallBackend, FirewallServer, HeadscaleServer, ProxyServer,
-    ServerConfig, WireGuardServer,
+    BackupServer, DerpMode, DnsServer, FirewallBackend, FirewallServer, HeadscaleServer, Interval,
+    ProxyServer, ServerConfig, WireGuardServer,
 };
 pub use service::Service;
 pub use template::{
