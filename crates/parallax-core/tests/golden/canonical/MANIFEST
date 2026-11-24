@@ -6,7 +6,7 @@ clients/sister-phone/linux.conf (secret)
 clients/sister-phone/macos.conf (secret)
 clients/sister-phone/mobile.conf (secret)
 clients/sister-phone/windows.conf (secret)
-dnsmasq/parallax.conf
+dns/routes.toml
 nftables/docker-user.nft
 nftables/parallax.nft
 nginx/snippets/parallax-family.conf

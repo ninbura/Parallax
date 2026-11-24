@@ -65,6 +65,7 @@ user = "staging"
 [template.dns]
 wireguard = "split"
 tailscale = "split"
+public = true
 [template.client]
 allowed_ips = "mapped_subnets"
 persistent_keepalive = 25

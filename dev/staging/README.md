@@ -12,7 +12,7 @@ QR code.
                           │ WireGuard to <this host>:51814
    ┌──────────────────────┴───────────────────────┐
    │ host: container parallax-staging, wg1        │
-   │ 10.9.0.1, DNS shim, nft table inet parallax  │
+   │ 10.9.0.1, DNS, nft table inet parallax       │
    └──────┬──────────────────────────────┬────────┘
      pxs-lan1 192.168.201.1         pxs-lan2 192.168.202.1
           │ routed                       │ masqueraded
@@ -29,13 +29,13 @@ must not be in use on your real network.
 
 ## Requirements
 
-Rootful Docker with Compose, `wireguard-tools`, `dnsmasq`, `python3`, `dig`,
+Rootful Docker with Compose, `wireguard-tools`, `dnsmasq` (the fake LANs' DNS), `python3`, `dig`,
 `curl`, `qrencode`, the `wireguard` kernel module. Everything runs as root,
 through `sudo` or `pkexec` (one prompt per command; `up` starts Docker if it's
 stopped).
 
-If the host runs a firewall such as ufw, allow the WireGuard port and the
-shim, as for any Parallax install (`docs/setup.md`):
+If the host runs a firewall such as ufw, allow the WireGuard port and DNS on
+the gateway address, as for any Parallax install (`docs/setup.md`):
 
 ```sh
 sudo ufw allow proto udp to <this host's LAN address> port 51814
@@ -73,7 +73,9 @@ a fresh client namespace to the real endpoint, and checks the following:
 - **Mapped addresses.** Both LANs are reachable by mapped address. On the
   routed LAN the host sees the tunnel address; on the masqueraded LAN it sees
   the gateway.
-- **DNS shim.** It rewrites `staging.test` answers into mapped space.
+- **DNS.** The personal peer gets `staging.test` answers rewritten into mapped
+  space, and public names (`dns.public`). The guest, whose only grant is a
+  service without hostnames, gets every name refused.
 - **LAN-initiated traffic.** On the routed LAN, a host can start a connection
   to a peer.
 - **Gateway isolation.** No peer reaches services on the gateway host.

@@ -12,9 +12,9 @@ RUN cargo build --release -p parallax-cli && strip target/release/parallax
 
 FROM alpine:3.21
 # wireguard-tools: wg/wg-quick; nftables: nft; iptables+ipset: fallback backend;
-# dnsmasq: the DNS shim; iproute2: ip; tailscale: subnet-router node (M2 drives it).
+# iproute2: ip; tailscale: subnet-router node (M2 drives it). DNS is built in.
 RUN apk add --no-cache \
-        wireguard-tools nftables iptables ipset dnsmasq iproute2 tailscale \
+        wireguard-tools nftables iptables ipset iproute2 tailscale \
         bind-tools curl ca-certificates tini
 COPY --from=build /src/target/release/parallax /usr/local/bin/parallax
 COPY docker/entrypoint.sh /usr/local/bin/parallax-entrypoint

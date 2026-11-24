@@ -51,8 +51,9 @@ pub enum DnsMode {
     /// the local network's resolver. The only correct posture on colliding LANs.
     #[default]
     Split,
-    /// Send all DNS to the shim, which forwards non-home zones to a public
-    /// resolver. The only option on the official mobile WireGuard apps.
+    /// Send all DNS to the gateway, which answers public names only for
+    /// templates with `dns.public`. The only option on the official mobile
+    /// WireGuard apps.
     TunnelWide,
     /// Do not configure DNS. Raw mapped IPs still work.
     None,
@@ -77,6 +78,13 @@ pub struct DnsPolicy {
     pub wireguard: DnsMode,
     #[serde(default)]
     pub tailscale: DnsMode,
+    /// Parallax's DNS server answers this template's public lookups (names
+    /// outside the operator's zones) through `server.dns.public_resolver`.
+    /// Off by default: a guest's lookups don't leave through the home
+    /// connection. Mobile WireGuard apps send every query to the gateway, so
+    /// with this off they resolve only the template's home names.
+    #[serde(default)]
+    pub public: bool,
 }
 
 /// What the courtesy `AllowedIPs` in an exported client config contains.

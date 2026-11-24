@@ -32,10 +32,10 @@ subnet_router_node = "parallax-gateway"
 interface = "tailscale0"
 
 [server.dns]
-# The shim listens on the WireGuard gateway address unless overridden.
+# Parallax's DNS server listens on the WireGuard gateway address unless overridden.
 # listen = "10.8.0.1"
 port = 53
-# Catch-all for tunnel-wide clients: mobile WireGuard exports send every query here.
+# Where public names go, for templates with dns.public = true.
 public_resolver = "1.1.1.1"
 
 [server.firewall]
@@ -105,9 +105,12 @@ pool = "10.8.1.0/24"
 [template.headscale]
 user = "gabriel"
 [template.dns]
-# split: only the home zones go to the shim; everything else stays local.
+# split: only the home zones go to the gateway; everything else stays local.
 wireguard = "split"
 tailscale = "split"
+# Answer public names too. Phones on the WireGuard app send every query to the
+# gateway, so without this they resolve only home names while connected.
+public = true
 [template.client]
 # mapped_subnets: routes for the visible networks' client prefixes plus the shim.
 allowed_ips = "mapped_subnets"
@@ -121,10 +124,12 @@ pool = "10.8.2.0/24"
 [template.headscale]
 tag = "tag:family"
 [template.dns]
-# Plain WireGuard cannot split DNS on phones, so send everything to the shim;
+# Plain WireGuard cannot split DNS on phones, so send everything to the gateway;
 # the Tailscale client does split DNS natively on every platform.
 wireguard = "tunnel_wide"
 tailscale = "split"
+# public is off (the default): the gateway answers only this template's names
+# (Immich), so a guest's other lookups never leave through the home connection.
 [template.client]
 # grants_only: the config routes just the granted hosts (in virtual space) plus the shim.
 allowed_ips = "grants_only"

@@ -1,5 +1,5 @@
 //! 1:1 prefix translation (NETMAP). One [`Mapping`] generates the nftables
-//! NETMAP rules, the dnsmasq `alias=` line, client routes and Headscale ACL
+//! NETMAP rules, the DNS server's answer rewrite, client routes and Headscale ACL
 //! addresses; operators never write the translation twice.
 
 use std::net::Ipv4Addr;
@@ -39,11 +39,6 @@ impl Mapping {
     pub fn virt(&self) -> Ipv4Net {
         self.virt
     }
-    /// Dotted-quad netmask, as dnsmasq's `alias=` wants it.
-    pub fn netmask(&self) -> Ipv4Addr {
-        self.real.netmask()
-    }
-
     fn host_mask(&self) -> u32 {
         !u32::from(self.real.netmask())
     }
@@ -98,7 +93,6 @@ mod tests {
         );
         assert_eq!(m.to_virtual("10.0.0.1".parse().unwrap()), None);
         assert_eq!(m.to_real("192.168.1.5".parse().unwrap()), None);
-        assert_eq!(m.netmask(), Ipv4Addr::new(255, 255, 255, 0));
     }
 
     #[test]

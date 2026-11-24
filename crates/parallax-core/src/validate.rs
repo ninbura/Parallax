@@ -352,16 +352,6 @@ impl<'a> Model<'a> {
             .or_else(|| self.config.networks.first().map(|n| n.interface.as_str()))
     }
 
-    /// Some client may send all DNS to the shim, so it needs a catch-all resolver.
-    /// A WireGuard `split` template counts: its mobile export falls back to
-    /// tunnel-wide, because the official mobile apps cannot split DNS.
-    pub fn needs_catch_all_resolver(&self) -> bool {
-        self.config
-            .templates
-            .iter()
-            .any(|t| t.dns.wireguard != DnsMode::None || t.dns.tailscale == DnsMode::TunnelWide)
-    }
-
     /// Any template grants internet egress.
     pub fn any_internet_grant(&self) -> bool {
         self.config
@@ -507,6 +497,9 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
     // --- networks -------------------------------------------------------
     let mut seen_names: BTreeSet<&str> = BTreeSet::new();
     let mut client_prefixes: Vec<(String, Ipv4Net)> = Vec::new(); // what tunnel clients route
+                                                                  // Lower-cased zone -> the network that declared it. The DNS server sends
+                                                                  // a zone to one network's resolvers, so two can't share it.
+    let mut seen_zones: BTreeMap<String, &str> = BTreeMap::new();
     for n in &config.networks {
         let ctx = format!("network '{}'", n.name);
         if !valid_ident(&n.name) {
@@ -603,6 +596,13 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         for d in &n.domains {
             if !valid_zone(d) {
                 errors.push(format!("{ctx}: '{d}' is not a valid DNS zone"));
+            }
+            if let Some(other) = seen_zones.insert(d.to_ascii_lowercase(), &n.name) {
+                errors.push(if other == n.name {
+                    format!("{ctx}: domain '{d}' is listed twice")
+                } else {
+                    format!("{ctx}: domain '{d}' is already declared by network '{other}'")
+                });
             }
         }
         for dns in &n.upstream_dns {
@@ -952,6 +952,27 @@ mod tests {
     }
 
     #[test]
+    fn a_zone_belongs_to_one_network() {
+        let e = errors_of(|c| {
+            let mut lab = c.networks[0].clone();
+            lab.name = "lab".into();
+            lab.subnet = "192.168.50.0/24".parse().unwrap();
+            lab.mapped_to = Some("198.18.50.0/24".parse().unwrap());
+            lab.domains = vec!["MyDomain.com".into()];
+            c.networks.push(lab);
+        });
+        assert!(
+            has(
+                &e,
+                "network 'lab': domain 'MyDomain.com' is already declared by network 'home'"
+            ),
+            "{e:?}"
+        );
+        let e = errors_of(|c| c.networks[0].domains.push("mydomain.com".into()));
+        assert!(has(&e, "domain 'mydomain.com' is listed twice"), "{e:?}");
+    }
+
+    #[test]
     fn detects_prefix_length_mismatch() {
         let e = errors_of(|c| c.networks[0].mapped_to = Some("198.18.1.0/25".parse().unwrap()));
         assert!(has(&e, "same prefix length"), "{e:?}");
@@ -1068,22 +1089,6 @@ mod tests {
         assert_eq!(m.active_peers().count(), 2);
         let m = Model::resolve(&cfg, Date::new(2025, 12, 31).unwrap()).unwrap();
         assert_eq!(m.active_peers().count(), 3);
-    }
-
-    #[test]
-    fn split_templates_need_catch_all_for_mobile_exports() {
-        let mut cfg = canonical_config();
-        for t in &mut cfg.templates {
-            t.dns.wireguard = DnsMode::Split;
-            t.dns.tailscale = DnsMode::Split;
-        }
-        let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
-        assert!(m.needs_catch_all_resolver());
-        for t in &mut cfg.templates {
-            t.dns.wireguard = DnsMode::None;
-        }
-        let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
-        assert!(!m.needs_catch_all_resolver());
     }
 
     fn proxy_immich(c: &mut Config) {

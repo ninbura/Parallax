@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/parallax-core", "crates/parallax-proxy", "crates/parallax-cli"]
+members = ["crates/parallax-core", "crates/parallax-proxy", "crates/parallax-dns", "crates/parallax-cli"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -35,6 +35,12 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["std"
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12", "logging"] }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "ring", "tls12", "logging"] }
 rcgen = "0.14"
+# The DNS server (parallax-dns): hickory's server for UDP/TCP framing,
+# truncation and EDNS, and its resolver (re-exported by the server) for
+# forwarding with a cache and TCP fallback. async-trait: hickory's handler
+# trait needs it.
+hickory-server = { version = "0.26.3", default-features = false, features = ["resolver"] }
+async-trait = "0.1"
 
 # Enforced in CI via `cargo clippy -- -D warnings`. See AGENTS.md.
 [workspace.lints.rust]

@@ -1,0 +1,18 @@
+[package]
+name = "parallax-dns"
+description = "Parallax DNS server: per-tier answers, home zones rewritten into mapped space"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+parallax-core = { path = "../parallax-core" }
+thiserror.workspace = true
+ipnet.workspace = true
+tokio.workspace = true
+hickory-server.workspace = true
+async-trait.workspace = true
+
+[lints]
+workspace = true

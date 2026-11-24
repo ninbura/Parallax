@@ -114,7 +114,8 @@ pub enum DerpMode {
     Tailscale,
 }
 
-/// The DNS shim.
+/// The DNS shim: Parallax's built-in DNS server (`parallax dns`), which
+/// answers each tier only the names it may reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsServer {

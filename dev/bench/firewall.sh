@@ -4,7 +4,7 @@
 # rulesets. Throughput and CPU are compared to see what re-checking every
 # packet a peer sends (instead of accepting established flows up front) costs.
 #
-# Needs root, nft, wg, ip, dnsmasq, iperf3 and python3. Arguments are the
+# Needs root, nft, wg, ip, iperf3 and python3. Arguments are the
 # builds to compare, as label=path (default: new=<this checkout>/target/release/parallax):
 #   dev/bench/firewall.sh main=/tmp/main/parallax new=target/release/parallax
 # Each build runs twice: as configured, and with PADDING templates ahead of
@@ -36,7 +36,7 @@ case "$MODE" in
 esac
 [ "$PADDING" -le 200 ] || { echo "PADDING is at most 200 (one /24 each from 10.8.11.0)"; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
-for t in nft wg ip dnsmasq iperf3 python3; do command -v $t >/dev/null || { echo "missing $t"; exit 2; }; done
+for t in nft wg ip iperf3 python3; do command -v $t >/dev/null || { echo "missing $t"; exit 2; }; done
 for build in "$@"; do
     case "$build" in *=*) ;; *) echo "builds are label=path, got '$build'"; exit 2 ;; esac
     [ -x "${build#*=}" ] || { echo "parallax binary not found at ${build#*=}"; exit 2; }

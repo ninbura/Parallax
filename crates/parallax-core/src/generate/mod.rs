@@ -2,7 +2,7 @@
 //! hand-edited. Output is deterministic so plan/diff and golden tests are exact.
 
 pub mod client;
-pub mod dnsmasq;
+pub mod dns;
 pub mod firewall;
 pub mod nginx;
 pub mod proxy;
@@ -21,7 +21,7 @@ pub enum ArtifactKind {
     WireGuardServer,
     Firewall,
     FirewallDockerUser,
-    Dnsmasq,
+    DnsRoutes,
     NginxSnippet,
     ProxyRoutes,
     ClientConfig,
@@ -96,7 +96,7 @@ pub fn generate_all(model: &Model<'_>, fs: &dyn FileSystem) -> Result<Bundle> {
         bundle.artifacts.extend(transport.generate(model, fs)?);
     }
     bundle.artifacts.extend(firewall::render(model)?);
-    bundle.artifacts.push(dnsmasq::render(model)?);
+    bundle.artifacts.push(dns::render(model)?);
     bundle.artifacts.extend(nginx::render(model)?);
     bundle.artifacts.push(proxy::render(model)?);
     bundle.artifacts.sort_by(|a, b| a.path.cmp(&b.path));

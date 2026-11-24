@@ -7,25 +7,28 @@
 #   home    192.168.1.5   "nginx" (TLS, picks the site by Host: immich and a sibling
 #           other.mydomain.com) + home DNS + plain HTTP on 8080 + an echo on 7000
 #   gw      eth0 192.168.1.1 (home LAN), wan0 203.0.113.1 (clients), up0 (internet),
-#           docker0 172.17.0.1 (a Docker bridge); runs `parallax apply` and `parallax proxy`
+#           docker0 172.17.0.1 (a Docker bridge); runs `parallax apply`, `parallax dns`
+#           and `parallax proxy`
 #   client  wan0 203.0.113.2 -> gw; lan0 192.168.1.10 on a *foreign* LAN with the
 #           same prefix as home; WireGuard interfaces wgp (personal), wgf (family)
 #           and wgx (friend)
 #   foreign 192.168.1.5   the foreign host (same address as home's) + foreign DNS
-#   net     the internet: 9.9.9.9 (a public server) and 10.99.0.5 (a private subnet
-#           the router knows but Parallax doesn't, like another VLAN)
+#   net     the internet: 9.9.9.9 (a public server and the public resolver) and
+#           10.99.0.5 (a private subnet the router knows but Parallax doesn't, like
+#           another VLAN)
 #   ctr     172.17.0.2, a "container" behind the gateway's Docker bridge
 #
-# Templates: personal (all_networks + internet), family (the proxied Immich, a
-# service on the gateway host, two echo ports), friend (internet only).
+# Templates: personal (all_networks + internet, public DNS), family (the proxied
+# Immich, a service on the gateway host, two echo ports), friend (internet only).
 #
-# Assertions: (a) mapped virtual IP lands on the real host, (b) shim answers in
-# virtual space, (c) guest reaches only its grants even with 0.0.0.0/0 AllowedIPs,
-# (d) reapply is idempotent, (e) raw mapped access without the shim,
+# Assertions: (a) mapped virtual IP lands on the real host, (b) the DNS server
+# answers in virtual space, (c) guest reaches only its grants even with 0.0.0.0/0
+# AllowedIPs, (d) reapply is idempotent, (e) raw mapped access without DNS,
 # (f) colliding guest network with split DNS, (g) the proxy: by name only, one
 # hostname, Host/SNI/:authority checked, (h) internet means public addresses,
 # (i) nothing else on the gateway, its Docker bridge or the public address,
-# (j) IPv6 from a peer is dropped, (k) a revoked grant cuts open connections.
+# (j) IPv6 from a peer is dropped, (k) a revoked grant cuts open connections,
+# (l) DNS answers each tier only its names, (m) large DNS answers.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -44,9 +47,9 @@ PIDS=()
 cleanup() {
     set +e
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
-    # $! above is the backgrounded `inns` subshell, not the server it starts, and the
-    # shim daemonizes: kill whatever still runs in each namespace, or they outlive the
-    # test and keep the caller's stdout open.
+    # $! above is the backgrounded `inns` subshell, not the server it starts: kill
+    # whatever still runs in each namespace, or they outlive the test and keep the
+    # caller's stdout open.
     for ns in $NAMESPACES; do
         ip netns pids $ns 2>/dev/null | xargs -r kill 2>/dev/null
     done
@@ -57,7 +60,12 @@ cleanup() {
 trap cleanup EXIT
 
 pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; [ -s "$WORK/proxy.log" ] && { echo "--- proxy log"; tail -20 "$WORK/proxy.log"; }; exit 1; }
+fail() {
+    echo "FAIL: $*"
+    [ -s "$WORK/proxy.log" ] && { echo "--- proxy log"; tail -20 "$WORK/proxy.log"; }
+    [ -s "$WORK/dns.log" ] && { echo "--- dns log"; tail -20 "$WORK/dns.log"; }
+    exit 1
+}
 inns() { ip netns exec "$@"; }
 
 # ---------------------------------------------------------------- topology
@@ -156,9 +164,17 @@ serve foreign 0.0.0.0 443 foreign-immich
 serve net 9.9.9.9 80 internet
 serve net 10.99.0.5 80 vlan
 serve ctr 0.0.0.0 80 container
-# Home DNS: authoritative-ish answers for mydomain.com; foreign DNS for hisdomain.com.
+# Home DNS: authoritative-ish answers for mydomain.com (big.mydomain.com has 40
+# addresses, more than a 512-byte UDP answer holds); foreign DNS for hisdomain.com;
+# a "public resolver" on the internet, with one name that points into private space.
+BIG=()
+for i in $(seq 10 49); do BIG+=(--host-record=big.mydomain.com,192.168.1.$i); done
 inns home dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
-    --address=/immich.mydomain.com/192.168.1.5 --address=/other.mydomain.com/192.168.1.5 >/dev/null 2>&1 &
+    --address=/immich.mydomain.com/192.168.1.5 --address=/other.mydomain.com/192.168.1.5 \
+    "${BIG[@]}" >/dev/null 2>&1 &
+PIDS+=($!)
+inns net dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=9.9.9.9 --bind-interfaces \
+    --address=/example.org/9.9.9.9 --address=/rebind.example.org/192.168.1.5 >/dev/null 2>&1 &
 PIDS+=($!)
 inns foreign dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
     --address=/immich.hisdomain.com/192.168.1.5 >/dev/null 2>&1 &
@@ -175,6 +191,8 @@ supernet = "10.8.0.0/16"
 endpoint = "203.0.113.1:51820"
 public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 private_key_file = "$WORK/wg-server.key"
+[server.dns]
+public_resolver = "9.9.9.9"
 [server.firewall]
 docker_coexistence = false
 [server.proxy]
@@ -204,6 +222,8 @@ grants = [{ kind = "all_networks" }, { kind = "internet" }]
 pool = "10.8.1.0/24"
 [template.headscale]
 user = "tester"
+[template.dns]
+public = true
 [[template]]
 name = "family"
 grants = [$FAMILY_GRANTS]
@@ -242,18 +262,22 @@ grep -q "^FAIL  user namespace" "$WORK/doctor-userns" || fail "doctor did not na
 pass "doctor passes on the gateway and refuses a user namespace"
 inns gw $P apply -o "$WORK/out" >/dev/null
 GW_PUB=$(sed -n 's/^public_key = "\(.*\)"/\1/p' "$WORK/parallax.toml")
-[ -f "$WORK/out/dnsmasq/dnsmasq.pid" ] || fail "shim did not start"
 
-# The proxy listens on the tunnel address, so it starts once apply has made wg0.
-inns gw sh -c 'echo $$ > "$1"; exec "$2" -c "$3" proxy -o "$4"' sh \
-    "$WORK/proxy.pid" "$PARALLAX" "$WORK/parallax.toml" "$WORK/out" > "$WORK/proxy.log" 2>&1 &
-PIDS+=($!)
-for _ in $(seq 50); do inns gw ss -Hltn 'sport = :8443' | grep -q . && break; sleep 0.1; done
-inns gw ss -Hltn 'sport = :8443' | grep -q . || fail "the proxy did not start"
-# apply re-reads nothing in the proxy itself; the entrypoint sends SIGHUP, so does this.
+# The DNS server and the proxy listen on the tunnel address, so they start once
+# apply has made wg0, as the entrypoint does.
+start() { # command, port
+    inns gw sh -c 'echo $$ > "$1"; exec "$2" -c "$3" "$4" -o "$5"' sh \
+        "$WORK/$1.pid" "$PARALLAX" "$WORK/parallax.toml" "$1" "$WORK/out" >> "$WORK/$1.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 50); do inns gw ss -Hltn "sport = :$2" | grep -q . && return 0; sleep 0.1; done
+    fail "parallax $1 did not start"
+}
+start dns 53
+start proxy 8443
+# apply re-reads nothing in either; the entrypoint sends SIGHUP, so does this.
 apply() { # [config]
     inns gw "$PARALLAX" -c "${1:-$WORK/parallax.toml}" apply -o "$WORK/out" >/dev/null
-    kill -HUP "$(cat "$WORK/proxy.pid")"
+    kill -HUP "$(cat "$WORK/dns.pid")" "$(cat "$WORK/proxy.pid")"
     sleep 0.3
 }
 
@@ -272,7 +296,7 @@ mkclient() { # iface, conf, addr
 mkclient wgp "$WORK/laptop.conf" 10.8.1.1
 mkclient wgf "$WORK/guest.conf" 10.8.2.1
 mkclient wgx "$WORK/friend.conf" 10.8.3.1
-# Split tunnel routes for the laptop: virtual range, shim and the test's internet hosts.
+# Split tunnel routes for the laptop: virtual range, the gateway and the test's internet hosts.
 for dst in 198.18.1.0/24 10.8.0.1/32 9.9.9.9/32 10.99.0.5/32; do
     inns client ip route add $dst dev wgp src 10.8.1.1
 done
@@ -302,10 +326,10 @@ LAPTOP=10.8.1.1 GUEST=10.8.2.1 FRIEND=10.8.3.1
 [ "$(curl_as $LAPTOP http://198.18.1.1:9090/)" = gw-self ] || fail "(a) personal -> service on the gateway host"
 pass "(a) personal peer reaches the mapped virtual address on the real host and on the gateway host"
 
-# (b) shim answers in virtual space
+# (b) DNS answers in virtual space
 ANS=$(inns client dig +short -b $LAPTOP @10.8.0.1 immich.mydomain.com)
-[ "$ANS" = 198.18.1.5 ] || fail "(b) shim answered '$ANS'"
-pass "(b) shim rewrites immich.mydomain.com to 198.18.1.5"
+[ "$ANS" = 198.18.1.5 ] || fail "(b) DNS answered '$ANS'"
+pass "(b) DNS rewrites immich.mydomain.com to 198.18.1.5"
 
 # (c) guest: granted host:port works, everything else is dropped despite 0.0.0.0/0
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(c) guest reached a non-granted port"
@@ -313,7 +337,7 @@ pass "(b) shim rewrites immich.mydomain.com to 198.18.1.5"
 [ "$(curl_as $GUEST http://198.18.1.1:9091/)" = BLOCKED ] || fail "(c) guest reached a non-granted port on the gateway host"
 [ "$(curl_as $GUEST http://198.18.1.1:8080/)" = BLOCKED ] || fail "(c) guest reached the gateway LAN address"
 ANS=$(inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
-[ "$ANS" = 198.18.1.5 ] || fail "(c) guest could not use the shim (tunnel-wide DNS): '$ANS'"
+[ "$ANS" = 198.18.1.5 ] || fail "(c) guest could not look up its granted name (tunnel-wide DNS): '$ANS'"
 pass "(c) guest reaches only its granted host:port; wider AllowedIPs change nothing"
 
 # (d) reapply is idempotent
@@ -325,17 +349,18 @@ diff -q "$WORK/wg1" "$WORK/wg2" >/dev/null || fail "(d) wg config changed on rea
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(d) traffic broken after reapply"
 pass "(d) reapply is idempotent"
 
-# (e) raw mapped IP access with the shim stopped
-kill "$(cat "$WORK/out/dnsmasq/dnsmasq.pid")"; sleep 0.5
-[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(e) mapped IP needs the shim"
-pass "(e) raw mapped IP works with the shim stopped"
-apply   # bring the shim back
+# (e) raw mapped IP access with the DNS server stopped
+kill "$(cat "$WORK/dns.pid")"; sleep 0.5
+inns gw ss -Hlun 'sport = :53' | grep -q . && fail "(e) the DNS server is still running"
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(e) mapped IP needs DNS"
+pass "(e) raw mapped IP works with the DNS server stopped"
+start dns 53
 
 # (f) colliding guest network: same name pattern, both boxes at 192.168.1.5
 FOREIGN=$(inns client dig +short @192.168.1.5 immich.hisdomain.com)   # via lan0, local resolver
 [ "$FOREIGN" = 192.168.1.5 ] || fail "(f) foreign resolver answered '$FOREIGN'"
 HOME_ANS=$(inns client dig +short -b $LAPTOP @10.8.0.1 immich.mydomain.com)
-[ "$HOME_ANS" = 198.18.1.5 ] || fail "(f) home name via shim answered '$HOME_ANS'"
+[ "$HOME_ANS" = 198.18.1.5 ] || fail "(f) home name via the gateway answered '$HOME_ANS'"
 [ "$(inns client curl -s -m 3 --resolve immich.hisdomain.com:443:$FOREIGN http://immich.hisdomain.com:443/)" = foreign-immich ] \
     || fail "(f) immich.hisdomain.com did not reach the foreign box"
 [ "$(https_as $LAPTOP immich.mydomain.com "$HOME_ANS")" = home-immich ] \
@@ -470,5 +495,36 @@ grep -q "^laptop-lan ALIVE$" "$WORK/hold.out" || { cat "$WORK/hold.out"; fail "(
 apply   # restore the grants
 [ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(k) guest grant not restored"
 pass "(k) a revoked grant cuts open connections (LAN, gateway host, proxy); others survive"
+
+# (l) DNS answers each tier only the names it may reach
+status_as() { # src, name, [dig args...]  -> the response status, e.g. NOERROR
+    local src=$1 name=$2; shift 2
+    inns client dig +time=2 +tries=1 -b "$src" @10.8.0.1 "$name" "$@" | sed -n 's/.*status: \([A-Z]*\).*/\1/p'
+}
+short_as() { # src, name, [dig args...]
+    local src=$1 name=$2; shift 2
+    inns client dig +short +time=2 +tries=1 -b "$src" @10.8.0.1 "$name" "$@" || true
+}
+[ "$(short_as $LAPTOP example.org)" = 9.9.9.9 ] || fail "(l) personal (dns.public) could not look up a public name"
+[ -z "$(short_as $LAPTOP rebind.example.org)" ] || fail "(l) a public name answered with a private address"
+[ "$(status_as $LAPTOP rebind.example.org)" = NOERROR ] || fail "(l) rebind.example.org: wanted an empty NOERROR"
+[ "$(status_as $LAPTOP immich.mydomain.com AAAA)" = NOERROR ] && [ -z "$(short_as $LAPTOP immich.mydomain.com AAAA)" ] \
+    || fail "(l) a home name answered AAAA"
+[ "$(status_as $GUEST other.mydomain.com)" = REFUSED ] || fail "(l) guest looked up a sibling vhost's name"
+[ "$(status_as $GUEST example.org)" = REFUSED ] || fail "(l) guest (dns.public off) looked up a public name"
+[ "$(status_as $GUEST example.org +tcp)" = REFUSED ] || fail "(l) guest looked up a public name over TCP"
+[ "$(status_as $FRIEND example.org)" = REFUSED ] || fail "(l) friend (internet, dns.public off) looked up a public name"
+[ "$(status_as $FRIEND immich.mydomain.com)" = REFUSED ] || fail "(l) friend looked up a home name"
+ST=$(inns gw dig +time=2 +tries=1 @10.8.0.1 immich.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
+[ "$ST" = REFUSED ] || fail "(l) a source outside every tier got '$ST'"
+pass "(l) DNS: personal gets home and public names; guest only its hostname; friend nothing; rebinding answers dropped"
+
+# (m) large answers: truncated over plain UDP, then complete over TCP (dig retries itself)
+BIG_ANS=$(short_as $LAPTOP big.mydomain.com +noedns)
+[ "$(grep -c '^198\.18\.1\.' <<<"$BIG_ANS")" = 40 ] || fail "(m) big.mydomain.com over UDP then TCP: '$BIG_ANS'"
+inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydomain.com | grep -q 'flags: qr tc' \
+    || fail "(m) the 512-byte UDP answer was not truncated"
+[ "$(short_as $LAPTOP big.mydomain.com +tcp | grep -c '^198\.18\.1\.')" = 40 ] || fail "(m) big.mydomain.com over TCP"
+pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rewritten"
 
 echo "ALL PASS"

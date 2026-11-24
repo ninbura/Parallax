@@ -35,15 +35,18 @@ $parallax -c /tmp/parallax.toml peer add tablet --template family --platform mob
 $parallax -c /tmp/parallax.toml peer show
 ```
 
-`apply` needs Linux with `nft`, `wg`, `ip` and `dnsmasq`; use the container
-(`docker/`) or read `docs/setup.md`.
+`apply` needs Linux with `nft`, `wg` and `ip`; use the container (`docker/`)
+or read `docs/setup.md`.
 
 ## Layout
 
 - `crates/parallax-core`: model, validation, allocation, transports,
   generators, plan/apply. UI-agnostic; all I/O behind traits.
-- `crates/parallax-cli`: `validate`, `plan`, `generate`, `apply`, `keygen`,
-  `peer add|remove|show|allocate`, `export`, `doctor`.
+- `crates/parallax-proxy`: the HTTPS proxy (`parallax proxy`).
+- `crates/parallax-dns`: the DNS server (`parallax dns`): per-tier answers,
+  home zones rewritten into mapped space.
+- `crates/parallax-cli`: `validate`, `plan`, `generate`, `apply`, `proxy`,
+  `dns`, `keygen`, `peer add|remove|show|allocate`, `export`, `doctor`.
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
 - `example/parallax.toml`: the canonical scenario, fully commented.
 - `tests/integration/netns.sh`: Linux namespace test: mapping, DNS, per-tier access, the HTTPS proxy and the bypass matrix.

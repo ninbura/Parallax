@@ -130,12 +130,26 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
                 s.push_str("# exempt apps). For real split DNS on a phone use the Tailscale transport instead.\n");
                 if template.dns.wireguard == DnsMode::Split {
                     warnings.push(format!(
-                        "template '{}' asks for split DNS but the mobile WireGuard apps cannot do it; this export sends all DNS to the shim",
+                        "template '{}' asks for split DNS but the mobile WireGuard apps cannot do it; this export sends all DNS to the gateway",
                         template.name
                     ));
                 }
             } else {
-                s.push_str("# DNS is tunnel-wide by template policy; the shim forwards non-home zones to a public resolver.\n");
+                s.push_str("# DNS is tunnel-wide by template policy.\n");
+            }
+            if template.dns.public {
+                s.push_str("# The gateway answers public names through its public resolver.\n");
+            } else {
+                s.push_str("# Only this template's home names resolve while connected: the gateway refuses public\n# names for it (template dns.public is off).\n");
+                let fix = if platform == Platform::Mobile {
+                    "turn dns.public on, or use Tailscale, which splits DNS on phones"
+                } else {
+                    "turn dns.public on, or set dns.wireguard = \"split\" to keep public names local"
+                };
+                warnings.push(format!(
+                    "template '{}' has dns.public off and this export sends all DNS to the gateway, so the device resolves only the template's home names while connected; {fix}",
+                    template.name
+                ));
             }
         }
         DnsMode::Split => {

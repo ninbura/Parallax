@@ -37,19 +37,20 @@
 - **A host firewall, if any, must allow Parallax's traffic too.** Parallax owns
   its own nftables table but cannot override another firewall on the host, and
   a packet must pass both. With ufw active, allow the WireGuard port and DNS
-  from the tunnel to the shim:
+  from the tunnel to the gateway address:
 
   ```sh
   sudo ufw allow proto udp to <gateway LAN address> port <listen_port>
-  sudo ufw allow in on wg0 to <shim address, e.g. 10.8.0.1> port 53 proto udp
+  sudo ufw allow in on wg0 to <DNS address, e.g. 10.8.0.1> port 53 proto udp
+  sudo ufw allow in on wg0 to <DNS address, e.g. 10.8.0.1> port 53 proto tcp
   ```
 
-  The shim runs in the host network namespace, so ufw sees tunnel DNS as
-  incoming traffic to the host.
+  The DNS server runs in the host network namespace, so ufw sees tunnel DNS
+  as incoming traffic to the host. TCP carries answers too large for UDP.
 
 ## Rootful Docker, not rootless
 
-Parallax creates `wg0`, loads an nftables table and runs the DNS shim in the
+Parallax creates `wg0`, loads an nftables table and runs its DNS server in the
 host's own network namespace, and needs `CAP_NET_ADMIN` over it. Under
 rootless Docker, the container's root is your unprivileged user on the host:
 its capabilities only cover namespaces the rootless daemon created, never the
@@ -96,7 +97,7 @@ It checks:
 | user namespace | running under rootless Docker or `userns-remap` | a rootful daemon (above) |
 | CAP_NET_ADMIN | the container lacks the capability | `cap_add: [NET_ADMIN]` |
 | ip_forward | `net.ipv4.ip_forward` is 0 | `/etc/sysctl.d/` (above) |
-| tools | `nft`, `wg`, `ip` or `dnsmasq` is missing | the image ships them; natively, install them |
+| tools | `nft`, `wg` or `ip` is missing | the image ships them; natively, install them |
 | interface \<name\> | a configured LAN or WAN interface doesn't exist | the name in `parallax.toml` (`ip link`) |
 | wireguard | a WireGuard interface can't be created | `/etc/modules-load.d/` (above) |
 | NETMAP | the kernel or `nft` rejects prefix NAT (`nftables` backend only) | a newer kernel or nftables |
@@ -113,7 +114,7 @@ through the tunnel**:
   connected at home pins the LAN address and loses the tunnel as soon as it
   leaves Wi-Fi.
 - The iOS app re-resolves on network changes, but by then its DNS points at
-  the shim, through the tunnel that just broke.
+  the gateway, through the tunnel that just broke.
 - The endpoint cannot be a name your services use either: through the tunnel,
   service names resolve to mapped addresses, and the endpoint must not.
 
@@ -132,11 +133,31 @@ Workable choices:
    help.
 4. **The public IP itself.** Simplest; re-export configs if it changes.
 
+## Public names and `dns.public`
+
+Parallax's DNS server answers each template only the names it may reach: the
+zones of its granted networks and the hostnames of its granted services.
+Names outside your zones are answered only for templates with
+`dns.public = true`, through `server.dns.public_resolver` (default `1.1.1.1`):
+
+```toml
+[[template]]
+name = "personal"
+# ...
+[template.dns]
+public = true
+```
+
+It's off by default, so a guest's lookups don't leave through your
+connection. The official mobile WireGuard apps send every query to the
+gateway, so a phone on a template without it resolves only that template's
+home names while connected; `parallax export` warns about it. Tailscale
+splits DNS natively on phones (M2), so Tailscale guests lose nothing.
+
 ## Networks that block outbound DNS
 
-Mobile WireGuard clients send every query to the shim, which forwards names
-outside your zones to `server.dns.public_resolver` (default `1.1.1.1`). If
-your network only allows DNS to your router, point it there:
+If your network only allows DNS to your router, point the public resolver
+there:
 
 ```toml
 [server.dns]
@@ -154,8 +175,10 @@ sudo docker compose logs -f parallax
 
 On every start the entrypoint runs `parallax doctor` first. On first start it
 then generates `wg-server.key` (mode 0600) next to the config and writes the
-public key into it. Then it applies the firewall, brings up `wg0`, starts the
-DNS shim and `tailscaled` (idle until M2), and starts the HTTPS proxy.
+public key into it. Then it starts `tailscaled` (idle until M2), applies the
+firewall, brings up `wg0`, and starts the DNS server and the HTTPS proxy. If
+either of those exits, the container stops and Docker's restart policy takes
+over.
 
 ## Adding a device
 
@@ -214,4 +237,5 @@ publicly trusted certificate for the name needs nothing more.
 See `docs/client-dns.md`. Short version: Linux configs carry the
 `resolvectl` PostUp, macOS and Windows configs carry the one-time recipe as
 comments, and the official mobile WireGuard apps get tunnel-wide DNS with a
-warning. The product's answer for phones is the Tailscale transport (M2).
+warning (and public names only with `dns.public`). The product's answer for
+phones is the Tailscale transport (M2).

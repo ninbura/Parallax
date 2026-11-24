@@ -596,11 +596,11 @@ mod tests {
     #[test]
     fn missing_tools_are_named() {
         let runner = RecordingRunner::new();
-        runner.respond("dnsmasq", failed(127, "not found"));
+        runner.respond("wg", failed(127, "not found"));
         let checks = run(&healthy_fs(), &runner);
         let p = problems(&checks);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0, "tools");
-        assert!(p[0].1.contains("dnsmasq"));
+        assert!(p[0].1.contains("wireguard-tools"), "{}", p[0].1);
     }
 }

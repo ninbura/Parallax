@@ -20,14 +20,17 @@ crates/parallax-core/           pure library, no I/O of its own
   src/io.rs                     FileSystem / ProcessRunner / KeyGenerator traits,
                                 memory + real implementations
   src/transport/{mod,wireguard,tailscale}.rs
-  src/generate/{firewall,dnsmasq,client,nginx,wg_server}.rs
+  src/generate/{firewall,dns,proxy,client,nginx,wg_server}.rs
   src/plan.rs, src/apply.rs
   src/doctor.rs                 host checks run before apply (`parallax doctor`)
   src/testing.rs                canonical fixture shared by all tests
   tests/golden.rs + tests/golden/   frozen outputs for every generator
   tests/example.rs              example/parallax.toml == canonical fixture
+crates/parallax-proxy/          the HTTPS proxy (`parallax proxy`)
+crates/parallax-dns/            the DNS server (`parallax dns`)
 crates/parallax-cli/            `parallax` binary (validate, plan, generate, apply,
-                                keygen, peer add/remove/show/allocate, export, doctor)
+                                proxy, dns, keygen, peer add/remove/show/allocate,
+                                export, doctor)
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)
 example/parallax.toml           fully commented canonical scenario
 tests/integration/netns.sh      Linux network-namespace integration test (CI)
@@ -101,7 +104,9 @@ Two additions relative to the handoff, both small and flagged:
   dropped by the trailing deny). Validation refuses `full_tunnel` without it.
 - `Template.dns` is per transport (`wireguard` / `tailscale`) because the
   canonical scenario wants tunnel-wide DNS on plain WireGuard for the family
-  tier but split DNS through the Tailscale client.
+  tier but split DNS through the Tailscale client. `dns.public` (off by
+  default) lets the template's members look up public names through the
+  gateway; see "DNS server".
 
 Grants are written against real addresses. `Model::reaches(template)` resolves
 them to `Reach { label, kind: Lan { network, real, port, proxied } | Internet }` and
@@ -127,7 +132,7 @@ pub trait Transport {
 pub fn all() -> Vec<Box<dyn Transport>>   // always [WireGuard, Tailscale]
 ```
 
-The shared generators (`firewall`, `dnsmasq`, `nginx`) iterate `transport::all()`
+The shared generators (`firewall`, `dns`, `proxy`, `nginx`) iterate `transport::all()`
 and only use the first five methods. That is why the M1 nftables table already
 has its final shape: NETMAP matches `{ "wg0", "tailscale0" }`, every template
 gets a WireGuard rule block keyed on its pool and a Tailscale block keyed on
@@ -135,8 +140,8 @@ the `ts_<template>` set (empty until M2 syncs it), and both transports end
 with a catch-all deny. `TailscaleTransport` implements those five methods
 today and returns `NotImplemented` for provision/export.
 
-The INPUT chain is locked down too: from a tunnel interface only the shim
-(UDP/TCP 53 to the shim address), ICMP echo, grants that cover a network's
+The INPUT chain is locked down too: from a tunnel interface only DNS
+(UDP/TCP 53 to the DNS server's address), ICMP echo, grants that cover a network's
 `gateway_address`, and the HTTPS proxy for tiers with a proxied grant are
 accepted, then drop. A host-networked gateway otherwise
 exposes every published container port and its SSH to guest peers. With
@@ -198,7 +203,7 @@ the proxy SIGHUP (the Docker entrypoint does).
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
-clients couldn't resolve them through the shim), and only on `tcp/443`. A
+clients couldn't resolve them through the DNS server), and only on `tcp/443`. A
 template with another grant that reaches the same host's web ports directly
 (`all_networks`, its network, `host`, tcp/80, or 443 on either protocol)
 gets a warning naming that grant, since it can bypass the hostname check.
@@ -257,13 +262,51 @@ via the virtual address. Parallax's prerouting chain runs at `dstnat - 10`,
 ahead of Docker's DNAT: the first NAT binding wins, so a tier's redirect to
 the proxy can't lose to a port Docker publishes on the gateway.
 
+## DNS server
+
+Every tier asks the same address (`server.dns.listen`, by default the
+WireGuard gateway address), and the answer depends on who asks. `parallax dns`
+(crate `parallax-dns`, built on hickory) reads `dns/routes.toml`, which
+`apply` writes, and SIGHUP re-reads it:
+
+- **Who asks.** The source address picks the tier: the template's WireGuard
+  pool, or (M2) its Tailscale nodes. WireGuard ties the source address to the
+  peer's key. A source outside every tier is refused.
+- **What it may ask.** A network grant (or `all_networks`) gives the
+  network's `domains`; a `service` grant gives the service's `hostnames`.
+  `host` and `host_port` grants give no names. Names outside every zone go
+  to `server.dns.public_resolver`, only for templates with `dns.public`.
+  Everything else is `REFUSED`. A name inside a zone is never sent to the
+  public resolver, even for a public tier: it would leak the operator's
+  names, and the public answer is the home's public address.
+- **Home zones** go to the owning network's `upstream_dns` (the most specific
+  zone wins). A records inside a mapped network are rewritten into its
+  virtual prefix by the same `Mapping` the NETMAP rules come from, so DNS
+  and the firewall can't drift. AAAA, SVCB and HTTPS records are dropped:
+  peers can't send IPv6, and address hints would carry real addresses.
+- **Public answers** lose A/AAAA records in private, reserved or mapped
+  space (DNS rebinding).
+- It holds no records and doesn't recurse. One caching resolver per zone,
+  2-second upstream timeout, TCP fallback; `SERVFAIL` when the upstream fails.
+  UDP answers follow the client's EDNS size, and anything larger is
+  truncated so the client retries over TCP. One tunnel address may have 64
+  lookups in flight.
+- A reload that fails refuses every query until one succeeds, like the
+  proxy: answering by grants that may have been revoked is worse than not
+  answering.
+
+DNS is convenience, never enforcement: the firewall and the proxy are the
+gate. The DNS server only keeps a guest from using the gateway's resolver for
+names it has no business with (and from sending its lookups out through the
+home connection). Why not dnsmasq or another server: ADR 0004.
+
 ## Generated artifacts (output directory layout)
 
 ```
 wireguard/wg0.conf                 wg(8) format for `wg syncconf`   (0600)
 nftables/parallax.nft              table inet parallax, atomic replace
 nftables/docker-user.nft           DOCKER-USER accepts (docker_coexistence)
-dnsmasq/parallax.conf              domain-scoped shim
+dns/routes.toml                    zones, mappings and tiers for `parallax dns`
 nginx/snippets/parallax-<t>.conf   allow lines per tier
 nginx/snippets/parallax-service-<s>.conf   allow lines + deny all per vhost
 proxy/routes.toml                  sites for `parallax proxy`
@@ -276,7 +319,9 @@ format, PARALLAX_* chains) and `iptables/docker-user.rules` instead.
 ## Apply order and idempotency
 
 firewall (`nft -c -f` then `nft -f`) → WireGuard (`ip link add` if missing,
-`ip address replace`, `wg syncconf`, `ip link set up`) → dnsmasq (`--test`,
-kill previous pid, start). Every step is a replace, never an insert/delete
-pair, so re-applying an unchanged bundle is a no-op (asserted by
-`apply_runs_expected_commands_and_is_idempotent`).
+`ip address replace`, `wg syncconf`, `ip link set up`). Every step is a
+replace, never an insert/delete pair, so re-applying an unchanged bundle is a
+no-op (asserted by `apply_runs_expected_commands_and_is_idempotent`). The DNS
+server and the HTTPS proxy are long-running processes that read the routes
+`apply` wrote; the container's entrypoint starts them after the first apply
+and sends them SIGHUP after each one.
