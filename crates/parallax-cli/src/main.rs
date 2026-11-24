@@ -2,9 +2,14 @@
 //!
 //! The database (`parallax-store`) is the source of truth. TOML is only a
 //! way in and out: `config import`, `config export` and `config edit`.
+//!
+//! `parallax daemon` holds the database and keeps the gateway applied. While
+//! it answers on its socket, every command goes through it; otherwise
+//! commands open the database themselves.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use clap::{Args, Parser, Subcommand};
@@ -20,7 +25,11 @@ use parallax_core::validate::ReachKind;
 use parallax_core::{Config, Model};
 use parallax_store::{Store, TempDir};
 
+use crate::protocol::{Reply, Request};
+
 mod backup;
+mod daemon;
+mod protocol;
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +46,14 @@ struct Cli {
         env = "PARALLAX_DB"
     )]
     db: PathBuf,
+    /// The daemon's socket. Commands go through the daemon while it answers here.
+    #[arg(
+        long,
+        global = true,
+        default_value = "/run/parallax/parallax.sock",
+        env = "PARALLAX_SOCKET"
+    )]
+    socket: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -52,11 +69,19 @@ enum Command {
     /// Generate everything into the output directory without touching the system.
     Generate(OutArgs),
     /// Generate, write, and reconcile the live gateway (firewall, WireGuard).
+    /// With a daemon running, it applies.
     Apply(OutArgs),
-    /// Run the HTTPS proxy from the routes `apply` wrote. SIGHUP re-reads them.
-    Proxy(OutArgs),
-    /// Run the DNS server from the routes `apply` wrote. SIGHUP re-reads them.
-    Dns(OutArgs),
+    /// Run the gateway: hold the database, apply, serve DNS and the HTTPS
+    /// proxy, apply every saved change, and repair drift. SIGHUP re-applies.
+    Daemon {
+        #[command(flatten)]
+        out: OutArgs,
+        /// Seconds between checks for drift and a new day.
+        #[arg(long, default_value_t = 60, hide = true)]
+        reconcile_every: u64,
+    },
+    /// Show whether a daemon is running and how its last apply went.
+    Status,
     /// Create the gateway's WireGuard private key file and print its public key.
     Keygen {
         /// Also record the public key in the configuration.
@@ -161,7 +186,7 @@ fn main() {
     }
 }
 
-fn today() -> Date {
+pub(crate) fn today() -> Date {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -170,7 +195,9 @@ fn today() -> Date {
 }
 
 /// The store is async; the CLI does one thing at a time.
-fn block_on<T>(f: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+pub(crate) fn block_on<T>(
+    f: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -178,32 +205,211 @@ fn block_on<T>(f: impl std::future::Future<Output = anyhow::Result<T>>) -> anyho
         .block_on(f)
 }
 
-/// Read the configuration. The database is closed again before this returns,
-/// so long-running work (`apply`) doesn't keep other commands out.
-fn load(db: &Path) -> anyhow::Result<Config> {
-    block_on(async { Ok(Store::open(db).await?.load().await?) })
+/// How often a change through the daemon is retried when another saved first.
+const SAVE_ATTEMPTS: usize = 10;
+
+/// Where the configuration lives: the daemon, when one answers on the
+/// socket, otherwise the database itself.
+pub(crate) struct Ctx {
+    db: PathBuf,
+    socket: PathBuf,
 }
 
-/// Change the configuration in one write transaction, refusing to save an
-/// invalid result.
-fn update<T>(
-    db: &Path,
-    change: impl FnOnce(&mut Config) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    block_on(async {
-        let mut store = Store::open(db).await?;
-        store
-            .update(|config| {
-                let out = change(config)?;
-                check(config)?;
-                Ok(out)
-            })
-            .await
-    })
+/// How a change was saved.
+pub(crate) enum Saved {
+    /// Into the database directly; `parallax apply` puts it into effect.
+    Direct,
+    /// Through the daemon, which applied it: the apply log, or why it failed.
+    Applied {
+        log: Vec<String>,
+        error: Option<String>,
+    },
+}
+
+impl Ctx {
+    pub(crate) fn db(&self) -> &Path {
+        &self.db
+    }
+
+    /// Ask the daemon. `None`: no daemon (no socket, or nothing listening on
+    /// it). A refusal comes back as an error.
+    pub(crate) fn ask(&self, request: &Request) -> anyhow::Result<Option<Reply>> {
+        use std::io::ErrorKind;
+        let mut stream = match std::os::unix::net::UnixStream::connect(&self.socket) {
+            Ok(stream) => stream,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+                return Ok(None)
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("connecting to the daemon at {}", self.socket.display())
+                })
+            }
+        };
+        protocol::write_message(&mut stream, request)?;
+        let line = protocol::read_line(&mut std::io::BufReader::new(&stream))
+            .with_context(|| format!("the daemon at {}", self.socket.display()))?;
+        match protocol::decode(&line)
+            .with_context(|| format!("the daemon at {}", self.socket.display()))?
+        {
+            Reply::Error { message } => Err(anyhow!(message)),
+            reply => Ok(Some(reply)),
+        }
+    }
+
+    /// Open the database, which must exist.
+    pub(crate) async fn open_store(&self) -> anyhow::Result<Store> {
+        Store::open(&self.db).await.map_err(|e| self.locked(e))
+    }
+
+    /// Open the database, creating an empty one if there is none.
+    pub(crate) async fn create_store(&self) -> anyhow::Result<Store> {
+        Store::create(&self.db).await.map_err(|e| self.locked(e))
+    }
+
+    /// Another process holds the database, yet no daemon answered.
+    fn locked(&self, e: parallax_store::Error) -> anyhow::Error {
+        match e {
+            parallax_store::Error::InUse(_) => anyhow!(
+                "the database {} is locked by another process; is a daemon running whose socket at {} isn't answering?",
+                self.db.display(),
+                self.socket.display()
+            ),
+            e => e.into(),
+        }
+    }
+
+    /// The configuration, and its revision when it came from the daemon.
+    /// The database is closed again before this returns.
+    fn load_revision(&self) -> anyhow::Result<(Config, Option<u64>)> {
+        match self.ask(&Request::Load)? {
+            Some(Reply::Configuration {
+                configuration,
+                revision,
+            }) => Ok((*configuration, Some(revision))),
+            Some(other) => Err(unexpected(other)),
+            None => {
+                let config = block_on(async { Ok(self.open_store().await?.load().await?) })?;
+                Ok((config, None))
+            }
+        }
+    }
+
+    pub(crate) fn load(&self) -> anyhow::Result<Config> {
+        Ok(self.load_revision()?.0)
+    }
+
+    /// What the database holds: `None` before the first import. Any other
+    /// failure (unreadable, locked) is an error, never "empty". With the
+    /// daemon's revision when it came from the daemon.
+    pub(crate) fn current(&self) -> anyhow::Result<(Option<Config>, Option<u64>)> {
+        match self.load_revision() {
+            Ok((config, revision)) => Ok((Some(config), revision)),
+            Err(e) => match e.downcast_ref::<parallax_store::Error>() {
+                Some(parallax_store::Error::Missing(_) | parallax_store::Error::Empty(_)) => {
+                    Ok((None, None))
+                }
+                _ => Err(e),
+            },
+        }
+    }
+
+    /// Change the configuration, refusing an invalid result. Directly, in
+    /// one write transaction. Through the daemon, against its latest
+    /// configuration, again if another change landed first; the daemon then
+    /// applies it.
+    fn update<T>(
+        &self,
+        mut change: impl FnMut(&mut Config) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(T, Saved)> {
+        for _ in 0..SAVE_ATTEMPTS {
+            let (mut config, revision) = match self.ask(&Request::Load)? {
+                Some(Reply::Configuration {
+                    configuration,
+                    revision,
+                }) => (configuration, revision),
+                Some(other) => return Err(unexpected(other)),
+                None => {
+                    let out = block_on(async {
+                        let mut store = self.open_store().await?;
+                        store
+                            .update(|config| {
+                                let out = change(config)?;
+                                check(config)?;
+                                Ok(out)
+                            })
+                            .await
+                    })?;
+                    return Ok((out, Saved::Direct));
+                }
+            };
+            let out = change(&mut config)?;
+            check(&config)?;
+            match self.save(config, revision)? {
+                Some(saved) => return Ok((out, saved)),
+                None => continue,
+            }
+        }
+        bail!("the configuration kept changing under this command ({SAVE_ATTEMPTS} tries); nothing saved, try again")
+    }
+
+    /// Save through the daemon. `None`: the configuration moved past `revision`.
+    fn save(&self, config: Box<Config>, revision: u64) -> anyhow::Result<Option<Saved>> {
+        let request = Request::Save {
+            configuration: config,
+            revision,
+        };
+        match self.ask(&request)? {
+            Some(Reply::Applied { log, error, .. }) => Ok(Some(Saved::Applied { log, error })),
+            Some(Reply::Conflict { .. }) => Ok(None),
+            Some(other) => Err(unexpected(other)),
+            None => bail!("the daemon stopped answering; nothing saved"),
+        }
+    }
+}
+
+/// A reply that doesn't answer the request.
+pub(crate) fn unexpected(reply: Reply) -> anyhow::Error {
+    let kind = match reply {
+        Reply::Status { .. } => "status",
+        Reply::Configuration { .. } => "configuration",
+        Reply::Applied { .. } => "applied",
+        Reply::Conflict { .. } => "conflict",
+        Reply::Done { .. } => "done",
+        Reply::Error { .. } => "error",
+    };
+    anyhow!("the daemon answered with an unexpected '{kind}' reply")
+}
+
+/// A change was saved, but putting it into effect failed.
+pub(crate) fn apply_failed(error: &str) -> anyhow::Error {
+    anyhow!("saved, but applying it failed: {error}. The daemon tries again every minute; fix the cause, or run `parallax apply`")
+}
+
+/// Say what became of a saved change: `direct` is the hint without a
+/// daemon. The apply log goes to stderr, so stdout stays the command's own.
+fn report(saved: Saved, direct: &str) -> anyhow::Result<()> {
+    match saved {
+        Saved::Direct => {
+            if !direct.is_empty() {
+                eprintln!("{direct}");
+            }
+            Ok(())
+        }
+        Saved::Applied { log, error } => {
+            for line in log {
+                eprintln!("{line}");
+            }
+            match error {
+                None => Ok(()),
+                Some(e) => Err(apply_failed(&e)),
+            }
+        }
+    }
 }
 
 /// Validation errors, as one error.
-fn check(config: &Config) -> anyhow::Result<()> {
+pub(crate) fn check(config: &Config) -> anyhow::Result<()> {
     let (errors, _) = parallax_core::validate::check(config);
     if errors.is_empty() {
         Ok(())
@@ -212,11 +418,11 @@ fn check(config: &Config) -> anyhow::Result<()> {
     }
 }
 
-fn resolve(config: &Config) -> anyhow::Result<Model<'_>> {
+pub(crate) fn resolve(config: &Config) -> anyhow::Result<Model<'_>> {
     Model::resolve(config, today()).map_err(|e| anyhow!("{e}"))
 }
 
-fn print_warnings(warnings: &[String]) {
+pub(crate) fn print_warnings(warnings: &[String]) {
     for w in warnings {
         eprintln!("warning: {w}");
     }
@@ -230,19 +436,52 @@ fn print_export(export: &Export) {
 /// Every hostname the proxy will serve needs a usable certificate, and the
 /// upstream CA bundle must load. Parallax never issues certificates, so say
 /// plainly what's missing before the proxy is handed routes it would refuse.
-fn check_certificates(model: &Model<'_>) -> anyhow::Result<()> {
-    let warnings = parallax_proxy::preflight(&generate::proxy::build(model))?;
-    print_warnings(&warnings);
+/// Returns warnings about unreadable certificates.
+fn check_certificates(model: &Model<'_>) -> anyhow::Result<Vec<String>> {
+    Ok(parallax_proxy::preflight(&generate::proxy::build(model))?)
+}
+
+/// Everything short of writing: validate, generate, check certificates.
+/// The daemon refuses a change that fails here before saving it.
+pub(crate) fn preview(config: &Config, today: Date) -> anyhow::Result<()> {
+    check(config)?;
+    let model = Model::resolve(config, today).map_err(|e| anyhow!("{e}"))?;
+    generate::generate_all(&model, &RealFs)?;
+    check_certificates(&model)?;
     Ok(())
+}
+
+/// Generate, write and reconcile the live gateway. Returns the warnings and
+/// the apply log.
+pub(crate) fn apply_config(
+    config: &Config,
+    out: &Path,
+    today: Date,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let model = Model::resolve(config, today).map_err(|e| anyhow!("{e}"))?;
+    let mut bundle = generate::generate_all(&model, &RealFs)?;
+    let mut warnings = std::mem::take(&mut bundle.warnings);
+    warnings.extend(check_certificates(&model)?);
+    let runner = RealRunner;
+    let sys = System {
+        fs: &RealFs,
+        runner: &runner,
+    };
+    let report = parallax_core::apply::apply(&model, &bundle, out, sys)?;
+    Ok((warnings, report.log))
 }
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let fs = RealFs;
-    let db = cli.db.as_path();
+    let ctx = Ctx {
+        db: cli.db,
+        socket: cli.socket,
+    };
+    let db = ctx.db();
     match cli.command {
         Command::Validate => {
-            let config = load(db)?;
+            let config = ctx.load()?;
             let model = resolve(&config)?;
             print_warnings(model.warnings());
             println!(
@@ -254,17 +493,17 @@ fn run() -> anyhow::Result<()> {
                 model.active_peers().count()
             );
         }
-        Command::Doctor => doctor(db)?,
+        Command::Doctor => doctor(&ctx)?,
         Command::Plan(out) => {
-            let config = load(db)?;
+            let config = ctx.load()?;
             let model = resolve(&config)?;
             let bundle = generate::generate_all(&model, &fs)?;
-            check_certificates(&model)?;
+            print_warnings(&check_certificates(&model)?);
             let plan = parallax_core::plan::plan(&bundle, &out.out, &fs)?;
             print!("{}", plan.render());
         }
         Command::Generate(out) => {
-            let config = load(db)?;
+            let config = ctx.load()?;
             let model = resolve(&config)?;
             let bundle = generate::generate_all(&model, &fs)?;
             print_warnings(&bundle.warnings);
@@ -273,37 +512,63 @@ fn run() -> anyhow::Result<()> {
                 println!("wrote {}", out.out.join(&a.path).display());
             }
         }
-        Command::Apply(out) => {
-            let config = load(db)?;
-            let model = resolve(&config)?;
-            let bundle = generate::generate_all(&model, &fs)?;
-            print_warnings(&bundle.warnings);
-            check_certificates(&model)?;
-            let runner = RealRunner;
-            let sys = System {
-                fs: &fs,
-                runner: &runner,
-            };
-            let report = parallax_core::apply::apply(&model, &bundle, &out.out, sys)?;
-            for line in report.log {
-                println!("{line}");
+        Command::Apply(out) => match ctx.ask(&Request::Apply)? {
+            Some(Reply::Applied { log, error, .. }) => {
+                for line in log {
+                    println!("{line}");
+                }
+                if let Some(e) = error {
+                    bail!("apply failed: {e}");
+                }
             }
-        }
-        Command::Proxy(out) => {
-            parallax_proxy::serve(&out.out.join(generate::proxy::PATH))?;
-        }
-        Command::Dns(out) => {
-            parallax_dns::serve(&out.out.join(generate::dns::PATH))?;
-        }
+            Some(other) => return Err(unexpected(other)),
+            None => {
+                let config = ctx.load()?;
+                let (warnings, log) = apply_config(&config, &out.out, today())?;
+                print_warnings(&warnings);
+                for line in log {
+                    println!("{line}");
+                }
+            }
+        },
+        Command::Daemon {
+            out,
+            reconcile_every,
+        } => daemon::run(daemon::Options {
+            db: ctx.db,
+            socket: ctx.socket,
+            out: out.out,
+            reconcile_every: Duration::from_secs(reconcile_every.max(1)),
+        })?,
+        Command::Status => match ctx.ask(&Request::Status)? {
+            Some(Reply::Status {
+                revision,
+                apply_error,
+            }) => {
+                println!(
+                    "daemon at {}: configuration revision {revision}",
+                    ctx.socket.display()
+                );
+                match apply_error {
+                    None => println!("last apply: ok"),
+                    Some(e) => bail!("last apply failed: {e}"),
+                }
+            }
+            Some(other) => return Err(unexpected(other)),
+            None => bail!(
+                "no daemon is running (nothing answers at {})",
+                ctx.socket.display()
+            ),
+        },
         Command::Keygen {
             write_config,
             if_missing,
-        } => keygen(db, write_config, if_missing)?,
-        Command::Config { command } => config_command(db, command)?,
-        Command::Backup { command } => backup::run(db, command)?,
-        Command::Peer { command } => peer_command(db, command)?,
+        } => keygen(&ctx, write_config, if_missing)?,
+        Command::Config { command } => config_command(&ctx, command)?,
+        Command::Backup { command } => backup::run(&ctx, command)?,
+        Command::Peer { command } => peer_command(&ctx, command)?,
         Command::Export { peer, platform } => {
-            let config = load(db)?;
+            let config = ctx.load()?;
             let model = resolve(&config)?;
             let p = model.peer(&peer)?;
             let export = transport::by_kind(p.transport).export(&model, p, platform)?;
@@ -313,13 +578,13 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn doctor(db: &Path) -> anyhow::Result<()> {
+fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
     let runner = RealRunner;
     let sys = System {
         fs: &RealFs,
         runner: &runner,
     };
-    let config = load(db).map_err(|e| format!("{e:#}"));
+    let config = ctx.load().map_err(|e| format!("{e:#}"));
     let checks = parallax_core::doctor::diagnose(config.as_ref().map_err(Clone::clone), sys);
     let mut failed = 0;
     for check in &checks {
@@ -339,9 +604,10 @@ fn doctor(db: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn keygen(db: &Path, write_config: bool, if_missing: bool) -> anyhow::Result<()> {
+fn keygen(ctx: &Ctx, write_config: bool, if_missing: bool) -> anyhow::Result<()> {
     let fs = RealFs;
-    let config = load(db)?;
+    let db = ctx.db();
+    let config = ctx.load()?;
     let path = config.server.wireguard.private_key_file.clone();
     if let Some(existing) = fs.read(&path)? {
         if if_missing {
@@ -355,8 +621,8 @@ fn keygen(db: &Path, write_config: bool, if_missing: bool) -> anyhow::Result<()>
                     .public_key();
                 if public != config.server.wireguard.public_key {
                     let shown = public.to_base64();
-                    update(db, |c| {
-                        c.server.wireguard.public_key = public;
+                    let ((), saved) = ctx.update(|c| {
+                        c.server.wireguard.public_key = public.clone();
                         Ok(())
                     })?;
                     println!(
@@ -364,6 +630,7 @@ fn keygen(db: &Path, write_config: bool, if_missing: bool) -> anyhow::Result<()>
                         path.display(),
                         db.display()
                     );
+                    report(saved, "")?;
                 }
             }
             return Ok(());
@@ -378,11 +645,12 @@ fn keygen(db: &Path, write_config: bool, if_missing: bool) -> anyhow::Result<()>
     println!("wrote {} (mode 0600)", path.display());
     println!("public key: {}", kp.public);
     if write_config {
-        update(db, |c| {
-            c.server.wireguard.public_key = kp.public;
+        let ((), saved) = ctx.update(|c| {
+            c.server.wireguard.public_key = kp.public.clone();
             Ok(())
         })?;
         println!("recorded server.wireguard.public_key in {}", db.display());
+        report(saved, "")?;
     } else {
         println!(
             "set server.wireguard.public_key = \"{}\" with `parallax config edit`",
@@ -408,19 +676,8 @@ fn prepare(text: &str) -> anyhow::Result<Config> {
     Ok(config)
 }
 
-/// What the database holds: `None` before the first import. Any other
-/// failure (unreadable, busy) is an error, never "empty".
-fn current(db: &Path) -> anyhow::Result<Option<Config>> {
-    match load(db) {
-        Ok(config) => Ok(Some(config)),
-        Err(e) => match e.downcast_ref::<parallax_store::Error>() {
-            Some(parallax_store::Error::Missing(_) | parallax_store::Error::Empty(_)) => Ok(None),
-            _ => Err(e),
-        },
-    }
-}
-
-fn config_command(db: &Path, command: ConfigCommand) -> anyhow::Result<()> {
+fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
+    let db = ctx.db();
     match command {
         ConfigCommand::Import { file, if_empty } => {
             let not_imported = || {
@@ -431,15 +688,31 @@ fn config_command(db: &Path, command: ConfigCommand) -> anyhow::Result<()> {
                 );
             };
             // Before parsing: a file the database already replaced may be stale.
-            if if_empty && current(db)?.is_some() {
+            if if_empty && ctx.current()?.0.is_some() {
                 not_imported();
                 return Ok(());
             }
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
             let config = prepare(&text).with_context(|| format!("importing {}", file.display()))?;
+            let summary = format!(
+                "imported {} into {} ({} networks, {} templates, {} peers)",
+                file.display(),
+                db.display(),
+                config.networks.len(),
+                config.templates.len(),
+                config.peers.len()
+            );
+            if ctx.ask(&Request::Status)?.is_some() {
+                let ((), saved) = ctx.update(|current| {
+                    current.clone_from(&config);
+                    Ok(())
+                })?;
+                println!("{summary}");
+                return report(saved, "");
+            }
             let saved = block_on(async {
-                let mut store = Store::create(db).await?;
+                let mut store = ctx.create_store().await?;
                 if if_empty {
                     // Checked again inside the write: another process may
                     // have imported since.
@@ -453,17 +726,10 @@ fn config_command(db: &Path, command: ConfigCommand) -> anyhow::Result<()> {
                 not_imported();
                 return Ok(());
             }
-            println!(
-                "imported {} into {} ({} networks, {} templates, {} peers); run `parallax apply` to put it into effect",
-                file.display(),
-                db.display(),
-                config.networks.len(),
-                config.templates.len(),
-                config.peers.len()
-            );
+            println!("{summary}; run `parallax apply` to put it into effect");
         }
         ConfigCommand::Export { output } => {
-            let text = load(db)?.to_toml()?;
+            let text = ctx.load()?.to_toml()?;
             match output {
                 Some(path) => {
                     RealFs.write(&path, &text, true)?;
@@ -472,15 +738,15 @@ fn config_command(db: &Path, command: ConfigCommand) -> anyhow::Result<()> {
                 None => print!("{text}"),
             }
         }
-        ConfigCommand::Edit { out, yes } => config_edit(db, &out.out, yes)?,
+        ConfigCommand::Edit { out, yes } => config_edit(ctx, &out.out, yes)?,
     }
     Ok(())
 }
 
-fn config_edit(db: &Path, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
+fn config_edit(ctx: &Ctx, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
     // The database stays closed while the editor is open, so the gateway and
     // other commands aren't locked out; a change in the meantime is caught below.
-    let before = load(db)?;
+    let (before, revision) = ctx.load_revision()?;
     let original = before.to_toml()?;
     // Private (0700), removed with everything in it (editor backups and swap
     // files too) unless kept.
@@ -530,13 +796,29 @@ fn config_edit(db: &Path, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
     if !yes && !confirm("save?", false)? {
         bail!("nothing saved");
     }
-    let mut changed_meanwhile = false;
+    let changed_meanwhile = || {
+        let kept = dir.keep();
+        anyhow!(
+            "the configuration changed while you were editing; nothing saved. Your version is in {}; run `parallax config edit` again",
+            kept.join("parallax.toml").display()
+        )
+    };
+    if let Some(revision) = revision {
+        return match ctx.save(Box::new(edited), revision)? {
+            Some(saved) => {
+                println!("saved");
+                report(saved, "")
+            }
+            None => Err(changed_meanwhile()),
+        };
+    }
+    let mut moved = false;
     let saved = block_on(async {
-        let mut store = Store::open(db).await?;
+        let mut store = ctx.open_store().await?;
         store
             .update(|config| {
                 if *config != before {
-                    changed_meanwhile = true;
+                    moved = true;
                     bail!("the configuration changed while you were editing");
                 }
                 *config = edited;
@@ -544,12 +826,8 @@ fn config_edit(db: &Path, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
             })
             .await
     });
-    if changed_meanwhile {
-        let kept = dir.keep();
-        bail!(
-            "the configuration changed while you were editing; nothing saved. Your version is in {}; run `parallax config edit` again",
-            kept.join("parallax.toml").display()
-        );
+    if moved {
+        return Err(changed_meanwhile());
     }
     saved?;
     println!("saved; run `parallax apply` to put it into effect");
@@ -606,7 +884,7 @@ fn redact(diff: &str) -> String {
         .collect()
 }
 
-fn peer_command(db: &Path, command: PeerCommand) -> anyhow::Result<()> {
+fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
     match command {
         PeerCommand::Add {
             name,
@@ -617,7 +895,7 @@ fn peer_command(db: &Path, command: PeerCommand) -> anyhow::Result<()> {
             expires,
             platform,
         } => {
-            let (peer, export) = update(db, |config| {
+            let ((peer, export), saved) = ctx.update(|config| {
                 let model = resolve(config)?;
                 let t = model.template(&template)?;
                 let tr = transport::by_kind(kind);
@@ -659,11 +937,12 @@ fn peer_command(db: &Path, command: PeerCommand) -> anyhow::Result<()> {
                     "the private key below is shown once and not stored; save the config now"
                 );
             }
-            eprintln!("run `parallax apply` to let the gateway accept it");
+            // Printed before any apply error: the key isn't stored anywhere else.
             print_export(&export);
+            report(saved, "run `parallax apply` to let the gateway accept it")?;
         }
         PeerCommand::Remove { name } => {
-            update(db, |config| {
+            let ((), saved) = ctx.update(|config| {
                 let before = config.peers.len();
                 config.peers.retain(|p| p.name != name);
                 if config.peers.len() == before {
@@ -671,10 +950,11 @@ fn peer_command(db: &Path, command: PeerCommand) -> anyhow::Result<()> {
                 }
                 Ok(())
             })?;
-            println!("removed peer '{name}'; run `parallax apply` to revoke it on the gateway");
+            println!("removed peer '{name}'");
+            report(saved, "run `parallax apply` to revoke it on the gateway")?;
         }
         PeerCommand::Show { name } => {
-            let config = load(db)?;
+            let config = ctx.load()?;
             let model = resolve(&config)?;
             let peers: Vec<&Peer> = match &name {
                 Some(n) => vec![model.peer(n)?],

@@ -18,9 +18,13 @@ pub enum Error {
     )]
     Empty(PathBuf),
 
-    /// Another process kept writing for longer than we wait.
-    #[error("database {0} is busy with another Parallax process's write; try again in a moment")]
+    /// Another connection kept writing for longer than we wait.
+    #[error("database {0} is busy with another write; try again in a moment")]
     Locked(PathBuf),
+
+    /// Another process (normally the daemon) holds the database open.
+    #[error("database {0} is open in another process")]
+    InUse(PathBuf),
 
     /// The database was written by a newer Parallax (or its version is garbage).
     #[error("database {path} has schema version {found}, but this Parallax knows only 0 to {known}; upgrade Parallax")]

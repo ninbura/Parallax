@@ -55,6 +55,8 @@ sha2 = "0.10"
 # The CLI's owner-only umask, so every file Turso creates (WAL, coordination
 # file) is born private, and reading a passphrase without echo. Already in the tree through Turso.
 rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "termios"] }
+# The daemon's socket protocol: one JSON request and one JSON reply per connection.
+serde_json = "1"
 
 # Enforced in CI via `cargo clippy -- -D warnings`. See AGENTS.md.
 [workspace.lints.rust]

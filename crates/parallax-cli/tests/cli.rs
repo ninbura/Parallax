@@ -59,6 +59,10 @@ impl Scratch {
     fn db(&self) -> PathBuf {
         self.dir.join("parallax.db")
     }
+    /// Where a daemon would listen; nothing does unless a test says so.
+    fn socket(&self) -> PathBuf {
+        self.dir.join("parallax.sock")
+    }
     /// Import the TOML file into the database, which must succeed.
     fn import(&self) {
         let (ok, _, err) = self.run(&["config", "import", &self.config().to_string_lossy()]);
@@ -71,6 +75,8 @@ impl Scratch {
         let out = Command::new(env!("CARGO_BIN_EXE_parallax"))
             .arg("--db")
             .arg(self.db())
+            .arg("--socket")
+            .arg(self.socket())
             .args(args)
             .envs(env.iter().copied())
             .env_remove("VISUAL")
@@ -375,42 +381,117 @@ fn config_diffs_never_show_keys() {
     assert!(!stdout.contains("private_key = \""), "{stdout}");
 }
 
+/// Without a daemon each command holds the database while it runs; another
+/// process gets an error naming the socket that should have answered.
 #[test]
-fn concurrent_peer_adds_all_land_with_distinct_addresses() {
-    let s = Scratch::new("concurrent");
+fn a_held_database_names_the_daemon_socket() {
+    let s = Scratch::new("held");
     s.import();
-    let children: Vec<_> = (0..8)
-        .map(|i| {
-            Command::new(env!("CARGO_BIN_EXE_parallax"))
-                .arg("--db")
-                .arg(s.db())
-                .args(["peer", "add", &format!("dev{i}"), "--template", "family"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap()
-        })
-        .collect();
-    for child in children {
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let (ok, out, err) = s.run(&["peer", "show"]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let store = runtime
+        .block_on(parallax_store::Store::open(&s.db()))
+        .unwrap();
+    let (ok, _, err) = s.run(&["peer", "show"]);
+    assert!(!ok);
+    assert!(err.contains("locked by another process"), "{err}");
+    assert!(
+        err.contains(&s.socket().display().to_string()),
+        "the socket is named: {err}"
+    );
+    drop(store);
+    let (ok, _, err) = s.run(&["peer", "show"]);
     assert!(ok, "{err}");
-    let mut addresses: Vec<&str> = out
-        .lines()
-        .filter(|l| l.starts_with("dev"))
-        .filter_map(|l| l.split("address=").nth(1))
-        .filter_map(|a| a.split_whitespace().next())
+}
+
+#[test]
+fn status_says_when_no_daemon_runs() {
+    let s = Scratch::new("status");
+    let (ok, _, err) = s.run(&["status"]);
+    assert!(!ok);
+    assert!(err.contains("no daemon is running"), "{err}");
+}
+
+/// A stand-in daemon: answers `load` with the example and `save` with an
+/// apply log, recording each request.
+fn fake_daemon(
+    socket: &Path,
+    config: serde_json::Value,
+    connections: usize,
+) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..connections {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let reply = match request["request"].as_str().unwrap() {
+                "load" => serde_json::json!({
+                    "protocol": 1, "reply": "configuration",
+                    "configuration": config, "revision": 3,
+                }),
+                "save" => serde_json::json!({
+                    "protocol": 1, "reply": "applied", "revision": 4,
+                    "log": ["applied by the fake daemon"], "error": null,
+                }),
+                other => panic!("unexpected request {other}"),
+            };
+            (&stream)
+                .write_all(format!("{reply}\n").as_bytes())
+                .unwrap();
+            seen.push(request);
+        }
+        seen
+    })
+}
+
+/// With a daemon answering, commands go through it and never open the
+/// database (there is none here).
+#[test]
+fn commands_go_through_a_running_daemon() {
+    let s = Scratch::new("daemon");
+    let text = std::fs::read_to_string(s.config()).unwrap();
+    let config: parallax_core::Config = parallax_core::Config::from_toml(&text).unwrap();
+    let json = serde_json::to_value(&config).unwrap();
+    let daemon = fake_daemon(&s.socket(), json, 3);
+
+    let (ok, out, err) = s.run(&["validate"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("valid"), "{out}");
+    let (ok, out, err) = s.run(&["peer", "remove", "router"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("removed peer 'router'"), "{out}");
+    assert!(err.contains("applied by the fake daemon"), "{err}");
+    assert!(!err.contains("parallax apply"), "no apply hint: {err}");
+    assert!(!s.db().exists(), "the database was never opened");
+
+    let seen = daemon.join().unwrap();
+    let kinds: Vec<&str> = seen
+        .iter()
+        .map(|r| r["request"].as_str().unwrap())
         .collect();
-    assert_eq!(addresses.len(), 8, "{out}");
-    addresses.sort_unstable();
-    addresses.dedup();
-    assert_eq!(addresses.len(), 8, "two peers got one address: {out}");
+    assert_eq!(kinds, ["load", "load", "save"]);
+    assert_eq!(seen[2]["revision"], 3, "saved against the loaded revision");
+    let peers = seen[2]["configuration"]["peer"].as_array().unwrap();
+    assert!(peers.iter().all(|p| p["name"] != "router"), "{peers:?}");
+    assert!(seen.iter().all(|r| r["protocol"] == 1));
+}
+
+/// A stale socket file (its daemon is gone) means no daemon.
+#[test]
+fn a_stale_socket_falls_back_to_the_database() {
+    let s = Scratch::new("stale");
+    s.import();
+    drop(std::os::unix::net::UnixListener::bind(s.socket()).unwrap());
+    assert!(s.socket().exists());
+    let (ok, out, err) = s.run(&["validate"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("valid"), "{out}");
 }
 
 #[test]

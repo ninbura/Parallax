@@ -15,7 +15,8 @@ use parallax_core::secret::Secret;
 use parallax_core::Config;
 use parallax_store::{backup, Store, TempDir};
 
-use crate::{block_on, confirm, current, load, print_warnings, redact, resolve, OutArgs};
+use crate::protocol::{Reply, Request};
+use crate::{block_on, confirm, print_warnings, redact, resolve, unexpected, Ctx, OutArgs};
 
 #[derive(Subcommand)]
 pub enum BackupCommand {
@@ -59,17 +60,17 @@ pub enum BackupCommand {
 /// Passphrases shorter than this are refused; generated ones are longer.
 const MIN_PASSPHRASE: usize = 12;
 
-pub fn run(db: &Path, command: BackupCommand) -> anyhow::Result<()> {
+pub fn run(ctx: &Ctx, command: BackupCommand) -> anyhow::Result<()> {
     match command {
-        BackupCommand::Create { if_due } => create(db, if_due),
-        BackupCommand::List { directory } => list(db, directory),
+        BackupCommand::Create { if_due } => create_command(ctx, if_due),
+        BackupCommand::List { directory } => list(ctx, directory),
         BackupCommand::Restore {
             file,
             out,
             yes,
             passphrase_file,
-        } => restore(db, &file, &out.out, yes, passphrase_file.as_deref()),
-        BackupCommand::Passphrase { generate, replace } => set_passphrase(db, generate, replace),
+        } => restore(ctx, &file, &out.out, yes, passphrase_file.as_deref()),
+        BackupCommand::Passphrase { generate, replace } => set_passphrase(ctx, generate, replace),
     }
 }
 
@@ -80,7 +81,7 @@ fn now_secs() -> u64 {
 }
 
 /// The passphrase in `path`, if one is set there.
-fn read_passphrase(path: &Path) -> anyhow::Result<Option<Secret>> {
+pub(crate) fn read_passphrase(path: &Path) -> anyhow::Result<Option<Secret>> {
     match RealFs.read(path)? {
         Some(text) => {
             let pass = text.trim_end_matches(['\n', '\r']);
@@ -104,8 +105,29 @@ fn backup_passphrase(settings: &BackupServer) -> anyhow::Result<Option<Secret>> 
     }
 }
 
-fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
-    let config = load(db)?;
+fn create_command(ctx: &Ctx, if_due: bool) -> anyhow::Result<()> {
+    let lines = match ctx.ask(&Request::BackupCreate { if_due })? {
+        Some(Reply::Done { lines }) => lines,
+        Some(other) => return Err(unexpected(other)),
+        None => block_on(async {
+            let mut store = ctx.open_store().await?;
+            let config = store.load().await?;
+            create(&store, &config, if_due).await
+        })?,
+    };
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Back up `store` as `config` says, and rotate. Returns what it did, one
+/// line each; nothing when `if_due` finds no backup due.
+pub(crate) async fn create(
+    store: &Store,
+    config: &Config,
+    if_due: bool,
+) -> anyhow::Result<Vec<String>> {
     let settings = &config.server.backup;
     // The newest not from the future: one written while the clock was ahead
     // would otherwise stay "newest" and never match.
@@ -117,7 +139,7 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
     };
     if if_due {
         if !settings.automatic {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // Look at the database once per interval: since the newest backup,
         // or since a look that found nothing new, whichever is later. Times
@@ -130,7 +152,7 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
             .filter(|&t| t <= now)
             .max();
         if last.is_some_and(|t| now - t < settings.interval.as_secs()) {
-            return Ok(());
+            return Ok(Vec::new());
         }
     }
     let passphrase = backup_passphrase(settings)?;
@@ -145,36 +167,30 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
             key_file.display()
         );
     }
-    let written = block_on(async {
-        let store = Store::open(db).await?;
-        let snapshot = store
-            .snapshot(&config.server.wireguard.private_key_file)
-            .await?;
-        if if_due {
-            let unchanged = newest
-                .as_ref()
-                // The whole file, so a damaged newest backup is replaced, not trusted.
-                .and_then(|n| backup::verify(&n.path).ok())
-                .is_some_and(|m| {
-                    m.contents_sha256 == snapshot.contents_sha256()
-                        && m.encrypted == passphrase.is_some()
-                });
-            if unchanged {
-                backup::record_check(&settings.directory, SystemTime::now())?;
-                return Ok(None);
-            }
+    let snapshot = store
+        .snapshot(&config.server.wireguard.private_key_file)
+        .await?;
+    if if_due {
+        let unchanged = newest
+            .as_ref()
+            // The whole file, so a damaged newest backup is replaced, not trusted.
+            .and_then(|n| backup::verify(&n.path).ok())
+            .is_some_and(|m| {
+                m.contents_sha256 == snapshot.contents_sha256()
+                    && m.encrypted == passphrase.is_some()
+            });
+        if unchanged {
+            backup::record_check(&settings.directory, SystemTime::now())?;
+            return Ok(Vec::new());
         }
-        Ok(Some(backup::write(
-            &snapshot,
-            &settings.directory,
-            passphrase.as_ref(),
-            SystemTime::now(),
-        )?))
-    })?;
-    let Some((path, manifest)) = written else {
-        return Ok(());
-    };
-    println!(
+    }
+    let (path, manifest) = backup::write(
+        &snapshot,
+        &settings.directory,
+        passphrase.as_ref(),
+        SystemTime::now(),
+    )?;
+    let mut lines = vec![format!(
         "wrote {} ({})",
         path.display(),
         if manifest.encrypted {
@@ -182,17 +198,21 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
         } else {
             "not encrypted"
         }
-    );
+    )];
     for old in backup::rotate(&settings.directory, settings.keep as usize, &path)? {
-        println!("deleted {} (keeping {})", old.display(), settings.keep);
+        lines.push(format!(
+            "deleted {} (keeping {})",
+            old.display(),
+            settings.keep
+        ));
     }
-    Ok(())
+    Ok(lines)
 }
 
-fn list(db: &Path, directory: Option<PathBuf>) -> anyhow::Result<()> {
+fn list(ctx: &Ctx, directory: Option<PathBuf>) -> anyhow::Result<()> {
     let directory = match directory {
         Some(d) => d,
-        None => load(db)?.server.backup.directory,
+        None => ctx.load()?.server.backup.directory,
     };
     let backups = backup::list(&directory)?;
     if backups.is_empty() {
@@ -228,8 +248,8 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn set_passphrase(db: &Path, generate: bool, replace: bool) -> anyhow::Result<()> {
-    let config = load(db)?;
+fn set_passphrase(ctx: &Ctx, generate: bool, replace: bool) -> anyhow::Result<()> {
+    let config = ctx.load()?;
     let path = &config.server.backup.passphrase_file;
     if read_passphrase(path)?.is_some() && !replace {
         bail!(
@@ -355,7 +375,7 @@ fn open_backup(
 }
 
 fn restore(
-    db: &Path,
+    ctx: &Ctx,
     file: &Path,
     out_dir: &Path,
     yes: bool,
@@ -374,7 +394,7 @@ fn restore(
             "not encrypted"
         }
     );
-    let before = current(db).context(
+    let (before, revision) = ctx.current().context(
         "can't read the current database; if it's damaged, move it (parallax.db*) aside and restore as on a fresh install",
     )?;
     let defaults = BackupServer::default();
@@ -384,8 +404,61 @@ fn restore(
     } else {
         (backup::open(file, None)?, None)
     };
+    // Next to the database: it holds the same private data.
+    let staging = TempDir::new_in(&private_dir_of(ctx.db())?, ".parallax-restore")?;
 
-    let db_dir = match db.parent() {
+    block_on(async {
+        let (staged, restored) = stage(&contents, file, staging.path()).await?;
+        show_changes(before.as_ref(), &restored, contents.server_key(), out_dir)?;
+        if !yes && !confirm("restore?", false)? {
+            bail!("nothing restored");
+        }
+        if let Some(revision) = revision {
+            // The daemon restores from the file itself, into the database it holds.
+            let request = Request::BackupRestore {
+                path: std::path::absolute(file)
+                    .with_context(|| format!("resolving {}", file.display()))?,
+                passphrase: typed,
+                revision,
+            };
+            return match ctx.ask(&request)? {
+                Some(Reply::Applied { log, error, .. }) => {
+                    for line in log {
+                        println!("{line}");
+                    }
+                    match error {
+                        None => Ok(()),
+                        Some(e) => Err(crate::apply_failed(&e)),
+                    }
+                }
+                Some(Reply::Conflict { .. }) => bail!(
+                    "the configuration changed while the restore waited; nothing restored. Run the restore again"
+                ),
+                Some(other) => Err(unexpected(other)),
+                None => bail!("the daemon stopped before the restore; nothing restored"),
+            };
+        }
+        let mut live = ctx.create_store().await?;
+        let lines = restore_into(
+            &mut live,
+            before.as_ref(),
+            &contents,
+            &staged,
+            &restored,
+            typed.as_ref(),
+        )
+        .await?;
+        for line in lines {
+            println!("{line}");
+        }
+        println!("run `parallax apply` to put it into effect");
+        Ok(())
+    })
+}
+
+/// The directory holding `db`, created owner-only if missing.
+pub(crate) fn private_dir_of(db: &Path) -> anyhow::Result<PathBuf> {
+    let dir = match db.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
@@ -396,76 +469,87 @@ fn restore(
         use std::os::unix::fs::DirBuilderExt;
         dirs.mode(0o700);
     }
-    dirs.create(db_dir)
-        .with_context(|| format!("creating {}", db_dir.display()))?;
-    // Next to the database: it holds the same private data.
-    let staging = TempDir::new_in(db_dir, ".parallax-restore")?;
+    dirs.create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir.to_path_buf())
+}
 
-    block_on(async {
-        let mut staged = contents.stage(staging.path()).await?;
-        let restored = staged.load().await?;
-        let key =
-            backup::parse_key(contents.server_key().expose().as_bytes()).map(|k| k.public_key());
-        if key.as_ref() != Some(&restored.server.wireguard.public_key) {
-            bail!(
-                "backup {}: its server key doesn't match the public key in its configuration, so clients couldn't connect; nothing restored",
-                file.display()
+/// Open a backup's database in `directory`, refusing one whose server key
+/// doesn't match its configuration.
+pub(crate) async fn stage(
+    contents: &backup::Contents,
+    file: &Path,
+    directory: &Path,
+) -> anyhow::Result<(Store, Config)> {
+    let mut staged = contents.stage(directory).await?;
+    let restored = staged.load().await?;
+    let key = backup::parse_key(contents.server_key().expose().as_bytes()).map(|k| k.public_key());
+    if key.as_ref() != Some(&restored.server.wireguard.public_key) {
+        bail!(
+            "backup {}: its server key doesn't match the public key in its configuration, so clients couldn't connect; nothing restored",
+            file.display()
+        );
+    }
+    Ok((staged, restored))
+}
+
+/// Replace `live` and the server key with a staged backup's. `before` is
+/// what `live` must still hold (checked inside the write). Backs up the
+/// current state first, and keeps a typed passphrase for later backups.
+/// Returns what it did, one line each.
+pub(crate) async fn restore_into(
+    live: &mut Store,
+    before: Option<&Config>,
+    contents: &backup::Contents,
+    staged: &Store,
+    restored: &Config,
+    typed: Option<&Secret>,
+) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    // Undo first: a restore never loses the state it replaces.
+    if let Some(before) = before {
+        let path = save_current(live, before, typed)
+            .await
+            .context("couldn't save the current state first, so nothing was restored")?;
+        lines.push(format!(
+            "saved the current state first as {}",
+            path.display()
+        ));
+    }
+    // The key goes in first and comes back out if the database can't
+    // be replaced, so the two always match.
+    let key_file = &restored.server.wireguard.private_key_file;
+    let old_key = RealFs.read(key_file)?;
+    write_atomic(key_file, contents.server_key().expose())?;
+    if let Err(e) = live.replace_with(staged, before).await {
+        let undone = match &old_key {
+            Some(old) => write_atomic(key_file, old),
+            None => std::fs::remove_file(key_file).map_err(Into::into),
+        };
+        if let Err(undo) = undone {
+            eprintln!(
+                "warning: putting the old server key {} back failed too: {undo:#}",
+                key_file.display()
             );
         }
-        show_changes(before.as_ref(), &restored, contents.server_key(), out_dir)?;
-        if !yes && !confirm("restore?", false)? {
-            bail!("nothing restored");
+        return Err(e.into());
+    }
+    lines.push(format!(
+        "restored the database {} and the server key {}",
+        live.path().display(),
+        key_file.display()
+    ));
+    let wanted = &restored.server.backup;
+    if let Some(pass) = typed.filter(|_| wanted.encrypt) {
+        if read_passphrase(&wanted.passphrase_file)?.is_none() {
+            write_atomic(&wanted.passphrase_file, &format!("{}\n", pass.expose()))?;
+            lines.push(format!(
+                "saved the backup passphrase to {} for the next backups",
+                wanted.passphrase_file.display()
+            ));
         }
-        // Undo first: a restore never loses the state it replaces.
-        if let Some(before) = &before {
-            let path = save_current(db, before, typed.as_ref())
-                .await
-                .context("couldn't save the current state first, so nothing was restored")?;
-            println!("saved the current state first as {}", path.display());
-        }
-        // The key goes in first and comes back out if the database can't
-        // be replaced, so the two always match.
-        let key_file = &restored.server.wireguard.private_key_file;
-        let old_key = RealFs.read(key_file)?;
-        write_atomic(key_file, contents.server_key().expose())?;
-        let replaced = async {
-            let mut live = Store::create(db).await?;
-            live.replace_with(&staged, before.as_ref()).await?;
-            anyhow::Ok(())
-        }
-        .await;
-        if let Err(e) = replaced {
-            let undone = match &old_key {
-                Some(old) => write_atomic(key_file, old),
-                None => std::fs::remove_file(key_file).map_err(Into::into),
-            };
-            if let Err(undo) = undone {
-                eprintln!(
-                    "warning: putting the old server key {} back failed too: {undo:#}",
-                    key_file.display()
-                );
-            }
-            return Err(e);
-        }
-        println!(
-            "restored the database {} and the server key {}",
-            db.display(),
-            key_file.display()
-        );
-        let wanted = &restored.server.backup;
-        if let Some(pass) = typed.filter(|_| wanted.encrypt) {
-            if read_passphrase(&wanted.passphrase_file)?.is_none() {
-                write_atomic(&wanted.passphrase_file, &format!("{}\n", pass.expose()))?;
-                println!(
-                    "saved the backup passphrase to {} for the next backups",
-                    wanted.passphrase_file.display()
-                );
-            }
-        }
-        Ok(())
-    })?;
-    println!("run `parallax apply` to put it into effect");
-    Ok(())
+    }
+    Ok(lines)
 }
 
 /// Print what restoring `restored` changes: the configuration (keys
@@ -529,7 +613,7 @@ fn show_changes(
 /// undone. With encryption on and no passphrase set, the one that opened the
 /// backup is used. Not rotated: that could delete the very backup being restored.
 async fn save_current(
-    db: &Path,
+    store: &Store,
     before: &Config,
     typed: Option<&Secret>,
 ) -> anyhow::Result<PathBuf> {
@@ -539,7 +623,6 @@ async fn save_current(
         (Err(_), Some(typed)) => Some(Secret::new(typed.expose())),
         (Err(e), None) => return Err(e),
     };
-    let store = Store::open(db).await?;
     let snapshot = store
         .snapshot(&before.server.wireguard.private_key_file)
         .await?;
@@ -554,7 +637,7 @@ async fn save_current(
 
 /// Replace `path` (mode 0600) all at once: a crash or a full disk leaves the
 /// old contents, never a truncated file.
-fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),

@@ -26,7 +26,6 @@ use hickory_server::Server;
 use parallax_core::generate::dns::{DnsRoutes, Route};
 use parallax_core::netmap::Mapping;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::Notify;
 
 use crate::{answer, Error, Result};
@@ -113,9 +112,6 @@ pub struct Dns {
     upstream_port: u16,
     state: Arc<State>,
     reload: Arc<Notify>,
-    /// Registered by `serve` before anything else, so a SIGHUP during
-    /// startup is a reload, not the default action (exit).
-    hangup: Option<Signal>,
 }
 
 impl Dns {
@@ -127,7 +123,6 @@ impl Dns {
             upstream_port,
             state: Arc::new(load_state(routes_path, upstream_port)?),
             reload: Arc::new(Notify::new()),
-            hangup: None,
         })
     }
 
@@ -136,12 +131,12 @@ impl Dns {
         self.state.routes.listen
     }
 
-    /// Notifying this re-reads the routes, like SIGHUP does.
+    /// Notifying this re-reads the routes (the daemon does after each apply).
     pub fn reload_trigger(&self) -> Arc<Notify> {
         Arc::clone(&self.reload)
     }
 
-    /// Serve on `udp` and `tcp` until the process ends. SIGHUP re-reads the routes.
+    /// Serve on `udp` and `tcp` until the task is dropped.
     pub async fn run(self, udp: UdpSocket, tcp: TcpListener) -> Result<()> {
         let local = udp
             .local_addr()
@@ -153,17 +148,12 @@ impl Dns {
         ));
         let listening = self.state.routes.listen;
         let shared: Shared = Arc::new(RwLock::new(Some(self.state)));
-        let hangup = match self.hangup {
-            Some(h) => Some(h),
-            None => watch_hangup(),
-        };
         tokio::spawn(reloader(
             listening,
             self.routes_path,
             self.upstream_port,
             Arc::clone(&shared),
             self.reload,
-            hangup,
         ));
         let mut server = Server::new(Handler {
             state: shared,
@@ -178,61 +168,20 @@ impl Dns {
     }
 }
 
-/// Until a handler is installed, SIGHUP kills the process.
-fn watch_hangup() -> Option<Signal> {
-    match signal(SignalKind::hangup()) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            log(format!("cannot watch SIGHUP, routes won't reload: {e}"));
-            None
-        }
-    }
-}
-
-/// Load the routes at `routes_path` and serve until the process ends.
-pub fn serve(routes_path: &Path) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::io("starting the async runtime", e))?;
-    runtime.block_on(async {
-        let hangup = watch_hangup();
-        let mut dns = Dns::load(routes_path, 53)?;
-        dns.hangup = hangup;
-        let listen = dns.listen();
-        let udp = UdpSocket::bind(listen)
-            .await
-            .map_err(|e| Error::io(format!("listening on udp {listen}"), e))?;
-        let tcp = TcpListener::bind(listen)
-            .await
-            .map_err(|e| Error::io(format!("listening on tcp {listen}"), e))?;
-        dns.run(udp, tcp).await
-    })
-}
-
 async fn reloader(
     listening: SocketAddrV4,
     routes_path: PathBuf,
     upstream_port: u16,
     shared: Shared,
     reload: Arc<Notify>,
-    mut hangup: Option<Signal>,
 ) {
     loop {
-        tokio::select! {
-            Some(()) = async {
-                match hangup.as_mut() {
-                    Some(h) => h.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {}
-            () = reload.notified() => {}
-        }
+        reload.notified().await;
         let next = match load_state(&routes_path, upstream_port) {
             Ok(state) => {
                 if state.routes.listen != listening {
                     log(format!(
-                        "the routes now say to listen on {}, but this process stays on {listening}; restart it to move",
+                        "the routes now say to listen on {}, but the server stays on {listening}; restart Parallax to move",
                         state.routes.listen
                     ));
                 }

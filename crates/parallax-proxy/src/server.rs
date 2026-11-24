@@ -112,9 +112,6 @@ pub struct Proxy {
     state: Arc<State>,
     refresh: Duration,
     reload: Arc<Notify>,
-    /// Registered by `serve` before anything else, so a SIGHUP during
-    /// startup is a reload, not the default action (exit).
-    hangup: Option<tokio::signal::unix::Signal>,
 }
 
 impl Proxy {
@@ -125,7 +122,6 @@ impl Proxy {
             state: Arc::new(load_state(routes_path)?),
             refresh: CERT_REFRESH,
             reload: Arc::new(Notify::new()),
-            hangup: None,
         })
     }
 
@@ -140,12 +136,12 @@ impl Proxy {
         self
     }
 
-    /// Notifying this re-reads the routes, like SIGHUP does.
+    /// Notifying this re-reads the routes (the daemon does after each apply).
     pub fn reload_trigger(&self) -> Arc<Notify> {
         Arc::clone(&self.reload)
     }
 
-    /// Serve on `listener` until the process ends. SIGHUP re-reads the routes.
+    /// Serve on `listener` until the task is dropped.
     pub async fn run(self, listener: TcpListener) -> Result<()> {
         let local = listener
             .local_addr()
@@ -155,17 +151,7 @@ impl Proxy {
             self.state.sites.len()
         ));
         let (tx, rx) = watch::channel(self.state);
-        let hangup = match self.hangup {
-            Some(h) => Some(h),
-            None => watch_hangup(),
-        };
-        tokio::spawn(reloader(
-            self.routes_path,
-            tx,
-            self.refresh,
-            self.reload,
-            hangup,
-        ));
+        tokio::spawn(reloader(self.routes_path, tx, self.refresh, self.reload));
         let counts: Arc<Mutex<HashMap<Ipv4Addr, usize>>> = Arc::default();
         loop {
             match listener.accept().await {
@@ -189,35 +175,6 @@ impl Proxy {
             }
         }
     }
-}
-
-/// Until a handler is installed, SIGHUP kills the process.
-fn watch_hangup() -> Option<tokio::signal::unix::Signal> {
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            log(format!("cannot watch SIGHUP, routes won't reload: {e}"));
-            None
-        }
-    }
-}
-
-/// Load the routes at `routes_path` and serve until the process ends.
-pub fn serve(routes_path: &Path) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::io("starting the async runtime", e))?;
-    runtime.block_on(async {
-        let hangup = watch_hangup();
-        let mut proxy = Proxy::load(routes_path)?;
-        proxy.hangup = hangup;
-        let listen = proxy.listen();
-        let listener = TcpListener::bind(listen)
-            .await
-            .map_err(|e| Error::io(format!("listening on {listen}"), e))?;
-        proxy.run(listener).await
-    })
 }
 
 fn ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
@@ -340,14 +297,12 @@ async fn reloader(
     tx: watch::Sender<Arc<State>>,
     refresh: Duration,
     trigger: Arc<Notify>,
-    mut hangup: Option<tokio::signal::unix::Signal>,
 ) {
     let mut tick = tokio::time::interval(refresh);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
     loop {
         tokio::select! {
-            Some(()) = recv(&mut hangup) => reload(&routes_path, &tx),
             () = trigger.notified() => reload(&routes_path, &tx),
             _ = tick.tick() => refresh_certificates(&tx),
         }
@@ -362,7 +317,7 @@ fn reload(routes_path: &Path, tx: &watch::Sender<Arc<State>>) {
         Ok(state) => {
             if state.routes.listen != old.routes.listen {
                 log(format!(
-                    "the listen address changed to {}; restart the proxy to use it",
+                    "the listen address changed to {}; restart Parallax to use it",
                     state.routes.listen
                 ));
             }
@@ -431,13 +386,6 @@ fn refresh_certificates(tx: &watch::Sender<Arc<State>>) {
             old.certs_fingerprint
         },
     }));
-}
-
-async fn recv(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
-    match signal {
-        Some(s) => s.recv().await,
-        None => std::future::pending().await,
-    }
 }
 
 /// Drive `work` until it ends or `client` loses `hostname` in a reload.

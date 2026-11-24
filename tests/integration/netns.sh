@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Parallax integration test on Linux network namespaces. Needs root, and:
 # nft, wg, ip, dnsmasq, dig, curl, openssl, ping, python3, and the parallax
-# binary (PARALLAX=...).
+# binary (PARALLAX=...). KEEP_LOG=<file> keeps a copy of the daemon's log.
 #
 # Topology (every namespace is fresh):
 #   home    192.168.1.5   "nginx" (TLS, picks the site by Host: immich and a sibling
 #           other.mydomain.com) + home DNS + plain HTTP on 8080 + an echo on 7000
 #   gw      eth0 192.168.1.1 (home LAN), wan0 203.0.113.1 (clients), up0 (internet),
-#           docker0 172.17.0.1 (a Docker bridge); runs `parallax apply`, `parallax dns`
-#           and `parallax proxy`
+#           docker0 172.17.0.1 (a Docker bridge); runs `parallax daemon` (apply, DNS,
+#           the HTTPS proxy), which the CLI drives over its socket
 #   client  wan0 203.0.113.2 -> gw; lan0 192.168.1.10 on a *foreign* LAN with the
 #           same prefix as home; WireGuard interfaces wgp (personal), wgf (family)
 #           and wgx (friend)
@@ -23,13 +23,15 @@
 #
 # Assertions: (a) mapped virtual IP lands on the real host, (b) the DNS server
 # answers in virtual space, (c) guest reaches only its grants even with 0.0.0.0/0
-# AllowedIPs, (d) reapply is idempotent, (e) raw mapped access without DNS,
+# AllowedIPs, (d) reapply is idempotent, (e) concurrent changes through the daemon,
 # (f) colliding guest network with split DNS, (g) the proxy: by name only, one
 # hostname, Host/SNI/:authority checked, (h) internet means public addresses,
 # (i) nothing else on the gateway, its Docker bridge or the public address,
 # (j) IPv6 from a peer is dropped, (k) a revoked grant cuts open connections,
 # (l) DNS answers each tier only its names, and no private address outside the
-# configured networks, (m) large DNS answers.
+# configured networks, (m) large DNS answers, (n) the daemon tears down on SIGTERM,
+# re-applies on SIGHUP and repairs a deleted table. Every change goes through the
+# daemon and takes effect without SIGHUP.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -56,6 +58,7 @@ cleanup() {
     done
     sleep 0.2
     for ns in $NAMESPACES; do ip netns del $ns 2>/dev/null; done
+    [ -n "${KEEP_LOG:-}" ] && cp "$WORK/daemon.log" "$KEEP_LOG"
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -63,8 +66,7 @@ trap cleanup EXIT
 pass() { echo "PASS: $*"; }
 fail() {
     echo "FAIL: $*"
-    [ -s "$WORK/proxy.log" ] && { echo "--- proxy log"; tail -20 "$WORK/proxy.log"; }
-    [ -s "$WORK/dns.log" ] && { echo "--- dns log"; tail -20 "$WORK/dns.log"; }
+    [ -s "$WORK/daemon.log" ] && { echo "--- daemon log"; tail -30 "$WORK/daemon.log"; }
     exit 1
 }
 inns() { ip netns exec "$@"; }
@@ -128,7 +130,8 @@ PY
     PIDS+=($!)
 }
 echo_server() { # ns, port: echoes lines back, for connections held across an apply
-    inns "$1" python3 - "$2" <<'PY' &
+    # Quiet: held connections end in resets when (n) tears the gateway down.
+    inns "$1" python3 - "$2" 2>/dev/null <<'PY' &
 import sys, socketserver
 class H(socketserver.StreamRequestHandler):
     def handle(self):
@@ -247,7 +250,8 @@ tag = "tag:friend"
 [template.client]
 allowed_ips = "full_tunnel"
 TOML
-P="$PARALLAX --db $WORK/parallax.db"
+SOCK="$WORK/run/parallax.sock"
+P="$PARALLAX --db $WORK/parallax.db --socket $SOCK"
 $P config import "$WORK/parallax.toml" >/dev/null
 $P keygen --write-config >/dev/null
 $P peer add laptop --template personal --keep-private-key --platform linux > "$WORK/laptop.conf" 2>/dev/null
@@ -263,28 +267,35 @@ if inns gw unshare -U -r "$WORK/parallax" --db "$WORK/parallax.db" doctor > "$WO
 fi
 grep -q "^FAIL  user namespace" "$WORK/doctor-userns" || fail "doctor did not name the user namespace"
 pass "doctor passes on the gateway and refuses a user namespace"
-inns gw $P apply -o "$WORK/out" >/dev/null
+
+# The daemon applies, then serves DNS and the proxy on the tunnel address. Drift
+# checks are hourly here, so the tests below can change live rules on purpose;
+# (n) restarts it with a short interval.
+start_daemon() { # reconcile interval in seconds
+    inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/daemon.pid" \
+        $P daemon -o "$WORK/out" --reconcile-every "$1" >> "$WORK/daemon.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 100); do
+        $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep -q . \
+            && inns gw ss -Hltn 'sport = :8443' | grep -q . && return 0
+        sleep 0.1
+    done
+    fail "parallax daemon did not start"
+}
+start_daemon 3600
+[ "$(stat -c %a "$SOCK")" = 600 ] && [ "$(stat -c %a "$WORK/run")" = 700 ] \
+    || fail "the socket or its directory is not owner-only"
 # The server's key comes first in the export, before any peer's.
 GW_PUB=$($P config export | sed -n 's/^public_key = "\(.*\)"/\1/p' | head -n1)
 
-# The DNS server and the proxy listen on the tunnel address, so they start once
-# apply has made wg0, as the entrypoint does.
-start() { # command, port
-    inns gw sh -c 'echo $$ > "$1"; exec "$2" "$3" -o "$4"' sh \
-        "$WORK/$1.pid" "$PARALLAX" "$1" "$WORK/out" >> "$WORK/$1.log" 2>&1 &
-    PIDS+=($!)
-    for _ in $(seq 50); do inns gw ss -Hltn "sport = :$2" | grep -q . && return 0; sleep 0.1; done
-    fail "parallax $1 did not start"
-}
-start dns 53
-start proxy 8443
-# apply re-reads nothing in either; the entrypoint sends SIGHUP, so does this.
-apply() { # [TOML file to import first]
+# Through the daemon: an import applies on save, `apply` re-applies. No SIGHUP;
+# the DNS server and the proxy re-read their routes right after the apply.
+apply() { # [TOML file to import]
     if [ -n "${1:-}" ]; then
-        $P config import "$1" >/dev/null
+        $P config import "$1" >/dev/null 2>&1 || fail "import of $1 through the daemon failed"
+    else
+        $P apply >/dev/null || fail "apply through the daemon failed"
     fi
-    inns gw $P apply -o "$WORK/out" >/dev/null
-    kill -HUP "$(cat "$WORK/dns.pid")" "$(cat "$WORK/proxy.pid")"
     sleep 0.3
 }
 
@@ -356,12 +367,23 @@ diff -q "$WORK/wg1" "$WORK/wg2" >/dev/null || fail "(d) wg config changed on rea
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(d) traffic broken after reapply"
 pass "(d) reapply is idempotent"
 
-# (e) raw mapped IP access with the DNS server stopped
-kill "$(cat "$WORK/dns.pid")"; sleep 0.5
-inns gw ss -Hlun 'sport = :53' | grep -q . && fail "(e) the DNS server is still running"
-[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(e) mapped IP needs DNS"
-pass "(e) raw mapped IP works with the DNS server stopped"
-start dns 53
+# (e) changes through the daemon: eight `peer add`s at once all land, with distinct
+# addresses, and are live on wg0 when each command returns (one writer, no SIGHUP)
+ADDS=()
+for i in $(seq 8); do
+    $P peer add "dev$i" --template family >/dev/null 2>"$WORK/add$i.err" &
+    ADDS+=($!)
+done
+for i in $(seq 8); do
+    wait "${ADDS[$((i - 1))]}" || { cat "$WORK/add$i.err"; fail "(e) concurrent peer add dev$i failed"; }
+done
+ADDRS=$($P peer show | sed -n 's/^dev[0-9]* .*address=\([^ ]*\).*/\1/p' | sort -u)
+[ "$(grep -c . <<<"$ADDRS")" = 8 ] || fail "(e) eight peers, eight addresses: '$ADDRS'"
+[ "$(inns gw wg show wg0 peers | grep -c .)" = 11 ] || fail "(e) the new peers are not on wg0"
+for i in $(seq 8); do $P peer remove "dev$i" >/dev/null 2>&1 || fail "(e) peer remove dev$i"; done
+[ "$(inns gw wg show wg0 peers | grep -c .)" = 3 ] || fail "(e) removed peers are still on wg0"
+grep -q 'applying (SIGHUP)' "$WORK/daemon.log" && fail "(e) something sent SIGHUP"
+pass "(e) concurrent peer adds through the daemon land with distinct addresses and apply on save"
 
 # (f) colliding guest network: same name pattern, both boxes at 192.168.1.5
 FOREIGN=$(inns client dig +short @192.168.1.5 immich.hisdomain.com)   # via lan0, local resolver
@@ -524,7 +546,7 @@ for c in guest-lan guest-gateway guest-proxy; do
 done
 grep -q "^laptop-lan ALIVE$" "$WORK/hold.out" || { cat "$WORK/hold.out"; fail "(k) the laptop's connection did not survive an unrelated change"; }
 [ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = BLOCKED ] || fail "(k) guest opened a new connection after the revoke"
-# The DNS server took the same SIGHUP: the name went with the grant.
+# The DNS server re-read its routes after the same apply: the name went with the grant.
 ST=$(inns client dig +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
 [ "$ST" = REFUSED ] || fail "(k) guest still looked up immich after the revoke: '$ST'"
 apply "$WORK/full.toml"   # restore the grants
@@ -565,5 +587,33 @@ inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydoma
     || fail "(m) the 512-byte UDP answer was not truncated"
 [ "$(short_as $LAPTOP big.mydomain.com +tcp | grep -c '^198\.18\.1\.')" = 40 ] || fail "(m) big.mydomain.com over TCP"
 pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rewritten"
+
+# (n) the daemon's lifecycle: SIGTERM takes the gateway down and removes the socket;
+# a new daemon re-applies on SIGHUP and puts back a table someone deleted.
+DAEMON=$(cat "$WORK/daemon.pid")
+kill -TERM "$DAEMON"
+for _ in $(seq 50); do kill -0 "$DAEMON" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$DAEMON" 2>/dev/null && fail "(n) the daemon did not stop on SIGTERM"
+inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) the table outlived the daemon"
+inns gw ip link show wg0 >/dev/null 2>&1 && fail "(n) wg0 outlived the daemon"
+[ -e "$SOCK" ] && fail "(n) the socket outlived the daemon"
+$P validate >/dev/null || fail "(n) without a daemon the CLI opens the database itself"
+start_daemon 1
+# wg0 is new: the clients' sessions are gone until they handshake again (up to ~15 s).
+for _ in $(seq 10); do [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] && break; done
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after a restart"
+before=$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log" || true)
+kill -HUP "$(cat "$WORK/daemon.pid")"
+for _ in $(seq 50); do [ "$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log")" -gt "$before" ] && break; sleep 0.1; done
+[ "$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log")" -gt "$before" ] || fail "(n) SIGHUP did not re-apply"
+sleep 3   # a few idle reconcile ticks: an unchanged gateway must not count as drift
+grep -q 'applying (the live' "$WORK/daemon.log" && fail "(n) an unchanged gateway was taken for drift"
+inns gw nft delete table inet parallax
+for _ in $(seq 50); do inns gw nft list table inet parallax >/dev/null 2>&1 && break; sleep 0.1; done
+inns gw nft list table inet parallax >/dev/null 2>&1 || fail "(n) the deleted table did not come back"
+grep -q 'applying (the live' "$WORK/daemon.log" || fail "(n) the repair was not logged as drift"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(n) guest grants after the repair"
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after the repair"
+pass "(n) SIGTERM tears down; SIGHUP re-applies; a deleted table comes back on its own"
 
 echo "ALL PASS"

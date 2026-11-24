@@ -8,7 +8,8 @@
 //! it, and forwards to the configured upstream over verified TLS.
 //!
 //! It reads only the routes file `apply` generates
-//! ([`parallax_core::generate::proxy`]); SIGHUP re-reads it, and the
+//! ([`parallax_core::generate::proxy`]); the daemon runs it and has it
+//! re-read the routes after each apply ([`Proxy::reload_trigger`]), and the
 //! certificate folder is re-checked every minute so renewals need no restart.
 
 mod error;
@@ -18,7 +19,7 @@ pub mod certs;
 pub mod http;
 
 pub use error::{Error, Result};
-pub use server::{serve, Proxy};
+pub use server::Proxy;
 
 use parallax_core::generate::proxy::ProxyRoutes;
 

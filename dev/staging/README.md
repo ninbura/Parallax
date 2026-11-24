@@ -50,8 +50,8 @@ sudo dev/staging/staging.sh up        # fake LANs, config on first run, build, s
 sudo dev/staging/staging.sh smoke     # end-to-end checks; prints SMOKE PASS or FAIL
 sudo dev/staging/staging.sh peer phone personal mobile   # add a peer, show its QR
 sudo dev/staging/staging.sh export    # the configuration as TOML, into $STAGING_STATE/config/export.toml (0600)
-sudo dev/staging/staging.sh import FILE   # replace it with FILE, then re-apply
-sudo dev/staging/staging.sh apply     # re-apply (SIGHUP the container)
+sudo dev/staging/staging.sh import FILE   # replace it with FILE (applies on save)
+sudo dev/staging/staging.sh apply     # re-apply now (`parallax apply` through the daemon)
 sudo dev/staging/staging.sh status
 sudo dev/staging/staging.sh down      # stop and remove the fake LANs; state is kept
 sudo dev/staging/staging.sh reset     # down, then delete all state
@@ -78,6 +78,8 @@ a fresh client namespace to the real endpoint, and checks the following:
   importing an export of the configuration changes nothing.
 - **Backups.** An encrypted backup is written, and restoring it gives back
   the same configuration. The first smoke run sets a generated passphrase.
+- **The daemon.** A new peer is on `wg1` as soon as `peer add` returns (no
+  SIGHUP), and a deleted nft table comes back within a minute.
 - **Mapped addresses.** Both LANs are reachable by mapped address. On the
   routed LAN the host sees the tunnel address; on the masqueraded LAN it sees
   the gateway.

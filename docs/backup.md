@@ -54,12 +54,12 @@ ok    backups: every 1d to /var/lib/parallax/backups, keeping 14, encrypted
 
 ```sh
 sudo docker compose exec parallax parallax backup restore /var/lib/parallax/backups/parallax-backup-20261124T153000Z.tar
-sudo docker compose kill -s HUP parallax    # re-apply
 ```
 
 `restore` checks the file, asks for the passphrase if the server's doesn't
 open it, and shows what changes: the configuration (keys hidden), the server
-key, and the generated files. It changes nothing until you confirm. Before
+key, and the generated files. It changes nothing until you confirm. Then the
+running gateway (`parallax daemon`) restores it and applies it at once. Before
 replacing anything it saves the current state as a new backup, so a restore
 can be undone with another restore; if it can't, nothing is restored. If the
 configuration changes while you're looking at the diff, nothing is restored

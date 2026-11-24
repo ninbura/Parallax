@@ -10,11 +10,12 @@
 //!
 //! It holds no records and doesn't recurse: it forwards, with a small cache.
 //! It reads only the routes file `apply` generates
-//! ([`parallax_core::generate::dns`]); SIGHUP re-reads it.
+//! ([`parallax_core::generate::dns`]); the daemon runs it and has it re-read
+//! the routes after each apply ([`Dns::reload_trigger`]).
 
 mod answer;
 mod error;
 mod server;
 
 pub use error::{Error, Result};
-pub use server::{serve, Dns};
+pub use server::Dns;

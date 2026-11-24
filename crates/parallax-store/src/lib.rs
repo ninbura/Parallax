@@ -5,11 +5,10 @@
 //! back in a single transaction, row by row: rows keep their ids, so
 //! anything pointing at them (later, the GUI's own tables) survives.
 //!
-//! Many processes may use the database at once (Turso's multi-process WAL
-//! mode): readers never wait, and a writer waits up to [`BUSY_TIMEOUT`] for
-//! another writer to commit. Turso's MVCC (parallel writers) refuses
-//! multi-process access, so it waits until one process (the daemon) owns
-//! the database.
+//! One process at a time holds the database (Turso locks the file): the
+//! daemon while it runs, otherwise each CLI command for as long as it needs.
+//! Another process gets [`Error::InUse`]. Everything else asks the daemon
+//! (docs/adr/0007-the-daemon.md).
 
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
@@ -31,7 +30,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_backup.sql"),
 ];
 
-/// How long a write waits for another process's write to commit.
+/// How long a write waits for another connection's write to commit.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An open database.
@@ -74,9 +73,9 @@ impl Store {
             .to_str()
             .ok_or_else(|| Error::Invalid(format!("{} is not valid UTF-8", path.display())))?;
         let db = turso::Builder::new_local(name)
-            .experimental_multiprocess_wal(true)
             .build()
-            .await?;
+            .await
+            .map_err(|e| lock_error(path, e))?;
         let conn = db.connect()?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
@@ -96,7 +95,7 @@ impl Store {
     /// The CLI's owner-only umask covers files Turso creates later.
     fn tighten(&self) -> Result<()> {
         #[cfg(unix)]
-        for suffix in ["", "-wal", "-tshm"] {
+        for suffix in ["", "-wal"] {
             use std::os::unix::fs::PermissionsExt;
             let mut file = self.path.as_os_str().to_owned();
             file.push(suffix);
@@ -120,8 +119,8 @@ impl Store {
 
     /// Apply every migration the database hasn't seen. Opening an up-to-date
     /// database only reads; otherwise one write transaction re-checks the
-    /// version and applies the rest, so processes opening a new database at
-    /// the same time migrate it once.
+    /// version and applies the rest, so connections opening a new database
+    /// at the same time migrate it once.
     async fn migrate(&self) -> Result<()> {
         let known = MIGRATIONS.len() as i64;
         if self.check_version(known).await? == known {
@@ -214,6 +213,16 @@ impl Store {
     /// Roll back, ignoring failure: the error that caused it matters more.
     async fn rollback(&self) {
         let _ = self.conn.execute("ROLLBACK", ()).await;
+    }
+}
+
+/// Turso refuses a file another process holds with a plain message; name
+/// the database instead.
+fn lock_error(path: &Path, e: turso::Error) -> Error {
+    if e.to_string().contains("locked by another process") {
+        Error::InUse(path.to_path_buf())
+    } else {
+        Error::Db(e)
     }
 }
 

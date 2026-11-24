@@ -7,7 +7,7 @@ server stopped, mapped access still works).
 
 Names need two pieces:
 
-1. **The shim** (`parallax dns`, Parallax's built-in DNS server on the
+1. **The shim** (Parallax's built-in DNS server, part of `parallax daemon` on the
    gateway address) forwards the operator's zones (`Network.domains`) to the
    real home resolvers and rewrites their A answers into virtual space with
    the same `Mapping` as the NETMAP rule. Both come from the one `mapped_to`

@@ -22,6 +22,7 @@ pub mod io;
 pub mod model;
 pub mod netmap;
 pub mod plan;
+pub mod reconcile;
 pub mod secret;
 pub mod testing;
 pub mod transport;
