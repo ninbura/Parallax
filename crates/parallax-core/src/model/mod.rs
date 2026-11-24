@@ -6,6 +6,7 @@
 
 mod config;
 mod grant;
+mod layout;
 mod network;
 mod peer;
 mod server;

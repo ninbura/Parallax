@@ -492,22 +492,30 @@ for _ in $(seq 50); do [ "$(grep -c '^open' "$WORK/hold.out")" = 4 ] && break; s
 # keeps only its gwapp grant.
 $P config export > "$WORK/full.toml"
 python3 - "$WORK/full.toml" > "$WORK/revoked.toml" <<'PY'
+# `config export` writes several grants one per line inside `grants = [`.
 import sys
-sections, template = [[]], None
+template, in_grants = None, False
 for line in open(sys.argv[1]):
-    if line.startswith("["):
-        sections.append([])
-    sections[-1].append(line)
-for lines in sections:
-    head = lines[0].strip() if lines else ""
-    if head == "[[template]]":
-        template = next((l.split('"')[1] for l in lines if l.startswith("name = ")), None)
-    if head == "[[template.grants]]" and template == "family" and 'name = "gwapp"\n' not in lines:
+    if line.startswith("[["):
+        template = None
+    elif line.startswith("name = ") and template is None:
+        template = line.split('"')[1]
+    if line.startswith("grants = ["):
+        in_grants = line.rstrip().endswith("[")
+    elif in_grants and line.startswith("]"):
+        in_grants = False
+    elif in_grants and template == "family" and '"gwapp"' not in line:
         continue
-    sys.stdout.write("".join(lines))
+    sys.stdout.write(line)
 PY
-[ "$(grep -c '^\[\[template.grants\]\]' "$WORK/revoked.toml")" = $(( $(grep -c '^\[\[template.grants\]\]' "$WORK/full.toml") - 3 )) ] \
-    || fail "(k) could not write the revoked config"
+python3 - "$WORK/full.toml" "$WORK/revoked.toml" <<'PY' || fail "(k) could not write the revoked config"
+import sys, tomllib
+def grants(path):
+    t = next(t for t in tomllib.load(open(path, "rb"))["template"] if t["name"] == "family")
+    return t["grants"]
+full, revoked = grants(sys.argv[1]), grants(sys.argv[2])
+assert len(full) == 4 and revoked == [{"kind": "service", "name": "gwapp"}], (full, revoked)
+PY
 apply "$WORK/revoked.toml"
 touch "$WORK/hold"
 for _ in $(seq 100); do [ "$(grep -cE ' (ALIVE|CLOSED|BROKEN)$' "$WORK/hold.out")" = 4 ] && break; sleep 0.1; done

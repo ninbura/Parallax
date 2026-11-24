@@ -37,8 +37,13 @@ impl Config {
         })
     }
 
+    /// Render the configuration in the canonical layout (see `layout.rs`).
     pub fn to_toml(&self) -> crate::Result<String> {
-        toml::to_string_pretty(self).map_err(|e| crate::Error::Parse(e.to_string()))
+        let value = toml::Value::try_from(self).map_err(|e| crate::Error::Parse(e.to_string()))?;
+        let root = value.as_table().ok_or_else(|| {
+            crate::Error::Parse("configuration did not serialize as a table".into())
+        })?;
+        Ok(super::layout::render(root))
     }
 
     pub fn network(&self, name: &str) -> Option<&Network> {
