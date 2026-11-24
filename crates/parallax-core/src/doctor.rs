@@ -109,17 +109,22 @@ fn check_backup(backup: &BackupServer, sys: System<'_>) -> Outcome {
                 .to_string(),
         );
     }
-    // Writing a file creates the directory too, as a backup would.
-    // Named for this process, so it can't be a file someone else made.
-    let probe = dir.join(format!(".parallax-doctor-{}", std::process::id()));
-    match sys.fs.write(&probe, "", true) {
-        Ok(()) => {
-            let _ = sys.fs.remove(&probe);
+    // Never create the directory here: RealFs would make it 0755, and the
+    // first backup creates it 0700. A directory reads as an error, a
+    // missing path as nothing.
+    let missing = matches!(sys.fs.read(dir), Ok(None));
+    if !missing {
+        // Named for this process, so it can't be a file someone else made.
+        let probe = dir.join(format!(".parallax-doctor-{}", std::process::id()));
+        match sys.fs.write(&probe, "", true) {
+            Ok(()) => {
+                let _ = sys.fs.remove(&probe);
+            }
+            Err(e) => problems.push(format!(
+                "can't write backups to {}: {e}; fix it or change server.backup.directory",
+                dir.display()
+            )),
         }
-        Err(e) => problems.push(format!(
-            "can't write backups to {}: {e}; fix it or change server.backup.directory",
-            dir.display()
-        )),
     }
     if backup.encrypt {
         let set =
@@ -140,9 +145,14 @@ fn check_backup(backup: &BackupServer, sys: System<'_>) -> Outcome {
         return Outcome::Warn(problems.join("; "));
     }
     Outcome::Ok(format!(
-        "every {} to {}, keeping {}, {}",
+        "every {} to {}{}, keeping {}, {}",
         backup.interval,
         dir.display(),
+        if missing {
+            " (made by the first backup)"
+        } else {
+            ""
+        },
         backup.keep,
         if backup.encrypt {
             "encrypted"
@@ -517,7 +527,8 @@ mod tests {
         let fs = healthy_fs().with_file("/etc/parallax/backup.passphrase", "secret\n");
         assert_eq!(
             backup_outcome(&canonical_config(), &fs),
-            Outcome::Ok("every 1d to /var/lib/parallax/backups, keeping 14, encrypted".into())
+            Outcome::Ok("every 1d to /var/lib/parallax/backups (made by the first backup), keeping 14, encrypted"
+                    .into())
         );
         // The probe file is gone again.
         assert_eq!(
@@ -560,7 +571,10 @@ mod tests {
         config.server.backup.directory = "/var/backups".into();
         assert_eq!(
             backup_outcome(&config, &fs),
-            Outcome::Ok("every 1d to /var/backups, keeping 14, not encrypted".into())
+            Outcome::Ok(
+                "every 1d to /var/backups (made by the first backup), keeping 14, not encrypted"
+                    .into()
+            )
         );
     }
 

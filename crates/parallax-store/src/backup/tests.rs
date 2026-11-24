@@ -332,3 +332,29 @@ async fn verify_catches_damage_without_the_passphrase() {
     let err = verify(&file).unwrap_err().to_string();
     assert!(err.contains("is damaged"), "{err}");
 }
+
+#[tokio::test]
+async fn tables_come_after_the_tables_they_point_at() {
+    let dir = TempDir::new();
+    let store = Store::create(&dir.db()).await.unwrap();
+    // As after a migration that rebuilds a parent table: created last.
+    store
+        .exec(
+            "CREATE TABLE late_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES late_parent (id))",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    store
+        .exec(
+            "CREATE TABLE late_parent (id INTEGER PRIMARY KEY)",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let tables = store.tables().await.unwrap();
+    let at = |name: &str| tables.iter().position(|t| t == name).unwrap();
+    assert!(at("late_parent") < at("late_child"), "{tables:?}");
+    assert!(at("networks") < at("template_grants"), "{tables:?}");
+    assert!(at("templates") < at("peers"), "{tables:?}");
+}

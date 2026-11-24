@@ -1,6 +1,7 @@
 //! Private scratch directories.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Error, Result};
 
@@ -10,13 +11,15 @@ use crate::{Error, Result};
 pub struct TempDir(Option<PathBuf>);
 
 impl TempDir {
-    /// Create `<parent>/<prefix>-<pid>-<random>`. `parent` must exist.
+    /// Create `<parent>/<prefix>-<pid>-<time>-<count>`. `parent` must exist.
     pub fn new_in(parent: &Path, prefix: &str) -> Result<TempDir> {
+        static COUNT: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let path = parent.join(format!("{prefix}-{}-{nanos:08x}", std::process::id()));
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!("{prefix}-{}-{nanos:08x}-{n}", std::process::id()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

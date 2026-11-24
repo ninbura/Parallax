@@ -579,7 +579,7 @@ fn run_editor(file: &Path) -> anyhow::Result<()> {
 /// Ask a yes/no question on the terminal. Without one, only `--yes` can say yes.
 fn confirm(question: &str, default: bool) -> anyhow::Result<bool> {
     if !std::io::stdin().is_terminal() {
-        bail!("{question} needs a terminal to answer; pass --yes to save without asking");
+        bail!("{question} needs a terminal to answer; pass --yes to go ahead without asking");
     }
     eprint!("{question} [{}] ", if default { "Y/n" } else { "y/N" });
     std::io::stderr().flush()?;

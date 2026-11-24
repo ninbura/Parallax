@@ -510,6 +510,7 @@ fn a_backup_restores_what_changed_since() {
     assert!(ok, "{err}");
     assert!(out.contains("+name = \"laptop\""), "{out}");
     assert!(out.contains("is replaced with the backup's"), "{out}");
+    assert!(out.contains("generated files after"), "{out}");
     assert!(out.contains("saved the current state first"), "{out}");
     assert!(out.contains("run `parallax apply`"), "{out}");
     assert!(!out.contains(key.trim()), "the key must never be printed");
@@ -659,4 +660,25 @@ fn a_restore_without_an_undo_backup_changes_nothing() {
     );
     let (_, after, _) = s.run(&["config", "export"]);
     assert_eq!(before, after);
+}
+
+#[test]
+fn a_backup_dated_in_the_future_does_not_stay_newest() {
+    let s = Scratch::new("backup-future");
+    s.gateway();
+    s.run(&["backup", "create"]);
+    let file = s.backups().pop().unwrap();
+    // Written while the clock was ahead.
+    std::fs::rename(
+        &file,
+        file.with_file_name("parallax-backup-20991231T000000Z.tar"),
+    )
+    .unwrap();
+    s.run(&["peer", "remove", "laptop"]);
+    let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
+    assert!(ok && out.contains("wrote"), "{out}{err}");
+    // The one just written counts as newest now: not due again.
+    let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
+    assert!(ok && out.is_empty(), "{out}{err}");
+    assert_eq!(s.backups().len(), 2);
 }

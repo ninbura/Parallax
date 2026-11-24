@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
 use parallax_core::generate;
+use parallax_core::io::memory::MemoryFs;
 use parallax_core::io::real::RealFs;
 use parallax_core::io::FileSystem;
 use parallax_core::model::BackupServer;
@@ -105,14 +106,19 @@ fn backup_passphrase(settings: &BackupServer) -> anyhow::Result<Option<Secret>> 
 fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
     let config = load(db)?;
     let settings = &config.server.backup;
-    let newest = backup::list(&settings.directory)?.pop();
+    // The newest not from the future: one written while the clock was ahead
+    // would otherwise stay "newest" and never match.
+    let now = now_secs();
+    let mut backups = backup::list(&settings.directory)?;
+    let newest = match backups.iter().rposition(|b| b.created <= now) {
+        Some(i) => Some(backups.swap_remove(i)),
+        None => backups.pop(),
+    };
     if if_due {
         if !settings.automatic {
             return Ok(());
         }
         if let Some(newest) = &newest {
-            let now = now_secs();
-            // A backup from the future (the clock went back) doesn't count.
             if newest.created <= now && now - newest.created < settings.interval.as_secs() {
                 return Ok(());
             }
@@ -235,7 +241,7 @@ fn set_passphrase(db: &Path, generate: bool, replace: bool) -> anyhow::Result<()
         }
         first
     };
-    RealFs.write(path, &format!("{passphrase}\n"), true)?;
+    write_atomic(path, &format!("{passphrase}\n"))?;
     if generate {
         println!("{passphrase}");
     }
@@ -286,7 +292,9 @@ fn read_secret(prompt: &str) -> anyhow::Result<String> {
     let read = stdin.lock().read_line(&mut line);
     let _ = tcsetattr(fd, OptionalActions::Now, &original);
     eprintln!();
-    read?;
+    if read? == 0 {
+        bail!("no passphrase given");
+    }
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
@@ -299,6 +307,9 @@ fn open_backup(
     server_file: &Path,
 ) -> anyhow::Result<(backup::Contents, Option<Secret>)> {
     if let Some(given) = given {
+        if !given.exists() {
+            bail!("the passphrase file {} doesn't exist", given.display());
+        }
         let pass = read_passphrase(given)?
             .ok_or_else(|| anyhow!("{} holds no passphrase", given.display()))?;
         let contents = backup::open(file, Some(&pass))?;
@@ -434,11 +445,7 @@ fn restore(
         let wanted = &restored.server.backup;
         if let Some(pass) = typed.filter(|_| wanted.encrypt) {
             if read_passphrase(&wanted.passphrase_file)?.is_none() {
-                RealFs.write(
-                    &wanted.passphrase_file,
-                    &format!("{}\n", pass.expose()),
-                    true,
-                )?;
+                write_atomic(&wanted.passphrase_file, &format!("{}\n", pass.expose()))?;
                 println!(
                     "saved the backup passphrase to {} for the next backups",
                     wanted.passphrase_file.display()
@@ -491,8 +498,10 @@ fn show_changes(
     };
     println!("server key: {key}");
     if errors.is_empty() {
+        // Generated with the backup's server key, compared with what's on disk.
+        let with_key = MemoryFs::new().with_file(key_file, server_key.expose());
         let plan = resolve(restored).and_then(|model| {
-            let bundle = generate::generate_all(&model, &RealFs)?;
+            let bundle = generate::generate_all(&model, &with_key)?;
             Ok(parallax_core::plan::plan(&bundle, out_dir, &RealFs)?)
         });
         match plan {

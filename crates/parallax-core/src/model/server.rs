@@ -292,13 +292,14 @@ impl std::str::FromStr for Interval {
             detail: format!("'{s}' is not a period like 30m, 6h or 1d"),
         };
         let s = s.trim();
-        let (number, unit) = s.split_at(s.len().saturating_sub(1));
-        let unit = match unit {
-            "m" => Interval::MINUTE,
-            "h" => Interval::HOUR,
-            "d" => Interval::DAY,
-            _ => return Err(malformed()),
-        };
+        let (number, unit) = [
+            ('m', Interval::MINUTE),
+            ('h', Interval::HOUR),
+            ('d', Interval::DAY),
+        ]
+        .iter()
+        .find_map(|&(suffix, unit)| s.strip_suffix(suffix).map(|n| (n, unit)))
+        .ok_or_else(malformed)?;
         let n: u64 = number.parse().map_err(|_| malformed())?;
         match n.checked_mul(unit) {
             Some(secs) if secs > 0 => Ok(Interval(secs)),

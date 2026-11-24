@@ -214,8 +214,8 @@ impl Store {
             if found.as_ref() != expected {
                 return Err(Error::Changed(self.path.clone()));
             }
-            // Tables are created after the ones they point at: delete in
-            // reverse, fill in order, and every reference holds throughout.
+            // Parents before children: delete in reverse, fill in order,
+            // and every reference holds throughout.
             for table in tables.iter().rev() {
                 self.exec(&format!("DELETE FROM {table}"), Vec::new())
                     .await?;
@@ -247,8 +247,40 @@ impl Store {
         self.tighten()
     }
 
-    /// Every table holding data, in the order they were created.
+    /// Every table holding data, each after the tables it points at.
     async fn tables(&self) -> Result<Vec<String>> {
+        let mut pending = self.data_tables().await?;
+        let mut parents = BTreeMap::new();
+        for table in &pending {
+            let refs: Vec<String> = self
+                .rows(&format!("PRAGMA foreign_key_list({table})"), Vec::new())
+                .await?
+                .iter()
+                .map(|r| r.get::<String>(2))
+                .collect::<std::result::Result<_, _>>()?;
+            parents.insert(table.clone(), refs);
+        }
+        let mut ordered: Vec<String> = Vec::new();
+        while !pending.is_empty() {
+            let ready = pending
+                .iter()
+                .position(|t| parents[t].iter().all(|p| p == t || ordered.contains(p)));
+            match ready {
+                Some(i) => ordered.push(pending.remove(i)),
+                None => {
+                    return Err(Error::Stored(format!(
+                        "{}: the tables {} point at each other",
+                        self.path.display(),
+                        pending.join(", ")
+                    )))
+                }
+            }
+        }
+        Ok(ordered)
+    }
+
+    /// Every table holding data, in the order they were created.
+    async fn data_tables(&self) -> Result<Vec<String>> {
         let names: Vec<String> = self
             .rows(
                 "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY rowid",
