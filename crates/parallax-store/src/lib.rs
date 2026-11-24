@@ -13,17 +13,23 @@
 
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod backup;
 mod config;
 mod error;
+mod tempdir;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use error::{Error, Result};
+pub use tempdir::TempDir;
 
 /// Schema migrations, applied in order. Never edit one that has shipped;
 /// add the next.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_config.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_config.sql"),
+    include_str!("../migrations/0002_backup.sql"),
+];
 
 /// How long a write waits for another process's write to commit.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);

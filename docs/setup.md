@@ -96,7 +96,7 @@ cd docker && sudo docker compose run --rm --no-deps parallax doctor
 Before the first start there is no database yet, so the configuration check
 fails ("no database at ..."); the host checks still run.
 
-It checks:
+It checks the following. `backups` only warns: the gateway runs without them.
 
 | Check | Fails when | Fix |
 |---|---|---|
@@ -108,6 +108,7 @@ It checks:
 | interface \<name\> | a configured LAN or WAN interface doesn't exist | the name in the configuration (`ip link`, `parallax config edit`) |
 | wireguard | a WireGuard interface can't be created | `/etc/modules-load.d/` (above) |
 | NETMAP | the kernel or `nft` rejects prefix NAT (`nftables` backend only) | a newer kernel or nftables |
+| backups (warns) | automatic backups are off, the directory isn't writable, no passphrase is set, or unencrypted backups go to a network filesystem | [docs/backup.md](backup.md) |
 
 ## Choosing the endpoint
 
@@ -193,6 +194,15 @@ public key in the configuration. Then it starts `tailscaled` (idle until M2), ap
 firewall, brings up `wg0`, and starts the DNS server and the HTTPS proxy. If
 either of those exits, the container stops and Docker's restart policy takes
 over.
+
+Then set the backup passphrase, and keep it in your password manager:
+
+```sh
+sudo docker compose exec parallax parallax backup passphrase --generate
+```
+
+Backups run daily into `docker/backups/`; restoring one is a single command.
+See [docs/backup.md](backup.md).
 
 ## Adding a device
 

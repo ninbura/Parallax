@@ -494,6 +494,24 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         }
     }
 
+    let backup = &server.backup;
+    if backup.keep == 0 {
+        errors.push(
+            "server.backup.keep must be at least 1; turn automatic backups off with server.backup.automatic = false".into(),
+        );
+    }
+    for (field, path) in [
+        ("directory", &backup.directory),
+        ("passphrase_file", &backup.passphrase_file),
+    ] {
+        if !path.is_absolute() {
+            errors.push(format!(
+                "server.backup.{field} {} must be an absolute path",
+                path.display()
+            ));
+        }
+    }
+
     // --- networks -------------------------------------------------------
     let mut seen_names: BTreeSet<&str> = BTreeSet::new();
     let mut client_prefixes: Vec<(String, Ipv4Net)> = Vec::new(); // what tunnel clients route
@@ -949,6 +967,22 @@ mod tests {
 
     fn has(errors: &[String], needle: &str) -> bool {
         errors.iter().any(|e| e.contains(needle))
+    }
+
+    #[test]
+    fn backup_settings_are_checked() {
+        let e = errors_of(|c| c.server.backup.keep = 0);
+        assert!(has(&e, "server.backup.keep must be at least 1"), "{e:?}");
+        let e = errors_of(|c| c.server.backup.directory = "backups".into());
+        assert!(
+            has(
+                &e,
+                "server.backup.directory backups must be an absolute path"
+            ),
+            "{e:?}"
+        );
+        let e = errors_of(|c| c.server.backup.passphrase_file = "pass".into());
+        assert!(has(&e, "server.backup.passphrase_file pass"), "{e:?}");
     }
 
     #[test]

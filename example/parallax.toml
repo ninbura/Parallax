@@ -56,6 +56,20 @@ certificates = "/etc/parallax/certs"
 # Upstream certificates are verified against this CA bundle.
 upstream_ca = "/etc/ssl/certs/ca-certificates.crt"
 
+[server.backup]
+# Backups of the database and the server key, one file each (docs/backup.md).
+# Best on another disk than the database.
+directory = "/var/lib/parallax/backups"
+# Back up every `interval` when something changed.
+automatic = true
+interval = "1d"
+# The oldest are deleted past this many.
+keep = 14
+# Encrypted with the passphrase in passphrase_file. Set it with
+# `parallax backup passphrase` and keep a copy in your password manager.
+encrypt = true
+passphrase_file = "/etc/parallax/backup.passphrase"
+
 # A physical network the gateway reaches. `mapped_to` is the collision-free
 # prefix clients see; host bits are preserved (192.168.1.5 -> 198.18.1.5).
 # 198.18.0.0/15 is reserved for benchmarking (RFC 2544), so no home or office

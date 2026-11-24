@@ -45,9 +45,15 @@ async-trait = "0.1"
 # SQLite's file format. Pinned exactly while it's before 1.0. No default
 # features: they add mimalloc (C) and full-text search, neither needed.
 turso = { version = "=0.8.4", default-features = false }
+# Backups (parallax-store): `age` encrypts them with a passphrase, so an
+# operator can also open one by hand with the `age` tool; `tar` packs the
+# files; `sha2` checksums them.
+age = "0.12"
+tar = { version = "0.4.46", default-features = false }
+sha2 = "0.10"
 # The CLI's owner-only umask, so every file Turso creates (WAL, coordination
-# file) is born private. Already in the tree through Turso.
-rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
+# file) is born private, and reading a passphrase without echo. Already in the tree through Turso.
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "termios"] }
 
 # Enforced in CI via `cargo clippy -- -D warnings`. See AGENTS.md.
 [workspace.lints.rust]
@@ -59,3 +65,14 @@ expect_used = "warn"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+
+# Backup encryption's key derivation (scrypt) is deliberately slow; unoptimized
+# it takes minutes, so tests build it optimized.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use clap::{Args, Parser, Subcommand};
 use parallax_core::date::Date;
+use parallax_core::doctor::Outcome;
 use parallax_core::generate::{self, Export};
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
@@ -17,7 +18,9 @@ use parallax_core::secret::PrivateKey;
 use parallax_core::transport::{self, ProvisionOptions};
 use parallax_core::validate::ReachKind;
 use parallax_core::{Config, Model};
-use parallax_store::Store;
+use parallax_store::{Store, TempDir};
+
+mod backup;
 
 #[derive(Parser)]
 #[command(
@@ -67,6 +70,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Back up and restore everything Parallax keeps: the database and the server key.
+    Backup {
+        #[command(subcommand)]
+        command: backup::BackupCommand,
     },
     /// Manage peers.
     Peer {
@@ -292,6 +300,7 @@ fn run() -> anyhow::Result<()> {
             if_missing,
         } => keygen(db, write_config, if_missing)?,
         Command::Config { command } => config_command(db, command)?,
+        Command::Backup { command } => backup::run(db, command)?,
         Command::Peer { command } => peer_command(db, command)?,
         Command::Export { peer, platform } => {
             let config = load(db)?;
@@ -314,9 +323,10 @@ fn doctor(db: &Path) -> anyhow::Result<()> {
     let checks = parallax_core::doctor::diagnose(config.as_ref().map_err(Clone::clone), sys);
     let mut failed = 0;
     for check in &checks {
-        match &check.result {
-            Ok(detail) => println!("ok    {}: {detail}", check.name),
-            Err(problem) => {
+        match &check.outcome {
+            Outcome::Ok(detail) => println!("ok    {}: {detail}", check.name),
+            Outcome::Warn(problem) => println!("warn  {}: {problem}", check.name),
+            Outcome::Fail(problem) => {
                 failed += 1;
                 println!("FAIL  {}: {problem}", check.name);
             }
@@ -398,13 +408,13 @@ fn prepare(text: &str) -> anyhow::Result<Config> {
     Ok(config)
 }
 
-/// Whether the database exists and holds a configuration. Any other failure
-/// (unreadable, busy) is an error, never "empty".
-fn holds_configuration(db: &Path) -> anyhow::Result<bool> {
+/// What the database holds: `None` before the first import. Any other
+/// failure (unreadable, busy) is an error, never "empty".
+fn current(db: &Path) -> anyhow::Result<Option<Config>> {
     match load(db) {
-        Ok(_) => Ok(true),
+        Ok(config) => Ok(Some(config)),
         Err(e) => match e.downcast_ref::<parallax_store::Error>() {
-            Some(parallax_store::Error::Missing(_) | parallax_store::Error::Empty(_)) => Ok(false),
+            Some(parallax_store::Error::Missing(_) | parallax_store::Error::Empty(_)) => Ok(None),
             _ => Err(e),
         },
     }
@@ -421,7 +431,7 @@ fn config_command(db: &Path, command: ConfigCommand) -> anyhow::Result<()> {
                 );
             };
             // Before parsing: a file the database already replaced may be stale.
-            if if_empty && holds_configuration(db)? {
+            if if_empty && current(db)?.is_some() {
                 not_imported();
                 return Ok(());
             }
@@ -467,55 +477,14 @@ fn config_command(db: &Path, command: ConfigCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A private (0700) directory for the file being edited, removed with
-/// everything in it (editor backups and swap files too) unless kept.
-struct TempDir(Option<PathBuf>);
-
-impl TempDir {
-    fn new() -> anyhow::Result<TempDir> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let path =
-            std::env::temp_dir().join(format!("parallax-edit-{}-{nanos:08x}", std::process::id()));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        // Fails if the name exists, so the guard only ever removes our own.
-        builder
-            .create(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        Ok(TempDir(Some(path)))
-    }
-
-    fn path(&self) -> &Path {
-        self.0.as_deref().unwrap_or(Path::new(""))
-    }
-
-    /// Leave the directory in place and return it.
-    fn keep(mut self) -> PathBuf {
-        self.0.take().unwrap_or_default()
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            let _ = std::fs::remove_dir_all(path);
-        }
-    }
-}
-
 fn config_edit(db: &Path, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
     // The database stays closed while the editor is open, so the gateway and
     // other commands aren't locked out; a change in the meantime is caught below.
     let before = load(db)?;
     let original = before.to_toml()?;
-    let dir = TempDir::new()?;
+    // Private (0700), removed with everything in it (editor backups and swap
+    // files too) unless kept.
+    let dir = TempDir::new_in(&std::env::temp_dir(), "parallax-edit")?;
     let file = dir.path().join("parallax.toml");
     RealFs.write(&file, &original, true)?;
 
@@ -610,7 +579,7 @@ fn run_editor(file: &Path) -> anyhow::Result<()> {
 /// Ask a yes/no question on the terminal. Without one, only `--yes` can say yes.
 fn confirm(question: &str, default: bool) -> anyhow::Result<bool> {
     if !std::io::stdin().is_terminal() {
-        bail!("{question} needs a terminal to answer; pass --yes to save without asking");
+        bail!("{question} needs a terminal to answer; pass --yes to go ahead without asking");
     }
     eprint!("{question} [{}] ", if default { "Y/n" } else { "y/N" });
     std::io::stderr().flush()?;

@@ -30,6 +30,20 @@ pub enum Error {
         known: i64,
     },
 
+    /// A backup file that can't be used, and why.
+    #[error("backup {file}: {problem}")]
+    Backup { file: PathBuf, problem: String },
+
+    /// The database changed between showing a restore and doing it.
+    #[error(
+        "database {0} changed while the restore waited; nothing restored. Run the restore again"
+    )]
+    Changed(PathBuf),
+
+    /// An encrypted backup didn't open with the passphrase given.
+    #[error("backup {0} did not decrypt; the passphrase is wrong")]
+    WrongPassphrase(PathBuf),
+
     /// A configuration the store can't represent, e.g. a grant naming a
     /// network that doesn't exist. Validation catches these first.
     #[error("{0}")]
@@ -60,6 +74,13 @@ impl From<turso::Error> for Error {
 }
 
 impl Error {
+    pub(crate) fn backup(file: &std::path::Path, problem: impl std::fmt::Display) -> Self {
+        Error::Backup {
+            file: file.to_path_buf(),
+            problem: problem.to_string(),
+        }
+    }
+
     pub(crate) fn io(context: impl std::fmt::Display, error: std::io::Error) -> Self {
         Error::Io {
             context: context.to_string(),

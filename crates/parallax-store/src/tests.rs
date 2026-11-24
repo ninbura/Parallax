@@ -10,11 +10,13 @@ use parallax_core::{Config, Model};
 
 use crate::{Error, Store};
 
+pub(crate) const LATEST: i64 = crate::MIGRATIONS.len() as i64;
+
 /// A fresh directory per test, removed on drop.
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(pub(crate) PathBuf);
 
 impl TempDir {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         static N: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "parallax-store-{}-{}",
@@ -24,7 +26,7 @@ impl TempDir {
         std::fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
     }
-    fn db(&self) -> PathBuf {
+    pub(crate) fn db(&self) -> PathBuf {
         self.0.join("parallax.db")
     }
 }
@@ -44,13 +46,21 @@ async fn round_trip(config: &Config) -> Config {
 }
 
 /// Every optional field set, every grant kind, both visibility forms.
-fn everything_config() -> Config {
+pub(crate) fn everything_config() -> Config {
     let mut c = canonical_config();
     c.server.wan_interface = Some("eth1".into());
     c.server.dns.listen = Some(Ipv4Addr::new(10, 8, 0, 1));
     c.server.proxy.listen = Some(Ipv4Addr::new(10, 8, 0, 1));
     c.server.firewall.backend = FirewallBackend::IptablesNft;
     c.server.headscale.derp = DerpMode::Tailscale;
+    c.server.backup = BackupServer {
+        directory: "/srv/backups/parallax".into(),
+        automatic: false,
+        interval: "6h".parse().unwrap(),
+        keep: 3,
+        encrypt: false,
+        passphrase_file: "/root/backup.passphrase".into(),
+    };
     c.networks.push(Network {
         name: "lab".into(),
         interface: "eth1".into(),
@@ -268,7 +278,7 @@ async fn the_database_and_its_log_are_owner_only() {
 async fn a_newer_schema_is_refused() {
     let dir = TempDir::new();
     let store = Store::create(&dir.db()).await.unwrap();
-    assert_eq!(store.schema_version().await.unwrap(), 1);
+    assert_eq!(store.schema_version().await.unwrap(), LATEST);
     store
         .exec(
             "INSERT INTO schema_version (version) VALUES (99)",
@@ -283,7 +293,7 @@ async fn a_newer_schema_is_refused() {
             err,
             Error::TooNew {
                 found: 99,
-                known: 1,
+                known: LATEST,
                 ..
             }
         ),
@@ -300,7 +310,59 @@ async fn reopening_does_not_migrate_twice() {
         .rows("SELECT count(*) FROM schema_version", Vec::new())
         .await
         .unwrap();
-    assert_eq!(rows[0].get::<i64>(0).unwrap(), 1);
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), LATEST);
+}
+
+/// A database as Parallax wrote it before backups (schema 1), holding the
+/// canonical configuration's server row.
+pub(crate) async fn schema_1_database(path: &Path) {
+    let db = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(crate::MIGRATIONS[0]).await.unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+         INSERT INTO schema_version (version) VALUES (1);",
+    )
+    .await
+    .unwrap();
+    let c = canonical_config();
+    conn.execute(
+        "INSERT INTO server (id, wireguard_interface, wireguard_listen_port,
+            wireguard_supernet, wireguard_endpoint, wireguard_public_key,
+            wireguard_private_key_file, headscale_interface, headscale_server_url,
+            headscale_api_key_file, headscale_derp, headscale_subnet_router_node,
+            dns_port, dns_public_resolver, firewall_backend,
+            firewall_docker_coexistence, proxy_port, proxy_certificates,
+            proxy_upstream_ca)
+         VALUES (1, 'wg0', 51820, '10.8.0.0/16', 'vpn.mydomain.com:51820', ?1,
+            '/etc/parallax/wg-server.key', 'tailscale0', 'https://headscale.mydomain.com',
+            '/etc/parallax/headscale-api.key', 'embedded', 'parallax-gateway',
+            53, '1.1.1.1', 'nftables', 1, 8443, '/etc/parallax/certs',
+            '/etc/ssl/certs/ca-certificates.crt')",
+        (c.server.wireguard.public_key.to_base64(),),
+    )
+    .await
+    .unwrap();
+    // Into the file itself, so a copy of the file alone holds it.
+    let mut rows = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+}
+
+#[tokio::test]
+async fn a_database_from_before_backups_gets_their_defaults() {
+    let dir = TempDir::new();
+    schema_1_database(&dir.db()).await;
+    let mut store = Store::open(&dir.db()).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), LATEST);
+    let loaded = store.load().await.unwrap();
+    assert_eq!(loaded.server, canonical_config().server);
 }
 
 #[tokio::test]

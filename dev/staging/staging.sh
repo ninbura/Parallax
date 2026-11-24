@@ -295,6 +295,17 @@ smoke() {
     after="$(px config export)"
     if [ -n "$before" ] && [ "$before" = "$after" ]; then pass_db "importing the export changes nothing"
     else fail_db "the export changed after importing it"; fi
+    echo "--- backups"
+    px backup passphrase --generate >/dev/null 2>&1 || true   # fails once one is set
+    local made file
+    made="$(px backup create 2>&1)" || true
+    file="$(sed -n 's/^wrote \(.*\) (encrypted)$/\1/p' <<<"$made")"
+    if [ -n "$file" ]; then pass_db "an encrypted backup ($file)"
+    else fail_db "backup create: $made"; fi
+    before="$(px config export)"
+    if [ -n "$file" ] && px backup restore --yes "$file" >/dev/null 2>&1 \
+        && [ "$(px config export)" = "$before" ]; then pass_db "restoring it gives the same configuration"
+    else fail_db "restoring ${file:-the backup} failed or changed the configuration"; fi
     smoke_cleanup
     local endpoint port gw
     endpoint="$(cfg endpoint)"; endpoint="${endpoint%:*}"

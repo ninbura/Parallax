@@ -26,7 +26,7 @@ crates/parallax-core/           pure library, no I/O of its own
   src/testing.rs                canonical fixture shared by all tests
   tests/golden.rs + tests/golden/   frozen outputs for every generator
   tests/example.rs              example/parallax.toml == canonical fixture
-crates/parallax-store/          the database (Turso, SQLite's file format): Config in, Config out
+crates/parallax-store/          the database (Turso, SQLite's file format): Config in, Config out; backups
   migrations/                   schema, one numbered SQL file per change
 crates/parallax-proxy/          the HTTPS proxy (`parallax proxy`)
 crates/parallax-dns/            the DNS server (`parallax dns`)
@@ -334,6 +334,13 @@ alternatives: ADR 0005.
 The CLI validates before every save, so the database only ever holds a valid
 configuration. `config import` and `config edit` also give WireGuard peers
 without an address the next free one.
+
+Backups (`parallax_store::backup`, ADR 0006): `parallax-backup-<time>.tar`
+holds a plaintext `manifest.toml` and `payload.tar.age`, which is `age`
+passphrase-encrypted and holds a `VACUUM INTO` copy of the database and the
+server key. Restore stages the backup's database next to the live one,
+migrates and checks it, then replaces every row of the live database with
+its rows in one write transaction. Operator guide: `docs/backup.md`.
 
 ## Generated artifacts (output directory layout)
 

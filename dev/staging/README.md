@@ -76,6 +76,8 @@ a fresh client namespace to the real endpoint, and checks the following:
 
 - **Database.** The first start imported `parallax.toml` and renamed it, and
   importing an export of the configuration changes nothing.
+- **Backups.** An encrypted backup is written, and restoring it gives back
+  the same configuration. The first smoke run sets a generated passphrase.
 - **Mapped addresses.** Both LANs are reachable by mapped address. On the
   routed LAN the host sees the tunnel address; on the masqueraded LAN it sees
   the gateway.

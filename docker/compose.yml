@@ -26,6 +26,9 @@ services:
       # - /etc/letsencrypt/live/immich.mydomain.com:/etc/letsencrypt/live/immich.mydomain.com:ro
       # - /etc/letsencrypt/archive/immich.mydomain.com:/etc/letsencrypt/archive/immich.mydomain.com:ro
       - parallax-state:/var/lib/parallax  # the database (parallax.db) and generated files
+      # Backups (server.backup.directory), a plain folder on the host so they
+      # are easy to copy elsewhere. Best on another disk. docs/backup.md.
+      - ./backups:/var/lib/parallax/backups
       - tailscale-state:/var/lib/tailscale
     environment:
       PARALLAX_CONFIG: /etc/parallax/parallax.toml
