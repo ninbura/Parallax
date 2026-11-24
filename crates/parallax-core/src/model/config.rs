@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{Network, Peer, ServerConfig, Service, Template};
 
-/// The whole configuration: the M1 source of truth, loaded from TOML.
+/// The whole configuration. Stored in the database (`parallax-store`); TOML
+/// is its import/export form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {

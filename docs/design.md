@@ -26,11 +26,13 @@ crates/parallax-core/           pure library, no I/O of its own
   src/testing.rs                canonical fixture shared by all tests
   tests/golden.rs + tests/golden/   frozen outputs for every generator
   tests/example.rs              example/parallax.toml == canonical fixture
+crates/parallax-store/          the database (Turso, SQLite's file format): Config in, Config out
+  migrations/                   schema, one numbered SQL file per change
 crates/parallax-proxy/          the HTTPS proxy (`parallax proxy`)
 crates/parallax-dns/            the DNS server (`parallax dns`)
 crates/parallax-cli/            `parallax` binary (validate, plan, generate, apply,
-                                proxy, dns, keygen, peer add/remove/show/allocate,
-                                export, doctor)
+                                proxy, dns, keygen, config import/export/edit,
+                                peer add/remove/show, export, doctor)
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)
 example/parallax.toml           fully commented canonical scenario
 tests/integration/netns.sh      Linux network-namespace integration test (CI)
@@ -307,6 +309,28 @@ DNS is convenience, never enforcement: the firewall and the proxy are the
 gate. The DNS server only keeps a guest from using the gateway's resolver for
 names it has no business with (and from sending its lookups out through the
 home connection). Why not dnsmasq or another server: ADR 0004.
+
+## Storage (`parallax-store`)
+
+The configuration lives in a database file, `/var/lib/parallax/parallax.db`
+by default (`--db`, `PARALLAX_DB`), mode 0600 together with its write-ahead
+log. `Store::load` returns a whole `Config`; `Store::save` writes one back in
+a single transaction. `parallax-core` never sees the database. Decisions and
+alternatives: ADR 0005.
+
+- One table per part of the model, child tables with a `position` for lists
+  (`network_domains`, `template_grants`, ...). Values are TEXT in their TOML
+  spelling.
+- Every row has a hidden integer id beside its unique name; references between
+  tables use the id. `save` matches rows by name, so a kept name keeps its id.
+- Migrations: `crates/parallax-store/migrations/NNNN_*.sql`, applied in order
+  when the database opens. A newer database than the binary knows is refused.
+- One process at a time: a command opens the database, works, and closes it,
+  waiting up to ten seconds if another holds it.
+
+The CLI validates before every save, so the database only ever holds a valid
+configuration. `config import` and `config edit` also give WireGuard peers
+without an address the next free one.
 
 ## Generated artifacts (output directory layout)
 

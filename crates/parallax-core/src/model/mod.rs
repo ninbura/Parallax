@@ -1,5 +1,6 @@
-//! The policy model. These serde types are the M1 TOML interface and will back
-//! the API and GUI unchanged. Everything here is plain data; behaviour lives in
+//! The policy model. `parallax-store` keeps it in the database, these serde
+//! types are its TOML import/export form, and they will back the API and GUI
+//! unchanged. Everything here is plain data; behaviour lives in
 //! [`crate::validate`], [`crate::alloc`], [`crate::transport`] and
 //! [`crate::generate`].
 

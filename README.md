@@ -27,12 +27,21 @@ design, not a "WireGuard-only" mode.
 cargo build
 cp example/parallax.toml /tmp/parallax.toml
 sed -i 's#/etc/parallax/wg-server.key#/tmp/wg-server.key#' /tmp/parallax.toml
-parallax=target/debug/parallax
-$parallax -c /tmp/parallax.toml keygen --write-config
-$parallax -c /tmp/parallax.toml validate
-$parallax -c /tmp/parallax.toml generate -o /tmp/parallax-out
-$parallax -c /tmp/parallax.toml peer add tablet --template family --platform mobile
-$parallax -c /tmp/parallax.toml peer show
+parallax="target/debug/parallax --db /tmp/parallax.db"
+$parallax config import /tmp/parallax.toml
+$parallax keygen --write-config
+$parallax validate
+$parallax generate -o /tmp/parallax-out
+$parallax peer add tablet --template family --platform mobile
+$parallax peer show
+$parallax config export
+```
+
+The database is the source of truth. TOML is how a configuration gets in
+(`config import`), out (`config export`), and edited (`config edit`).
+
+```sh
+EDITOR=nvim $parallax config edit -o /tmp/parallax-out
 ```
 
 `apply` needs Linux with `nft`, `wg` and `ip`; use the container (`docker/`)
@@ -42,11 +51,14 @@ or read `docs/setup.md`.
 
 - `crates/parallax-core`: model, validation, allocation, transports,
   generators, plan/apply. UI-agnostic; all I/O behind traits.
+- `crates/parallax-store`: the database, the source of truth for the
+  configuration (Turso, in SQLite's file format).
 - `crates/parallax-proxy`: the HTTPS proxy (`parallax proxy`).
 - `crates/parallax-dns`: the DNS server (`parallax dns`): per-tier answers,
   home zones rewritten into mapped space.
 - `crates/parallax-cli`: `validate`, `plan`, `generate`, `apply`, `proxy`,
-  `dns`, `keygen`, `peer add|remove|show|allocate`, `export`, `doctor`.
+  `dns`, `keygen`, `config import|export|edit`, `peer add|remove|show`,
+  `export`, `doctor`.
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
 - `example/parallax.toml`: the canonical scenario, fully commented.
 - `tests/integration/netns.sh`: Linux namespace test: mapping, DNS, per-tier access, the HTTPS proxy and the bypass matrix.

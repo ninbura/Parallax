@@ -18,10 +18,11 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ${STAGING_STATE:?run through staging.sh}/config:/etc/parallax
-      - ${STAGING_STATE:?run through staging.sh}/out:/var/lib/parallax
+      - ${STAGING_STATE:?run through staging.sh}/out:/var/lib/parallax   # parallax.db + generated files
       - tailscale-state:/var/lib/tailscale
     environment:
       PARALLAX_CONFIG: /etc/parallax/parallax.toml
+      PARALLAX_DB: /var/lib/parallax/parallax.db
       PARALLAX_OUT: /var/lib/parallax
 
 volumes:

@@ -20,7 +20,9 @@ COPY --from=build /src/target/release/parallax /usr/local/bin/parallax
 COPY docker/entrypoint.sh /usr/local/bin/parallax-entrypoint
 RUN chmod +x /usr/local/bin/parallax-entrypoint \
     && mkdir -p /etc/parallax /var/lib/parallax /var/lib/tailscale
+# PARALLAX_CONFIG is imported into the database (PARALLAX_DB) on the first start.
 ENV PARALLAX_CONFIG=/etc/parallax/parallax.toml \
+    PARALLAX_DB=/var/lib/parallax/parallax.db \
     PARALLAX_OUT=/var/lib/parallax
 VOLUME ["/etc/parallax", "/var/lib/parallax", "/var/lib/tailscale"]
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/parallax-entrypoint"]

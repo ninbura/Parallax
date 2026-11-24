@@ -6,7 +6,9 @@
 #   up                         fake LANs, config (first run), build, start the container
 #   down                       stop the container and remove the fake LANs (state is kept)
 #   reset                      down, then delete the state directory (server key, peers, config)
-#   apply                      re-apply $STAGING_STATE/config/parallax.toml (SIGHUP the container)
+#   apply                      re-apply the configuration (SIGHUP the container)
+#   export                     print the configuration (the container's database) as TOML
+#   import FILE                replace the configuration with a TOML file, then re-apply
 #   peer NAME TEMPLATE [PLAT]  add a peer (private key kept), re-apply, show its QR
 #   qr NAME [PLATFORM]         write $STAGING_STATE/qr/NAME-PLATFORM.png and print the QR
 #   smoke                      end-to-end checks from a client namespace through the tunnel
@@ -97,8 +99,11 @@ lan_down() {
 }
 
 # ------------------------------------------------------------------ config
+# Rendered once. The container imports it into its database on the first start
+# and renames it to parallax.toml.imported; from then on the database is the
+# configuration (`staging.sh export` / `import`).
 render_config() {
-    [ -f "$CONFIG" ] && return 0
+    [ -f "$CONFIG" ] || [ -f "$CONFIG.imported" ] && return 0
     local route wan src gw
     route="$(ip -4 route get 1.1.1.1)"
     wan="$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<<"$route")"
@@ -113,7 +118,12 @@ render_config() {
     say "rendered $CONFIG (endpoint $endpoint:$port, wan $wan, public resolver $resolver)"
 }
 
-cfg() { sed -n "/^$1 *= */{s/^$1 *= *\"\{0,1\}\([^\"]*\)\"\{0,1\}/\1/p;q}" "$CONFIG"; }
+# A value from the rendered file. Only for what staging never changes
+# (interface, endpoint), so the copy the container renamed still holds it.
+cfg() {
+    local file="$CONFIG"; [ -f "$file" ] || file="$CONFIG.imported"
+    sed -n "/^$1 *= */{s/^$1 *= *\"\{0,1\}\([^\"]*\)\"\{0,1\}/\1/p;q}" "$file"
+}
 
 # ------------------------------------------------------------------ container
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; }
@@ -198,6 +208,16 @@ down() {
 
 has_peer() { px peer show "$1" >/dev/null 2>&1; }
 
+import_config() { # file: copied into the mounted config directory, imported, removed
+    running || die "gateway not running (staging.sh up)"
+    [ -f "$1" ] || die "no such file: $1"
+    install -m 600 "$1" "$STATE/config/import.toml"
+    local rc=0
+    px config import /etc/parallax/import.toml || rc=$?
+    rm -f "$STATE/config/import.toml"
+    [ "$rc" = 0 ] || die "import failed; nothing changed"
+}
+
 # Adds the peer if it's missing. Callers re-apply afterwards, also when it already
 # existed, so a peer saved by an earlier run whose re-apply failed still goes live.
 add_peer() { # name template platform
@@ -257,12 +277,26 @@ client_iface() { # peer iface -> brings up iface in $CLIENT from the peer's expo
 
 smoke() {
     running || die "gateway not running (staging.sh up)"
+    local ok=1
+    pass_db() { echo "PASS: $*"; }
+    fail_db() { echo "FAIL: $*"; ok=0; }
     add_peer smoke-personal personal linux
     add_peer smoke-guest guest linux
     reapply
     trap 'smoke_cleanup' EXIT
+    echo "--- database"
+    if [ -f "$CONFIG.imported" ] && [ ! -f "$CONFIG" ]; then pass_db "the first start imported parallax.toml and renamed it"
+    else fail_db "config/parallax.toml.imported missing, or parallax.toml still there"; fi
+    local before after
+    before="$(px config export)"
+    px config export -o /etc/parallax/smoke-export.toml 2>/dev/null
+    px config import /etc/parallax/smoke-export.toml >/dev/null
+    rm -f "$STATE/config/smoke-export.toml"
+    after="$(px config export)"
+    if [ -n "$before" ] && [ "$before" = "$after" ]; then pass_db "importing the export changes nothing"
+    else fail_db "the export changed after importing it"; fi
     smoke_cleanup
-    local endpoint ok=1 port gw
+    local endpoint port gw
     endpoint="$(cfg endpoint)"; endpoint="${endpoint%:*}"
     gw="$GATEWAY"
     ip netns add "$CLIENT"
@@ -352,6 +386,8 @@ case "$cmd" in
     down) down ;;
     reset) down; [ -f "$MARKER" ] && rm -rf "$STATE"; "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true; say "state removed" ;;
     apply) reapply; say "re-applied" ;;
+    export) running || die "gateway not running (staging.sh up)"; px config export ;;
+    import) [ $# -ge 1 ] || die "usage: staging.sh import FILE"; import_config "$1"; reapply; say "imported and re-applied" ;;
     peer)
         [ $# -ge 2 ] || die "usage: staging.sh peer NAME TEMPLATE [PLATFORM]"
         add_peer "$1" "$2" "${3:-mobile}"
@@ -362,5 +398,5 @@ case "$cmd" in
     smoke) smoke ;;
     status) status ;;
     logs) docker logs -f "$CONTAINER" ;;
-    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

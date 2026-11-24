@@ -883,7 +883,7 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                         }
                         match w.address {
                             None => errors.push(format!(
-                                "{ctx}: has no address yet; run `parallax peer allocate` to assign one from the template pool"
+                                "{ctx}: has no address yet; `parallax config import` or `config edit` assigns one from the template pool"
                             )),
                             Some(addr) => {
                                 if let Some(t) = template {

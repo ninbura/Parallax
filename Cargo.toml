@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/parallax-core", "crates/parallax-proxy", "crates/parallax-dns", "crates/parallax-cli"]
+members = ["crates/parallax-core", "crates/parallax-store", "crates/parallax-proxy", "crates/parallax-dns", "crates/parallax-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,7 +12,6 @@ rust-version = "1.100"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "1"
-toml_edit = { version = "0.23", features = ["serde"] }
 ipnet = { version = "2.10", features = ["serde"] }
 thiserror = "2"
 base64 = "0.23"
@@ -42,6 +41,10 @@ rcgen = "0.14"
 # trait needs it.
 hickory-server = { version = "0.26.3", default-features = false, features = ["resolver"] }
 async-trait = "0.1"
+# The database (parallax-store): Turso, the Rust rewrite of SQLite, in
+# SQLite's file format. Pinned exactly while it's before 1.0. No default
+# features: they add mimalloc (C) and full-text search, neither needed.
+turso = { version = "=0.8.4", default-features = false }
 
 # Enforced in CI via `cargo clippy -- -D warnings`. See AGENTS.md.
 [workspace.lints.rust]

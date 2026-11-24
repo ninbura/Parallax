@@ -79,7 +79,7 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
     let address = wg.address.ok_or_else(|| Error::Malformed {
         what: "peer",
         detail: format!(
-            "'{}' has no address; run `parallax peer allocate`",
+            "'{}' has no address; import or edit the configuration (`parallax config edit`) to assign one",
             peer.name
         ),
     })?;
