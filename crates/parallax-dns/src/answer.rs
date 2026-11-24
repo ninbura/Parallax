@@ -11,24 +11,30 @@ use parallax_core::generate::firewall::NOT_PUBLIC;
 use parallax_core::netmap::Mapping;
 
 /// Answers from a home resolver. A records in a mapped network move into
-/// its virtual prefix (the DNS mirror of the NETMAP rule). Public addresses
-/// and those in an `unmapped` network pass unchanged. Any other private or
-/// reserved address is dropped: Parallax can't route it, and on a visited
-/// network that uses the same prefix it would send the client to a stranger's
-/// host. AAAA records are
-/// dropped: tunnel peers can't send IPv6, and a home address on a prefix the
-/// visited network also uses would send the client somewhere else.
-/// SVCB/HTTPS records go too: their address hints would carry real,
-/// unmapped addresses.
+/// its virtual prefix (the DNS mirror of the NETMAP rule). Public addresses,
+/// those in an `unmapped` network and those already in a virtual prefix pass
+/// unchanged. Any other private or reserved address is dropped: on a visited
+/// network that uses the same prefix it would send the client to a
+/// stranger's host. If that leaves no address, the CNAMEs go too, so the
+/// client can't chase the alias through the visited network's resolver.
+/// AAAA records are dropped: tunnel peers can't send IPv6, and a home
+/// address on a prefix the visited network also uses would send the client
+/// somewhere else. SVCB/HTTPS records go too: their address hints would
+/// carry real, unmapped addresses.
 pub fn home(records: &[Record], mappings: &[Mapping], unmapped: &[Ipv4Net]) -> Vec<Record> {
-    records
+    let mut dropped_address = false;
+    let out: Vec<Record> = records
         .iter()
         .filter_map(|r| match &r.data {
             RData::A(A(addr)) => {
                 let mut r = r.clone();
                 if let Some(v) = mappings.iter().find_map(|m| m.to_virtual(*addr)) {
                     r.data = RData::A(A(v));
-                } else if !is_public_v4(*addr) && !unmapped.iter().any(|n| n.contains(addr)) {
+                } else if !is_public_v4(*addr)
+                    && !unmapped.iter().any(|n| n.contains(addr))
+                    && !mappings.iter().any(|m| m.virt().contains(addr))
+                {
+                    dropped_address = true;
                     return None;
                 }
                 Some(r)
@@ -36,7 +42,11 @@ pub fn home(records: &[Record], mappings: &[Mapping], unmapped: &[Ipv4Net]) -> V
             RData::AAAA(_) | RData::SVCB(_) | RData::HTTPS(_) => None,
             _ => Some(r.clone()),
         })
-        .collect()
+        .collect();
+    if dropped_address && !out.iter().any(|r| matches!(r.data, RData::A(_))) {
+        return Vec::new();
+    }
+    out
 }
 
 /// Only the records of the asked type, as if they sat under `name`: drops
@@ -152,6 +162,8 @@ mod tests {
             a("192.168.7.7"),
             a("10.20.0.4"),
             a("127.0.0.1"),
+            a("198.18.1.6"),
+            a("198.18.9.9"),
             a("9.9.9.9"),
             aaaa("fd00::5"),
             Record::from_rdata(
@@ -163,17 +175,33 @@ mod tests {
         let unmapped = ["10.20.0.0/24".parse().unwrap()];
         let out = home(&records, &home_mapping(), &unmapped);
         // 192.168.7.7 is on no configured network: off-site it would be a
-        // host on the visited network, so it goes.
+        // host on the visited network, so it goes. 198.18.1.6 is already
+        // virtual (NETMAP takes it home); 198.18.9.9 is in no mapping.
         assert_eq!(
             addrs(&out),
             [
                 "cname x.mydomain.com.",
                 "198.18.1.5",
                 "10.20.0.4",
+                "198.18.1.6",
                 "9.9.9.9"
             ]
         );
         assert_eq!(out[1].ttl, 60);
+    }
+
+    #[test]
+    fn an_alias_with_only_dropped_addresses_goes_entirely() {
+        let cname = Record::from_rdata(
+            name("nas.mydomain.com."),
+            60,
+            RData::CNAME(CNAME(name("nas.example.net."))),
+        );
+        // The client would otherwise chase nas.example.net through the
+        // visited network's resolver.
+        assert!(home(&[cname.clone(), a("10.99.0.5")], &home_mapping(), &[]).is_empty());
+        // A CNAME with no address at all is passed on as before.
+        assert_eq!(home(&[cname], &home_mapping(), &[]).len(), 1);
     }
 
     #[test]

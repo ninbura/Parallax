@@ -38,8 +38,8 @@ pub struct DnsRoutes {
     /// Real subnets of configured networks without `mapped_to`: home answers
     /// there pass unchanged. Any other private or reserved address in a home
     /// answer is dropped, since off-site it would mean a host on the visited
-    /// network.
-    #[serde(default)]
+    /// network. Required, so a routes file from an older version fails to
+    /// load instead of dropping those networks' names.
     pub unmapped: Vec<Ipv4Net>,
     #[serde(default, rename = "zone")]
     pub zones: Vec<DnsZone>,
@@ -478,8 +478,15 @@ mod tests {
 
     #[test]
     fn a_broken_mapping_is_refused_at_load() {
-        let text = "listen = \"10.8.0.1:53\"\npublic_resolver = \"1.1.1.1\"\n[[mapping]]\nreal = \"192.168.1.0/24\"\nvirtual = \"198.18.1.0/25\"\n";
+        let text = "listen = \"10.8.0.1:53\"\npublic_resolver = \"1.1.1.1\"\nunmapped = []\n[[mapping]]\nreal = \"192.168.1.0/24\"\nvirtual = \"198.18.1.0/25\"\n";
         let e = DnsRoutes::from_toml(text).unwrap_err().to_string();
         assert!(e.contains("different prefix lengths"), "{e}");
+    }
+
+    #[test]
+    fn a_routes_file_without_unmapped_is_refused() {
+        let text = "listen = \"10.8.0.1:53\"\npublic_resolver = \"1.1.1.1\"\n";
+        let e = DnsRoutes::from_toml(text).unwrap_err().to_string();
+        assert!(e.contains("unmapped"), "{e}");
     }
 }

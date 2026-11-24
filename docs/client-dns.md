@@ -55,9 +55,11 @@ and unaffected; raw IPs always work; Android allows per-app VPN exemptions.
 - Public answers lose addresses in private, reserved or mapped space, on
   purpose (DNS rebinding).
 - Mapping covers the home side only. The tunnel addresses and the shim
-  (`10.8.0.0/16` in the examples) can still clash with a visited network; if
-  it uses the shim's address for its own router, the client's route to the
-  shim hides that router. Pick a tunnel range you're unlikely to visit. The
+  (`10.8.0.0/16` in the examples) can still clash with a visited network
+  that uses the shim's address for its own router. A split-tunnel export
+  routes the shim's `/32` into the tunnel and hides that router; a Linux
+  full-tunnel export keeps the visited LAN's route, so DNS goes to that
+  router instead of the shim. Pick a tunnel range you're unlikely to visit. The
   same goes for `198.18.0.0/15` on a device running a proxy app that hands
   out fake addresses from it (Clash, Surge).
 - A `host` or `host_port` grant gives no name: only network zones and service

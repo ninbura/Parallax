@@ -179,6 +179,7 @@ fn routes(family_public: bool) -> String {
     format!(
         r#"listen = "127.0.0.1:53"
 public_resolver = "{UPSTREAM}"
+unmapped = []
 
 [[zone]]
 name = "mydomain.com"
