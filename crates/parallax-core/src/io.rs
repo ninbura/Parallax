@@ -32,7 +32,7 @@ impl Output {
     }
 }
 
-/// Runs external programs (`nft`, `wg`, `ip`, `dnsmasq`).
+/// Runs external programs (`nft`, `wg`, `ip`).
 pub trait ProcessRunner {
     fn run(&self, program: &str, args: &[&str], stdin: Option<&str>) -> Result<Output>;
 

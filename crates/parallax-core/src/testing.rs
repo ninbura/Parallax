@@ -85,6 +85,7 @@ pub fn canonical_config() -> Config {
                 dns: DnsPolicy {
                     wireguard: DnsMode::Split,
                     tailscale: DnsMode::Split,
+                    public: true,
                 },
                 client: ClientDefaults {
                     allowed_ips: AllowedIpsStrategy::MappedSubnets,
@@ -108,6 +109,7 @@ pub fn canonical_config() -> Config {
                 dns: DnsPolicy {
                     wireguard: DnsMode::TunnelWide,
                     tailscale: DnsMode::Split,
+                    public: false,
                 },
                 client: ClientDefaults {
                     allowed_ips: AllowedIpsStrategy::GrantsOnly,

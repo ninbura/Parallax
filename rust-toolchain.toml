@@ -2,6 +2,7 @@
 # Bump deliberately, in its own PR, and fix any new lints there.
 # CI installs it from here (`rustup install`).
 # docker/Dockerfile pins the same version.
+# Cargo.toml's workspace rust-version is the same number: bump them together.
 [toolchain]
 channel = "1.100.0"
 components = ["rustfmt", "clippy"]

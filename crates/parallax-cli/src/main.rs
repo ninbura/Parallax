@@ -47,10 +47,12 @@ enum Command {
     Plan(OutArgs),
     /// Generate everything into the output directory without touching the system.
     Generate(OutArgs),
-    /// Generate, write, and reconcile the live gateway (firewall, WireGuard, DNS shim).
+    /// Generate, write, and reconcile the live gateway (firewall, WireGuard).
     Apply(OutArgs),
     /// Run the HTTPS proxy from the routes `apply` wrote. SIGHUP re-reads them.
     Proxy(OutArgs),
+    /// Run the DNS server from the routes `apply` wrote. SIGHUP re-reads them.
+    Dns(OutArgs),
     /// Create the gateway's WireGuard private key file and print its public key.
     Keygen {
         /// Also record the public key in the configuration file.
@@ -217,6 +219,9 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Proxy(out) => {
             parallax_proxy::serve(&out.out.join(generate::proxy::PATH))?;
+        }
+        Command::Dns(out) => {
+            parallax_dns::serve(&out.out.join(generate::dns::PATH))?;
         }
         Command::Keygen { write_config } => {
             let config = load(&cli.config)?;
@@ -385,9 +390,10 @@ fn peer_command(config_path: &Path, command: PeerCommand) -> anyhow::Result<()> 
                     println!("    reaches {}{via}{proxied}", r.label);
                 }
                 println!(
-                    "    dns: wireguard={} tailscale={}; allowed_ips={:?}",
+                    "    dns: wireguard={} tailscale={} public={}; allowed_ips={:?}",
                     t.dns.wireguard.as_str(),
                     t.dns.tailscale.as_str(),
+                    t.dns.public,
                     t.client.allowed_ips
                 );
             }

@@ -19,7 +19,7 @@
 # Read on the first `up`, when the config is rendered:
 #   STAGING_ENDPOINT         address clients dial (default: this host's default-route source)
 #   STAGING_PORT             WireGuard listen port (default 51814)
-#   STAGING_PUBLIC_RESOLVER  catch-all resolver for the shim (default: the default-route gateway)
+#   STAGING_PUBLIC_RESOLVER  where the DNS server sends public names (default: the default-route gateway)
 set -euo pipefail
 umask 077   # the state directory holds the server key and exported client configs with private keys
 
@@ -29,6 +29,7 @@ case "$STATE" in /*/*) ;; *) echo "staging: STAGING_STATE must be an absolute pa
 export STAGING_STATE="$STATE"   # compose.yml mounts from it
 CONFIG="$STATE/config/parallax.toml"
 CONTAINER=parallax-staging
+GATEWAY=10.9.0.1   # the tunnel gateway address, from the template's supernet 10.9.0.0/16
 COMPOSE=(docker compose -f "$DIR/compose.yml")
 
 say() { echo "staging: $*"; }
@@ -118,11 +119,14 @@ cfg() { sed -n "/^$1 *= */{s/^$1 *= *\"\{0,1\}\([^\"]*\)\"\{0,1\}/\1/p;q}" "$CON
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; }
 px() { docker exec "$CONTAINER" parallax "$@"; }
 
-# Wait until the container has applied the config: wg1 up and the shim's pid file present.
+# Wait until the container has applied the config and started its servers: wg1 up, and
+# the DNS server and the HTTPS proxy listening on the gateway address (they start after apply).
 wait_applied() {
     local iface; iface="$(cfg interface)"
     for _ in $(seq 1 60); do
-        if ip link show "$iface" >/dev/null 2>&1 && [ -s "$STATE/out/dnsmasq/dnsmasq.pid" ]; then
+        if ip link show "$iface" >/dev/null 2>&1 \
+            && ss -Hltn 'sport = :53' | grep -qF "$GATEWAY:53" \
+            && ss -Hltn 'sport = :8443' | grep -qF "$GATEWAY:8443"; then
             return 0
         fi
         running || { docker logs --tail 30 "$CONTAINER" >&2; die "container exited"; }
@@ -169,7 +173,6 @@ up() {
     if nft list table inet parallax >/dev/null 2>&1 || ip link show "$(cfg interface)" >/dev/null 2>&1; then
         die "nft table inet parallax or $(cfg interface) already exists: another Parallax gateway runs on this host"
     fi
-    rm -f "$STATE/out/dnsmasq/dnsmasq.pid"   # wait_applied must see this run's shim
     "${COMPOSE[@]}" up -d --build
     wait_applied
     say "gateway up: $(cfg endpoint) on $(cfg interface)"
@@ -261,7 +264,7 @@ smoke() {
     smoke_cleanup
     local endpoint ok=1 port gw
     endpoint="$(cfg endpoint)"; endpoint="${endpoint%:*}"
-    gw="10.9.0.1"
+    gw="$GATEWAY"
     ip netns add "$CLIENT"
     inns "$CLIENT" ip link set lo up
     ip link add "$CLIENT" type veth peer name eth0 netns "$CLIENT"
@@ -279,6 +282,7 @@ smoke() {
     fail() { echo "FAIL: $*"; ok=0; }
     get() { inns "$CLIENT" curl -s --max-time 3 "$@"; }
     resolve() { inns "$CLIENT" dig +short +time=2 +tries=1 @"$gw" "$1" A | tail -n1 || true; }
+    status() { inns "$CLIENT" dig +time=2 +tries=1 @"$gw" "$1" A | sed -n 's/.*status: \([A-Z]*\).*/\1/p'; }
     expect() { # description, expected substring ("" = must be blocked), curl args...
         local d=$1 want=$2 out rc=0; shift 2
         out="$(get "$@")" || rc=$?
@@ -306,11 +310,14 @@ smoke() {
     expect "lan1 host by mapped IP, routed (sees the tunnel address)" "saw $me" http://198.19.201.5/
     expect "lan2 host by mapped IP, masqueraded (sees the gateway)" "saw 192.168.202.1" http://198.19.202.5/
     expect "lan1 other port" "lan1-other" http://198.19.201.5:8080/
-    [ "$(resolve immich.staging.test)" = 198.19.201.5 ] && pass "shim: immich.staging.test -> 198.19.201.5" \
-        || fail "shim: immich.staging.test -> '$(resolve immich.staging.test)'"
-    [ "$(resolve nas.staging.test)" = 198.19.202.5 ] && pass "shim: nas.staging.test -> 198.19.202.5" \
-        || fail "shim: nas.staging.test -> '$(resolve nas.staging.test)'"
-    expect "by name through the shim" "lan1-immich" --resolve "immich.staging.test:80:$(resolve immich.staging.test)" \
+    [ "$(resolve immich.staging.test)" = 198.19.201.5 ] && pass "dns: immich.staging.test -> 198.19.201.5" \
+        || fail "dns: immich.staging.test -> '$(resolve immich.staging.test)'"
+    [ "$(resolve nas.staging.test)" = 198.19.202.5 ] && pass "dns: nas.staging.test -> 198.19.202.5" \
+        || fail "dns: nas.staging.test -> '$(resolve nas.staging.test)'"
+    local public; public="$(resolve example.com)"
+    [[ "$public" =~ ^[0-9.]+$ ]] && pass "dns: public name for personal (dns.public) -> $public" \
+        || fail "dns: example.com for personal -> '$public'"
+    expect "by name through the DNS server" "lan1-immich" --resolve "immich.staging.test:80:$(resolve immich.staging.test)" \
         http://immich.staging.test/
     if inns pxs-lan1 ping -c1 -W2 "$me" >/dev/null 2>&1; then pass "lan1 host starts a connection to the peer (routed)"
     else fail "lan1 host cannot ping the peer at $me"; fi
@@ -320,8 +327,11 @@ smoke() {
     echo "--- guest"
     me="$(client_iface smoke-guest wgg)"
     expect "granted service" "lan1-immich" http://198.19.201.5/
-    [ "$(resolve immich.staging.test)" = 198.19.201.5 ] && pass "shim reachable from guest" \
-        || fail "shim from guest: '$(resolve immich.staging.test)'"
+    # The guest's only grant is a service without hostnames: no names, and dns.public is off.
+    for name in immich.staging.test nas.staging.test example.com; do
+        [ "$(status "$name")" = REFUSED ] && pass "dns: $name refused to the guest" \
+            || fail "dns: $name for the guest: '$(status "$name")', wanted REFUSED"
+    done
     # Widen the client's routes: the gateway, not the client config, must enforce the grant.
     inns "$CLIENT" wg set wgg peer "$(inns "$CLIENT" wg show wgg peers | head -n1)" allowed-ips 0.0.0.0/0
     ip -n "$CLIENT" route replace 198.19.0.0/16 dev wgg

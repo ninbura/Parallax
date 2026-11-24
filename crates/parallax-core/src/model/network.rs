@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// A mapped network (one with `mapped_to`) is presented to every VPN client
 /// under the virtual prefix instead of its real one, on both transports. The
-/// single mapping drives the NETMAP rules, the dnsmasq `alias=` rewrite, the
+/// single mapping drives the NETMAP rules, the DNS answer rewrite, the
 /// client routes and (M2) the Tailscale advertised route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,8 +31,9 @@ pub struct Network {
     /// Authoritative resolvers for `domains` (the existing source of truth).
     #[serde(default)]
     pub upstream_dns: Vec<Ipv4Addr>,
-    /// DNS zones whose names live on this network. They scope the shim
-    /// (`server=/zone/`), the clients' routing domains, and (M2) Headscale
+    /// DNS zones whose names live on this network. They scope Parallax's DNS
+    /// server (which names go to `upstream_dns`, and which tiers may ask),
+    /// the clients' routing domains, and (M2) Headscale
     /// split DNS.
     #[serde(default)]
     pub domains: Vec<String>,

@@ -3,7 +3,7 @@
 //! `parallax-core` is a UI-agnostic library: it holds the policy model, its
 //! validation, address allocation, the [`transport::Transport`] abstraction with
 //! the WireGuard implementation, every generator (WireGuard server config,
-//! nftables ruleset, dnsmasq shim, per-platform client configs, nginx
+//! nftables ruleset, DNS routes, per-platform client configs, nginx
 //! snippets), and plan/apply. All side effects go through the traits in
 //! [`io`], so every piece of the engine is testable in memory.
 //!

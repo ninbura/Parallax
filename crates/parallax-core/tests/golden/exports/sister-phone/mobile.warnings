@@ -1,1 +1,1 @@
-
+template 'family' has dns.public off and this export sends all DNS to the gateway, so the device resolves only the template's home names while connected; turn dns.public on, or use Tailscale, which splits DNS on phones

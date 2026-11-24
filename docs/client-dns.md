@@ -2,18 +2,19 @@
 
 Raw mapped addresses always work without DNS: `198.18.1.1` reaches the
 home router through routing plus the PREROUTING NETMAP rule and nothing else.
-This is the foundational guarantee and has its own integration test (shim
-stopped, mapped access still works).
+This is the foundational guarantee and has its own integration test (DNS
+server stopped, mapped access still works).
 
 Names need two pieces:
 
-1. **The shim** (dnsmasq in the gateway) forwards only the operator's zones
-   (`Network.domains`) to the real home resolvers and rewrites their A answers
-   with `alias=real,virtual,mask`, the DNS mirror of the NETMAP rule. Both come
-   from the one `mapped_to` field. It is safe as a blanket rewrite *because*
-   only home zones transit the shim. A forward-everything shim with `alias`
-   would rewrite answers about the client's local network and misroute them;
-   Parallax never generates that.
+1. **The shim** (`parallax dns`, Parallax's built-in DNS server on the
+   gateway address) forwards the operator's zones (`Network.domains`) to the
+   real home resolvers and rewrites their A answers into virtual space with
+   the same `Mapping` as the NETMAP rule. Both come from the one `mapped_to`
+   field. The rewrite is safe *because* only home zones get it: rewriting
+   answers about the client's local network would misroute them. It answers
+   each tier only the names that tier may reach (see `docs/design.md`, "DNS
+   server").
 2. **The client routes only the home zones to the shim.** On a foreign
    192.168.1.0/24 an answer of `192.168.1.5` is inherently ambiguous; the
    domain name is the only unambiguous routing key.
@@ -25,14 +26,16 @@ Names need two pieces:
 | WireGuard, Linux systemd-resolved | native  | `PostUp = resolvectl dns %i <shim>; resolvectl domain %i ~zone` |
 | WireGuard, macOS                | via OS    | comment recipe: `/etc/resolver/<zone>` with `nameserver <shim>` |
 | WireGuard, Windows              | via OS    | comment recipe: `Add-DnsClientNrptRule -Namespace ".zone" -NameServers "<shim>"` |
-| WireGuard, iOS/Android official app | **no** | `DNS = <shim>` tunnel-wide; shim forwards other zones to `public_resolver` |
-| Tailscale (M2)                  | native    | Headscale pushes per-zone restricted nameservers; the client resolver does the split on every OS |
+| WireGuard, iOS/Android official app | **no** | `DNS = <shim>` tunnel-wide; the shim answers other names only with `dns.public` |
+| Tailscale (M2)                  | native    | Headscale pushes per-zone restricted nameservers; the client resolver does the split on every OS (Android through its on-device resolver) |
 
 Template `dns.wireguard = "split"` on a mobile export falls back to tunnel-wide
-with a warning. The shim therefore gets a catch-all resolver whenever any
-template configures WireGuard DNS (`split` or `tunnel_wide`), since any of its
-peers may be exported for a phone. Split clients on other platforms only send
-the home zones to the shim, so they never use it.
+with a warning. A tunnel-wide device sends every query to the shim, which
+forwards names outside the home zones to `server.dns.public_resolver` only
+for templates with `dns.public = true`. Without it, the device resolves only
+the template's home names while connected, and the export says so. Split
+clients on other platforms only send the home zones to the shim, so the
+setting doesn't matter to them.
 
 Honest caveats for tunnel-wide devices: unicast names on the visited network
 do not resolve while connected; mDNS/Bonjour (casting, AirPlay) is multicast
@@ -40,7 +43,11 @@ and unaffected; raw IPs always work; Android allows per-app VPN exemptions.
 
 ## Limits (documented, not hidden)
 
-- `alias=` rewrites A records only. AAAA answers pass through untranslated
-  (no IPv6 mapping in this release).
+- Only A records are rewritten. AAAA answers for home names are dropped (no
+  IPv6 mapping in this release, and peers can't send IPv6), and so are
+  SVCB/HTTPS records, whose address hints would carry real addresses.
 - PTR lookups for virtual addresses are not rewritten.
-- `stop-dns-rebind` blocks private answers from non-home zones on purpose.
+- Public answers lose addresses in private, reserved or mapped space, on
+  purpose (DNS rebinding).
+- A `host` or `host_port` grant gives no name: only network zones and service
+  hostnames are answered. DNS-resolved hostname grants come later.

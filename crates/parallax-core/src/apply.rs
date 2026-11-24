@@ -1,7 +1,9 @@
 //! `apply`: write the bundle, then reconcile the live system in a fixed
 //! order — firewall first (so a half-configured interface never forwards
-//! unfiltered), then each transport, then the DNS shim. Every step is
-//! idempotent, so re-applying an unchanged bundle changes nothing.
+//! unfiltered), then each transport. Every step is idempotent, so
+//! re-applying an unchanged bundle changes nothing. The DNS server and the
+//! HTTPS proxy are long-running processes that read the routes written here;
+//! whoever runs them sends SIGHUP afterwards (the container's entrypoint does).
 
 use std::path::Path;
 
@@ -10,9 +12,6 @@ use crate::io::System;
 use crate::model::FirewallBackend;
 use crate::validate::Model;
 use crate::{Error, Result};
-
-/// Where the shim's pid file lives, relative to the output directory.
-pub const DNSMASQ_PIDFILE: &str = "dnsmasq/dnsmasq.pid";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplyReport {
@@ -67,14 +66,6 @@ pub fn preflight(backend: FirewallBackend, sys: System<'_>) -> Vec<String> {
         .unwrap_or(true)
     {
         missing.push("`ip` is not available: install iproute2".into());
-    }
-    if sys
-        .runner
-        .run("dnsmasq", &["--version"], None)
-        .map(|o| !o.ok())
-        .unwrap_or(true)
-    {
-        missing.push("`dnsmasq` is not available: install dnsmasq".into());
     }
     missing
 }
@@ -248,41 +239,6 @@ fn apply_firewall(
     Ok(())
 }
 
-fn apply_dnsmasq(
-    bundle: &Bundle,
-    out_dir: &Path,
-    sys: System<'_>,
-    log: &mut Vec<String>,
-) -> Result<()> {
-    let conf = bundle
-        .of_kind(ArtifactKind::Dnsmasq)
-        .next()
-        .ok_or_else(|| Error::Malformed {
-            what: "apply",
-            detail: "no dnsmasq artifact in the bundle".into(),
-        })?;
-    let conf_path = out_dir.join(&conf.path);
-    let conf_str = conf_path.to_string_lossy().into_owned();
-    let pid_path = out_dir.join(DNSMASQ_PIDFILE);
-    let pid_str = pid_path.to_string_lossy().into_owned();
-    let conf_arg = format!("--conf-file={conf_str}");
-    let pid_arg = format!("--pid-file={pid_str}");
-    sys.runner
-        .run_checked("dnsmasq", &["--test", &conf_arg], None)?;
-    // dnsmasq only re-reads hosts files on SIGHUP, not server=/alias= lines: restart.
-    if let Some(pid) = sys.fs.read(&pid_path)? {
-        let pid = pid.trim().to_string();
-        if !pid.is_empty() {
-            let _ = sys.runner.run("kill", &[&pid], None)?;
-            log.push(format!("dnsmasq: stopped previous instance (pid {pid})"));
-        }
-    }
-    sys.runner
-        .run_checked("dnsmasq", &[&conf_arg, &pid_arg, "--user=root"], None)?;
-    log.push("dnsmasq: started with the generated shim config".into());
-    Ok(())
-}
-
 /// Write the bundle and reconcile the system.
 pub fn apply(
     model: &Model<'_>,
@@ -314,6 +270,5 @@ pub fn apply(
             .collect();
         log.extend(transport.apply(model, &owned, sys)?);
     }
-    apply_dnsmasq(bundle, out_dir, sys, &mut log)?;
     Ok(ApplyReport { log })
 }
