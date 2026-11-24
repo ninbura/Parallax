@@ -6,7 +6,8 @@ members = ["crates/parallax-core", "crates/parallax-proxy", "crates/parallax-dns
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.88"
+# The pinned toolchain (rust-toolchain.toml): the only compiler CI builds with.
+rust-version = "1.100"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
