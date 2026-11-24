@@ -246,7 +246,9 @@ impl Ctx {
                 })
             }
         };
-        protocol::write_message(&mut stream, request)?;
+        stream
+            .write_all(&protocol::encode_request(request, &self.db)?)
+            .with_context(|| format!("writing to the daemon at {}", self.socket.display()))?;
         let line = protocol::read_line(&mut std::io::BufReader::new(&stream))
             .with_context(|| format!("the daemon at {}", self.socket.display()))?;
         match protocol::decode(&line)
@@ -523,8 +525,13 @@ fn run() -> anyhow::Result<()> {
             }
             Some(other) => return Err(unexpected(other)),
             None => {
-                let config = ctx.load()?;
-                let (warnings, log) = apply_config(&config, &out.out, today())?;
+                // The database stays open (locked) through the apply, so a
+                // daemon starting meanwhile can't apply something newer first.
+                let (warnings, log) = block_on(async {
+                    let mut store = ctx.open_store().await?;
+                    let config = store.load().await?;
+                    apply_config(&config, &out.out, today())
+                })?;
                 print_warnings(&warnings);
                 for line in log {
                     println!("{line}");
@@ -709,7 +716,7 @@ fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
                     Ok(())
                 })?;
                 println!("{summary}");
-                return report(saved, "");
+                return report(saved, "run `parallax apply` to put it into effect");
             }
             let saved = block_on(async {
                 let mut store = ctx.create_store().await?;
@@ -796,42 +803,46 @@ fn config_edit(ctx: &Ctx, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
     if !yes && !confirm("save?", false)? {
         bail!("nothing saved");
     }
-    let changed_meanwhile = || {
-        let kept = dir.keep();
+    // `None`: someone else saved first.
+    let outcome = match revision {
+        Some(revision) => ctx.save(Box::new(edited), revision),
+        None => {
+            let mut moved = false;
+            block_on(async {
+                let mut store = ctx.open_store().await?;
+                store
+                    .update(|config| {
+                        if *config != before {
+                            moved = true;
+                            bail!("the configuration changed while you were editing");
+                        }
+                        *config = edited;
+                        Ok(())
+                    })
+                    .await
+            })
+            .map(|()| Some(Saved::Direct))
+            .or_else(|e| if moved { Ok(None) } else { Err(e) })
+        }
+    };
+    // Whatever went wrong, the edit isn't lost.
+    let keep = |why: String| {
+        let kept = dir.keep().join("parallax.toml");
         anyhow!(
-            "the configuration changed while you were editing; nothing saved. Your version is in {}; run `parallax config edit` again",
-            kept.join("parallax.toml").display()
+            "{why}; nothing saved. Your version is in {}; run `parallax config edit` again",
+            kept.display()
         )
     };
-    if let Some(revision) = revision {
-        return match ctx.save(Box::new(edited), revision)? {
-            Some(saved) => {
-                println!("saved");
-                report(saved, "")
-            }
-            None => Err(changed_meanwhile()),
-        };
+    match outcome {
+        Ok(Some(saved)) => {
+            println!("saved");
+            report(saved, "run `parallax apply` to put it into effect")
+        }
+        Ok(None) => Err(keep(
+            "the configuration changed while you were editing".into(),
+        )),
+        Err(e) => Err(keep(format!("{e:#}"))),
     }
-    let mut moved = false;
-    let saved = block_on(async {
-        let mut store = ctx.open_store().await?;
-        store
-            .update(|config| {
-                if *config != before {
-                    moved = true;
-                    bail!("the configuration changed while you were editing");
-                }
-                *config = edited;
-                Ok(())
-            })
-            .await
-    });
-    if moved {
-        return Err(changed_meanwhile());
-    }
-    saved?;
-    println!("saved; run `parallax apply` to put it into effect");
-    Ok(())
 }
 
 /// `$VISUAL`, then `$EDITOR`, then `vi`. The variable may carry arguments

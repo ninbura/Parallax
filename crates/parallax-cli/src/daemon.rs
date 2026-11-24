@@ -102,6 +102,14 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let mut hangup = signal(SignalKind::hangup()).context("watching SIGHUP")?;
     let mut terminate = signal(SignalKind::terminate()).context("watching SIGTERM")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("watching SIGINT")?;
+    // Before touching anything: a daemon for another database may own this socket.
+    if std::os::unix::net::UnixStream::connect(&opts.socket).is_ok() {
+        bail!(
+            "a daemon already answers on {}; stop it, or give this one another --socket",
+            opts.socket.display()
+        );
+    }
+    let database = Arc::new(same_file(&opts.db));
 
     let (tx, rx) = mpsc::unbounded_channel();
     let (publish, views) = watch::channel(None);
@@ -130,7 +138,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
         anyhow::Ok((servers, listener))
     }
     .await;
-    let ((mut dns, mut proxy, reloaders), listener) = match started {
+    let ((mut dns, mut proxy, reloaders), (listener, socket_id)) = match started {
         Ok(started) => started,
         Err(e) => {
             stop_engine(&tx, &mut done_rx).await;
@@ -138,7 +146,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
         }
     };
     let _ = tx.send(Msg::Serving(reloaders));
-    let server = tokio::spawn(accept(listener, tx.clone(), views));
+    let server = tokio::spawn(accept(listener, tx.clone(), views, database));
     let timers = tokio::spawn(timers(tx.clone(), opts.reconcile_every));
     log(format!(
         "gateway up; listening for commands on {}. Saved changes apply at once; SIGHUP re-applies",
@@ -163,8 +171,11 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     log("shutting down");
     server.abort();
     timers.abort();
-    if let Err(e) = std::fs::remove_file(&opts.socket) {
-        warn(format!("could not remove {}: {e}", opts.socket.display()));
+    // Only our own: another daemon may have bound the path since.
+    if file_id(&opts.socket) == Some(socket_id) {
+        if let Err(e) = std::fs::remove_file(&opts.socket) {
+            warn(format!("could not remove {}: {e}", opts.socket.display()));
+        }
     }
     dns.abort();
     proxy.abort();
@@ -218,10 +229,23 @@ async fn start_servers(out: &Path) -> anyhow::Result<Servers> {
     Ok((dns, proxy, reloaders))
 }
 
+/// A path as the daemon compares it: resolved when it exists.
+fn same_file(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Device and inode of `path`, to tell our socket from a later one.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
 /// Listen on `path`: directory 0700 when it's made here, socket 0600.
-/// Called while the engine holds the database, so a socket file already
-/// there belongs to a daemon that's gone.
-fn bind_socket(path: &Path) -> anyhow::Result<UnixListener> {
+/// Returns the socket's identity, so shutdown removes only this one. A
+/// socket file nobody answers on belongs to a daemon that's gone.
+fn bind_socket(path: &Path) -> anyhow::Result<(UnixListener, (u64, u64))> {
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         if !dir.exists() {
@@ -233,8 +257,16 @@ fn bind_socket(path: &Path) -> anyhow::Result<UnixListener> {
         }
     }
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)
-            .with_context(|| format!("removing the stale socket {}", path.display()))?,
+        Ok(meta) if meta.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                bail!(
+                    "a daemon already answers on {}; stop it, or give this one another --socket",
+                    path.display()
+                );
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing the stale socket {}", path.display()))?
+        }
         Ok(_) => bail!(
             "{} exists and is not a socket; remove it or pick another --socket",
             path.display()
@@ -246,14 +278,25 @@ fn bind_socket(path: &Path) -> anyhow::Result<UnixListener> {
         UnixListener::bind(path).with_context(|| format!("listening on {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("securing {}", path.display()))?;
-    Ok(listener)
+    let id = file_id(path).ok_or_else(|| anyhow!("{} vanished after binding", path.display()))?;
+    Ok((listener, id))
 }
 
-async fn accept(listener: UnixListener, tx: mpsc::UnboundedSender<Msg>, views: Views) {
+async fn accept(
+    listener: UnixListener,
+    tx: mpsc::UnboundedSender<Msg>,
+    views: Views,
+    database: Arc<PathBuf>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(answer(stream, tx.clone(), views.clone()));
+                tokio::spawn(answer(
+                    stream,
+                    tx.clone(),
+                    views.clone(),
+                    Arc::clone(&database),
+                ));
             }
             Err(e) => {
                 // Usually out of file descriptors; back off rather than spin.
@@ -265,14 +308,26 @@ async fn accept(listener: UnixListener, tx: mpsc::UnboundedSender<Msg>, views: V
 }
 
 /// One connection: one request, one reply.
-async fn answer(stream: UnixStream, tx: mpsc::UnboundedSender<Msg>, views: Views) {
+async fn answer(
+    stream: UnixStream,
+    tx: mpsc::UnboundedSender<Msg>,
+    views: Views,
+    database: Arc<PathBuf>,
+) {
     let (read, mut write) = stream.into_split();
     let reply = match tokio::time::timeout(REQUEST_TIMEOUT, read_request(read)).await {
         Err(_) => return,
         Ok(Err(e)) => Reply::Error {
             message: format!("{e:#}"),
         },
-        Ok(Ok(request)) => dispatch(request, &tx, &views).await,
+        Ok(Ok((theirs, _))) if same_file(&theirs) != *database => Reply::Error {
+            message: format!(
+                "this daemon holds the database {}, not {}; pass the matching --db, or --socket to reach another daemon",
+                database.display(),
+                theirs.display()
+            ),
+        },
+        Ok(Ok((_, request))) => dispatch(request, &tx, &views).await,
     };
     let line = protocol::encode(&reply).or_else(|e| {
         protocol::encode(&Reply::Error {
@@ -284,7 +339,7 @@ async fn answer(stream: UnixStream, tx: mpsc::UnboundedSender<Msg>, views: Views
     }
 }
 
-async fn read_request(read: tokio::net::unix::OwnedReadHalf) -> anyhow::Result<Request> {
+async fn read_request(read: tokio::net::unix::OwnedReadHalf) -> anyhow::Result<(PathBuf, Request)> {
     let mut reader = tokio::io::BufReader::new(read.take(protocol::MAX_MESSAGE as u64));
     let mut line = Vec::new();
     reader
@@ -292,7 +347,7 @@ async fn read_request(read: tokio::net::unix::OwnedReadHalf) -> anyhow::Result<R
         .await
         .context("reading the request")?;
     protocol::check_line(&line)?;
-    protocol::decode(&line)
+    protocol::decode_request(&line)
 }
 
 async fn dispatch(request: Request, tx: &mpsc::UnboundedSender<Msg>, views: &Views) -> Reply {
@@ -360,8 +415,9 @@ fn engine_thread(
             return;
         }
     };
+    // A failed first apply leaves the host as it is (nothing here was set
+    // up yet, as far as this process knows); Docker restarts and tries again.
     if let Err(e) = engine.first_apply() {
-        engine.teardown();
         let _ = ready.send(Err(e));
         return;
     }
@@ -414,7 +470,8 @@ impl Engine {
             store,
             view: View {
                 config: Arc::new(config),
-                revision: 0,
+                // Random, so a revision from before a restart never matches.
+                revision: rand::random::<u64>() >> 1,
                 apply_error: None,
             },
             publish,
@@ -440,10 +497,19 @@ impl Engine {
 
     /// Handle a batch of work. Returns true to shut down.
     fn handle(&mut self, batch: Vec<Msg>) -> bool {
+        // Shutting down: change nothing, refuse whatever else is queued.
+        if batch.iter().any(|m| matches!(m, Msg::Shutdown)) {
+            for msg in batch {
+                if let Msg::Request(_, reply) = msg {
+                    let _ = reply.send(shutting_down());
+                }
+            }
+            return true;
+        }
         // Requests answered after the apply, with their own lines first.
         let mut waiting: Vec<(oneshot::Sender<Reply>, Vec<String>)> = Vec::new();
         let mut why: Option<&str> = None;
-        let (mut tick, mut backup_due, mut shutdown) = (false, false, false);
+        let (mut tick, mut backup_due) = (false, false);
         for msg in batch {
             match msg {
                 Msg::Request(request, reply) => match request {
@@ -467,7 +533,8 @@ impl Engine {
                         path,
                         passphrase,
                         revision,
-                    } => match self.restore(&path, passphrase, revision) {
+                        contents_sha256,
+                    } => match self.restore(&path, passphrase, revision, &contents_sha256) {
                         Ok(lines) => {
                             waiting.push((reply, lines));
                             why.get_or_insert("a restored backup");
@@ -498,21 +565,8 @@ impl Engine {
                 Msg::Tick => tick = true,
                 Msg::BackupTick => backup_due = true,
                 Msg::Serving(reloaders) => self.reloaders = reloaders,
-                Msg::Shutdown => shutdown = true,
+                Msg::Shutdown => {}
             }
-        }
-        if shutdown {
-            for (reply, log) in waiting {
-                let _ = reply.send(Reply::Applied {
-                    revision: self.view.revision,
-                    log,
-                    error: Some(
-                        "the daemon shut down first; the change is saved and applies when it starts again"
-                            .into(),
-                    ),
-                });
-            }
-            return true;
         }
         if let Some(why) = why {
             let (log, error) = self.apply(why);
@@ -584,7 +638,7 @@ impl Engine {
     /// The configuration changed: remember and publish it.
     fn replace(&mut self, config: Config) {
         self.view.config = Arc::new(config);
-        self.view.revision += 1;
+        self.view.revision = self.view.revision.wrapping_add(1);
         self.publish();
     }
 
@@ -616,13 +670,14 @@ impl Engine {
         path: &Path,
         passphrase: Option<Secret>,
         revision: u64,
+        shown: &str,
     ) -> Result<Vec<String>, Reply> {
         if revision != self.view.revision {
             return Err(Reply::Conflict {
                 revision: self.view.revision,
             });
         }
-        match self.restore_inner(path, passphrase) {
+        match self.restore_inner(path, passphrase, shown) {
             Ok(lines) => {
                 lines.iter().for_each(log);
                 Ok(lines)
@@ -637,6 +692,7 @@ impl Engine {
         &mut self,
         path: &Path,
         passphrase: Option<Secret>,
+        shown: &str,
     ) -> anyhow::Result<Vec<String>> {
         let manifest = backup::inspect(path)?;
         let server_file = &self.view.config.server.backup.passphrase_file;
@@ -654,6 +710,12 @@ impl Engine {
             }
         };
         let contents = backup::open(path, key.as_ref())?;
+        if contents.manifest.contents_sha256 != shown {
+            bail!(
+                "backup {} changed since it was shown; nothing restored. Run the restore again",
+                path.display()
+            );
+        }
         let staging = TempDir::new_in(
             &crate::backup::private_dir_of(self.store.path())?,
             ".parallax-restore",
@@ -671,7 +733,8 @@ impl Engine {
                 passphrase.as_ref(),
             )
             .await?;
-            anyhow::Ok((lines, store.load().await?))
+            // The rows just copied in: what the database now holds.
+            anyhow::Ok((lines, restored))
         })?;
         self.replace(config);
         Ok(lines)
@@ -685,10 +748,11 @@ impl Engine {
         ))
     }
 
-    /// Take down what the last successful apply set up (or, if none
-    /// worked, what the configuration names).
+    /// Take down what the last successful apply set up; nothing if none did.
     fn teardown(&self) {
-        let server = self.applied.as_ref().unwrap_or(&self.view.config.server);
+        let Some(server) = &self.applied else {
+            return;
+        };
         for line in reconcile::teardown(server, sys()) {
             log(line);
         }

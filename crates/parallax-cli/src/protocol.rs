@@ -6,8 +6,8 @@
 //! passphrase). It is root-only (0600 in a 0700 directory), the types keep
 //! their redacted `Debug`, and nothing logs a message.
 
-use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use parallax_core::secret::Secret;
@@ -37,12 +37,14 @@ pub enum Request {
     /// `parallax backup create [--if-due]`, on the daemon's open database.
     BackupCreate { if_due: bool },
     /// Restore a backup the caller already showed and confirmed, if the
-    /// configuration is still at `revision`, and apply it. Without a
-    /// passphrase the server's own is used.
+    /// configuration is still at `revision` and the file still holds what
+    /// was shown (`contents_sha256`), and apply it. Without a passphrase the
+    /// server's own is used.
     BackupRestore {
         path: PathBuf,
         passphrase: Option<Secret>,
         revision: u64,
+        contents_sha256: String,
     },
 }
 
@@ -75,11 +77,27 @@ pub enum Reply {
 
 /// One message as a line: the JSON object with `protocol` added.
 pub fn encode(message: &impl Serialize) -> anyhow::Result<Vec<u8>> {
+    encode_with(message, None)
+}
+
+/// A request as a line. It names the database the caller means, so a daemon
+/// holding another one refuses it instead of changing the wrong gateway.
+pub fn encode_request(request: &Request, database: &Path) -> anyhow::Result<Vec<u8>> {
+    encode_with(request, Some(database))
+}
+
+fn encode_with(message: &impl Serialize, database: Option<&Path>) -> anyhow::Result<Vec<u8>> {
     let mut value = serde_json::to_value(message).context("encoding a message")?;
     let Some(object) = value.as_object_mut() else {
         bail!("a message must be a JSON object");
     };
     object.insert("protocol".into(), PROTOCOL.into());
+    if let Some(database) = database {
+        object.insert(
+            "database".into(),
+            serde_json::to_value(database).context("encoding a message")?,
+        );
+    }
     let mut line = serde_json::to_vec(&value).context("encoding a message")?;
     line.push(b'\n');
     if line.len() > MAX_MESSAGE {
@@ -93,6 +111,25 @@ pub fn encode(message: &impl Serialize) -> anyhow::Result<Vec<u8>> {
 
 /// Parse one line, refusing another protocol version before anything else.
 pub fn decode<T: DeserializeOwned>(line: &[u8]) -> anyhow::Result<T> {
+    let value = checked(line)?;
+    serde_json::from_value(value).context("the message does not match the protocol")
+}
+
+/// Parse a request line, with the database it names.
+pub fn decode_request(line: &[u8]) -> anyhow::Result<(PathBuf, Request)> {
+    let mut value = checked(line)?;
+    let database = value
+        .as_object_mut()
+        .and_then(|o| o.remove("database"))
+        .and_then(|d| d.as_str().map(PathBuf::from))
+        .ok_or_else(|| anyhow::anyhow!("the request names no database"))?;
+    let request =
+        serde_json::from_value(value).context("the request does not match the protocol")?;
+    Ok((database, request))
+}
+
+/// The message as JSON, its protocol version checked and removed.
+fn checked(line: &[u8]) -> anyhow::Result<serde_json::Value> {
     let mut value: serde_json::Value =
         serde_json::from_slice(line).context("the message is not JSON")?;
     let theirs = value
@@ -106,7 +143,7 @@ pub fn decode<T: DeserializeOwned>(line: &[u8]) -> anyhow::Result<T> {
         ),
         None => bail!("the message names no protocol version"),
     }
-    serde_json::from_value(value).context("the message does not match the protocol")
+    Ok(value)
 }
 
 /// Read one line of at most [`MAX_MESSAGE`] bytes.
@@ -129,14 +166,6 @@ pub fn check_line(line: &[u8]) -> anyhow::Result<()> {
         bail!("the connection closed before a whole message arrived");
     }
     Ok(())
-}
-
-/// Write one message as a line.
-pub fn write_message(writer: &mut impl Write, message: &impl Serialize) -> anyhow::Result<()> {
-    writer
-        .write_all(&encode(message)?)
-        .context("writing to the socket")?;
-    writer.flush().context("writing to the socket")
 }
 
 #[cfg(test)]
@@ -188,10 +217,22 @@ mod tests {
             path: "/b.tar".into(),
             passphrase: Some(Secret::new("correct horse")),
             revision: 2,
+            contents_sha256: "ab".into(),
         }) else {
             panic!("not a restore");
         };
         assert_eq!(passphrase.unwrap().expose(), "correct horse");
+    }
+
+    #[test]
+    fn a_request_names_its_database() {
+        let line =
+            encode_request(&Request::Status, Path::new("/var/lib/parallax/parallax.db")).unwrap();
+        let (database, request) = decode_request(&line).unwrap();
+        assert_eq!(database, Path::new("/var/lib/parallax/parallax.db"));
+        assert!(matches!(request, Request::Status));
+        let e = decode_request(&encode(&Request::Status).unwrap()).unwrap_err();
+        assert!(e.to_string().contains("names no database"), "{e}");
     }
 
     #[test]

@@ -91,6 +91,16 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
         )),
         FirewallBackend::IptablesNft => commands.push(("iptables-save", vec![])),
     }
+    // Apply's accepts in Docker's chain: a Docker restart or a firewall
+    // reload can drop them while the table stays.
+    let docker =
+        server.firewall.docker_coexistence && server.firewall.backend == FirewallBackend::Nftables;
+    if docker {
+        commands.push((
+            "nft",
+            vec!["-s", "list", "chain", "ip", "filter", "DOCKER-USER"],
+        ));
+    }
     commands.extend([
         ("ip", vec!["-o", "link", "show", "dev", iface]),
         ("ip", vec!["-4", "-o", "addr", "show", "dev", iface]),
@@ -103,9 +113,13 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
         match sys.runner.run(program, &args, None) {
             Ok(out) => {
                 listing.push_str(&format!("status {}\n", out.status));
-                if program == "iptables-save" {
+                if program == "iptables-save" || args.contains(&"DOCKER-USER") {
                     // Only Parallax's rules: the rest belong to others (Docker).
-                    for line in out.stdout.lines().filter(|l| l.contains("PARALLAX")) {
+                    for line in out.stdout.lines().filter(|l| {
+                        l.contains("PARALLAX")
+                            || l.contains("comment \"parallax\"")
+                            || l.contains("--comment parallax")
+                    }) {
                         listing.push_str(line);
                         listing.push('\n');
                     }
@@ -227,12 +241,45 @@ mod tests {
             ok.command_lines(),
             [
                 "nft -s list table inet parallax",
+                "nft -s list chain ip filter DOCKER-USER",
                 "ip -o link show dev wg0",
                 "ip -4 -o addr show dev wg0",
                 "wg show wg0 listen-port",
                 "wg show wg0 allowed-ips",
             ]
         );
+    }
+
+    #[test]
+    fn lost_docker_user_accepts_count_as_drift() {
+        let config = canonical_config();
+        let fs = MemoryFs::new();
+        let listing = |chain: &str| {
+            let runner = RecordingRunner::new();
+            runner.respond_to(
+                "nft",
+                &["-s", "list", "chain", "ip", "filter", "DOCKER-USER"],
+                Output {
+                    status: 0,
+                    stdout: chain.into(),
+                    stderr: String::new(),
+                },
+            );
+            live_state(
+                &config.server,
+                System {
+                    fs: &fs,
+                    runner: &runner,
+                },
+            )
+        };
+        let ours = "iifname \"wg0\" accept comment \"parallax\"\n";
+        // Docker's own rules come and go; only ours matter.
+        assert_eq!(
+            listing(ours),
+            listing(&format!("{ours}counter jump DOCKER\n"))
+        );
+        assert_ne!(listing(ours), listing("counter jump DOCKER\n"));
     }
 
     #[test]

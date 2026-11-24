@@ -13,12 +13,14 @@ socket.
 - **One process owns the database.** It opens it in Turso's default,
   single-process mode (the file is locked to one process; the multi-process
   WAL mode of ADR 0005 is gone). A second daemon fails on that lock before
-  it touches anything, including the socket.
+  it touches anything; one for another database refuses a socket a daemon
+  already answers on, and a daemon removes only the socket it bound.
 - **Everything runs inside it.** The DNS server and the HTTPS proxy are tasks
   in its runtime, not separate processes; `parallax dns` and `parallax
   proxy` are gone. They still read the routes files `apply` writes, and the
-  daemon tells them to re-read after each successful apply (no SIGHUP). A
-  failed reload still refuses everything until one works. If either task
+  daemon tells them to re-read after each successful apply (no SIGHUP).
+  Generated files are written aside and renamed into place, so a reload
+  never reads half a file while the next apply writes. A failed reload still refuses everything until one works. If either task
   stops, the daemon exits non-zero and Docker's restart policy takes over.
   Automatic backups (`backup create --if-due` every 10 minutes) run inside
   it too, on its open database.
@@ -26,7 +28,8 @@ socket.
   after a saved change, on SIGHUP, when the UTC date changes (peer expiry is
   in UTC days), and when the live state drifts: after each apply it lists
   the nftables table and the WireGuard interface (`nft -s list table`, `wg
-  show ... allowed-ips`, the address), and every 60 s it lists them again
+  show ... allowed-ips`, the address, its own DOCKER-USER accepts), and
+  every 60 s it lists them again
   and re-applies only on a difference. A failed apply is retried on the next
   tick. Requests that arrive during an apply queue up and share the next one.
   The decision logic (`parallax_core::reconcile`) takes the date and the
@@ -44,11 +47,13 @@ socket.
   `PARALLAX_SOCKET`): directory 0700, socket 0600, owned by the daemon's
   user. One JSON request and one JSON reply per connection, each a single
   line of at most 16 MiB, each carrying `protocol: 1`; a mismatch is refused
-  naming both versions. Requests: `status`, `load`, `save` (a whole
+  naming both versions. Requests also name the database the caller means
+  (`--db`); a daemon holding another one refuses them. Requests: `status`, `load`, `save` (a whole
   configuration plus the revision it was based on), `apply`,
   `backup_create`, `backup_restore`. Private keys and a backup passphrase
   cross it; it's root-only, and nothing logs a message.
-- **Conflicts by revision.** The daemon counts saves in memory. A `save`
+- **Conflicts by revision.** The daemon counts saves in memory, from a
+  random start, so a revision read before a restart never matches after it. A `save`
   based on an older revision is refused; `peer add` and friends load,
   change and save again, and `config edit` tells the user their version is
   kept. Without a daemon, `config edit` still compares whole configurations.
@@ -57,7 +62,8 @@ socket.
   that died leaves the file), the CLI opens the database itself as before.
   If that hits the lock, it says so and names the socket that should have
   answered. `backup restore` reads and shows the backup itself, asks, then
-  has the daemon do the restore and apply.
+  has the daemon do the restore and apply, if the file still holds what was
+  shown (its contents checksum).
 - **Shutdown.** SIGTERM or SIGINT stops the socket, DNS and the proxy,
   deletes the nftables table and the WireGuard interface
   (`parallax_core::reconcile::teardown`, through the same `System` runner as

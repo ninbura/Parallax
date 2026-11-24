@@ -420,6 +420,7 @@ fn restore(
                     .with_context(|| format!("resolving {}", file.display()))?,
                 passphrase: typed,
                 revision,
+                contents_sha256: contents.manifest.contents_sha256.clone(),
             };
             return match ctx.ask(&request)? {
                 Some(Reply::Applied { log, error, .. }) => {
@@ -539,14 +540,26 @@ pub(crate) async fn restore_into(
         live.path().display(),
         key_file.display()
     ));
+    // The restore is done; failing to keep the passphrase only means the
+    // next backups need it set again.
     let wanted = &restored.server.backup;
     if let Some(pass) = typed.filter(|_| wanted.encrypt) {
-        if read_passphrase(&wanted.passphrase_file)?.is_none() {
-            write_atomic(&wanted.passphrase_file, &format!("{}\n", pass.expose()))?;
-            lines.push(format!(
+        let file = &wanted.passphrase_file;
+        let kept = match read_passphrase(file) {
+            Ok(Some(_)) => Ok(false),
+            Ok(None) => write_atomic(file, &format!("{}\n", pass.expose())).map(|()| true),
+            Err(e) => Err(e),
+        };
+        match kept {
+            Ok(true) => lines.push(format!(
                 "saved the backup passphrase to {} for the next backups",
-                wanted.passphrase_file.display()
-            ));
+                file.display()
+            )),
+            Ok(false) => {}
+            Err(e) => lines.push(format!(
+                "warning: couldn't save the backup passphrase to {}: {e:#}; set it with `parallax backup passphrase`",
+                file.display()
+            )),
         }
     }
     Ok(lines)
