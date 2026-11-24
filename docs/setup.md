@@ -93,16 +93,19 @@ any check fails. Run it by hand to see every problem at once:
 cd docker && sudo docker compose run --rm --no-deps parallax doctor
 ```
 
+Before the first start there is no database yet, so the configuration check
+fails ("no database at ..."); the host checks still run.
+
 It checks:
 
 | Check | Fails when | Fix |
 |---|---|---|
-| configuration | the file is missing, unparsable or invalid | the listed errors |
+| configuration | there's no database yet, or the configuration in it is invalid | import one (First start), or fix the listed errors with `parallax config edit` |
 | user namespace | running under rootless Docker or `userns-remap` | a rootful daemon (above) |
 | CAP_NET_ADMIN | the container lacks the capability | `cap_add: [NET_ADMIN]` |
 | ip_forward | `net.ipv4.ip_forward` is 0 | `/etc/sysctl.d/` (above) |
 | tools | `nft`, `wg` or `ip` is missing | the image ships them; natively, install them |
-| interface \<name\> | a configured LAN or WAN interface doesn't exist | the name in `parallax.toml` (`ip link`) |
+| interface \<name\> | a configured LAN or WAN interface doesn't exist | the name in the configuration (`ip link`, `parallax config edit`) |
 | wireguard | a WireGuard interface can't be created | `/etc/modules-load.d/` (above) |
 | NETMAP | the kernel or `nft` rejects prefix NAT (`nftables` backend only) | a newer kernel or nftables |
 
@@ -177,9 +180,16 @@ cd docker && sudo docker compose up -d
 sudo docker compose logs -f parallax
 ```
 
-On every start the entrypoint runs `parallax doctor` first. On first start it
-then generates `wg-server.key` (mode 0600) next to the config and writes the
-public key into it. Then it starts `tailscaled` (idle until M2), applies the
+The configuration lives in a database, `/var/lib/parallax/parallax.db` (mode
+0600, in the `parallax-state` volume). On the first start the entrypoint
+imports `parallax.toml` into it and renames the file to
+`parallax.toml.imported`, so nobody keeps editing a file Parallax no longer
+reads. From then on `parallax.toml` is ignored (the log says so if one shows
+up again); see Editing the configuration.
+
+On every start the entrypoint then runs `parallax doctor`. On the first start
+it generates `wg-server.key` (mode 0600) in `docker/config/` and records its
+public key in the configuration. Then it starts `tailscaled` (idle until M2), applies the
 firewall, brings up `wg0`, and starts the DNS server and the HTTPS proxy. If
 either of those exits, the container stops and Docker's restart policy takes
 over.
@@ -199,9 +209,30 @@ placeholder for the key if it was not retained).
 
 ## Editing the configuration
 
-Edit `parallax.toml`, then `parallax validate`, `parallax plan` to see the
-diff, and send `SIGHUP` to the container (or run `parallax apply`) to
-reconcile. Every artifact is regenerated from scratch; nothing under
+The database is the source of truth; TOML is how you read and change it:
+
+```sh
+sudo docker compose exec parallax parallax config edit   # $EDITOR, then a diff and "save?"
+sudo docker compose exec parallax parallax config export -o /etc/parallax/export.toml
+sudo docker compose exec parallax parallax config import /etc/parallax/new.toml
+sudo docker compose kill -s HUP parallax    # re-apply
+```
+
+`config edit` opens the configuration as TOML (in `$VISUAL` or `$EDITOR`,
+else `vi`), checks it, shows what changes in the configuration and in the
+generated files, and saves only when you confirm. An invalid edit can be
+fixed and retried, and nothing is saved until it's valid. `config import`
+replaces the whole configuration with a file (copy it into `docker/config/`
+first, which the container sees as `/etc/parallax`). Both give a WireGuard
+peer without an address the next free one. The export and the database
+hold any retained private keys, so keep exports private: `config export -o
+<file>` writes mode 0600 (in `docker/config/` here), while a shell
+redirect (`> file`) creates the file with your shell's umask.
+
+Comments and layout don't survive the round trip: an export lists every
+setting, defaults included, in a fixed order.
+
+Every artifact is regenerated from scratch; nothing else under
 `/var/lib/parallax` is meant to be edited.
 
 ## nginx

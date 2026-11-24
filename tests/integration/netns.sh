@@ -247,7 +247,8 @@ tag = "tag:friend"
 [template.client]
 allowed_ips = "full_tunnel"
 TOML
-P="$PARALLAX -c $WORK/parallax.toml"
+P="$PARALLAX --db $WORK/parallax.db"
+$P config import "$WORK/parallax.toml" >/dev/null
 $P keygen --write-config >/dev/null
 $P peer add laptop --template personal --keep-private-key --platform linux > "$WORK/laptop.conf" 2>/dev/null
 $P peer add guest --template family --keep-private-key --platform mobile > "$WORK/guest.conf" 2>/dev/null
@@ -257,19 +258,20 @@ inns gw $P doctor > "$WORK/doctor" || { cat "$WORK/doctor"; fail "doctor rejects
 # Root in a user namespace (as under rootless Docker) must be refused. That root
 # maps only uid 0, so run a copy it can reach (not one under someone's home).
 cp "$PARALLAX" "$WORK/parallax"
-if inns gw unshare -U -r "$WORK/parallax" -c "$WORK/parallax.toml" doctor > "$WORK/doctor-userns" 2>&1; then
+if inns gw unshare -U -r "$WORK/parallax" --db "$WORK/parallax.db" doctor > "$WORK/doctor-userns" 2>&1; then
     fail "doctor accepted a user namespace"
 fi
 grep -q "^FAIL  user namespace" "$WORK/doctor-userns" || fail "doctor did not name the user namespace"
 pass "doctor passes on the gateway and refuses a user namespace"
 inns gw $P apply -o "$WORK/out" >/dev/null
-GW_PUB=$(sed -n 's/^public_key = "\(.*\)"/\1/p' "$WORK/parallax.toml")
+# The server's key comes first in the export, before any peer's.
+GW_PUB=$($P config export | sed -n 's/^public_key = "\(.*\)"/\1/p' | head -n1)
 
 # The DNS server and the proxy listen on the tunnel address, so they start once
 # apply has made wg0, as the entrypoint does.
 start() { # command, port
-    inns gw sh -c 'echo $$ > "$1"; exec "$2" -c "$3" "$4" -o "$5"' sh \
-        "$WORK/$1.pid" "$PARALLAX" "$WORK/parallax.toml" "$1" "$WORK/out" >> "$WORK/$1.log" 2>&1 &
+    inns gw sh -c 'echo $$ > "$1"; exec "$2" "$3" -o "$4"' sh \
+        "$WORK/$1.pid" "$PARALLAX" "$1" "$WORK/out" >> "$WORK/$1.log" 2>&1 &
     PIDS+=($!)
     for _ in $(seq 50); do inns gw ss -Hltn "sport = :$2" | grep -q . && return 0; sleep 0.1; done
     fail "parallax $1 did not start"
@@ -277,8 +279,11 @@ start() { # command, port
 start dns 53
 start proxy 8443
 # apply re-reads nothing in either; the entrypoint sends SIGHUP, so does this.
-apply() { # [config]
-    inns gw "$PARALLAX" -c "${1:-$WORK/parallax.toml}" apply -o "$WORK/out" >/dev/null
+apply() { # [TOML file to import first]
+    if [ -n "${1:-}" ]; then
+        $P config import "$1" >/dev/null
+    fi
+    inns gw $P apply -o "$WORK/out" >/dev/null
     kill -HUP "$(cat "$WORK/dns.pid")" "$(cat "$WORK/proxy.pid")"
     sleep 0.3
 }
@@ -483,9 +488,26 @@ PY
 PIDS+=($!)
 for _ in $(seq 50); do [ "$(grep -c '^open' "$WORK/hold.out")" = 4 ] && break; sleep 0.1; done
 [ "$(grep -c '^open' "$WORK/hold.out")" = 4 ] || { cat "$WORK/hold.out"; fail "(k) could not open the held connections"; }
-sed "s|^grants = \[$FAMILY_GRANTS\]|grants = [{ kind = \"service\", name = \"gwapp\" }]|" \
-    "$WORK/parallax.toml" > "$WORK/revoked.toml"
-grep -q '^grants = \[{ kind = "service", name = "gwapp" }\]' "$WORK/revoked.toml" || fail "(k) could not write the revoked config"
+# The whole configuration (peers included), and a copy whose family template
+# keeps only its gwapp grant.
+$P config export > "$WORK/full.toml"
+python3 - "$WORK/full.toml" > "$WORK/revoked.toml" <<'PY'
+import sys
+sections, template = [[]], None
+for line in open(sys.argv[1]):
+    if line.startswith("["):
+        sections.append([])
+    sections[-1].append(line)
+for lines in sections:
+    head = lines[0].strip() if lines else ""
+    if head == "[[template]]":
+        template = next((l.split('"')[1] for l in lines if l.startswith("name = ")), None)
+    if head == "[[template.grants]]" and template == "family" and 'name = "gwapp"\n' not in lines:
+        continue
+    sys.stdout.write("".join(lines))
+PY
+[ "$(grep -c '^\[\[template.grants\]\]' "$WORK/revoked.toml")" = $(( $(grep -c '^\[\[template.grants\]\]' "$WORK/full.toml") - 3 )) ] \
+    || fail "(k) could not write the revoked config"
 apply "$WORK/revoked.toml"
 touch "$WORK/hold"
 for _ in $(seq 100); do [ "$(grep -cE ' (ALIVE|CLOSED|BROKEN)$' "$WORK/hold.out")" = 4 ] && break; sleep 0.1; done
@@ -497,7 +519,7 @@ grep -q "^laptop-lan ALIVE$" "$WORK/hold.out" || { cat "$WORK/hold.out"; fail "(
 # The DNS server took the same SIGHUP: the name went with the grant.
 ST=$(inns client dig +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
 [ "$ST" = REFUSED ] || fail "(k) guest still looked up immich after the revoke: '$ST'"
-apply   # restore the grants
+apply "$WORK/full.toml"   # restore the grants
 [ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(k) guest grant not restored"
 ANS=$(inns client dig +short +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
 [ "$ANS" = 198.18.1.5 ] || fail "(k) guest name not restored: '$ANS'"

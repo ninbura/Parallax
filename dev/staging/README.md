@@ -49,7 +49,9 @@ sudo ufw allow in on wg1 to 10.9.0.1 port 53 proto tcp
 sudo dev/staging/staging.sh up        # fake LANs, config on first run, build, start
 sudo dev/staging/staging.sh smoke     # end-to-end checks; prints SMOKE PASS or FAIL
 sudo dev/staging/staging.sh peer phone personal mobile   # add a peer, show its QR
-sudo dev/staging/staging.sh apply     # re-apply after editing $STAGING_STATE/config/parallax.toml
+sudo dev/staging/staging.sh export    # the configuration as TOML, into $STAGING_STATE/config/export.toml (0600)
+sudo dev/staging/staging.sh import FILE   # replace it with FILE, then re-apply
+sudo dev/staging/staging.sh apply     # re-apply (SIGHUP the container)
 sudo dev/staging/staging.sh status
 sudo dev/staging/staging.sh down      # stop and remove the fake LANs; state is kept
 sudo dev/staging/staging.sh reset     # down, then delete all state
@@ -64,12 +66,16 @@ configs.
 The first `up` renders `parallax.toml.in` into `config/parallax.toml` there,
 taking the endpoint from the default route's source address. Set
 `STAGING_ENDPOINT`, `STAGING_PORT` or `STAGING_PUBLIC_RESOLVER` (default: the
-default-route gateway, for networks that block outbound DNS) to override. From
-then on that file is the source of truth.
+default-route gateway, for networks that block outbound DNS) to override. The
+container imports that file into its database (`out/parallax.db`) on the
+first start and renames it to `parallax.toml.imported`; from then on the
+database is the source of truth. Change it with `export` and `import`.
 
 `smoke` adds the peers `smoke-personal` and `smoke-guest`, connects them from
 a fresh client namespace to the real endpoint, and checks the following:
 
+- **Database.** The first start imported `parallax.toml` and renamed it, and
+  importing an export of the configuration changes nothing.
 - **Mapped addresses.** Both LANs are reachable by mapped address. On the
   routed LAN the host sees the tunnel address; on the masqueraded LAN it sees
   the gateway.

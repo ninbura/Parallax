@@ -41,19 +41,19 @@ impl Check {
     }
 }
 
-/// Run every check against the configuration at `config_path` and the host.
-pub fn diagnose(config_path: &Path, sys: System<'_>) -> Vec<Check> {
-    let (config_check, config) = check_config(config_path, sys);
+/// Run every check against the configuration and the host. `config` is the
+/// loaded configuration, or why it couldn't be loaded; the host checks run
+/// either way.
+pub fn diagnose(config: Result<&Config, String>, sys: System<'_>) -> Vec<Check> {
     let mut checks = vec![
-        config_check,
+        check_config(&config),
         Check::new("user namespace", check_user_namespace(sys)),
         Check::new("CAP_NET_ADMIN", check_net_admin(sys)),
         Check::new("ip_forward", check_ip_forward(sys)),
     ];
 
-    let backend = config
-        .as_ref()
-        .map_or(FirewallBackend::Nftables, |c| c.server.firewall.backend);
+    let config = config.ok();
+    let backend = config.map_or(FirewallBackend::Nftables, |c| c.server.firewall.backend);
     let missing = crate::apply::preflight(backend, sys);
     checks.push(Check::new(
         "tools",
@@ -64,7 +64,7 @@ pub fn diagnose(config_path: &Path, sys: System<'_>) -> Vec<Check> {
         },
     ));
 
-    if let Some(config) = &config {
+    if let Some(config) = config {
         for name in interfaces(config) {
             checks.push(Check::new(
                 format!("interface {name}"),
@@ -79,42 +79,22 @@ pub fn diagnose(config_path: &Path, sys: System<'_>) -> Vec<Check> {
     checks
 }
 
-/// Parse and validate. The parsed config is returned even when validation
-/// fails, so the interface checks still run.
-fn check_config(path: &Path, sys: System<'_>) -> (Check, Option<Config>) {
+/// Validate. An invalid configuration still names the interfaces to check.
+fn check_config(config: &Result<&Config, String>) -> Check {
     let name = "configuration";
-    let text = match sys.fs.read(path) {
-        Ok(Some(text)) => text,
-        Ok(None) => {
-            return (
-                Check::new(name, Err(format!("no configuration at {}", path.display()))),
-                None,
-            )
-        }
-        Err(e) => return (Check::new(name, Err(e.to_string())), None),
-    };
-    let config = match Config::from_toml(&text) {
+    let config = match config {
         Ok(c) => c,
-        Err(e) => {
-            return (
-                Check::new(name, Err(format!("{}: {e}", path.display()))),
-                None,
-            )
-        }
+        Err(e) => return Check::new(name, Err(e.clone())),
     };
-    let (errors, warnings) = crate::validate::check(&config);
+    let (errors, warnings) = crate::validate::check(config);
     let result = if errors.is_empty() {
         Ok(match warnings.len() {
-            0 => format!("{} is valid", path.display()),
-            n => format!(
-                "{} is valid, with {n} warning(s); `parallax validate` lists them",
-                path.display()
-            ),
+            0 => "valid".to_string(),
+            n => format!("valid, with {n} warning(s); `parallax validate` lists them"),
         })
     } else {
         Err(format!(
-            "{} is invalid:\n{}",
-            path.display(),
+            "invalid:\n{}",
             errors
                 .iter()
                 .map(|e| format!("  - {e}"))
@@ -122,7 +102,7 @@ fn check_config(path: &Path, sys: System<'_>) -> (Check, Option<Config>) {
                 .join("\n")
         ))
     };
-    (Check::new(name, result), Some(config))
+    Check::new(name, result)
 }
 
 /// Parallax drives the host's network stack, which needs real root
@@ -321,12 +301,10 @@ mod tests {
     use crate::io::Output;
     use crate::testing::canonical_config;
 
-    const CONFIG: &str = "/etc/parallax/parallax.toml";
     const ROOT_STATUS: &str = "Name:\tparallax\nCapEff:\t000001ffffffffff\n";
 
     fn healthy_fs() -> MemoryFs {
         MemoryFs::new()
-            .with_file(CONFIG, canonical_config().to_toml().unwrap())
             .with_file("/proc/self/uid_map", "         0          0 4294967295\n")
             .with_file("/proc/self/status", ROOT_STATUS)
             .with_file("/proc/sys/net/ipv4/ip_forward", "1\n")
@@ -343,6 +321,14 @@ mod tests {
     /// Runs the checks. Answers queued by a test take precedence over the
     /// healthy `ip link show` answer queued here.
     fn run(fs: &MemoryFs, runner: &RecordingRunner) -> Vec<Check> {
+        run_with(Ok(&canonical_config()), fs, runner)
+    }
+
+    fn run_with(
+        config: Result<&Config, String>,
+        fs: &MemoryFs,
+        runner: &RecordingRunner,
+    ) -> Vec<Check> {
         runner.respond_to(
             "ip",
             &["-o", "link", "show", "dev", "eth0"],
@@ -352,7 +338,7 @@ mod tests {
                 stderr: String::new(),
             },
         );
-        diagnose(Path::new(CONFIG), System { fs, runner })
+        diagnose(config, System { fs, runner })
     }
 
     fn problems(checks: &[Check]) -> Vec<(&str, &str)> {
@@ -430,12 +416,16 @@ mod tests {
             .with_file("/proc/self/uid_map", "0 0 4294967295\n")
             .with_file("/proc/self/status", ROOT_STATUS)
             .with_file("/proc/sys/net/ipv4/ip_forward", "1\n");
-        let checks = run(&fs, &RecordingRunner::new());
+        let checks = run_with(
+            Err("no database at /var/lib/parallax/parallax.db".into()),
+            &fs,
+            &RecordingRunner::new(),
+        );
         assert_eq!(
             problems(&checks),
             vec![(
                 "configuration",
-                "no configuration at /etc/parallax/parallax.toml"
+                "no database at /var/lib/parallax/parallax.db"
             )]
         );
         assert!(checks.iter().any(|c| c.name == "wireguard"));
@@ -447,12 +437,11 @@ mod tests {
         cfg.templates.clear();
         cfg.peers.clear();
         cfg.networks[0].subnet = "10.8.0.0/24".parse().unwrap();
-        let fs = healthy_fs().with_file(CONFIG, cfg.to_toml().unwrap());
-        let checks = run(&fs, &RecordingRunner::new());
+        let checks = run_with(Ok(&cfg), &healthy_fs(), &RecordingRunner::new());
         let p = problems(&checks);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0, "configuration");
-        assert!(p[0].1.contains("is invalid:\n  - "));
+        assert!(p[0].1.starts_with("invalid:\n  - "));
         assert!(checks.iter().any(|c| c.name == "interface eth0"));
     }
 
@@ -509,8 +498,7 @@ mod tests {
     fn wan_interface_is_checked_once_even_if_shared() {
         let mut cfg = canonical_config();
         cfg.server.wan_interface = Some("eth0".into());
-        let fs = healthy_fs().with_file(CONFIG, cfg.to_toml().unwrap());
-        let checks = run(&fs, &RecordingRunner::new());
+        let checks = run_with(Ok(&cfg), &healthy_fs(), &RecordingRunner::new());
         assert_eq!(
             checks
                 .iter()
@@ -573,7 +561,6 @@ mod tests {
     #[test]
     fn kernel_without_user_namespaces_passes() {
         let fs = MemoryFs::new()
-            .with_file(CONFIG, canonical_config().to_toml().unwrap())
             .with_file("/proc/self/status", ROOT_STATUS)
             .with_file("/proc/sys/net/ipv4/ip_forward", "1\n");
         assert_eq!(problems(&run(&fs, &RecordingRunner::new())), vec![]);
@@ -583,10 +570,9 @@ mod tests {
     fn iptables_backend_needs_ipset_and_skips_the_nft_probe() {
         let mut cfg = canonical_config();
         cfg.server.firewall.backend = FirewallBackend::IptablesNft;
-        let fs = healthy_fs().with_file(CONFIG, cfg.to_toml().unwrap());
         let runner = RecordingRunner::new();
         runner.respond("ipset", failed(127, "not found"));
-        let checks = run(&fs, &runner);
+        let checks = run_with(Ok(&cfg), &healthy_fs(), &runner);
         let p = problems(&checks);
         assert_eq!(p.len(), 1);
         assert!(p[0].1.contains("`ipset` is not available"), "{}", p[0].1);

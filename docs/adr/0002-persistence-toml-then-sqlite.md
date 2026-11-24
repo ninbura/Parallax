@@ -1,6 +1,6 @@
 # ADR 0002: The TOML file is M1 persistence; SQLite comes with the daemon
 
-Status: accepted (M1), revisit in M2/M3
+Status: superseded by [ADR 0005](0005-database-is-the-source-of-truth.md) (step 6a)
 
 ## Decision
 

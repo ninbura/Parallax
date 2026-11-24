@@ -19,16 +19,17 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
-      - ./config:/etc/parallax          # parallax.toml + wg-server.key (0600)
+      - ./config:/etc/parallax          # wg-server.key (0600); parallax.toml, imported on the first start
       # Certificates for proxied hostnames (server.proxy.certificates). Mount
       # only what Parallax should hold, read-only; certbot's live/ entries
       # link into archive/, so mount both at the same paths. docs/setup.md.
       # - /etc/letsencrypt/live/immich.mydomain.com:/etc/letsencrypt/live/immich.mydomain.com:ro
       # - /etc/letsencrypt/archive/immich.mydomain.com:/etc/letsencrypt/archive/immich.mydomain.com:ro
-      - parallax-state:/var/lib/parallax
+      - parallax-state:/var/lib/parallax  # the database (parallax.db) and generated files
       - tailscale-state:/var/lib/tailscale
     environment:
       PARALLAX_CONFIG: /etc/parallax/parallax.toml
+      PARALLAX_DB: /var/lib/parallax/parallax.db
       PARALLAX_OUT: /var/lib/parallax
     depends_on:
       - headscale

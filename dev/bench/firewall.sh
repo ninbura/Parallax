@@ -136,15 +136,23 @@ cpu_busy() { # jiffies busy and total across all CPUs
 scenario() { # label, binary, padding
     local label=$1 bin=$2 pad=$3 cfg="$WORK/$1.toml"
     config "$pad" > "$cfg"
-    if [ ! -f "$WORK/wg-server.key" ]; then
-        "$bin" -c "$cfg" keygen --write-config >/dev/null
-        GW_PUB=$(sed -n 's/^public_key = "\(.*\)"/\1/p' "$cfg")
-    else
+    if [ -n "${GW_PUB:-}" ]; then
         sed -i "s|^public_key = .*|public_key = \"$GW_PUB\"|" "$cfg"
     fi
-    "$bin" -c "$cfg" peer add bench --template bench --keep-private-key --platform linux \
+    local px
+    if "$bin" --help 2>/dev/null | grep -q -- '--db'; then
+        px=("$bin" --db "$WORK/$label.db")   # the configuration lives in a database
+        "${px[@]}" config import "$cfg" >/dev/null
+    else
+        px=("$bin" -c "$cfg")                 # older builds read the TOML file
+    fi
+    if [ ! -f "$WORK/wg-server.key" ]; then
+        "${px[@]}" keygen --write-config >/dev/null
+        GW_PUB=$(wg pubkey < "$WORK/wg-server.key")
+    fi
+    "${px[@]}" peer add bench --template bench --keep-private-key --platform linux \
         > "$WORK/$label.conf" 2>/dev/null
-    inns bgw "$bin" -c "$cfg" apply -o "$OUT" >/dev/null
+    inns bgw "${px[@]}" apply -o "$OUT" >/dev/null
     local rules
     # Forward rules in all, including each template's chain: what a packet
     # would walk without the per-template chains.
