@@ -61,7 +61,12 @@ sudo docker compose kill -s HUP parallax    # re-apply
 open it, and shows what changes: the configuration (keys hidden), the server
 key, and the generated files. It changes nothing until you confirm. Before
 replacing anything it saves the current state as a new backup, so a restore
-can be undone with another restore.
+can be undone with another restore; if it can't, nothing is restored. If the
+configuration changes while you're looking at the diff, nothing is restored
+either: run it again.
+
+If the database is damaged and won't open, move `parallax.db*` aside and
+restore as on a fresh install (below).
 
 A backup from an older Parallax is brought up to date as it's restored. One
 from a newer Parallax is refused, naming the version needed.

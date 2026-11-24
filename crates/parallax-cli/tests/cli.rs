@@ -488,7 +488,11 @@ fn a_backup_restores_what_changed_since() {
 
     let key = std::fs::read_to_string(s.dir.join("wg-server.key")).unwrap();
     s.run(&["peer", "remove", "laptop"]);
-    std::fs::write(s.dir.join("wg-server.key"), "changed\n").unwrap();
+    std::fs::write(
+        s.dir.join("wg-server.key"),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    )
+    .unwrap();
 
     // Without a terminal, only --yes can say yes.
     let (ok, _, err) = s.run(&["backup", "restore", &file.to_string_lossy()]);
@@ -619,6 +623,40 @@ fn backups_rotate_and_need_a_passphrase_when_encrypted() {
 
     let (ok, _, err) = s.run(&["backup", "passphrase", "--generate"]);
     assert!(ok && err.contains("don't use it yet"), "{err}");
+
+    std::fs::write(s.dir.join("wg-server.key"), "not a key\n").unwrap();
+    let (ok, _, err) = s.run(&["backup", "create"]);
+    assert!(
+        !ok && err.contains("doesn't hold a WireGuard private key"),
+        "{err}"
+    );
     let (ok, _, err) = s.run(&["backup", "passphrase", "--generate"]);
     assert!(!ok && err.contains("--replace"), "{err}");
+}
+
+#[test]
+fn a_restore_without_an_undo_backup_changes_nothing() {
+    let s = Scratch::new("backup-undo");
+    s.gateway();
+    s.run(&["backup", "create"]);
+    let file = s.backups().pop().unwrap();
+    s.run(&["peer", "remove", "laptop"]);
+    // Backups can't be written any more: the directory is now a file.
+    let blocker = s.dir.join("blocker");
+    std::fs::write(&blocker, "").unwrap();
+    let text = std::fs::read_to_string(s.config()).unwrap().replace(
+        &s.dir.join("backups").to_string_lossy().into_owned(),
+        &blocker.to_string_lossy(),
+    );
+    std::fs::write(s.config(), text).unwrap();
+    s.import();
+    let (_, before, _) = s.run(&["config", "export"]);
+
+    let (ok, _, err) = s.run(&["backup", "restore", "--yes", &file.to_string_lossy()]);
+    assert!(
+        !ok && err.contains("couldn't save the current state first"),
+        "{err}"
+    );
+    let (_, after, _) = s.run(&["config", "export"]);
+    assert_eq!(before, after);
 }

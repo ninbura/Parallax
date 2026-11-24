@@ -119,6 +119,17 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
         }
     }
     let passphrase = backup_passphrase(settings)?;
+    // A backup whose key can't be used would restore a gateway no client
+    // reaches. (The undo backup a restore makes takes the state as it is.)
+    let key_file = &config.server.wireguard.private_key_file;
+    let key = std::fs::read(key_file)
+        .with_context(|| format!("reading the server key {}", key_file.display()))?;
+    if backup::parse_key(&key).is_none() {
+        bail!(
+            "the server key {} doesn't hold a WireGuard private key; nothing backed up",
+            key_file.display()
+        );
+    }
     let written = block_on(async {
         let store = Store::open(db).await?;
         let snapshot = store
@@ -127,7 +138,8 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
         if if_due {
             let unchanged = newest
                 .as_ref()
-                .and_then(|n| backup::inspect(&n.path).ok())
+                // The whole file, so a damaged newest backup is replaced, not trusted.
+                .and_then(|n| backup::verify(&n.path).ok())
                 .is_some_and(|m| {
                     m.contents_sha256 == snapshot.contents_sha256()
                         && m.encrypted == passphrase.is_some()
@@ -155,7 +167,7 @@ fn create(db: &Path, if_due: bool) -> anyhow::Result<()> {
             "not encrypted"
         }
     );
-    for old in backup::rotate(&settings.directory, settings.keep as usize)? {
+    for old in backup::rotate(&settings.directory, settings.keep as usize, &path)? {
         println!("deleted {} (keeping {})", old.display(), settings.keep);
     }
     Ok(())
@@ -341,7 +353,9 @@ fn restore(
             "not encrypted"
         }
     );
-    let before = current(db)?;
+    let before = current(db).context(
+        "can't read the current database; if it's damaged, move it (parallax.db*) aside and restore as on a fresh install",
+    )?;
     let defaults = BackupServer::default();
     let settings = before.as_ref().map_or(&defaults, |c| &c.server.backup);
     let (contents, typed) = if manifest.encrypted {
@@ -369,24 +383,49 @@ fn restore(
     block_on(async {
         let mut staged = contents.stage(staging.path()).await?;
         let restored = staged.load().await?;
+        let key =
+            backup::parse_key(contents.server_key().expose().as_bytes()).map(|k| k.public_key());
+        if key.as_ref() != Some(&restored.server.wireguard.public_key) {
+            bail!(
+                "backup {}: its server key doesn't match the public key in its configuration, so clients couldn't connect; nothing restored",
+                file.display()
+            );
+        }
         show_changes(before.as_ref(), &restored, contents.server_key(), out_dir)?;
         if !yes && !confirm("restore?", false)? {
             bail!("nothing restored");
         }
+        // Undo first: a restore never loses the state it replaces.
         if let Some(before) = &before {
-            save_current(db, before).await;
+            let path = save_current(db, before, typed.as_ref())
+                .await
+                .context("couldn't save the current state first, so nothing was restored")?;
+            println!("saved the current state first as {}", path.display());
         }
-        let mut live = Store::create(db).await?;
-        live.replace_with(&staged).await?;
+        // The key goes in first and comes back out if the database can't
+        // be replaced, so the two always match.
         let key_file = &restored.server.wireguard.private_key_file;
-        RealFs
-            .write(key_file, contents.server_key().expose(), true)
-            .with_context(|| {
-                format!(
-                    "the database is restored, but writing the server key {} failed; fix that and restore again",
+        let old_key = RealFs.read(key_file)?;
+        write_atomic(key_file, contents.server_key().expose())?;
+        let replaced = async {
+            let mut live = Store::create(db).await?;
+            live.replace_with(&staged, before.as_ref()).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = replaced {
+            let undone = match &old_key {
+                Some(old) => write_atomic(key_file, old),
+                None => std::fs::remove_file(key_file).map_err(Into::into),
+            };
+            if let Err(undo) = undone {
+                eprintln!(
+                    "warning: putting the old server key {} back failed too: {undo:#}",
                     key_file.display()
-                )
-            })?;
+                );
+            }
+            return Err(e);
+        }
         println!(
             "restored the database {} and the server key {}",
             db.display(),
@@ -468,26 +507,53 @@ fn show_changes(
 }
 
 /// Back up the current state before replacing it, so a restore can be
-/// undone. Not rotated: that could delete the very backup being restored.
-async fn save_current(db: &Path, before: &Config) {
+/// undone. With encryption on and no passphrase set, the one that opened the
+/// backup is used. Not rotated: that could delete the very backup being restored.
+async fn save_current(
+    db: &Path,
+    before: &Config,
+    typed: Option<&Secret>,
+) -> anyhow::Result<PathBuf> {
     let settings = &before.server.backup;
-    let saved = async {
-        let passphrase = backup_passphrase(settings)?;
-        let store = Store::open(db).await?;
-        let snapshot = store
-            .snapshot(&before.server.wireguard.private_key_file)
-            .await?;
-        let (path, _) = backup::write(
-            &snapshot,
-            &settings.directory,
-            passphrase.as_ref(),
-            SystemTime::now(),
-        )?;
-        anyhow::Ok(path)
+    let passphrase = match (backup_passphrase(settings), typed) {
+        (Ok(p), _) => p,
+        (Err(_), Some(typed)) => Some(Secret::new(typed.expose())),
+        (Err(e), None) => return Err(e),
+    };
+    let store = Store::open(db).await?;
+    let snapshot = store
+        .snapshot(&before.server.wireguard.private_key_file)
+        .await?;
+    let (path, _) = backup::write(
+        &snapshot,
+        &settings.directory,
+        passphrase.as_ref(),
+        SystemTime::now(),
+    )?;
+    Ok(path)
+}
+
+/// Replace `path` (mode 0600) all at once: a crash or a full disk leaves the
+/// old contents, never a truncated file.
+fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let scratch = TempDir::new_in(dir, ".parallax-key")?;
+    let tmp = scratch.path().join("key");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    .await;
-    match saved {
-        Ok(path) => println!("saved the current state first as {}", path.display()),
-        Err(e) => eprintln!("warning: couldn't save the current state first: {e:#}"),
-    }
+    let ctx = || format!("writing {}", path.display());
+    let mut f = opts.open(&tmp).with_context(ctx)?;
+    f.write_all(contents.as_bytes()).with_context(ctx)?;
+    f.sync_all().with_context(ctx)?;
+    std::fs::rename(&tmp, path).with_context(ctx)?;
+    Ok(())
 }

@@ -23,7 +23,7 @@ impl Store {
         result.map_err(|e| self.busy(e))
     }
 
-    async fn load_inner(&self) -> Result<Config> {
+    pub(crate) async fn load_inner(&self) -> Result<Config> {
         let Some(server) = self.load_server().await? else {
             return Err(Error::Empty(self.path.clone()));
         };

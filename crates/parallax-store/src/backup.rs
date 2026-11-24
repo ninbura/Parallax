@@ -135,6 +135,7 @@ impl Store {
                 e,
             )
         })?;
+
         let scratch = TempDir::new_in(parent(&self.path), ".parallax-backup")?;
         let copy = scratch.path().join(DATABASE);
         let target = copy.to_str().filter(|p| !p.contains('\'')).ok_or_else(|| {
@@ -184,7 +185,16 @@ impl Store {
     /// transaction. Ids are copied as they are, so anything pointing at a
     /// row by id points at the same thing again. Both must be at the same
     /// schema version.
-    pub async fn replace_with(&mut self, source: &Store) -> Result<()> {
+    ///
+    /// `expected` is what this database must still hold, checked inside the
+    /// same transaction (`None`: no configuration yet); otherwise nothing is
+    /// replaced and the result is [`Error::Changed`]. So a change made after
+    /// the caller looked (and backed it up) is never lost.
+    pub async fn replace_with(
+        &mut self,
+        source: &Store,
+        expected: Option<&parallax_core::Config>,
+    ) -> Result<()> {
         let (ours, theirs) = (self.schema_version().await?, source.schema_version().await?);
         let tables = source.tables().await?;
         if ours != theirs || self.tables().await? != tables {
@@ -196,6 +206,14 @@ impl Store {
         }
         self.begin().await.map_err(|e| self.busy(e))?;
         let result = async {
+            let found = match self.load_inner().await {
+                Ok(config) => Some(config),
+                Err(Error::Empty(_)) => None,
+                Err(e) => return Err(e),
+            };
+            if found.as_ref() != expected {
+                return Err(Error::Changed(self.path.clone()));
+            }
             // Tables are created after the ones they point at: delete in
             // reverse, fill in order, and every reference holds throughout.
             for table in tables.iter().rev() {
@@ -317,13 +335,17 @@ pub fn list(directory: &Path) -> Result<Vec<Listed>> {
         .collect())
 }
 
-/// Delete all but the newest `keep` backups in `directory`; returns the
-/// deleted files.
-pub fn rotate(directory: &Path, keep: usize) -> Result<Vec<PathBuf>> {
-    let backups = list(directory)?;
-    let excess = backups.len().saturating_sub(keep);
+/// Delete all but the newest `keep` backups in `directory`, never
+/// `written` (just made; after the clock went back it may not sort newest).
+/// Returns the deleted files.
+pub fn rotate(directory: &Path, keep: usize, written: &Path) -> Result<Vec<PathBuf>> {
+    let others: Vec<Listed> = list(directory)?
+        .into_iter()
+        .filter(|b| b.path != written)
+        .collect();
+    let excess = others.len().saturating_sub(keep.saturating_sub(1));
     let mut deleted = Vec::new();
-    for old in backups.into_iter().take(excess) {
+    for old in others.into_iter().take(excess) {
         std::fs::remove_file(&old.path)
             .map_err(|e| Error::io(format!("deleting {}", old.path.display()), e))?;
         deleted.push(old.path);
@@ -353,9 +375,58 @@ pub fn inspect(file: &Path) -> Result<Manifest> {
     parse_manifest(file, &text)
 }
 
+/// Read a whole backup and check its payload against the manifest, without
+/// decrypting it.
+pub fn verify(file: &Path) -> Result<Manifest> {
+    read_checked(file).map(|(manifest, _)| manifest)
+}
+
 /// Open a backup: check it, decrypt it with `passphrase` if it's
 /// encrypted, and check the contents against the manifest.
 pub fn open(file: &Path, passphrase: Option<&Secret>) -> Result<Contents> {
+    let (manifest, payload) = read_checked(file)?;
+    let plain = if manifest.encrypted {
+        let passphrase = passphrase.ok_or_else(|| {
+            Error::backup(file, "is encrypted; restoring it needs its passphrase")
+        })?;
+        decrypt(file, &payload, passphrase)?
+    } else {
+        payload
+    };
+    if sha256(&plain) != manifest.contents_sha256 {
+        return Err(Error::backup(
+            file,
+            "is damaged: its contents don't match their checksum",
+        ));
+    }
+    let mut contents = unpack(&plain).map_err(|e| Error::backup(file, e))?;
+    let database = contents
+        .remove(DATABASE)
+        .ok_or_else(|| Error::backup(file, format!("has no {DATABASE}")))?;
+    let server_key = contents
+        .remove(SERVER_KEY)
+        .and_then(|k| String::from_utf8(k).ok())
+        .filter(|k| parse_key(k.as_bytes()).is_some())
+        .ok_or_else(|| {
+            Error::backup(
+                file,
+                format!("has no {SERVER_KEY} holding a WireGuard private key"),
+            )
+        })?;
+    Ok(Contents {
+        manifest,
+        database,
+        server_key: Secret::new(server_key),
+    })
+}
+
+/// The server key in a key file's contents.
+pub fn parse_key(contents: &[u8]) -> Option<parallax_core::secret::PrivateKey> {
+    std::str::from_utf8(contents).ok()?.trim().parse().ok()
+}
+
+/// The manifest and the stored payload, checked against its checksum.
+fn read_checked(file: &Path) -> Result<(Manifest, Vec<u8>)> {
     let bytes =
         std::fs::read(file).map_err(|e| Error::io(format!("reading {}", file.display()), e))?;
     let mut entries = unpack(&bytes).map_err(|e| Error::backup(file, e))?;
@@ -381,33 +452,7 @@ pub fn open(file: &Path, passphrase: Option<&Secret>) -> Result<Contents> {
             format!("is damaged: {name} doesn't match its checksum"),
         ));
     }
-    let plain = if manifest.encrypted {
-        let passphrase = passphrase.ok_or_else(|| {
-            Error::backup(file, "is encrypted; restoring it needs its passphrase")
-        })?;
-        decrypt(file, &payload, passphrase)?
-    } else {
-        payload
-    };
-    if sha256(&plain) != manifest.contents_sha256 {
-        return Err(Error::backup(
-            file,
-            "is damaged: its contents don't match their checksum",
-        ));
-    }
-    let mut contents = unpack(&plain).map_err(|e| Error::backup(file, e))?;
-    let database = contents
-        .remove(DATABASE)
-        .ok_or_else(|| Error::backup(file, format!("has no {DATABASE}")))?;
-    let server_key = contents
-        .remove(SERVER_KEY)
-        .and_then(|k| String::from_utf8(k).ok())
-        .ok_or_else(|| Error::backup(file, format!("has no readable {SERVER_KEY}")))?;
-    Ok(Contents {
-        manifest,
-        database,
-        server_key: Secret::new(server_key),
-    })
+    Ok((manifest, payload))
 }
 
 fn parse_manifest(file: &Path, text: &str) -> Result<Manifest> {
@@ -593,28 +638,39 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 /// Write a new backup file under the first free name, completely or not at
-/// all: a partial file (crash, full disk) never looks like a backup.
+/// all: a partial file (crash, full disk) never looks like a backup, and two
+/// writers at the same second never touch each other's file.
 fn write_new(directory: &Path, stamp: &str, data: &[u8]) -> Result<PathBuf> {
+    let scratch = TempDir::new_in(directory, ".partial")?;
+    let partial = scratch.path().join("backup.tar");
+    write_private(&partial, data)?;
     for n in 0..100 {
         let name = match n {
             0 => format!("{PREFIX}{stamp}.tar"),
             n => format!("{PREFIX}{stamp}-{n}.tar"),
         };
         let path = directory.join(&name);
-        if path.exists() {
-            continue;
+        // A hard link never replaces an existing file.
+        match std::fs::hard_link(&partial, &path) {
+            Ok(()) => {
+                sync_dir(directory)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Error::io(format!("writing {}", path.display()), e)),
         }
-        let partial = directory.join(format!(".{name}.partial"));
-        let _ = std::fs::remove_file(&partial);
-        write_private(&partial, data)?;
-        std::fs::rename(&partial, &path)
-            .map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
-        return Ok(path);
     }
     Err(Error::Invalid(format!(
         "{} already holds 100 backups made at {stamp}",
         directory.display()
     )))
+}
+
+/// Make a new name in `directory` survive a crash.
+fn sync_dir(directory: &Path) -> Result<()> {
+    std::fs::File::open(directory)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| Error::io(format!("syncing {}", directory.display()), e))
 }
 
 #[cfg(test)]

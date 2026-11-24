@@ -33,7 +33,11 @@ key. `parallax backup restore <file>` puts both back. How to use them:
   transaction, ids included. Other processes keep their open connections,
   and no stale log or coordination file can be applied to a swapped-in file.
   Before that, restore shows the configuration and generated-file diff,
-  waits for confirmation, and backs up the current state.
+  waits for confirmation, and backs up the current state (required: no
+  undo backup, no restore). The replace checks, inside its transaction, that
+  the configuration is still what was shown and backed up. The server key is
+  written first (atomically) and put back if the replace fails, so key and
+  database always match.
 - **Skip when unchanged.** The plaintext payload is deterministic (same
   database contents and key, same bytes), and the manifest records its
   SHA-256, so an automatic backup with nothing new isn't written. The

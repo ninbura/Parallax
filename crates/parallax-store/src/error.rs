@@ -34,6 +34,12 @@ pub enum Error {
     #[error("backup {file}: {problem}")]
     Backup { file: PathBuf, problem: String },
 
+    /// The database changed between showing a restore and doing it.
+    #[error(
+        "database {0} changed while the restore waited; nothing restored. Run the restore again"
+    )]
+    Changed(PathBuf),
+
     /// An encrypted backup didn't open with the passphrase given.
     #[error("backup {0} did not decrypt; the passphrase is wrong")]
     WrongPassphrase(PathBuf),

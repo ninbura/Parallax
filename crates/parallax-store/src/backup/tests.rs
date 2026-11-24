@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parallax_core::secret::Secret;
-use parallax_core::testing::canonical_config;
+use parallax_core::testing::{canonical_config, keypair};
 
 use super::*;
 use crate::tests::{everything_config, schema_1_database, TempDir, LATEST};
@@ -14,6 +14,11 @@ fn at(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
 
+/// A key file's contents.
+fn server_key(seed: u8) -> String {
+    format!("{}\n", keypair(seed).private.expose_base64())
+}
+
 fn passphrase() -> Secret {
     Secret::new("correct horse battery staple")
 }
@@ -23,7 +28,7 @@ async fn gateway(dir: &TempDir, config: &parallax_core::Config) -> (Store, PathB
     let mut store = Store::create(&dir.db()).await.unwrap();
     store.save(config).await.unwrap();
     let key = dir.0.join("wg-server.key");
-    std::fs::write(&key, "c2VydmVyIGtleSBmb3IgdGVzdHMgb25seSBwYWRkaW5nIQ==\n").unwrap();
+    std::fs::write(&key, server_key(5)).unwrap();
     (store, key)
 }
 
@@ -44,7 +49,9 @@ async fn restore(file: &Path, passphrase: Option<&Secret>) -> parallax_core::Con
     live.save(&canonical_config()).await.unwrap();
     let staging = crate::TempDir::new_in(&target.0, "restore").unwrap();
     let staged = contents.stage(staging.path()).await.unwrap();
-    live.replace_with(&staged).await.unwrap();
+    live.replace_with(&staged, Some(&canonical_config()))
+        .await
+        .unwrap();
     live.load().await.unwrap()
 }
 
@@ -88,10 +95,7 @@ async fn an_unencrypted_backup_restores_everything_with_its_ids() {
     let staged = contents.stage(staging.path()).await.unwrap();
     let source = Store::open(&dir.db()).await.unwrap();
     assert_eq!(peer_ids(&staged).await, peer_ids(&source).await);
-    assert_eq!(
-        contents.server_key().expose(),
-        "c2VydmVyIGtleSBmb3IgdGVzdHMgb25seSBwYWRkaW5nIQ==\n"
-    );
+    assert_eq!(contents.server_key().expose(), server_key(5));
 }
 
 async fn peer_ids(s: &Store) -> Vec<(i64, String)> {
@@ -122,7 +126,7 @@ async fn an_encrypted_backup_needs_its_passphrase() {
     // Nothing private is readable without the passphrase.
     let bytes = std::fs::read(&file).unwrap();
     let text = String::from_utf8_lossy(&bytes);
-    assert!(!text.contains("c2VydmVyIGtleSBm"));
+    assert!(!text.contains(server_key(5).trim()));
     assert!(!text.contains("SQLite format"));
 }
 
@@ -142,7 +146,7 @@ async fn unchanged_contents_give_the_same_checksum() {
     let after = store.snapshot(&key).await.unwrap();
     assert_ne!(first.contents_sha256(), after.contents_sha256());
 
-    std::fs::write(&key, "another key\n").unwrap();
+    std::fs::write(&key, server_key(6)).unwrap();
     store.save(&canonical_config()).await.unwrap();
     let new_key = store.snapshot(&key).await.unwrap();
     assert_ne!(first.contents_sha256(), new_key.contents_sha256());
@@ -210,7 +214,14 @@ async fn an_older_backup_is_migrated_forward() {
     let old = dir.0.join("old.db");
     schema_1_database(&old).await;
     let database = std::fs::read(&old).unwrap();
-    let payload = pack(&[(DATABASE, &database), (SERVER_KEY, b"key\n")], 0).unwrap();
+    let payload = pack(
+        &[
+            (DATABASE, &database),
+            (SERVER_KEY, server_key(5).as_bytes()),
+        ],
+        0,
+    )
+    .unwrap();
     let snapshot = Snapshot {
         contents_sha256: sha256(&payload),
         payload,
@@ -247,7 +258,7 @@ async fn rotation_keeps_the_newest() {
     );
     std::fs::write(backups.join("notes.txt"), "kept").unwrap();
 
-    let deleted = rotate(&backups, 2).unwrap();
+    let deleted = rotate(&backups, 2, &made[3]).unwrap();
     assert_eq!(deleted, made[..2]);
     let left: Vec<_> = list(&backups)
         .unwrap()
@@ -268,4 +279,56 @@ async fn backups_and_their_directory_are_owner_only() {
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&file), 0o600);
     assert_eq!(mode(file.parent().unwrap()), 0o700);
+}
+
+#[tokio::test]
+async fn rotation_never_deletes_the_backup_just_written() {
+    let dir = TempDir::new();
+    let (store, key) = gateway(&dir, &canonical_config()).await;
+    let snapshot = store.snapshot(&key).await.unwrap();
+    let backups = dir.0.join("backups");
+    // From before the clock went back: it sorts newest.
+    let future = write(&snapshot, &backups, None, at(NOW + 86_400))
+        .unwrap()
+        .0;
+    let now = write(&snapshot, &backups, None, at(NOW)).unwrap().0;
+    assert_eq!(rotate(&backups, 1, &now).unwrap(), [future]);
+    assert_eq!(list(&backups).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_restore_waits_for_nobody_and_loses_nothing() {
+    let dir = TempDir::new();
+    let file = backup(&dir, None).await;
+    let contents = open(&file, None).unwrap();
+    let target = TempDir::new();
+    let mut live = Store::create(&target.db()).await.unwrap();
+    live.save(&canonical_config()).await.unwrap();
+    let staging = crate::TempDir::new_in(&target.0, "restore").unwrap();
+    let staged = contents.stage(staging.path()).await.unwrap();
+
+    // Someone changed the configuration after the restore looked at it.
+    let mut looked_at = canonical_config();
+    looked_at.peers.pop();
+    let err = live
+        .replace_with(&staged, Some(&looked_at))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Changed(_)), "{err}");
+    let err = live.replace_with(&staged, None).await.unwrap_err();
+    assert!(matches!(err, Error::Changed(_)), "{err}");
+    assert_eq!(live.load().await.unwrap(), canonical_config());
+}
+
+#[tokio::test]
+async fn verify_catches_damage_without_the_passphrase() {
+    let dir = TempDir::new();
+    let file = backup(&dir, Some(&passphrase())).await;
+    assert!(verify(&file).unwrap().encrypted);
+    let mut bytes = std::fs::read(&file).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0xff;
+    std::fs::write(&file, &bytes).unwrap();
+    let err = verify(&file).unwrap_err().to_string();
+    assert!(err.contains("is damaged"), "{err}");
 }

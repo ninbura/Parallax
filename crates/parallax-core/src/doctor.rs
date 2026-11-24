@@ -110,7 +110,8 @@ fn check_backup(backup: &BackupServer, sys: System<'_>) -> Outcome {
         );
     }
     // Writing a file creates the directory too, as a backup would.
-    let probe = dir.join(".parallax-doctor");
+    // Named for this process, so it can't be a file someone else made.
+    let probe = dir.join(format!(".parallax-doctor-{}", std::process::id()));
     match sys.fs.write(&probe, "", true) {
         Ok(()) => {
             let _ = sys.fs.remove(&probe);
@@ -522,7 +523,7 @@ mod tests {
         assert_eq!(
             fs.paths()
                 .iter()
-                .filter(|p| p.ends_with(".parallax-doctor"))
+                .filter(|p| p.to_string_lossy().contains(".parallax-doctor"))
                 .count(),
             0
         );
