@@ -36,17 +36,21 @@
   that LAN services then see the gateway's address for every peer.
 - **A host firewall, if any, must allow Parallax's traffic too.** Parallax owns
   its own nftables table but cannot override another firewall on the host, and
-  a packet must pass both. With ufw active, allow the WireGuard port and DNS
-  from the tunnel to the gateway address:
+  a packet must pass both. With ufw active, allow the WireGuard port, and DNS
+  and the HTTPS proxy from the tunnel to the gateway address:
 
   ```sh
   sudo ufw allow proto udp to <gateway LAN address> port <listen_port>
   sudo ufw allow in on wg0 to <DNS address, e.g. 10.8.0.1> port 53 proto udp
   sudo ufw allow in on wg0 to <DNS address, e.g. 10.8.0.1> port 53 proto tcp
+  sudo ufw allow in on wg0 to <proxy address, e.g. 10.8.0.1> port 8443 proto tcp
   ```
 
-  The DNS server runs in the host network namespace, so ufw sees tunnel DNS
-  as incoming traffic to the host. TCP carries answers too large for UDP.
+  The DNS server and the proxy run in the host network namespace, so ufw
+  sees their tunnel traffic as incoming to the host. TCP carries DNS answers
+  too large for UDP. The proxy rule matters only with proxied services
+  (`hostnames`): Parallax redirects a tier's `:443` to the proxy port, and
+  without the rule ufw drops it there.
 
 ## Rootful Docker, not rootless
 
