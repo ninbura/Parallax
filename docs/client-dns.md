@@ -23,11 +23,15 @@ Names need two pieces:
 
 | Transport / platform            | Split DNS | What the export contains |
 |---------------------------------|-----------|--------------------------|
-| WireGuard, Linux systemd-resolved | native  | `PostUp = resolvectl dns %i <shim>; resolvectl domain %i ~zone` |
+| WireGuard, Linux systemd-resolved | native  | `PostUp = resolvectl dns %i <shim>; resolvectl domain %i ~zone`, `PreDown = resolvectl revert %i` |
 | WireGuard, macOS                | via OS    | comment recipe: `/etc/resolver/<zone>` with `nameserver <shim>` |
 | WireGuard, Windows              | via OS    | comment recipe: `Add-DnsClientNrptRule -Namespace ".zone" -NameServers "<shim>"` |
 | WireGuard, iOS/Android official app | **no** | `DNS = <shim>` tunnel-wide; the shim answers other names only with `dns.public` |
 | Tailscale (M2)                  | native    | Headscale pushes per-zone restricted nameservers; the client resolver does the split on every OS (Android through its on-device resolver) |
+
+The macOS and Windows recipes change system-wide settings that outlive the
+tunnel: while it is down, home names go to an unreachable shim and fail, even
+on the home LAN. Each export says so and gives the command that removes them.
 
 Template `dns.wireguard = "split"` on a mobile export falls back to tunnel-wide
 with a warning. A tunnel-wide device sends every query to the shim, which
