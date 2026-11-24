@@ -35,6 +35,8 @@ fn upstream_answer(name: &str, qtype: RecordType) -> Result<Vec<RData>, Response
     match (name, qtype) {
         ("immich.mydomain.com.", RecordType::A) => Ok(vec![a("192.168.1.5")]),
         ("other.mydomain.com.", RecordType::A) => Ok(vec![a("192.168.1.5")]),
+        // A host on a subnet Parallax doesn't know, next to a mapped one.
+        ("vlan.mydomain.com.", RecordType::A) => Ok(vec![a("10.99.0.5"), a("192.168.1.6")]),
         ("big.mydomain.com.", RecordType::A) => Ok((1..=BIG)
             .map(|i| RData::A(A(Ipv4Addr::new(192, 168, 1, i))))
             .collect()),
@@ -177,6 +179,7 @@ fn routes(family_public: bool) -> String {
     format!(
         r#"listen = "127.0.0.1:53"
 public_resolver = "{UPSTREAM}"
+unmapped = []
 
 [[zone]]
 name = "mydomain.com"
@@ -401,6 +404,16 @@ async fn zone_transfers_and_any_are_refused() {
         assert_eq!(m.metadata.response_code, ResponseCode::Refused, "{qtype}");
     }
     assert!(!s.upstream.asked("mydomain.com. AXFR"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn home_names_lose_addresses_on_unknown_subnets() {
+    let s = start().await;
+    // 10.99.0.5 is on no configured network: off-site the client would
+    // reach whatever uses that address on the visited network.
+    let m = ask(PERSONAL, s.addr, "vlan.mydomain.com.", RecordType::A).await;
+    assert_eq!(m.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(addresses(&m), ["198.18.1.6"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

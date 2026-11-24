@@ -282,7 +282,11 @@ WireGuard gateway address), and the answer depends on who asks. `parallax dns`
 - **Home zones** go to the owning network's `upstream_dns` (the most specific
   zone wins). A records inside a mapped network are rewritten into its
   virtual prefix by the same `Mapping` the NETMAP rules come from, so DNS
-  and the firewall can't drift. AAAA, SVCB and HTTPS records are dropped:
+  and the firewall can't drift. Public addresses, those in an unmapped
+  network and those already in a virtual prefix pass unchanged; any other
+  private or reserved address is dropped, because on a visited network with
+  the same prefix it would lead to a stranger's host. When that leaves no
+  address, the CNAMEs go too. AAAA, SVCB and HTTPS records are dropped:
   peers can't send IPv6, and address hints would carry real addresses. A tier
   that may see a single name (a service hostname) gets only records of the
   asked type, under the asked name: a CNAME would name the sibling it points

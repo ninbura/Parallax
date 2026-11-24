@@ -47,7 +47,21 @@ and unaffected; raw IPs always work; Android allows per-app VPN exemptions.
   IPv6 mapping in this release, and peers can't send IPv6), and so are
   SVCB/HTTPS records, whose address hints would carry real addresses.
 - PTR lookups for virtual addresses are not rewritten.
+- Home answers lose private and reserved addresses outside every configured
+  network, such as a VLAN Parallax doesn't know: off-site they would point at
+  a host on the visited network. This holds even for a tier that reaches
+  such a VLAN through `internet`. To get its names, configure that subnet as
+  a network with `mapped_to` (and `masquerade = true` if the router has no
+  route back to the tunnel range).
 - Public answers lose addresses in private, reserved or mapped space, on
   purpose (DNS rebinding).
+- Mapping covers the home side only. The tunnel addresses and the shim
+  (`10.8.0.0/16` in the examples) can still clash with a visited network
+  that uses the shim's address for its own router. A split-tunnel export
+  routes the shim's `/32` into the tunnel and hides that router; a
+  full-tunnel export lets the visited LAN's route win, so DNS goes to that
+  router instead of the shim. Pick a tunnel range you're unlikely to visit. The
+  same goes for `198.18.0.0/15` on a device running a proxy app that hands
+  out fake addresses from it (Clash, Surge).
 - A `host` or `host_port` grant gives no name: only network zones and service
   hostnames are answered. DNS-resolved hostname grants come later.
