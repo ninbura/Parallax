@@ -78,14 +78,25 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
     let transports = transport::all();
     let mut sites = Vec::new();
     for svc in cfg.services.iter().filter(|s| s.is_proxied()) {
+        // A name that hasn't resolved (or not to an allowed address) has
+        // nowhere to send the proxy; when it has several addresses, the
+        // lowest is the upstream.
+        let Some(upstream) = model.addresses(&svc.host).first().copied() else {
+            continue;
+        };
         let grant = Grant::Service {
             name: svc.name.clone(),
         };
         let mut allowed: Vec<Ipv4Net> = Vec::new();
         // A template that reaches the service directly gets no redirect
-        // (see the firewall), so it never comes through the proxy.
+        // (see the firewall), so it never comes through the proxy. With
+        // several addresses, it's redirected for those it doesn't reach.
+        let addresses = model.addresses(&svc.host);
         for t in cfg.templates.iter().filter(|t| {
-            t.grants.contains(&grant) && !model.reaches_directly(t, svc.host, svc.proto, svc.port)
+            t.grants.contains(&grant)
+                && addresses
+                    .iter()
+                    .any(|ip| !model.reaches_directly(t, *ip, svc.proto, svc.port))
         }) {
             for tr in &transports {
                 for m in tr.tier_members(model, t) {
@@ -102,7 +113,7 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
             sites.push(ProxySite {
                 hostname: hostname.clone(),
                 service: svc.name.clone(),
-                upstream: SocketAddrV4::new(svc.host, svc.port),
+                upstream: SocketAddrV4::new(upstream, svc.port),
                 allowed: allowed.clone(),
             });
         }
@@ -113,6 +124,35 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
         upstream_ca: proxy.upstream_ca.clone(),
         sites,
     }
+}
+
+/// The routes with every granted proxied hostname, also those whose service
+/// is named by a DNS name that hasn't resolved (no upstream yet), for
+/// checking certificates: whether one is there mustn't depend on DNS, or a
+/// name resolving later could start failing every apply.
+pub fn certificate_check(model: &Model<'_>) -> ProxyRoutes {
+    let mut routes = build(model);
+    let granted = |name: &str| {
+        model.config().templates.iter().any(|t| {
+            t.grants
+                .iter()
+                .any(|g| matches!(g, Grant::Service { name: n } if n == name))
+        })
+    };
+    for svc in model.config().services.iter().filter(|s| s.is_proxied()) {
+        if !model.addresses(&svc.host).is_empty() || !granted(&svc.name) {
+            continue;
+        }
+        for hostname in &svc.hostnames {
+            routes.sites.push(ProxySite {
+                hostname: hostname.clone(),
+                service: svc.name.clone(),
+                upstream: SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, svc.port),
+                allowed: Vec::new(),
+            });
+        }
+    }
+    routes
 }
 
 pub fn render(model: &Model<'_>) -> Result<Artifact> {
@@ -164,6 +204,47 @@ mod tests {
         cfg.templates[1].grants.clear();
         let model = Model::resolve(&cfg, today()).unwrap();
         assert!(build(&model).sites.is_empty());
+    }
+
+    #[test]
+    fn several_addresses_keep_a_tier_that_reaches_only_some() {
+        let mut cfg = proxied();
+        cfg.services[0].host = crate::model::Host::Name("immich.mydomain.com".into());
+        cfg.templates[1].grants.push(Grant::Host {
+            host: "192.168.1.5".parse().unwrap(),
+        });
+        let found = [(
+            "immich.mydomain.com".to_string(),
+            vec![
+                "192.168.1.5".parse().unwrap(),
+                "192.168.1.6".parse().unwrap(),
+            ],
+        )]
+        .into();
+        let model = Model::resolve(&cfg, today()).unwrap().with_names(found);
+        let routes = build(&model);
+        // `family` reaches .5 directly, but .6 still goes through the proxy.
+        assert_eq!(
+            routes.sites[0].allowed,
+            vec!["10.8.2.0/24".parse::<Ipv4Net>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn certificates_are_checked_for_names_not_resolved_yet() {
+        let mut cfg = proxied();
+        cfg.services[0].host = crate::model::Host::Name("immich.mydomain.com".into());
+        let model = Model::resolve(&cfg, today()).unwrap();
+        assert!(build(&model).sites.is_empty());
+        let check = certificate_check(&model);
+        assert_eq!(check.sites.len(), 1);
+        assert_eq!(check.sites[0].hostname, "immich.mydomain.com");
+        cfg.templates[1].grants.clear();
+        let model = Model::resolve(&cfg, today()).unwrap();
+        assert!(
+            certificate_check(&model).sites.is_empty(),
+            "not granted: no certificate needed"
+        );
     }
 
     #[test]

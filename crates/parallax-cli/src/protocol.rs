@@ -11,13 +11,15 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+use parallax_core::names::Resolved;
 use parallax_core::secret::Secret;
 use parallax_core::Config;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The version this build speaks. 2: replies carry the home's public IP.
-pub const PROTOCOL: u64 = 2;
+/// 3: and what hosts named by DNS name resolved to.
+pub const PROTOCOL: u64 = 3;
 /// The largest message either side accepts, newline included.
 pub const MAX_MESSAGE: usize = 16 << 20;
 
@@ -59,13 +61,16 @@ pub enum Reply {
         /// The home's public IP in effect: the configured one, else the
         /// last one found. `None` if neither.
         public_ip: Option<Ipv4Addr>,
+        /// What each host named by DNS name last resolved to.
+        names: Resolved,
     },
     Configuration {
         configuration: Box<Config>,
         revision: u64,
         /// What generation also needs: the home's public IP as a lookup
-        /// last found it.
+        /// last found it, and what named hosts resolved to.
         public_ip: Option<Ipv4Addr>,
+        names: Resolved,
     },
     /// A change was saved (or nothing was asked to change), then applied.
     /// `error` says why the apply failed; the change stays saved either way.
@@ -203,20 +208,28 @@ mod tests {
         };
         assert_eq!(*configuration, config);
         assert_eq!(revision, 7);
+        let found: Resolved = [(
+            "nas.mydomain.com".to_string(),
+            vec![Ipv4Addr::new(192, 168, 1, 9)],
+        )]
+        .into();
         let Reply::Configuration {
             configuration,
             public_ip,
+            names,
             ..
         } = round_trip(&Reply::Configuration {
             configuration: Box::new(config.clone()),
             revision: 1,
             public_ip: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            names: found.clone(),
         })
         else {
             panic!("not a configuration");
         };
         assert_eq!(*configuration, config);
         assert_eq!(public_ip, Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(names, found);
     }
 
     #[test]
@@ -225,7 +238,7 @@ mod tests {
         let text = String::from_utf8(line).unwrap();
         assert_eq!(
             text,
-            "{\"if_due\":true,\"protocol\":2,\"request\":\"backup_create\"}\n"
+            "{\"if_due\":true,\"protocol\":3,\"request\":\"backup_create\"}\n"
         );
         let Request::BackupRestore { passphrase, .. } = round_trip(&Request::BackupRestore {
             path: "/b.tar".into(),
@@ -255,13 +268,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("protocol 2") && e.contains("other side 1"),
+            e.contains("protocol 3") && e.contains("other side 1"),
             "{e}"
         );
         let e = decode::<Request>(b"{\"request\":\"status\"}").unwrap_err();
         assert!(e.to_string().contains("no protocol"), "{e}");
         let e = decode::<Request>(
-            b"{\"protocol\":2,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
+            b"{\"protocol\":3,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
         )
         .unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");

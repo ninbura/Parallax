@@ -73,8 +73,9 @@ pub struct Network {
     pub masquerade: bool,
 }
 
-pub struct Service { name, host: Ipv4Addr, proto: Proto, port: u16, nginx_vhost: bool,
+pub struct Service { name, host: Host, proto: Proto, port: u16, nginx_vhost: bool,
                      hostnames: Vec<String> }
+pub enum Host { Ip(Ipv4Addr), Name(String) }   // TOML: a string either way
 
 pub struct Template {
     pub name: String,
@@ -87,7 +88,7 @@ pub struct Template {
 }
 
 #[serde(tag = "kind")]
-pub enum Grant { AllNetworks, Network{name}, Host{ip}, HostPort{ip,proto,port}, Service{name}, Internet }
+pub enum Grant { AllNetworks, Network{name}, Host{host}, HostPort{host,proto,port}, Service{name}, Internet }
 pub enum DnsMode { Split, TunnelWide, None }
 pub enum AllowedIpsStrategy { MappedSubnets, GrantsOnly, FullTunnel }
 
@@ -104,16 +105,21 @@ pub struct Peer {
 
 Two additions relative to the handoff, both small and flagged:
 
-- `Grant::Internet` and `server.wan_interface`. Without an egress grant the
-  `full_tunnel` AllowedIPs strategy has no meaning (all non-LAN traffic would be
-  dropped by the trailing deny). Validation refuses `full_tunnel` without it.
+- `Grant::Internet` and `server.wan_interface`. Without an egress grant a
+  `full_tunnel` device reaches only what it's granted (the trailing deny drops
+  the rest); validation warns, since that's usually a mistake but can be a
+  locked-down device on purpose.
 - `Template.dns` is per transport (`wireguard` / `tailscale`) because the
   canonical scenario wants tunnel-wide DNS on plain WireGuard for the family
   tier but split DNS through the Tailscale client. `dns.public` (off by
   default) lets the template's members look up public names through the
   gateway; see "DNS server".
 
-Grants are written against real addresses. `Model::reaches(template)` resolves
+Grants are written against real addresses, or DNS names that resolve to
+them (ADR 0009): a name is looked up through the resolvers of the network
+whose zone holds it, and grants what it resolved to when every address is
+inside a configured network. Those addresses are an input to generation
+(`Model::with_names`), like the date. `Model::reaches(template)` resolves
 them to `Reach { label, kind: Lan { network, real, port, proxied } | Internet }` and
 `Reach::client_net()` translates to virtual space for clients, nginx and (M2)
 Headscale ACLs. The nftables FORWARD chain matches real addresses because it
@@ -279,7 +285,9 @@ server (crate `parallax-dns`, built on hickory, a task in the daemon) reads
   peer's key. A source outside every tier is refused.
 - **What it may ask.** A network grant (or `all_networks`) gives the
   network's `domains`; a `service` grant gives the service's `hostnames`.
-  `host` and `host_port` grants give no names. Names outside every zone go
+  A `host` or `host_port` grant on a name gives that name (one granted by
+  address gives none), and so does a granted service whose host is a name.
+  Names outside every zone go
   to `server.dns.public_resolver`, only for templates with `dns.public`.
   Everything else is `REFUSED`. A name inside a zone is never sent to the
   public resolver, even for a public tier: it would leak the operator's
@@ -393,3 +401,11 @@ input to generation (`Model::with_public_ip`), like the date; it joins the
 would hairpin it back into the home. The lookup logic is `parallax_core::public_ip`,
 behind the `Resolver` trait in `io.rs`; `parallax_dns::Lookup` is the real
 one (plain DNS, and DNS over HTTPS by IP address).
+
+Hosts named by DNS name (ADR 0009) are looked up the same way, through their
+zone's `upstream_dns`: right after startup, every 5 minutes and when a saved
+change alters the names or the networks. Only the latest answer counts: a
+name whose lookup fails or is refused grants nothing until it resolves
+again, and answers aren't stored. A save that adds a name looks
+it up first and is refused if it doesn't resolve to addresses inside the
+configured networks.

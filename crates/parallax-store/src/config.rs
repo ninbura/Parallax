@@ -412,7 +412,7 @@ impl Store {
                     &[
                         ("name", text(&s.name)),
                         ("position", position.into()),
-                        ("host", text(s.host)),
+                        ("host", text(&s.host)),
                         ("proto", variant_text(&s.proto)?),
                         ("port", s.port.into()),
                         ("nginx_vhost", s.nginx_vhost.into()),
@@ -496,7 +496,7 @@ impl Store {
     async fn load_grants(&self, template_id: i64, at: &str) -> Result<Vec<Grant>> {
         let rows = self
             .rows(
-                "SELECT g.kind, n.name, s.name, g.ip, g.proto, g.port
+                "SELECT g.kind, n.name, s.name, g.host, g.proto, g.port
                  FROM template_grants g
                  LEFT JOIN networks n ON n.id = g.network_id
                  LEFT JOIN services s ON s.id = g.service_id
@@ -518,16 +518,16 @@ impl Store {
                     name: r.get::<Option<String>>(2)?.ok_or_else(missing)?,
                 },
                 "host" => Grant::Host {
-                    ip: parse(
+                    host: parse(
                         at,
-                        "grant ip",
+                        "grant host",
                         &r.get::<Option<String>>(3)?.ok_or_else(missing)?,
                     )?,
                 },
                 "host_port" => Grant::HostPort {
-                    ip: parse(
+                    host: parse(
                         at,
-                        "grant ip",
+                        "grant host",
                         &r.get::<Option<String>>(3)?.ok_or_else(missing)?,
                     )?,
                     proto: variant(
@@ -594,7 +594,7 @@ impl Store {
             }
             for (position, g) in (0_i64..).zip(&t.grants) {
                 let null = || Value::Null;
-                let (kind, network, service, ip, proto, port) = match g {
+                let (kind, network, service, host, proto, port) = match g {
                     Grant::AllNetworks => ("all_networks", null(), null(), null(), null(), null()),
                     Grant::Internet => ("internet", null(), null(), null(), null(), null()),
                     Grant::Network { name } => (
@@ -613,19 +613,19 @@ impl Store {
                         null(),
                         null(),
                     ),
-                    Grant::Host { ip } => ("host", null(), null(), text(ip), null(), null()),
-                    Grant::HostPort { ip, proto, port } => (
+                    Grant::Host { host } => ("host", null(), null(), text(host), null(), null()),
+                    Grant::HostPort { host, proto, port } => (
                         "host_port",
                         null(),
                         null(),
-                        text(ip),
+                        text(host),
                         variant_text(proto)?,
                         (*port).into(),
                     ),
                 };
                 self.exec(
                     "INSERT INTO template_grants
-                        (template_id, position, kind, network_id, service_id, ip, proto, port)
+                        (template_id, position, kind, network_id, service_id, host, proto, port)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     vec![
                         id.into(),
@@ -633,7 +633,7 @@ impl Store {
                         kind.into(),
                         network,
                         service,
-                        ip,
+                        host,
                         proto,
                         port,
                     ],

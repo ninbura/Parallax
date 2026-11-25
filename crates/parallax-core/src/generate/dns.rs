@@ -7,8 +7,9 @@
 //! resolvers and rewrites their answers with the same [`Mapping`] the NETMAP
 //! rules come from, so DNS and the firewall can't drift. Every query is
 //! checked against the tier the source address belongs to: a tier gets the
-//! zones of the networks it's granted and the hostnames of the services it's
-//! granted, and public names only with `dns.public`. Everything else is
+//! zones of the networks it's granted, the hostnames of the services it's
+//! granted and the names of hosts it's granted by name, and public names
+//! only with `dns.public`. Everything else is
 //! refused. DNS is convenience, never enforcement: the firewall and the proxy
 //! are the gate, this only keeps a guest from using the gateway's resolver
 //! for names it has no business with.
@@ -79,7 +80,8 @@ pub struct DnsTier {
     /// Whole zones (every name in them).
     #[serde(default)]
     pub zones: Vec<String>,
-    /// Single names inside a zone (a service's hostnames).
+    /// Single names inside a zone: a granted service's hostnames, and hosts
+    /// granted by name.
     #[serde(default)]
     pub names: Vec<String>,
     /// Names outside every zone go to the public resolver.
@@ -223,7 +225,8 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
                 Grant::Network { name } => vec![name.as_str()],
                 Grant::Service { name } => {
                     if let Some(svc) = cfg.services.iter().find(|s| &s.name == name) {
-                        for h in &svc.hostnames {
+                        let own = svc.host.name().map(str::to_string);
+                        for h in svc.hostnames.iter().chain(&own) {
                             if !names.contains(h) {
                                 names.push(h.clone());
                             }
@@ -231,9 +234,17 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
                     }
                     Vec::new()
                 }
-                // A host or port has no name of its own (yet: DNS-resolved
-                // hostname grants come later).
-                Grant::Host { .. } | Grant::HostPort { .. } | Grant::Internet => Vec::new(),
+                // A host granted by name may look that name up; one granted
+                // by address has no name.
+                Grant::Host { host } | Grant::HostPort { host, .. } => {
+                    if let Some(h) = host.name() {
+                        if !names.iter().any(|n| n == h) {
+                            names.push(h.to_string());
+                        }
+                    }
+                    Vec::new()
+                }
+                Grant::Internet => Vec::new(),
             };
             for z in zones
                 .iter()
@@ -425,7 +436,7 @@ mod tests {
             domains: vec!["lab.mydomain.com".into()],
             masquerade: false,
         });
-        cfg.services[0].host = addr("192.168.50.5");
+        cfg.services[0].host = addr("192.168.50.5").into();
         cfg.services[0].hostnames = vec!["immich.lab.mydomain.com".into()];
         cfg.templates[1].grants.push(Grant::Network {
             name: "home".into(),
@@ -452,7 +463,7 @@ mod tests {
         let mut cfg = canonical_config();
         cfg.services.push(Service {
             name: "printer".into(),
-            host: addr("192.168.1.9"),
+            host: addr("192.168.1.9").into(),
             proto: crate::model::Proto::Tcp,
             port: 631,
             nginx_vhost: false,

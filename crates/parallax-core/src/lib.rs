@@ -20,6 +20,7 @@ pub mod error;
 pub mod generate;
 pub mod io;
 pub mod model;
+pub mod names;
 pub mod netmap;
 pub mod plan;
 pub mod public_ip;

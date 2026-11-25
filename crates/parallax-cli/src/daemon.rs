@@ -10,7 +10,11 @@
 //! When guest templates have `internet`, it looks up the home's public IP
 //! (for their hairpin drop) at startup, every 5 minutes, and when a saved
 //! change alters what the lookup depends on; it re-applies when the address
-//! changes, and keeps the last one found across restarts.
+//! changes, and keeps the last one found across restarts. Hosts named by
+//! DNS name are looked up right after startup, every 5 minutes and when
+//! they change; only the latest answer counts. A save that adds a name looks
+//! it up before saving, and refuses the change if it doesn't resolve
+//! ([`parallax_core::names`]).
 //!
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
@@ -30,7 +34,8 @@ use anyhow::{anyhow, bail, Context};
 use parallax_core::generate;
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::System;
-use parallax_core::model::{PublicIpServer, ServerConfig};
+use parallax_core::model::{Network, PublicIpServer, ServerConfig};
+use parallax_core::names::{self, Refreshed, Resolved};
 use parallax_core::public_ip::{self, Found};
 use parallax_core::reconcile::{self, Reconciler};
 use parallax_core::secret::Secret;
@@ -60,6 +65,8 @@ pub struct Options {
 const BACKUP_EVERY: Duration = Duration::from_secs(600);
 /// How often the home's public IP is looked up.
 const PUBLIC_IP_EVERY: Duration = Duration::from_secs(300);
+/// How often hosts named by DNS name are looked up.
+const NAMES_EVERY: Duration = Duration::from_secs(300);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -87,6 +94,17 @@ struct View {
     apply_error: Option<String>,
     /// The home's public IP as last found.
     public_ip: Option<Ipv4Addr>,
+    /// What each host named by DNS name last resolved to.
+    names: Resolved,
+}
+
+impl View {
+    fn learned(&self) -> crate::Learned {
+        crate::Learned {
+            public_ip: self.public_ip,
+            names: self.names.clone(),
+        }
+    }
 }
 
 /// Work for the engine thread.
@@ -99,6 +117,8 @@ enum Msg {
     Serving(Vec<Arc<Notify>>),
     /// A lookup of the home's public IP finished, for these inputs.
     PublicIp(Inputs, Result<Found, Vec<String>>),
+    /// The named hosts were looked up, for these inputs.
+    Names(NameInputs, Refreshed),
     Shutdown,
 }
 
@@ -162,6 +182,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     };
     let _ = tx.send(Msg::Serving(reloaders));
     let refresher = tokio::spawn(refresh_public_ip(tx.clone(), views.clone()));
+    let names = tokio::spawn(refresh_names(tx.clone(), views.clone()));
     let server = tokio::spawn(accept(listener, tx.clone(), views, database));
     let timers = tokio::spawn(timers(tx.clone(), opts.reconcile_every));
     log(format!(
@@ -188,6 +209,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     server.abort();
     timers.abort();
     refresher.abort();
+    names.abort();
     // Only our own: another daemon may have bound the path since.
     if file_id(&opts.socket) == Some(socket_id) {
         if let Err(e) = std::fs::remove_file(&opts.socket) {
@@ -379,11 +401,13 @@ async fn dispatch(request: Request, tx: &mpsc::UnboundedSender<Msg>, views: &Vie
             revision: view.revision,
             apply_error: view.apply_error,
             public_ip: public_ip::effective(&view.config.server, view.public_ip),
+            names: view.names,
         },
         Request::Load => Reply::Configuration {
             configuration: Box::new((*view.config).clone()),
             revision: view.revision,
             public_ip: view.public_ip,
+            names: view.names,
         },
         request => {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -468,6 +492,57 @@ async fn refresh_public_ip(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
             tokio::task::spawn_blocking(move || crate::find_public_ip(&config.server)).await;
         if let Ok(found) = found {
             if tx.send(Msg::PublicIp(asked, found)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// What the name lookups depend on: the names, and the networks that say
+/// which resolvers to ask and which answers are allowed.
+type NameInputs = (Vec<String>, Vec<Network>);
+
+fn name_inputs(config: &Config) -> NameInputs {
+    (
+        names::used(config)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        config.networks.clone(),
+    )
+}
+
+/// Look the named hosts up right away (startup applied with what the
+/// database remembered), then every [`NAMES_EVERY`], and when a change
+/// alters what the lookups depend on. Blocks for seconds, so it runs here.
+async fn refresh_names(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
+    let mut every = tokio::time::interval(NAMES_EVERY);
+    every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let inputs = |views: &Views| views.borrow().as_ref().map(|v| name_inputs(&v.config));
+    let mut last = inputs(&views);
+    loop {
+        tokio::select! {
+            _ = every.tick() => {}
+            changed = views.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let now = inputs(&views);
+                if now == last {
+                    continue;
+                }
+                last = now;
+            }
+        }
+        let view = views.borrow().clone();
+        let Some(view) = view.filter(|v| !names::used(&v.config).is_empty()) else {
+            continue;
+        };
+        let asked = name_inputs(&view.config);
+        last = Some(asked.clone());
+        let found = tokio::task::spawn_blocking(move || crate::find_names(&view.config)).await;
+        if let Ok(found) = found {
+            if tx.send(Msg::Names(asked, found)).is_err() {
                 return;
             }
         }
@@ -567,6 +642,8 @@ struct Engine {
     /// The database holds `view.public_ip`; false after a failed write, so
     /// the next lookup writes it again.
     public_ip_saved: bool,
+    /// Why the last name lookups failed, logged once.
+    name_problems: Vec<String>,
 }
 
 impl Engine {
@@ -598,6 +675,9 @@ impl Engine {
                 revision: rand::random::<u64>() >> 1,
                 apply_error: None,
                 public_ip,
+                // Looked up right after the first apply: an answer from
+                // before a restart may be stale.
+                names: Resolved::new(),
             },
             publish,
             out,
@@ -607,6 +687,7 @@ impl Engine {
             backups,
             public_ip_problems: None,
             public_ip_saved: true,
+            name_problems: Vec::new(),
         };
         engine.publish();
         Ok(engine)
@@ -697,6 +778,14 @@ impl Engine {
                         why.get_or_insert("the home's public IP changed");
                     }
                 }
+                // The names, their resolvers or the networks changed while
+                // these lookups ran: the lookups for the new ones are coming.
+                Msg::Names(asked, _) if asked != name_inputs(&self.view.config) => {}
+                Msg::Names(_, found) => {
+                    if self.note_names(found) {
+                        why.get_or_insert("a named host's address changed");
+                    }
+                }
                 Msg::Shutdown => {}
             }
         }
@@ -729,7 +818,7 @@ impl Engine {
     fn apply(&mut self, why: &str) -> (Vec<String>, Option<String>) {
         log(format!("applying ({why})"));
         let today = crate::today();
-        match crate::apply_config(&self.view.config, &self.out, today, self.view.public_ip) {
+        match crate::apply_config(&self.view.config, &self.out, today, &self.view.learned()) {
             Ok((warnings, applied)) => {
                 let lines: Vec<String> = warnings
                     .into_iter()
@@ -795,6 +884,42 @@ impl Engine {
         }
     }
 
+    /// Take the name lookups' results, for the configuration as it is:
+    /// what they found replaces what was there, and a name that didn't
+    /// resolve grants nothing. Returns whether anything changed.
+    fn note_names(&mut self, found: Refreshed) -> bool {
+        if found.problems != self.name_problems {
+            for problem in &found.problems {
+                warn(format!("warning: {problem}"));
+            }
+            self.name_problems = found.problems;
+        }
+        self.set_names(found.resolved)
+    }
+
+    /// Publish what the names resolve to now. Returns whether it changed.
+    fn set_names(&mut self, resolved: Resolved) -> bool {
+        if resolved == self.view.names {
+            return false;
+        }
+        for (name, addresses) in &resolved {
+            if self.view.names.get(name) != Some(addresses) {
+                log(format!("{name} is {}", names::list(addresses)));
+            }
+        }
+        for name in self
+            .view
+            .names
+            .keys()
+            .filter(|n| !resolved.contains_key(*n))
+        {
+            log(format!("{name} no longer grants anything"));
+        }
+        self.view.names = resolved;
+        self.publish();
+        true
+    }
+
     fn set_apply_error(&mut self, error: Option<String>) {
         if self.view.apply_error != error {
             self.view.apply_error = error;
@@ -809,8 +934,9 @@ impl Engine {
         self.publish();
     }
 
-    /// Validate, generate and check certificates; only then save. Returns
-    /// the reply refusing the change. Warnings come with the apply that follows.
+    /// Validate, look up names it adds, generate and check certificates;
+    /// only then save. Returns the reply refusing the change. Warnings come
+    /// with the apply that follows.
     fn save(&mut self, config: Config, revision: u64) -> Result<(), Reply> {
         if revision != self.view.revision {
             return Err(Reply::Conflict {
@@ -820,11 +946,26 @@ impl Engine {
         let refuse = |e: anyhow::Error| Reply::Error {
             message: format!("{e:#}"),
         };
-        crate::preview(&config, crate::today()).map_err(refuse)?;
+        crate::check(&config).map_err(refuse)?;
+        // Blocks this thread for a new name's lookup only (a few seconds at
+        // most): known names aren't asked again.
+        let resolved = names::check_save(
+            Some(&self.view.config),
+            &config,
+            &crate::lookup(&config.server),
+            &self.view.names,
+        )
+        .map_err(|problems| refuse(anyhow!("{}", problems.join("; "))))?;
+        let learned = crate::Learned {
+            public_ip: self.view.public_ip,
+            names: resolved,
+        };
+        crate::preview(&config, crate::today(), &learned).map_err(refuse)?;
         self.rt
             .block_on(self.store.save(&config))
             .map_err(|e| refuse(e.into()))?;
         self.replace(config);
+        self.set_names(learned.names);
         log(format!(
             "saved a change (configuration revision {})",
             self.view.revision
@@ -903,7 +1044,13 @@ impl Engine {
             // The rows just copied in: what the database now holds.
             anyhow::Ok((lines, restored))
         })?;
+        // What the restored configuration doesn't use goes; the lookups for
+        // what it adds follow.
+        let used = names::used(&config);
+        let mut resolved = self.view.names.clone();
+        resolved.retain(|name, _| used.contains(name.as_str()));
         self.replace(config);
+        self.set_names(resolved);
         Ok(lines)
     }
 

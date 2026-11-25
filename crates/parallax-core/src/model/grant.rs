@@ -1,6 +1,6 @@
-use std::net::Ipv4Addr;
-
 use serde::{Deserialize, Serialize};
+
+use super::Host;
 
 /// L4 protocol for port-scoped grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -20,7 +20,8 @@ impl Proto {
     }
 }
 
-/// What a template's members may reach. Expressed against **real** addresses;
+/// What a template's members may reach. Expressed against **real** addresses
+/// (or names that resolve to them);
 /// the engine translates to virtual space for clients, Headscale ACLs and
 /// nginx, and to real space for the post-NETMAP FORWARD chain.
 ///
@@ -32,11 +33,16 @@ pub enum Grant {
     AllNetworks,
     /// One network by name.
     Network { name: String },
-    /// One host, all ports.
-    Host { ip: Ipv4Addr },
+    /// One host, all ports. `host` is an address or a DNS name (`ip` is
+    /// its older spelling).
+    Host {
+        #[serde(alias = "ip")]
+        host: Host,
+    },
     /// One host, one port.
     HostPort {
-        ip: Ipv4Addr,
+        #[serde(alias = "ip")]
+        host: Host,
         #[serde(default)]
         proto: Proto,
         port: u16,

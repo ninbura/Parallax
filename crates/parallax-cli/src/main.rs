@@ -20,6 +20,7 @@ use parallax_core::generate::{self, Export};
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
 use parallax_core::model::{Peer, Platform, ServerConfig, TransportKind};
+use parallax_core::names::{self, Resolved};
 use parallax_core::public_ip;
 use parallax_core::secret::PrivateKey;
 use parallax_core::transport::{self, ProvisionOptions};
@@ -284,22 +285,27 @@ impl Ctx {
     }
 
     /// The configuration, its revision when it came from the daemon, and
-    /// the home's public IP as last found. The database is closed again
-    /// before this returns.
-    fn load_full(&self) -> anyhow::Result<(Config, Option<u64>, Option<Ipv4Addr>)> {
+    /// what the gateway learned (the home's public IP, named hosts). The
+    /// database is closed again before this returns.
+    fn load_full(&self) -> anyhow::Result<(Config, Option<u64>, Learned)> {
         match self.ask(&Request::Load)? {
             Some(Reply::Configuration {
                 configuration,
                 revision,
                 public_ip,
-            }) => Ok((*configuration, Some(revision), public_ip)),
+                names,
+            }) => Ok((*configuration, Some(revision), Learned { public_ip, names })),
             Some(other) => Err(unexpected(other)),
             None => {
                 let (config, public_ip) = block_on(async {
                     let mut store = self.open_store().await?;
                     Ok((store.load().await?, store.public_ip().await?))
                 })?;
-                Ok((config, None, public_ip))
+                let learned = Learned {
+                    public_ip,
+                    names: Resolved::new(),
+                };
+                Ok((config, None, learned))
             }
         }
     }
@@ -313,10 +319,14 @@ impl Ctx {
         Ok(self.load_revision()?.0)
     }
 
-    /// The configuration and the home's public IP: what generation needs.
-    pub(crate) fn load_for_generation(&self) -> anyhow::Result<(Config, Option<Ipv4Addr>)> {
-        let (config, _, public_ip) = self.load_full()?;
-        Ok((config, public_ip))
+    /// The configuration and what the gateway learned: what generation
+    /// needs. Without a daemon, the named hosts are looked up here.
+    pub(crate) fn load_for_generation(&self) -> anyhow::Result<(Config, Learned)> {
+        let (config, revision, mut learned) = self.load_full()?;
+        if revision.is_none() {
+            learned.names = find_names(&config).resolved;
+        }
+        Ok((config, learned))
     }
 
     /// What the database holds: `None` before the first import. Any other
@@ -443,6 +453,27 @@ pub(crate) fn resolve(config: &Config) -> anyhow::Result<Model<'_>> {
     Model::resolve(config, today()).map_err(|e| anyhow!("{e}"))
 }
 
+/// What the gateway learned while running that generation needs besides
+/// the configuration: the home's public IP as a lookup last found it, and
+/// what each host named by DNS name resolved to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Learned {
+    pub(crate) public_ip: Option<Ipv4Addr>,
+    pub(crate) names: Resolved,
+}
+
+/// The model generation uses: validated, with what the gateway learned.
+pub(crate) fn model_for<'a>(
+    config: &'a Config,
+    today: Date,
+    learned: &Learned,
+) -> anyhow::Result<Model<'a>> {
+    Ok(Model::resolve(config, today)
+        .map_err(|e| anyhow!("{e}"))?
+        .with_public_ip(public_ip::effective(&config.server, learned.public_ip))
+        .with_names(learned.names.clone()))
+}
+
 pub(crate) fn print_warnings(warnings: &[String]) {
     for w in warnings {
         eprintln!("warning: {w}");
@@ -459,35 +490,34 @@ fn print_export(export: &Export) {
 /// plainly what's missing before the proxy is handed routes it would refuse.
 /// Returns warnings about unreadable certificates.
 fn check_certificates(model: &Model<'_>) -> anyhow::Result<Vec<String>> {
-    Ok(parallax_proxy::preflight(&generate::proxy::build(model))?)
+    Ok(parallax_proxy::preflight(
+        &generate::proxy::certificate_check(model),
+    )?)
 }
 
 /// Everything short of writing: validate, generate, check certificates.
 /// The daemon refuses a change that fails here before saving it.
-pub(crate) fn preview(config: &Config, today: Date) -> anyhow::Result<()> {
+pub(crate) fn preview(config: &Config, today: Date, learned: &Learned) -> anyhow::Result<()> {
     check(config)?;
-    let model = Model::resolve(config, today).map_err(|e| anyhow!("{e}"))?;
+    let model = model_for(config, today, learned)?;
     generate::generate_all(&model, &RealFs)?;
     check_certificates(&model)?;
     Ok(())
 }
 
-/// Generate, write and reconcile the live gateway. `last_found` is the
-/// home's public IP as a lookup last found it. Returns the warnings and the
-/// apply log.
+/// Generate, write and reconcile the live gateway with what the gateway
+/// learned. Returns the warnings and the apply log.
 pub(crate) fn apply_config(
     config: &Config,
     out: &Path,
     today: Date,
-    last_found: Option<Ipv4Addr>,
+    learned: &Learned,
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
-    let public_ip = public_ip::effective(&config.server, last_found);
-    let model = Model::resolve(config, today)
-        .map_err(|e| anyhow!("{e}"))?
-        .with_public_ip(public_ip);
+    let model = model_for(config, today, learned)?;
     let mut bundle = generate::generate_all(&model, &RealFs)?;
     let mut warnings = std::mem::take(&mut bundle.warnings);
-    warnings.extend(public_ip_unknown(config, public_ip));
+    warnings.extend(public_ip_unknown(config, model.public_ip()));
+    warnings.extend(model.name_problems());
     warnings.extend(check_certificates(&model)?);
     let runner = RealRunner;
     let sys = System {
@@ -501,10 +531,26 @@ pub(crate) fn apply_config(
 /// Look up the home's public IP ([`parallax_core::public_ip`]). Blocks
 /// for up to a few seconds per nameserver it asks.
 pub(crate) fn find_public_ip(server: &ServerConfig) -> Result<public_ip::Found, Vec<String>> {
-    public_ip::find(
-        server,
-        &parallax_dns::Lookup::new(&server.proxy.upstream_ca),
-    )
+    public_ip::find(server, &lookup(server))
+}
+
+/// Look up every host named by DNS name ([`parallax_core::names`]).
+/// Blocks for up to a few seconds per resolver it asks.
+pub(crate) fn find_names(config: &Config) -> names::Refreshed {
+    names::refresh(config, &lookup(&config.server))
+}
+
+/// The real resolver.
+pub(crate) fn lookup(server: &ServerConfig) -> parallax_dns::Lookup {
+    parallax_dns::Lookup::new(&server.proxy.upstream_ca)
+}
+
+/// `name: address, address` per named host, for `plan` and `status`.
+fn name_lines(names: &Resolved) -> Vec<String> {
+    names
+        .iter()
+        .map(|(name, addresses)| format!("{name}: {}", names::list(addresses)))
+        .collect()
 }
 
 /// Why a lookup failed, and what stays in effect.
@@ -549,20 +595,23 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Doctor => doctor(&ctx)?,
         Command::Plan(out) => {
-            let (config, last_found) = ctx.load_for_generation()?;
-            let public_ip = public_ip::effective(&config.server, last_found);
-            let model = resolve(&config)?.with_public_ip(public_ip);
+            let (config, learned) = ctx.load_for_generation()?;
+            let model = model_for(&config, today(), &learned)?;
             let bundle = generate::generate_all(&model, &fs)?;
+            print_warnings(&model.name_problems());
             print_warnings(&check_certificates(&model)?);
+            for line in name_lines(model.names()) {
+                println!("name {line}");
+            }
             let plan = parallax_core::plan::plan(&bundle, &out.out, &fs)?;
             print!("{}", plan.render());
         }
         Command::Generate(out) => {
-            let (config, last_found) = ctx.load_for_generation()?;
-            let public_ip = public_ip::effective(&config.server, last_found);
-            let model = resolve(&config)?.with_public_ip(public_ip);
+            let (config, learned) = ctx.load_for_generation()?;
+            let model = model_for(&config, today(), &learned)?;
             let bundle = generate::generate_all(&model, &fs)?;
             print_warnings(&bundle.warnings);
+            print_warnings(&model.name_problems());
             parallax_core::plan::write_bundle(&bundle, &out.out, &fs)?;
             for a in &bundle.artifacts {
                 println!("wrote {}", out.out.join(&a.path).display());
@@ -597,7 +646,13 @@ fn run() -> anyhow::Result<()> {
                             Err(problems) => notes.push(public_ip_lookup_failed(&problems, known)),
                         }
                     }
-                    let (warnings, log) = apply_config(&config, &out.out, today(), known)?;
+                    let found = find_names(&config);
+                    notes.extend(found.problems);
+                    let learned = Learned {
+                        public_ip: known,
+                        names: found.resolved,
+                    };
+                    let (warnings, log) = apply_config(&config, &out.out, today(), &learned)?;
                     notes.extend(warnings);
                     anyhow::Ok((notes, log))
                 })?;
@@ -621,6 +676,7 @@ fn run() -> anyhow::Result<()> {
                 revision,
                 apply_error,
                 public_ip,
+                names,
             }) => {
                 println!(
                     "daemon at {}: configuration revision {revision}",
@@ -628,6 +684,9 @@ fn run() -> anyhow::Result<()> {
                 );
                 if let Some(ip) = public_ip {
                     println!("home public IP: {ip}");
+                }
+                for line in name_lines(&names) {
+                    println!("name {line}");
                 }
                 match apply_error {
                     None => println!("last apply: ok"),
@@ -648,8 +707,8 @@ fn run() -> anyhow::Result<()> {
         Command::Backup { command } => backup::run(&ctx, command)?,
         Command::Peer { command } => peer_command(&ctx, command)?,
         Command::Export { peer, platform } => {
-            let config = ctx.load()?;
-            let model = resolve(&config)?;
+            let (config, learned) = ctx.load_for_generation()?;
+            let model = model_for(&config, today(), &learned)?;
             let p = model.peer(&peer)?;
             let export = transport::by_kind(p.transport).export(&model, p, platform)?;
             print_export(&export);
@@ -670,8 +729,8 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
         .map(|(config, _)| config)
         .map_err(Clone::clone);
     let mut checks = parallax_core::doctor::diagnose(config.clone(), sys);
-    if let Ok((config, last_found)) = &loaded {
-        let known = public_ip::effective(&config.server, *last_found);
+    if let Ok((config, learned)) = &loaded {
+        let known = public_ip::effective(&config.server, learned.public_ip);
         checks.push(parallax_core::doctor::public_ip_check(config, known));
     }
     let mut failed = 0;
@@ -834,7 +893,7 @@ fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
 fn config_edit(ctx: &Ctx, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
     // The database stays closed while the editor is open, so the gateway and
     // other commands aren't locked out; a change in the meantime is caught below.
-    let (before, revision) = ctx.load_revision()?;
+    let (before, revision, learned) = ctx.load_full()?;
     let original = before.to_toml()?;
     // Private (0700), removed with everything in it (editor backups and swap
     // files too) unless kept.
@@ -871,7 +930,7 @@ fn config_edit(ctx: &Ctx, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
         "{}",
         redact(&parallax_core::plan::unified_diff(&original, &new_text))
     );
-    let model = resolve(&edited)?;
+    let model = model_for(&edited, today(), &learned)?;
     match generate::generate_all(&model, &RealFs)
         .and_then(|bundle| parallax_core::plan::plan(&bundle, out_dir, &RealFs))
     {
@@ -987,6 +1046,8 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
             expires,
             platform,
         } => {
+            // For the export: a grant by name reaches what it resolved to.
+            let (_, learned) = ctx.load_for_generation()?;
             let ((peer, export), saved) = ctx.update(|config| {
                 let model = resolve(config)?;
                 let t = model.template(&template)?;
@@ -1001,7 +1062,8 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                 // One-time export against a model that includes the new peer.
                 let mut with_peer = config.clone();
                 with_peer.peers.push(peer.clone());
-                let export = tr.export(&resolve(&with_peer)?, &peer, platform)?;
+                let export =
+                    tr.export(&model_for(&with_peer, today(), &learned)?, &peer, platform)?;
 
                 let mut stored = peer.clone();
                 if !keep_private_key {
@@ -1046,8 +1108,8 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
             report(saved, "run `parallax apply` to revoke it on the gateway")?;
         }
         PeerCommand::Show { name } => {
-            let config = ctx.load()?;
-            let model = resolve(&config)?;
+            let (config, learned) = ctx.load_for_generation()?;
+            let model = model_for(&config, today(), &learned)?;
             let peers: Vec<&Peer> = match &name {
                 Some(n) => vec![model.peer(n)?],
                 None => config.peers.iter().collect(),

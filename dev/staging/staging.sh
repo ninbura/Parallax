@@ -386,6 +386,33 @@ smoke() {
     expect "gateway host service" "" "http://$gw:$port/"
     ip -n "$CLIENT" link del wgg
 
+    echo "--- a host granted by name"
+    # The guest also gets lan2's web port by name: looked up through lan1's resolver
+    # (the staging.test zone) when saved, then put back as it was.
+    px config export -o /etc/parallax/smoke-named.toml 2>/dev/null
+    cp "$STATE/config/smoke-named.toml" "$STATE/config/smoke-named-before.toml"
+    sed -i 's/^grants = \[{ kind = "service", name = "immich" }\]$/grants = [{ kind = "service", name = "immich" }, { kind = "host_port", host = "nas.staging.test", port = 80 }]/' \
+        "$STATE/config/smoke-named.toml"
+    if grep -q 'host = "nas.staging.test"' "$STATE/config/smoke-named.toml" \
+        && px config import /etc/parallax/smoke-named.toml >/dev/null 2>&1; then
+        pass "a grant on nas.staging.test is saved"
+    else fail "could not save a grant on nas.staging.test"; fi
+    local st; st="$(px status 2>&1 || true)"
+    grep -qx "name nas.staging.test: 192.168.202.5" <<<"$st" && pass "nas.staging.test was looked up (192.168.202.5)" \
+        || fail "status does not list nas.staging.test: ${st//$'\n'/; }"
+    me="$(client_iface smoke-guest wgn)"
+    [ "$(resolve nas.staging.test)" = 198.19.202.5 ] && pass "dns: nas.staging.test -> 198.19.202.5 for the guest" \
+        || fail "dns: nas.staging.test for the guest -> '$(resolve nas.staging.test)'"
+    expect "lan2 by the granted name" "lan2-nas" http://198.19.202.5/
+    expect "another port on the named host" "" http://198.19.202.5:8080/
+    ip -n "$CLIENT" link del wgn
+    if px config import /etc/parallax/smoke-named-before.toml >/dev/null 2>&1; then
+        st="$(px status 2>&1 || true)"
+        grep -q '^name ' <<<"$st" && fail "a name no longer granted is still listed" \
+            || pass "removing the grant forgets the name"
+    else fail "could not put the configuration back (see $STATE/config/smoke-named-before.toml)"; fi
+    rm -f "$STATE/config/smoke-named.toml" "$STATE/config/smoke-named-before.toml"
+
     [ "$ok" = 1 ] && { echo "SMOKE PASS"; return 0; }
     echo "SMOKE FAIL"; return 1
 }
