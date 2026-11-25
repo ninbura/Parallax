@@ -31,11 +31,13 @@ home's DNS stays the only place a machine's address is written down.
   minutes, and when a saved change alters the names or the networks; it
   re-applies only when an address changed. `parallax apply` without a
   daemon looks too.
-- **Failure keeps the last good answer.** A lookup that fails or is refused
-  keeps the addresses found before, and logs why once. A name never found
-  grants nothing (no rule; never open), with a warning. The last good
-  answers are kept in `daemon_state` (`name:<hostname>`), so a restart
-  doesn't lose them, and a restore leaves them alone.
+- **Only the latest answer counts.** A lookup that fails, comes back empty
+  or is refused leaves the name granting nothing (no rule; never open)
+  until it resolves again, and the daemon logs why once. An earlier answer
+  is never kept in its place: a name that's gone may have been dropped on
+  purpose, and its old address may belong to something else by now.
+  Answers aren't stored either; after a restart the first lookups run right
+  after the first apply.
 - **A save can't add a problem.** The daemon looks up the names a change
   adds before saving it, and refuses the change if one doesn't resolve or
   resolves outside every network, naming the host and why; a typo fails
@@ -65,6 +67,11 @@ home's DNS stays the only place a machine's address is written down.
   home records rarely change, and a fixed 5-minute interval is what the
   public IP lookup already uses. A grant follows a changed address within
   minutes either way.
+- **Keeping the last good answer when a lookup fails** (the plan before
+  7a.1 was merged). It rides out a resolver restart, but a grant would
+  outlive its name: drop a record, or point a new name at the same host,
+  and the old name would keep granting. A resolver outage costing guests
+  their named hosts for a few minutes is the safer failure.
 - **Refusing every save while a name can't be looked up.** It would lock the
   operator out of unrelated changes whenever the home resolver is down.
 - **Matching a name and an address for the same machine** in the warning

@@ -1265,10 +1265,7 @@ mod tests {
         let family = m.template("family").unwrap();
         // Not looked up yet: nothing beyond the service.
         assert_eq!(m.reaches(family).len(), 1);
-        assert!(has(
-            &m.name_problems(),
-            "nas.mydomain.com hasn't been found yet"
-        ));
+        assert!(has(&m.name_problems(), "nas.mydomain.com didn't resolve"));
         let found: Resolved = [(
             "nas.mydomain.com".to_string(),
             vec![

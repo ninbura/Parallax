@@ -404,7 +404,8 @@ one (plain DNS, and DNS over HTTPS by IP address).
 
 Hosts named by DNS name (ADR 0009) are looked up the same way, through their
 zone's `upstream_dns`: right after startup, every 5 minutes and when a saved
-change alters the names or the networks. A failed or refused lookup keeps
-the last good answer (also in `daemon_state`). A save that adds a name looks
+change alters the names or the networks. Only the latest answer counts: a
+name whose lookup fails or is refused grants nothing until it resolves
+again, and answers aren't stored. A save that adds a name looks
 it up first and is refused if it doesn't resolve to addresses inside the
 configured networks.

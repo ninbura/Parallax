@@ -297,15 +297,14 @@ impl Ctx {
             }) => Ok((*configuration, Some(revision), Learned { public_ip, names })),
             Some(other) => Err(unexpected(other)),
             None => {
-                let (config, learned) = block_on(async {
+                let (config, public_ip) = block_on(async {
                     let mut store = self.open_store().await?;
-                    let config = store.load().await?;
-                    let learned = Learned {
-                        public_ip: store.public_ip().await?,
-                        names: store.names().await?,
-                    };
-                    Ok((config, learned))
+                    Ok((store.load().await?, store.public_ip().await?))
                 })?;
+                let learned = Learned {
+                    public_ip,
+                    names: Resolved::new(),
+                };
                 Ok((config, None, learned))
             }
         }
@@ -320,9 +319,13 @@ impl Ctx {
         Ok(self.load_revision()?.0)
     }
 
-    /// The configuration and what the gateway learned: what generation needs.
+    /// The configuration and what the gateway learned: what generation
+    /// needs. Without a daemon, the named hosts are looked up here.
     pub(crate) fn load_for_generation(&self) -> anyhow::Result<(Config, Learned)> {
-        let (config, _, learned) = self.load_full()?;
+        let (config, revision, mut learned) = self.load_full()?;
+        if revision.is_none() {
+            learned.names = find_names(&config).resolved;
+        }
         Ok((config, learned))
     }
 
@@ -533,8 +536,8 @@ pub(crate) fn find_public_ip(server: &ServerConfig) -> Result<public_ip::Found, 
 
 /// Look up every host named by DNS name ([`parallax_core::names`]).
 /// Blocks for up to a few seconds per resolver it asks.
-pub(crate) fn find_names(config: &Config, known: &Resolved) -> names::Refreshed {
-    names::refresh(config, &lookup(&config.server), known)
+pub(crate) fn find_names(config: &Config) -> names::Refreshed {
+    names::refresh(config, &lookup(&config.server))
 }
 
 /// The real resolver.
@@ -643,11 +646,7 @@ fn run() -> anyhow::Result<()> {
                             Err(problems) => notes.push(public_ip_lookup_failed(&problems, known)),
                         }
                     }
-                    let stored = store.names().await?;
-                    let found = find_names(&config, &stored);
-                    if found.resolved != stored {
-                        store.set_names(&found.resolved).await?;
-                    }
+                    let found = find_names(&config);
                     notes.extend(found.problems);
                     let learned = Learned {
                         public_ip: known,
