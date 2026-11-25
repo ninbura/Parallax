@@ -14,7 +14,7 @@
 //! - **The home's public IP, one port at a time.** There every port is a
 //!   port forward, maybe each to another machine, and a raw web port
 //!   reaches every site behind it without the proxy's name check. So a
-//!   template that doesn't already reach everything (`all_networks`) gets
+//!   template that doesn't reach it anyway (`all_networks` + `internet`) gets
 //!   no `host` grant there, and web ports only as an HTTPS service with
 //!   `hostnames` ([`public_ip_refusal`]).
 //! - **The last good answer stays.** A lookup that fails or is refused
@@ -110,14 +110,14 @@ pub(crate) fn is_web(proto: Proto, port: u16) -> bool {
 
 /// Why `template` may not reach `port` (`None`: every port) on the home's
 /// public IP, if it may not. `proxied`: through the HTTPS proxy, which
-/// checks the name. A template with `all_networks` reaches the home anyway
-/// and isn't limited.
+/// checks the name. A template with `all_networks` and `internet` reaches
+/// the home's public IP anyway and isn't limited.
 pub fn public_ip_refusal(
     template: &Template,
     port: Option<(Proto, u16)>,
     proxied: bool,
 ) -> Option<&'static str> {
-    if template.grants.contains(&Grant::AllNetworks) {
+    if template.grants.contains(&Grant::AllNetworks) && template.grants.contains(&Grant::Internet) {
         return None;
     }
     match port {
@@ -190,7 +190,12 @@ pub fn refresh(
             Ok(addresses) => {
                 out.resolved.insert(name.to_string(), addresses);
             }
-            Err(why) => match known.get(name) {
+            // An answer the configuration no longer allows (the public IP
+            // moved) isn't worth keeping: it gives nothing.
+            Err(why) => match known
+                .get(name)
+                .filter(|a| refused(config, public_ip, name, a).is_none())
+            {
                 Some(addresses) => {
                     out.problems
                         .push(format!("{why}; keeping the last known {}", list(addresses)));
@@ -288,6 +293,9 @@ pub fn check_save(
             Ok(addresses) => {
                 resolved.insert(name.to_string(), addresses);
             }
+            // A name `old` had: whether this change made it worse is for
+            // the comparison of problems below, not the lookup.
+            Err(_) if had.contains(name) => {}
             Err(why) => failed.push(why),
         }
     }
@@ -525,8 +533,11 @@ mod tests {
         // On the LAN the same grants are fine.
         let at_lan: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
         assert!(problems(&cfg, Some(HOME), &at_lan).is_empty());
-        // A template that reaches everything isn't limited.
+        // `all_networks` alone doesn't reach the public IP: still limited.
         cfg.templates[1].grants.push(Grant::AllNetworks);
+        assert_eq!(problems(&cfg, Some(HOME), &at_home).len(), 2);
+        // With `internet` too it reaches everything, and isn't.
+        cfg.templates[1].grants.push(Grant::Internet);
         assert!(problems(&cfg, Some(HOME), &at_home).is_empty());
     }
 
@@ -566,6 +577,25 @@ mod tests {
             check_save(Some(&old), &new, None, &r, &known).unwrap()[NAS],
             [moved]
         );
+    }
+
+    #[test]
+    fn a_moved_public_ip_doesnt_block_other_changes() {
+        // The name pointed at the old public IP; DNS hasn't caught up.
+        let old = named();
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        let moved = Some(Ipv4Addr::new(1, 2, 3, 5));
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[HOME]);
+        let out = refresh(&old, moved, &r, &known);
+        assert!(out.resolved.is_empty(), "the old answer gives nothing now");
+        assert!(
+            out.problems[0].ends_with("until it resolves"),
+            "{:?}",
+            out.problems
+        );
+        let mut new = old.clone();
+        new.peers.pop();
+        assert!(check_save(Some(&old), &new, moved, &r, &known).is_ok());
     }
 
     #[test]

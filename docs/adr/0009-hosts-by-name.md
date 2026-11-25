@@ -27,8 +27,8 @@ home's DNS stays the only place a machine's address is written down.
 - **The home's public IP is port forwards.** A name that resolves there is
   a service the router forwards in (no local path or record). Every port
   there may lead to a different machine, and a web port to every site
-  behind one nginx. So for a template without `all_networks` (which
-  reaches the home anyway):
+  behind one nginx. So for a template that doesn't reach it anyway (one
+  without both `all_networks` and `internet`):
   - only one port at a time: a `host` grant there is refused;
   - no raw web ports (tcp/80, tcp/443, udp/443): web traffic must be a
     service with `hostnames`, so the HTTPS proxy checks the name and

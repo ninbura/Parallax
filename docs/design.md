@@ -123,7 +123,7 @@ port forwards: a template that doesn't reach everything gets one port at
 a time there, and web ports only through the HTTPS proxy
 (`ReachKind::HomePublic`). Those addresses are an input to generation
 (`Model::with_names`), like the date. `Model::reaches(template)` resolves
-them to `Reach { label, kind: Lan { network, real, port, proxied } | Internet }` and
+them to `Reach { label, kind: Lan { network, real, port, proxied } | HomePublic { address, port, proxied } | Internet }` and
 `Reach::client_net()` translates to virtual space for clients, nginx and (M2)
 Headscale ACLs. The nftables FORWARD chain matches real addresses because it
 runs after PREROUTING NETMAP.

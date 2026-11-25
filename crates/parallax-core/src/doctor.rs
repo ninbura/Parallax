@@ -439,7 +439,13 @@ fn read(sys: System<'_>, path: &Path) -> Result<String, String> {
 /// runs without it.
 pub fn public_ip_check(config: &Config, known: Option<std::net::Ipv4Addr>) -> Check {
     let outcome = match (crate::public_ip::hairpin(config), known) {
-        (false, _) => Outcome::Ok("not needed: no guest template has internet".into()),
+        (false, _) if !crate::public_ip::needed(config) => {
+            Outcome::Ok("not needed: no guest template has internet, and no host is named by DNS name".into())
+        }
+        (false, Some(ip)) => Outcome::Ok(format!("{ip}; hosts named by DNS name may point at it (port forwards)")),
+        (false, None) => Outcome::Ok(
+            "not known yet; a host named by DNS name that points at it gives nothing until it is".into(),
+        ),
         (true, Some(ip)) => Outcome::Ok(format!(
             "{ip}; guest templates with internet can't reach it"
         )),

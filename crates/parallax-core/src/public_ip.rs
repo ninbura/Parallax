@@ -188,6 +188,12 @@ mod tests {
         assert!(!needed(&cfg), "all_networks reaches the router anyway");
         cfg.templates[1].grants.push(Grant::Internet);
         assert!(needed(&cfg));
+        assert!(hairpin(&cfg));
+        // A host named by DNS name may point at it, without any hairpin.
+        let mut cfg = canonical_config();
+        cfg.services[0].host = crate::model::Host::Name("immich.mydomain.com".into());
+        assert!(needed(&cfg));
+        assert!(!hairpin(&cfg));
     }
 
     #[test]
