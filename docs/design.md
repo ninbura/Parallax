@@ -28,11 +28,14 @@ crates/parallax-core/           pure library, no I/O of its own
   tests/example.rs              example/parallax.toml == canonical fixture
 crates/parallax-store/          the database (Turso, SQLite's file format): Config in, Config out; backups
   migrations/                   schema, one numbered SQL file per change
-crates/parallax-proxy/          the HTTPS proxy (`parallax proxy`)
-crates/parallax-dns/            the DNS server (`parallax dns`)
-crates/parallax-cli/            `parallax` binary (validate, plan, generate, apply,
-                                proxy, dns, keygen, config import/export/edit,
-                                peer add/remove/show, export, doctor)
+crates/parallax-core/src/reconcile.rs   the daemon's apply triggers, drift listing, teardown
+crates/parallax-proxy/          the HTTPS proxy (a task in the daemon)
+crates/parallax-dns/            the DNS server (a task in the daemon)
+crates/parallax-cli/            `parallax` binary (daemon, status, validate, plan,
+                                generate, apply, keygen, config import/export/edit,
+                                backup, peer add/remove/show, export, doctor);
+                                src/daemon.rs and src/protocol.rs: the daemon and
+                                its socket protocol
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)
 example/parallax.toml           fully commented canonical scenario
 tests/integration/netns.sh      Linux network-namespace integration test (CI)
@@ -200,8 +203,8 @@ no redirect: the proxy would add nothing. Only tiers with a redirect may
 reach the proxy port in INPUT. The firewall works per tier and the proxy per
 hostname: when a tier loses one of several proxied hostnames, its other
 redirects keep the proxy port open to it, and the proxy closes the revoked
-hostname's connections when it reloads. So whatever runs `apply` also sends
-the proxy SIGHUP (the Docker entrypoint does).
+hostname's connections when it reloads. So the daemon has the proxy re-read
+its routes after every apply.
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
@@ -241,7 +244,7 @@ are dropped, since after a switch the proxy only relays bytes. HTTP/1 vs
 HTTP/2 comes from ALPN, so the header timeout runs from the first byte, and
 one tunnel address may hold at most 64 connections.
 
-Reloads (SIGHUP) swap the routes whole. Every request looks its site up in
+Reloads (after each apply) swap the routes whole. Every request looks its site up in
 the current routes, and open connections and WebSocket relays are closed
 when a reload takes their hostname away from their address. A reload that
 fails (unreadable routes or CA bundle) refuses everything until one
@@ -267,9 +270,9 @@ the proxy can't lose to a port Docker publishes on the gateway.
 ## DNS server
 
 Every tier asks the same address (`server.dns.listen`, by default the
-WireGuard gateway address), and the answer depends on who asks. `parallax dns`
-(crate `parallax-dns`, built on hickory) reads `dns/routes.toml`, which
-`apply` writes, and SIGHUP re-reads it:
+WireGuard gateway address), and the answer depends on who asks. The DNS
+server (crate `parallax-dns`, built on hickory, a task in the daemon) reads
+`dns/routes.toml`, which `apply` writes, and re-reads it after each apply:
 
 - **Who asks.** The source address picks the tier: the template's WireGuard
   pool, or (M2) its Tailscale nodes. WireGuard ties the source address to the
@@ -325,11 +328,11 @@ alternatives: ADR 0005.
   tables use the id. `save` matches rows by name, so a kept name keeps its id.
 - Migrations: `crates/parallax-store/migrations/NNNN_*.sql`, applied in order
   when the database opens. A newer database than the binary knows is refused.
-- Many processes at once (Turso's multi-process WAL mode): reads never wait;
-  a write waits up to ten seconds for another to commit. Every change is one
-  write transaction (`Store::update`), so concurrent commands don't lose each
-  other's changes.
-- The database, its log and its `-tshm` coordination file are 0600.
+- One process at a time (Turso's default lock): the daemon while it runs,
+  otherwise each CLI command while it needs it. Every change is one write
+  transaction (`Store::update`). With the daemon, changes queue in its one
+  writer (ADR 0007).
+- The database and its log are 0600.
 
 The CLI validates before every save, so the database only ever holds a valid
 configuration. `config import` and `config edit` also give WireGuard peers
@@ -348,10 +351,10 @@ its rows in one write transaction. Operator guide: `docs/backup.md`.
 wireguard/wg0.conf                 wg(8) format for `wg syncconf`   (0600)
 nftables/parallax.nft              table inet parallax, atomic replace
 nftables/docker-user.nft           DOCKER-USER accepts (docker_coexistence)
-dns/routes.toml                    zones, mappings and tiers for `parallax dns`
+dns/routes.toml                    zones, mappings and tiers for the DNS server
 nginx/snippets/parallax-<t>.conf   allow lines per tier
 nginx/snippets/parallax-service-<s>.conf   allow lines + deny all per vhost
-proxy/routes.toml                  sites for `parallax proxy`
+proxy/routes.toml                  sites for the HTTPS proxy
 clients/<peer>/<platform>.conf     only for peers that retain their private key (0600)
 ```
 
@@ -364,6 +367,19 @@ firewall (`nft -c -f` then `nft -f`) → WireGuard (`ip link add` if missing,
 `ip address replace`, `wg syncconf`, `ip link set up`). Every step is a
 replace, never an insert/delete pair, so re-applying an unchanged bundle is a
 no-op (asserted by `apply_runs_expected_commands_and_is_idempotent`). The DNS
-server and the HTTPS proxy are long-running processes that read the routes
-`apply` wrote; the container's entrypoint starts them after the first apply
-and sends them SIGHUP after each one.
+server and the HTTPS proxy are tasks in the daemon that read the routes
+`apply` wrote; the daemon starts them after the first apply and has them
+re-read after each one.
+
+## The daemon
+
+`parallax daemon` (ADR 0007) holds the database, keeps the configuration in
+memory and keeps the gateway applied: at startup, after every saved change,
+on SIGHUP, when the UTC date changes, and when the live table or WireGuard
+interface differs from the listing taken after the last apply (checked every
+60 s). A failed apply is retried every tick. It serves DNS and the proxy,
+runs automatic backups, and listens on `/run/parallax/parallax.sock` for the
+CLI: one JSON request and one JSON reply per connection, `protocol: 1`. Saves
+carry the revision they were based on; an older one is refused and the CLI
+retries against the latest. With no daemon answering, the CLI opens the
+database itself. SIGTERM deletes the table and the interface.

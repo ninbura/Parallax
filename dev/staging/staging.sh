@@ -6,10 +6,10 @@
 #   up                         fake LANs, config (first run), build, start the container
 #   down                       stop the container and remove the fake LANs (state is kept)
 #   reset                      down, then delete the state directory (server key, peers, config)
-#   apply                      re-apply the configuration (SIGHUP the container)
+#   apply                      re-apply the configuration (`parallax apply` through the daemon)
 #   export                     write the configuration as TOML to $STAGING_STATE/config/export.toml (0600)
-#   import FILE                replace the configuration with a TOML file, then re-apply
-#   peer NAME TEMPLATE [PLAT]  add a peer (private key kept), re-apply, show its QR
+#   import FILE                replace the configuration with a TOML file (applies on save)
+#   peer NAME TEMPLATE [PLAT]  add a peer (private key kept; applies on save), show its QR
 #   qr NAME [PLATFORM]         write $STAGING_STATE/qr/NAME-PLATFORM.png and print the QR
 #   smoke                      end-to-end checks from a client namespace through the tunnel
 #   status                     container, WireGuard and firewall summary
@@ -129,12 +129,12 @@ cfg() {
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ]; }
 px() { docker exec "$CONTAINER" parallax "$@"; }
 
-# Wait until the container has applied the config and started its servers: wg1 up, and
-# the DNS server and the HTTPS proxy listening on the gateway address (they start after apply).
+# Wait until the daemon has applied the config and started its servers: it answers on
+# its socket, wg1 is up, and DNS and the HTTPS proxy listen on the gateway address.
 wait_applied() {
     local iface; iface="$(cfg interface)"
     for _ in $(seq 1 60); do
-        if ip link show "$iface" >/dev/null 2>&1 \
+        if px status >/dev/null 2>&1 && ip link show "$iface" >/dev/null 2>&1 \
             && ss -Hltn 'sport = :53' | grep -qF "$GATEWAY:53" \
             && ss -Hltn 'sport = :8443' | grep -qF "$GATEWAY:8443"; then
             return 0
@@ -146,22 +146,9 @@ wait_applied() {
     die "gateway did not come up"
 }
 
-# SIGHUP, then wait for the entrypoint's "re-applied" or "re-apply failed" line.
+# Re-apply through the daemon; fails with the daemon's error.
 reapply() {
-    local pattern='parallax: re-appl\(ied\|y failed\)' before now
-    before="$(docker logs "$CONTAINER" 2>&1 | grep -c "$pattern" || true)"
-    docker kill -s HUP "$CONTAINER" >/dev/null
-    for _ in $(seq 1 60); do
-        sleep 0.5
-        now="$(docker logs "$CONTAINER" 2>&1 | grep "$pattern" || true)"
-        [ "$(grep -c . <<<"$now")" -gt "$before" ] || continue
-        if tail -n1 <<<"$now" | grep -q 'failed'; then
-            docker logs --tail 20 "$CONTAINER" >&2
-            die "re-apply failed"
-        fi
-        return 0
-    done
-    die "re-apply did not finish"
+    px apply >/dev/null || die "re-apply failed"
 }
 
 up() {
@@ -192,7 +179,7 @@ down() {
     if docker inspect "$CONTAINER" >/dev/null 2>&1; then
         "${COMPOSE[@]}" down
     fi
-    # The entrypoint removes the nft table and the WireGuard interface; DOCKER-USER
+    # The daemon removes the nft table and the WireGuard interface; DOCKER-USER
     # rules stay behind (harmless, but remove them so the host is as we found it).
     # Same match as apply.rs: exact comment "parallax", deleted by handle.
     local h
@@ -218,8 +205,7 @@ import_config() { # file: copied into the mounted config directory, imported, re
     [ "$rc" = 0 ] || die "import failed; nothing changed"
 }
 
-# Adds the peer if it's missing. Callers re-apply afterwards, also when it already
-# existed, so a peer saved by an earlier run whose re-apply failed still goes live.
+# Adds the peer if it's missing; the daemon applies it on save.
 add_peer() { # name template platform
     running || die "gateway not running (staging.sh up)"
     if has_peer "$1"; then
@@ -282,7 +268,6 @@ smoke() {
     fail_db() { echo "FAIL: $*"; ok=0; }
     add_peer smoke-personal personal linux
     add_peer smoke-guest guest linux
-    reapply
     trap 'smoke_cleanup' EXIT
     echo "--- database"
     if [ -f "$CONFIG.imported" ] && [ ! -f "$CONFIG" ]; then pass_db "the first start imported parallax.toml and renamed it"
@@ -306,6 +291,21 @@ smoke() {
     if [ -n "$file" ] && px backup restore --yes "$file" >/dev/null 2>&1 \
         && [ "$(px config export)" = "$before" ]; then pass_db "restoring it gives the same configuration"
     else fail_db "restoring ${file:-the backup} failed or changed the configuration"; fi
+    echo "--- daemon"
+    # A change applies on save: a throwaway peer is on the interface when `peer add` returns.
+    local iface peers back=0
+    iface="$(cfg interface)"
+    px peer remove smoke-transient >/dev/null 2>&1 || true
+    peers="$(wg show "$iface" peers | grep -c . || true)"
+    if px peer add smoke-transient --template guest >/dev/null 2>&1 \
+        && [ "$(wg show "$iface" peers | grep -c .)" = $((peers + 1)) ]; then pass_db "a change applies without SIGHUP"
+    else fail_db "the new peer is not on $iface after peer add"; fi
+    px peer remove smoke-transient >/dev/null 2>&1 || true
+    # Drift: a deleted table comes back within a reconcile tick (60 s).
+    nft delete table inet parallax
+    for _ in $(seq 1 75); do nft list table inet parallax >/dev/null 2>&1 && { back=1; break; }; sleep 1; done
+    if [ "$back" = 1 ]; then pass_db "a deleted table comes back"
+    else fail_db "the deleted nft table did not come back within 75 s"; fi
     smoke_cleanup
     local endpoint port gw
     endpoint="$(cfg endpoint)"; endpoint="${endpoint%:*}"
@@ -402,11 +402,10 @@ case "$cmd" in
         px config export -o /etc/parallax/export.toml >/dev/null 2>&1
         say "wrote $STATE/config/export.toml"
         ;;
-    import) [ $# -ge 1 ] || die "usage: staging.sh import FILE"; import_config "$1"; reapply; say "imported and re-applied" ;;
+    import) [ $# -ge 1 ] || die "usage: staging.sh import FILE"; import_config "$1"; say "imported and applied" ;;
     peer)
         [ $# -ge 2 ] || die "usage: staging.sh peer NAME TEMPLATE [PLATFORM]"
         add_peer "$1" "$2" "${3:-mobile}"
-        reapply
         qr "$1" "${3:-mobile}"
         ;;
     qr) [ $# -ge 1 ] || die "usage: staging.sh qr NAME [PLATFORM]"; qr "$1" "${2:-mobile}" ;;

@@ -301,6 +301,34 @@ async fn a_newer_schema_is_refused() {
     );
 }
 
+/// Before the daemon (step 7) the database was opened in Turso's
+/// multi-process mode; such a file must still open, and keep its data.
+#[tokio::test]
+async fn a_database_written_in_multi_process_mode_opens() {
+    let dir = TempDir::new();
+    let path = dir.db();
+    {
+        let db = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_multiprocess_wal(true)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (7);")
+            .await
+            .unwrap();
+    }
+    let mut tshm = path.as_os_str().to_owned();
+    tshm.push("-tshm");
+    assert!(
+        Path::new(&tshm).exists(),
+        "the old mode leaves its coordination file"
+    );
+    let store = Store::open(&path).await.unwrap();
+    let rows = store.rows("SELECT x FROM t", Vec::new()).await.unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 7);
+}
+
 #[tokio::test]
 async fn reopening_does_not_migrate_twice() {
     let dir = TempDir::new();
@@ -317,7 +345,6 @@ async fn reopening_does_not_migrate_twice() {
 /// canonical configuration's server row.
 pub(crate) async fn schema_1_database(path: &Path) {
     let db = turso::Builder::new_local(path.to_str().unwrap())
-        .experimental_multiprocess_wal(true)
         .build()
         .await
         .unwrap();

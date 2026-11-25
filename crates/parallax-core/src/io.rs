@@ -238,13 +238,26 @@ pub mod real {
         /// Modes are set explicitly, not left to the umask: the CLI runs with
         /// an owner-only umask, but generated files that aren't secret (nginx
         /// snippets) stay readable as before.
+        ///
+        /// Written next to the target and renamed over it, so a reader (the
+        /// DNS server or the proxy reloading its routes while the next apply
+        /// writes) sees the old file or the new one, never half of one.
         fn write(&self, path: &Path, contents: &str, secret: bool) -> Result<()> {
             let ctx = || format!("writing {}", path.display());
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
+            let dir = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => {
                     create_dirs(parent).map_err(|e| Error::io(ctx(), e))?;
+                    parent
                 }
-            }
+                _ => Path::new("."),
+            };
+            let name = path
+                .file_name()
+                .ok_or_else(|| Error::io(ctx(), std::io::ErrorKind::InvalidInput.into()))?;
+            let mut tmp_name = std::ffi::OsString::from(".");
+            tmp_name.push(name);
+            tmp_name.push(".tmp");
+            let tmp = dir.join(tmp_name);
             let mode = if secret { 0o600 } else { 0o644 };
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
@@ -253,15 +266,20 @@ pub mod real {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(mode);
             }
-            let mut f = opts.open(path).map_err(|e| Error::io(ctx(), e))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                f.set_permissions(std::fs::Permissions::from_mode(mode))
-                    .map_err(|e| Error::io(ctx(), e))?;
+            let written = (|| {
+                let mut f = opts.open(&tmp)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+                }
+                f.write_all(contents.as_bytes())?;
+                std::fs::rename(&tmp, path)
+            })();
+            if written.is_err() {
+                let _ = std::fs::remove_file(&tmp);
             }
-            f.write_all(contents.as_bytes())
-                .map_err(|e| Error::io(ctx(), e))
+            written.map_err(|e| Error::io(ctx(), e))
         }
 
         fn remove(&self, path: &Path) -> Result<bool> {

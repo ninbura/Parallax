@@ -54,12 +54,13 @@ or read `docs/setup.md`. Backups (automatic, encrypted, one-command restore):
   generators, plan/apply. UI-agnostic; all I/O behind traits.
 - `crates/parallax-store`: the database, the source of truth for the
   configuration (Turso, in SQLite's file format).
-- `crates/parallax-proxy`: the HTTPS proxy (`parallax proxy`).
-- `crates/parallax-dns`: the DNS server (`parallax dns`): per-tier answers,
-  home zones rewritten into mapped space.
-- `crates/parallax-cli`: `validate`, `plan`, `generate`, `apply`, `proxy`,
-  `dns`, `keygen`, `config import|export|edit`, `peer add|remove|show`,
-  `export`, `doctor`, `backup create|list|restore|passphrase`.
+- `crates/parallax-proxy`: the HTTPS proxy (a task in `parallax daemon`).
+- `crates/parallax-dns`: the DNS server (a task in `parallax daemon`):
+  per-tier answers, home zones rewritten into mapped space.
+- `crates/parallax-cli`: `daemon`, `status`, `validate`, `plan`, `generate`,
+  `apply`, `keygen`, `config import|export|edit`, `peer add|remove|show`,
+  `export`, `doctor`, `backup create|list|restore|passphrase`. While the
+  daemon runs, every command goes through its socket.
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
 - `example/parallax.toml`: the canonical scenario, fully commented.
 - `tests/integration/netns.sh`: Linux namespace test: mapping, DNS, per-tier access, the HTTPS proxy and the bypass matrix.

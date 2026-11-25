@@ -147,7 +147,7 @@ impl Store {
             ))
         })?;
         // One statement, one read transaction: a consistent copy even while
-        // another process writes.
+        // another connection writes.
         self.conn
             .execute(&format!("VACUUM INTO '{target}'"), ())
             .await

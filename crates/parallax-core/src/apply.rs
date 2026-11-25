@@ -2,8 +2,8 @@
 //! order — firewall first (so a half-configured interface never forwards
 //! unfiltered), then each transport. Every step is idempotent, so
 //! re-applying an unchanged bundle changes nothing. The DNS server and the
-//! HTTPS proxy are long-running processes that read the routes written here;
-//! whoever runs them sends SIGHUP afterwards (the container's entrypoint does).
+//! HTTPS proxy read the routes written here; the daemon has them re-read
+//! after each apply.
 
 use std::path::Path;
 

@@ -1,9 +1,12 @@
 #!/bin/sh
 # Parallax container entrypoint.
 #   run       on first start import the configuration, check the host
-#             (`parallax doctor`), apply, start tailscaled, the DNS server and
-#             the HTTPS proxy, stay up, back up when due; SIGHUP re-applies
-#   <other>   pass through to the parallax binary (e.g. `doctor`, `peer add ...`)
+#             (`parallax doctor`), create the server key, start tailscaled,
+#             then become `parallax daemon`: it applies, serves DNS and the
+#             HTTPS proxy, applies every saved change, repairs drift and backs
+#             up when due. SIGHUP re-applies; SIGTERM takes the gateway down.
+#   <other>   pass through to the parallax binary (e.g. `doctor`, `peer add ...`),
+#             which talks to the running daemon over its socket
 set -eu
 
 # The database is the configuration. CONFIG is only read once, on the first
@@ -58,95 +61,8 @@ parallax keygen --if-missing --write-config
 # --netfilter-mode=off is passed at `tailscale up` time (M2); tailscaled itself owns no rules.
 tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock \
     --tun=tailscale0 --port=41641 >/var/log/tailscaled.log 2>&1 &
-TAILSCALED_PID=$!
 
-# The WireGuard interface the last successful apply configured, for teardown:
-# apply writes wireguard/<interface>.conf. Not read from the database, which
-# may already hold an edit that isn't applied yet.
-WG_IF=
-apply() {
-    parallax apply -o "$OUT" || return 1
-    # Newest: a renamed interface leaves its old file behind.
-    conf="$(ls -t "$OUT"/wireguard/*.conf 2>/dev/null | head -n1)"
-    if [ -n "$conf" ]; then
-        WG_IF="$(basename "$conf" .conf)"
-    fi
-}
-
-teardown() {
-    echo "parallax: shutting down"
-    kill "$TAILSCALED_PID" ${DNS_PID:-} ${PROXY_PID:-} 2>/dev/null || true
-    nft delete table inet parallax 2>/dev/null || true
-    [ -n "$WG_IF" ] && ip link del "$WG_IF" 2>/dev/null || true
-    exit "${1:-0}"
-}
-
-reload() {
-    echo "parallax: SIGHUP, re-applying"
-    if apply; then
-        # The DNS server and the proxy re-read their routes on SIGHUP. If one
-        # can't, it refuses everything until a reload succeeds rather than
-        # keep the old grants. Unset during the first apply: both start after it.
-        for pid in ${DNS_PID:-} ${PROXY_PID:-}; do
-            kill -HUP "$pid" 2>/dev/null || true
-        done
-        echo "parallax: re-applied"
-    else
-        echo "parallax: re-apply failed; fix the configuration (\`parallax config edit\`) and send SIGHUP again" >&2
-    fi
-}
-
-# `--if-due` decides: automatic backups on, the newest older than the
-# interval, and something changed. So checking often costs little.
-BACKUP_ROUNDS=300   # rounds of the loop below (2 s each): every 10 minutes
-backup_if_due() {
-    if ! out="$(parallax backup create --if-due 2>&1)"; then
-        echo "parallax: warning: automatic backup failed: $out" >&2
-    elif [ -n "$out" ]; then
-        echo "$out" | sed 's/^/parallax: /'
-    fi
-}
-
-# Running, and not a zombie: a child that exited but isn't reaped yet still
-# answers `kill -0`, and when the shell reaps it varies between shells.
-alive() {
-    kill -0 "$1" 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
-}
-
-trap teardown TERM INT
-trap reload HUP
-apply
-# After apply: both listen on the gateway address, which wg0 now carries.
-parallax dns -o "$OUT" &
-DNS_PID=$!
-parallax proxy -o "$OUT" &
-PROXY_PID=$!
-# Most failures (port taken, unreadable CA bundle) happen at once.
-sleep 1
-for name_pid in "DNS server:$DNS_PID" "HTTPS proxy:$PROXY_PID"; do
-    if ! alive "${name_pid##*:}"; then
-        echo "parallax: the ${name_pid%:*} did not start; see above" >&2
-        teardown 1
-    fi
-done
-echo "parallax: gateway up; send SIGHUP to re-apply after changing the configuration"
-backup_if_due
-rounds=0
-# Wait on both. A trapped signal makes `wait` return >128 while they still
-# run (and `set -e` would treat that as fatal). If either exits, so does the
-# container, and Docker's restart policy takes over.
-while :; do
-    sleep 2 &
-    wait $! || true
-    for name_pid in "DNS server:$DNS_PID" "HTTPS proxy:$PROXY_PID"; do
-        if ! alive "${name_pid##*:}"; then
-            echo "parallax: the ${name_pid%:*} exited; stopping" >&2
-            teardown 1
-        fi
-    done
-    rounds=$((rounds + 1))
-    if [ "$rounds" -ge "$BACKUP_ROUNDS" ]; then
-        rounds=0
-        backup_if_due
-    fi
-done
+# The daemon holds the database from here on; `docker exec parallax parallax ...`
+# goes through its socket. tini (the image's init) forwards signals to it and
+# reaps tailscaled if it dies.
+exec parallax daemon -o "$OUT"

@@ -190,10 +190,20 @@ up again); see Editing the configuration.
 
 On every start the entrypoint then runs `parallax doctor`. On the first start
 it generates `wg-server.key` (mode 0600) in `docker/config/` and records its
-public key in the configuration. Then it starts `tailscaled` (idle until M2), applies the
-firewall, brings up `wg0`, and starts the DNS server and the HTTPS proxy. If
-either of those exits, the container stops and Docker's restart policy takes
-over.
+public key in the configuration. Then it starts `tailscaled` (idle until M2)
+and hands over to `parallax daemon`, which applies the firewall, brings up
+`wg0`, starts the DNS server and the HTTPS proxy, and keeps it all applied.
+If DNS or the proxy stops, the container stops and Docker's restart policy
+takes over.
+
+The daemon holds the database. `parallax` commands run with `docker compose
+exec` talk to it over its socket (`/run/parallax/parallax.sock`, root-only),
+and every change applies as soon as it's saved: no restart, no SIGHUP. It
+also re-applies once a minute if the firewall or `wg0` was changed behind its
+back, and just after midnight UTC so expired peers drop. `parallax status`
+shows how the last apply went. SIGHUP still re-applies on demand
+(`docker compose kill -s HUP parallax`). Stopping the container removes the
+firewall table and `wg0`.
 
 Then set the backup passphrase, and keep it in your password manager:
 
@@ -209,11 +219,11 @@ See [docs/backup.md](backup.md).
 ```sh
 sudo docker compose exec parallax parallax peer add laptop --template personal --platform linux
 sudo docker compose exec parallax parallax peer add sister-phone --template family --platform mobile
-sudo docker compose kill -s HUP parallax    # re-apply
 ```
 
 `peer add` prints the client config once, with the private key, and stores
-only the public key unless you pass `--keep-private-key`. `export <peer>
+only the public key unless you pass `--keep-private-key`. The gateway accepts
+the device as soon as the command returns. `export <peer>
 --platform <linux|macos|windows|mobile>` re-renders a config later (with a
 placeholder for the key if it was not retained).
 
@@ -225,13 +235,16 @@ The database is the source of truth; TOML is how you read and change it:
 sudo docker compose exec parallax parallax config edit   # $EDITOR, then a diff and "save?"
 sudo docker compose exec parallax parallax config export -o /etc/parallax/export.toml
 sudo docker compose exec parallax parallax config import /etc/parallax/new.toml
-sudo docker compose kill -s HUP parallax    # re-apply
 ```
 
 `config edit` opens the configuration as TOML (in `$VISUAL` or `$EDITOR`,
 else `vi`), checks it, shows what changes in the configuration and in the
-generated files, and saves only when you confirm. An invalid edit can be
-fixed and retried, and nothing is saved until it's valid. `config import`
+generated files, and saves only when you confirm; the gateway applies it
+right away. An invalid edit can be fixed and retried, and nothing is saved
+until it's valid. A change the gateway would refuse (a proxied hostname with
+no certificate) is refused before it's saved. If someone else saved a change
+while your editor was open, nothing is saved and your version is kept in a
+file it names. `config import`
 replaces the whole configuration with a file (copy it into `docker/config/`
 first, which the container sees as `/etc/parallax`). Both give a WireGuard
 peer without an address the next free one. The export and the database

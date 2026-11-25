@@ -16,7 +16,7 @@ use crate::{Error, Result, Store};
 impl Store {
     /// The whole configuration. Fails with [`Error::Empty`] before the first import.
     pub async fn load(&mut self) -> Result<Config> {
-        // One read transaction: a snapshot, even while another process writes.
+        // One read transaction: a consistent snapshot.
         self.conn.execute("BEGIN", ()).await?;
         let result = self.load_inner().await;
         let _ = self.conn.execute("COMMIT", ()).await;
@@ -52,7 +52,7 @@ impl Store {
     }
 
     /// Read, change and write the configuration in one write transaction, so
-    /// no other process writes in between (two `peer add`s can't both take
+    /// no other write lands in between (two `peer add`s can't both take
     /// the same free address). Nothing is saved if `change` fails.
     pub async fn update<T, E>(
         &mut self,

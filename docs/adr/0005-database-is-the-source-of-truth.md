@@ -1,6 +1,7 @@
 # ADR 0005: The database is the source of truth
 
-Status: accepted (step 6a, before M2). Supersedes ADR 0002.
+Status: accepted (step 6a, before M2). Supersedes ADR 0002. Its
+multi-process and MVCC paragraphs are superseded by ADR 0007 (the daemon).
 
 ## Decision
 
@@ -25,7 +26,9 @@ a file next to it.
 - **Migrations** are numbered SQL files compiled into the binary, applied in
   order on open, each in its own transaction. A database newer than the binary
   is refused, naming both versions.
-- **Many processes at once** (the user, 2026-11-24: concurrency now, as
+- **Many processes at once** *(superseded by ADR 0007: the daemon holds the
+  database alone, in Turso's single-process mode, and the CLI goes through
+  it)* (the user, 2026-11-24: concurrency now, as
   fast as possible). By default Turso locks the file to one process; we open
   it in its multi-process WAL mode (experimental, a `-tshm` coordination file
   beside the database), so the gateway, the CLI and anything else read
@@ -38,7 +41,8 @@ a file next to it.
   each other's changes (two `peer add`s can't take the same address).
   `config edit` saves only if nobody changed the configuration while the
   editor was open, and keeps the edited file if someone did.
-- **Parallel writers (MVCC, `BEGIN CONCURRENT`) wait for the daemon.** Turso's
+- **Parallel writers (MVCC, `BEGIN CONCURRENT`) wait for the daemon.**
+  *(Decided in ADR 0007: not now.)* Turso's
   MVCC refuses multi-process access (its bookkeeping lives in one process's
   memory), and while it's on `sqlite3` can't open the file. Once the daemon
   (step 7) is the only process holding the database and the CLI talks to it,
@@ -47,9 +51,9 @@ a file next to it.
   import --if-empty` on `/etc/parallax/parallax.toml` (it imports only into a
   database without a configuration, decided inside the write) and renames the
   file to `parallax.toml.imported`.
-- **Files are owner-only.** The database, its log and the coordination file
-  hold private keys: the CLI runs with an owner-only umask and the store
-  tightens all three to 0600; generated files get explicit modes.
+- **Files are owner-only.** The database and its log hold private keys: the
+  CLI runs with an owner-only umask and the store tightens both to 0600;
+  generated files get explicit modes.
 
 ## Why
 
@@ -61,8 +65,8 @@ a file next to it.
 - **Turso over SQLite in C:** the user wants to end up on Turso and would
   rather start there than migrate. It reads and writes SQLite's file format
   (the `sqlite3` tool opens a Parallax database), so going back stays cheap.
-  It's pre-1.0, hence the exact version pin; the one experimental feature on
-  is multi-process access, chosen for concurrency and covered by tests.
+  It's pre-1.0, hence the exact version pin. (Multi-process access, the one
+  experimental feature this used, is off since ADR 0007.)
 
 ## Rejected
 
