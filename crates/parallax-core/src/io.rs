@@ -5,6 +5,9 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use std::net::Ipv4Addr;
+
+use crate::model::EncryptedDns;
 use crate::secret::{KeyPair, PresharedKey};
 use crate::{Error, Result};
 
@@ -58,6 +61,30 @@ pub trait ProcessRunner {
 pub trait KeyGenerator {
     fn keypair(&self) -> KeyPair;
     fn preshared_key(&self) -> PresharedKey;
+}
+
+/// Where a name is looked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nameserver {
+    /// Plain DNS to this address, port 53.
+    Plain(Ipv4Addr),
+    /// DNS over HTTPS to this provider.
+    Encrypted(EncryptedDns),
+}
+
+impl std::fmt::Display for Nameserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Nameserver::Plain(ip) => write!(f, "{ip}"),
+            Nameserver::Encrypted(p) => write!(f, "{p} (encrypted)"),
+        }
+    }
+}
+
+/// DNS lookups. Each call gives up after a few seconds.
+pub trait Resolver {
+    /// The IPv4 addresses `name` has; empty when it has none.
+    fn lookup_ipv4(&self, name: &str, via: Nameserver) -> Result<Vec<Ipv4Addr>>;
 }
 
 /// Everything `apply` needs, bundled.
@@ -195,6 +222,35 @@ pub mod memory {
                 stdout: String::new(),
                 stderr: String::new(),
             })
+        }
+    }
+
+    /// Answers from a table of `(name, nameserver)`; anything else fails.
+    /// Records every question.
+    #[derive(Debug, Default)]
+    pub struct FakeResolver {
+        answers: BTreeMap<(String, String), Vec<Ipv4Addr>>,
+        pub asked: RefCell<Vec<(String, Nameserver)>>,
+    }
+
+    impl FakeResolver {
+        pub fn new() -> Self {
+            Self::default()
+        }
+        pub fn answer(mut self, name: &str, via: Nameserver, addresses: &[Ipv4Addr]) -> Self {
+            self.answers
+                .insert((name.to_string(), via.to_string()), addresses.to_vec());
+            self
+        }
+    }
+
+    impl Resolver for FakeResolver {
+        fn lookup_ipv4(&self, name: &str, via: Nameserver) -> Result<Vec<Ipv4Addr>> {
+            self.asked.borrow_mut().push((name.to_string(), via));
+            self.answers
+                .get(&(name.to_string(), via.to_string()))
+                .cloned()
+                .ok_or_else(|| Error::Lookup("no answer within 3 seconds".into()))
         }
     }
 

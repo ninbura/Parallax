@@ -138,6 +138,36 @@ fn internet_grant_and_masquerade_match_golden() {
 }
 
 #[test]
+fn guest_internet_drops_the_home_public_ip() {
+    let mut cfg = canonical_config();
+    cfg.templates[0].grants.push(Grant::Internet);
+    cfg.templates[1].grants.push(Grant::Internet);
+    let home = std::net::Ipv4Addr::new(1, 2, 3, 4);
+    let model = Model::resolve(&cfg, today())
+        .unwrap()
+        .with_public_ip(Some(home));
+    let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    check_golden("variants/hairpin.nft", &fw.contents);
+    // In the not_public set, which only public-only tiers use: the owner's
+    // all_networks template (lan_real) reaches the router anyway, and a grant
+    // listed after `internet` that covers the address still works.
+    let set: Vec<&str> = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("set not_public"))
+        .take_while(|l| !l.trim().starts_with('}'))
+        .collect();
+    assert!(set.iter().any(|l| l.contains("1.2.3.4")), "{set:#?}");
+    assert_eq!(fw.contents.matches("1.2.3.4").count(), 1, "{}", fw.contents);
+    // Unknown: not in the set.
+    let unknown = bundle_for(&cfg);
+    let unknown = unknown.of_kind(ArtifactKind::Firewall).next().unwrap();
+    assert!(!unknown.contents.contains("1.2.3.4"));
+    assert!(!unknown.contents.contains("home's public IP"));
+}
+
+#[test]
 fn proxied_service_gets_no_direct_accept() {
     let mut cfg = canonical_config();
     cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];

@@ -13,6 +13,8 @@ tokio.workspace = true
 hickory-server.workspace = true
 async-trait.workspace = true
 ipnet.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 
 [lints]
 workspace = true

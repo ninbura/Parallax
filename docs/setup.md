@@ -141,6 +141,55 @@ Workable choices:
    help.
 4. **The public IP itself.** Simplest; re-export configs if it changes.
 
+## The home's public IP (guests with `internet`)
+
+A guest template with `internet` reaches public addresses only. Your own
+public IP is public too, but your router hairpins traffic sent to it back
+into your port forwards, so a guest would reach the services its grants
+leave out. Parallax drops it for those templates, and for that it has to
+know it. Templates with `all_networks` reach your networks anyway and keep
+it.
+
+It finds it, in order:
+
+1. `server.public_ip.address`, if you set one. No lookup at all.
+2. The endpoint, if it's a public IPv4 address.
+3. The endpoint's hostname through `server.dns.public_resolver`. Only an
+   answer that is one public address counts. Parallax trusts that resolver:
+   one that answers your hostname with some other public address (a block
+   page) gets that address dropped instead of yours. If yours might, set
+   the address.
+4. Encrypted DNS (DNS over HTTPS), if you turn it on; see below.
+
+The daemon looks at startup, every 5 minutes, and when you change one of
+these settings, and re-applies when the address changes. If every way
+fails, it keeps the last address it found (across restarts too) and logs
+why. `parallax status` shows the address; `parallax doctor` warns while
+it's unknown.
+
+### When your resolver rewrites your own hostname
+
+If `public_resolver` is your router and it answers your endpoint's
+hostname with the LAN address (a wildcard such as `*.example.com ->
+192.168.1.5`, or split horizon), step 3 can't work, and if your network
+also blocks outbound DNS to anything but the router, no plain lookup can.
+Either set the address, or let Parallax ask an encrypted DNS provider over
+HTTPS (port 443):
+
+```toml
+[server.public_ip]
+encrypted_dns = ["quad9", "cloudflare"]
+```
+
+It's off by default. When on, the provider learns that your gateway looked
+up your endpoint's hostname, from your public IP, every 5 minutes, and only
+when everything before it failed. Providers are asked one after another,
+never at once, so the second sees the question only when the first fails.
+Quad9 is the better first choice: it records no client IP addresses.
+Cloudflare truncates them and deletes them within 25 hours. Both are reached
+by IP address, so there's no lookup before the lookup, and their
+certificates are checked against `server.proxy.upstream_ca`.
+
 ## Public names and `dns.public`
 
 Parallax's DNS server answers each template only the names it may reach: the

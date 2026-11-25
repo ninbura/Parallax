@@ -13,7 +13,9 @@
 #           same prefix as home; WireGuard interfaces wgp (personal), wgf (family)
 #           and wgx (friend)
 #   foreign 192.168.1.5   the foreign host (same address as home's) + foreign DNS
-#   net     the internet: 9.9.9.9 (a public server and the public resolver) and
+#   net     the internet: 9.9.9.9 (a public server and the public resolver),
+#           1.2.3.4 (stands in for the home's public IP, which the router would
+#           hairpin back into the home) and
 #           10.99.0.5 (a private subnet the router knows but Parallax doesn't, like
 #           another VLAN)
 #   ctr     172.17.0.2, a "container" behind the gateway's Docker bridge
@@ -29,8 +31,10 @@
 # (i) nothing else on the gateway, its Docker bridge or the public address,
 # (j) IPv6 from a peer is dropped, (k) a revoked grant cuts open connections,
 # (l) DNS answers each tier only its names, and no private address outside the
-# configured networks, (m) large DNS answers, (n) the daemon tears down on SIGTERM,
-# re-applies on SIGHUP and repairs a deleted table. Every change goes through the
+# configured networks, (m) large DNS answers, (o) guests with internet can't reach
+# the home's public IP, and a lookup answered with a private address is refused,
+# (n) the daemon tears down on SIGTERM, re-applies on SIGHUP and repairs a deleted
+# table, and keeps the home's public IP across the restart. Every change goes through the
 # daemon and takes effect without SIGHUP.
 set -euo pipefail
 
@@ -94,6 +98,7 @@ inns foreign ip addr add 192.168.1.5/24 dev lan0; inns foreign ip link set lan0 
 inns net ip addr add 198.51.100.2/24 dev up0; inns net ip link set up0 up
 inns net ip addr add 9.9.9.9/32 dev lo
 inns net ip addr add 10.99.0.5/32 dev lo
+inns net ip addr add 1.2.3.4/32 dev lo
 inns ctr ip addr add 172.17.0.2/16 dev eth0; inns ctr ip link set eth0 up
 inns ctr ip route add default via 172.17.0.1
 inns gw sysctl -qw net.ipv4.ip_forward=1
@@ -167,6 +172,7 @@ echo_server gw 7000
 serve foreign 0.0.0.0 443 foreign-immich
 serve net 9.9.9.9 80 internet
 serve net 10.99.0.5 80 vlan
+serve net 1.2.3.4 80 home-public
 serve ctr 0.0.0.0 80 container
 # Home DNS: authoritative-ish answers for mydomain.com (big.mydomain.com has 40
 # addresses, more than a 512-byte UDP answer holds); foreign DNS for hisdomain.com;
@@ -315,7 +321,7 @@ mkclient wgp "$WORK/laptop.conf" 10.8.1.1
 mkclient wgf "$WORK/guest.conf" 10.8.2.1
 mkclient wgx "$WORK/friend.conf" 10.8.3.1
 # Split tunnel routes for the laptop: virtual range, the gateway and the test's internet hosts.
-for dst in 198.18.1.0/24 10.8.0.1/32 9.9.9.9/32 10.99.0.5/32; do
+for dst in 198.18.1.0/24 10.8.0.1/32 9.9.9.9/32 10.99.0.5/32 1.2.3.4/32; do
     inns client ip route add $dst dev wgp src 10.8.1.1
 done
 # Guest and friend send everything through their tunnel (full tunnel), in their own
@@ -588,6 +594,46 @@ inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydoma
 [ "$(short_as $LAPTOP big.mydomain.com +tcp | grep -c '^198\.18\.1\.')" = 40 ] || fail "(m) big.mydomain.com over TCP"
 pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rewritten"
 
+# (o) the home's public IP: guests with internet drop it (the router would hairpin it
+# back into the home); the owner's all_networks template doesn't. The endpoint here
+# is a documentation address, so not the public IP; a fixed address counts the moment
+# it's saved. A hostname is looked up and re-applied when it changes; an answer with
+# a private address is refused, and the last address found stays.
+public_ip_is() { # address
+    for _ in $(seq 50); do $P status | grep -qx "home public IP: $1" && return 0; sleep 0.1; done
+    $P status; return 1
+}
+$P status | grep -q "home public IP" && fail "(o) the private endpoint was taken as the public IP"
+grep -q "the endpoint 203.0.113.1:51820 is not a public address" "$WORK/daemon.log" \
+    || fail "(o) the daemon did not say why the public IP is unknown"
+$P config export > "$WORK/public-ip.toml"
+sed -i 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' "$WORK/public-ip.toml"
+apply "$WORK/public-ip.toml"
+public_ip_is 1.2.3.4 || fail "(o) a saved public_ip.address is not in effect"
+[ "$(curl_as $FRIEND http://1.2.3.4/)" = BLOCKED ] || fail "(o) friend reached the home's public IP"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(o) friend lost the internet"
+[ "$(curl_as $LAPTOP http://1.2.3.4/)" = home-public ] || fail "(o) personal (all_networks) can't reach the home's public IP"
+# A hostname the public resolver answers with 9.9.9.9 (dnsmasq answers all of example.org).
+sed -e '/^address = "1.2.3.4"$/d' -e 's/^endpoint = .*/endpoint = "home.example.org:51820"/' \
+    "$WORK/public-ip.toml" > "$WORK/public-ip-name.toml"
+apply "$WORK/public-ip-name.toml"
+public_ip_is 9.9.9.9 || fail "(o) the endpoint's hostname was not looked up"
+for _ in $(seq 50); do grep -q "applying (the home's public IP changed)" "$WORK/daemon.log" && break; sleep 0.1; done
+grep -q "applying (the home's public IP changed)" "$WORK/daemon.log" || fail "(o) no re-apply for the looked-up address"
+sleep 0.3
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(o) friend reached the looked-up public IP"
+[ "$(curl_as $FRIEND http://1.2.3.4/)" = home-public ] || fail "(o) the old address is still dropped"
+sed -e 's/^endpoint = .*/endpoint = "rebind.example.org:51820"/' \
+    "$WORK/public-ip-name.toml" > "$WORK/public-ip-rebind.toml"
+apply "$WORK/public-ip-rebind.toml"
+for _ in $(seq 50); do grep -q "isn't a public address" "$WORK/daemon.log" && break; sleep 0.1; done
+grep -q "rebind.example.org through 9.9.9.9: answered 192.168.1.5, which isn't a public address" "$WORK/daemon.log" \
+    || fail "(o) a private answer was not refused"
+grep -q "keeping the last known 9.9.9.9" "$WORK/daemon.log" || fail "(o) the last known address was not kept"
+public_ip_is 9.9.9.9 || fail "(o) the address changed after a refused answer"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(o) friend reached the home's public IP after a refused lookup"
+pass "(o) guests drop the home's public IP: configured, looked up and re-applied on change; a private answer is refused"
+
 # (n) the daemon's lifecycle: SIGTERM takes the gateway down and removes the socket;
 # a new daemon re-applies on SIGHUP and puts back a table someone deleted.
 DAEMON=$(cat "$WORK/daemon.pid")
@@ -602,6 +648,9 @@ start_daemon 1
 # wg0 is new: the clients' sessions are gone until they handshake again (up to ~15 s).
 for _ in $(seq 10); do [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] && break; done
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after a restart"
+# The lookup still fails (see (o)); the address from before the restart stays.
+public_ip_is 9.9.9.9 || fail "(n) the home's public IP was lost in the restart"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(n) friend reached the home's public IP after a restart"
 before=$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log" || true)
 kill -HUP "$(cat "$WORK/daemon.pid")"
 for _ in $(seq 50); do [ "$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log")" -gt "$before" ] && break; sleep 0.1; done

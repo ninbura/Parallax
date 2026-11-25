@@ -14,11 +14,14 @@ use crate::model::*;
 use crate::netmap::Mapping;
 use crate::{Error, Result, TAILSCALE_CGNAT};
 
-/// A validated configuration plus the evaluation date (for peer expiry).
+/// A validated configuration plus what generation needs from outside it:
+/// the evaluation date (for peer expiry) and the home's public IP (for the
+/// guest hairpin drop).
 #[derive(Debug, Clone)]
 pub struct Model<'a> {
     config: &'a Config,
     today: Date,
+    public_ip: Option<Ipv4Addr>,
     warnings: Vec<String>,
 }
 
@@ -148,11 +151,23 @@ impl<'a> Model<'a> {
             Ok(Model {
                 config,
                 today,
+                public_ip: None,
                 warnings,
             })
         } else {
             Err(Error::Invalid(errors))
         }
+    }
+
+    /// The home's public IP, as last found ([`crate::public_ip`]). Guest
+    /// tiers with `internet` drop traffic to it; `None` adds no rule.
+    pub fn with_public_ip(mut self, public_ip: Option<Ipv4Addr>) -> Self {
+        self.public_ip = public_ip;
+        self
+    }
+
+    pub fn public_ip(&self) -> Option<Ipv4Addr> {
+        self.public_ip
     }
 
     pub fn config(&self) -> &'a Config {
@@ -509,6 +524,21 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                 "server.backup.{field} {} must be an absolute path",
                 path.display()
             ));
+        }
+    }
+
+    let public_ip = &server.public_ip;
+    if let Some(address) = public_ip.address {
+        if !crate::public_ip::is_public(address) {
+            errors.push(format!(
+                "server.public_ip.address {address} is not a public address; give the home's public IPv4 address, or leave it out to look it up"
+            ));
+        }
+    }
+    let mut seen_providers = BTreeSet::new();
+    for p in &public_ip.encrypted_dns {
+        if !seen_providers.insert(p) {
+            errors.push(format!("server.public_ip.encrypted_dns lists '{p}' twice"));
         }
     }
 
@@ -957,6 +987,25 @@ mod tests {
         let cfg = canonical_config();
         let (errors, _) = check(&cfg);
         assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn public_ip_must_be_public_and_providers_unique() {
+        let errors =
+            errors_of(|c| c.server.public_ip.address = Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(
+            has(
+                &errors,
+                "server.public_ip.address 192.168.1.1 is not a public address"
+            ),
+            "{errors:?}"
+        );
+        let errors = errors_of(|c| c.server.public_ip.address = Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(errors.is_empty(), "{errors:?}");
+        let errors = errors_of(|c| {
+            c.server.public_ip.encrypted_dns = vec![EncryptedDns::Quad9, EncryptedDns::Quad9]
+        });
+        assert!(has(&errors, "lists 'quad9' twice"), "{errors:?}");
     }
 
     fn errors_of(mutate: impl FnOnce(&mut Config)) -> Vec<String> {

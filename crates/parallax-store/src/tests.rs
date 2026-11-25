@@ -61,6 +61,11 @@ pub(crate) fn everything_config() -> Config {
         encrypt: false,
         passphrase_file: "/root/backup.passphrase".into(),
     };
+    c.server.public_ip = PublicIpServer {
+        address: Some(Ipv4Addr::new(1, 2, 3, 4)),
+        // Not in declaration order: the order is the try order.
+        encrypted_dns: vec![EncryptedDns::Cloudflare, EncryptedDns::Quad9],
+    };
     c.networks.push(Network {
         name: "lab".into(),
         interface: "eth1".into(),
@@ -390,6 +395,31 @@ async fn a_database_from_before_backups_gets_their_defaults() {
     assert_eq!(store.schema_version().await.unwrap(), LATEST);
     let loaded = store.load().await.unwrap();
     assert_eq!(loaded.server, canonical_config().server);
+}
+
+#[tokio::test]
+async fn the_public_ip_is_kept_apart_from_the_configuration() {
+    let dir = TempDir::new();
+    let mut store = Store::create(&dir.db()).await.unwrap();
+    store.save(&canonical_config()).await.unwrap();
+    assert_eq!(store.public_ip().await.unwrap(), None);
+    store
+        .set_public_ip(Ipv4Addr::new(1, 2, 3, 4))
+        .await
+        .unwrap();
+    store
+        .set_public_ip(Ipv4Addr::new(1, 2, 3, 5))
+        .await
+        .unwrap();
+    // Saving the configuration leaves it alone.
+    store.save(&canonical_config()).await.unwrap();
+    drop(store);
+    let mut store = Store::open(&dir.db()).await.unwrap();
+    assert_eq!(
+        store.public_ip().await.unwrap(),
+        Some(Ipv4Addr::new(1, 2, 3, 5))
+    );
+    assert_eq!(store.load().await.unwrap(), canonical_config());
 }
 
 #[tokio::test]

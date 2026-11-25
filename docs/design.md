@@ -379,7 +379,17 @@ on SIGHUP, when the UTC date changes, and when the live table or WireGuard
 interface differs from the listing taken after the last apply (checked every
 60 s). A failed apply is retried every tick. It serves DNS and the proxy,
 runs automatic backups, and listens on `/run/parallax/parallax.sock` for the
-CLI: one JSON request and one JSON reply per connection, `protocol: 1`. Saves
+CLI: one JSON request and one JSON reply per connection, `protocol: 2`. Saves
 carry the revision they were based on; an older one is refused and the CLI
 retries against the latest. With no daemon answering, the CLI opens the
 database itself. SIGTERM deletes the table and the interface.
+
+When a guest template has `internet`, the daemon also keeps the home's
+public IP (ADR 0008): it looks it up at startup, every 5 minutes and when a
+saved change alters what the lookup depends on, re-applies when it changes,
+and keeps the last one found in the `daemon_state` table. The address is an
+input to generation (`Model::with_public_ip`), like the date; it joins the
+`not_public` set those tiers' `internet` accept excludes, because the router
+would hairpin it back into the home. The lookup logic is `parallax_core::public_ip`,
+behind the `Resolver` trait in `io.rs`; `parallax_dns::Lookup` is the real
+one (plain DNS, and DNS over HTTPS by IP address).

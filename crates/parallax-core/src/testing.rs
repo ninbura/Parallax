@@ -51,6 +51,7 @@ pub fn canonical_config() -> Config {
             },
             proxy: ProxyServer::default(),
             backup: BackupServer::default(),
+            public_ip: PublicIpServer::default(),
             wan_interface: None,
         },
         networks: vec![Network {

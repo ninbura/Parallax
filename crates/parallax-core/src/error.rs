@@ -45,6 +45,10 @@ pub enum Error {
         stderr: String,
     },
 
+    /// A DNS lookup got no usable answer (timed out, refused, unreachable).
+    #[error("{0}")]
+    Lookup(String),
+
     /// The operation is defined by the design but not built in this milestone.
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),

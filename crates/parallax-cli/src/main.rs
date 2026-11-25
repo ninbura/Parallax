@@ -8,6 +8,7 @@
 //! commands open the database themselves.
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,7 +19,8 @@ use parallax_core::doctor::Outcome;
 use parallax_core::generate::{self, Export};
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
-use parallax_core::model::{Peer, Platform, TransportKind};
+use parallax_core::model::{Peer, Platform, ServerConfig, TransportKind};
+use parallax_core::public_ip;
 use parallax_core::secret::PrivateKey;
 use parallax_core::transport::{self, ProvisionOptions};
 use parallax_core::validate::ReachKind;
@@ -281,24 +283,40 @@ impl Ctx {
         }
     }
 
-    /// The configuration, and its revision when it came from the daemon.
-    /// The database is closed again before this returns.
-    fn load_revision(&self) -> anyhow::Result<(Config, Option<u64>)> {
+    /// The configuration, its revision when it came from the daemon, and
+    /// the home's public IP as last found. The database is closed again
+    /// before this returns.
+    fn load_full(&self) -> anyhow::Result<(Config, Option<u64>, Option<Ipv4Addr>)> {
         match self.ask(&Request::Load)? {
             Some(Reply::Configuration {
                 configuration,
                 revision,
-            }) => Ok((*configuration, Some(revision))),
+                public_ip,
+            }) => Ok((*configuration, Some(revision), public_ip)),
             Some(other) => Err(unexpected(other)),
             None => {
-                let config = block_on(async { Ok(self.open_store().await?.load().await?) })?;
-                Ok((config, None))
+                let (config, public_ip) = block_on(async {
+                    let mut store = self.open_store().await?;
+                    Ok((store.load().await?, store.public_ip().await?))
+                })?;
+                Ok((config, None, public_ip))
             }
         }
     }
 
+    fn load_revision(&self) -> anyhow::Result<(Config, Option<u64>)> {
+        let (config, revision, _) = self.load_full()?;
+        Ok((config, revision))
+    }
+
     pub(crate) fn load(&self) -> anyhow::Result<Config> {
         Ok(self.load_revision()?.0)
+    }
+
+    /// The configuration and the home's public IP: what generation needs.
+    pub(crate) fn load_for_generation(&self) -> anyhow::Result<(Config, Option<Ipv4Addr>)> {
+        let (config, _, public_ip) = self.load_full()?;
+        Ok((config, public_ip))
     }
 
     /// What the database holds: `None` before the first import. Any other
@@ -329,6 +347,7 @@ impl Ctx {
                 Some(Reply::Configuration {
                     configuration,
                     revision,
+                    ..
                 }) => (configuration, revision),
                 Some(other) => return Err(unexpected(other)),
                 None => {
@@ -453,16 +472,22 @@ pub(crate) fn preview(config: &Config, today: Date) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Generate, write and reconcile the live gateway. Returns the warnings and
-/// the apply log.
+/// Generate, write and reconcile the live gateway. `last_found` is the
+/// home's public IP as a lookup last found it. Returns the warnings and the
+/// apply log.
 pub(crate) fn apply_config(
     config: &Config,
     out: &Path,
     today: Date,
+    last_found: Option<Ipv4Addr>,
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
-    let model = Model::resolve(config, today).map_err(|e| anyhow!("{e}"))?;
+    let public_ip = public_ip::effective(&config.server, last_found);
+    let model = Model::resolve(config, today)
+        .map_err(|e| anyhow!("{e}"))?
+        .with_public_ip(public_ip);
     let mut bundle = generate::generate_all(&model, &RealFs)?;
     let mut warnings = std::mem::take(&mut bundle.warnings);
+    warnings.extend(public_ip_unknown(config, public_ip));
     warnings.extend(check_certificates(&model)?);
     let runner = RealRunner;
     let sys = System {
@@ -471,6 +496,33 @@ pub(crate) fn apply_config(
     };
     let report = parallax_core::apply::apply(&model, &bundle, out, sys)?;
     Ok((warnings, report.log))
+}
+
+/// Look up the home's public IP ([`parallax_core::public_ip`]). Blocks
+/// for up to a few seconds per nameserver it asks.
+pub(crate) fn find_public_ip(server: &ServerConfig) -> Result<public_ip::Found, Vec<String>> {
+    public_ip::find(
+        server,
+        &parallax_dns::Lookup::new(&server.proxy.upstream_ca),
+    )
+}
+
+/// Why a lookup failed, and what stays in effect.
+pub(crate) fn public_ip_lookup_failed(problems: &[String], known: Option<Ipv4Addr>) -> String {
+    let problems = problems.join("; ");
+    match known {
+        Some(ip) => {
+            format!("can't look up the home's public IP ({problems}); keeping the last known {ip}")
+        }
+        None => format!("can't look up the home's public IP ({problems})"),
+    }
+}
+
+/// Guests need the home's public IP and it was never found.
+fn public_ip_unknown(config: &Config, public_ip: Option<Ipv4Addr>) -> Option<String> {
+    (public_ip.is_none() && public_ip::needed(config)).then(|| {
+        "the home's public IP isn't known: until it is, guest templates with internet can reach the home through the router (hairpin). Set server.public_ip.address, or server.public_ip.encrypted_dns if your resolver rewrites your own hostname".to_string()
+    })
 }
 
 fn run() -> anyhow::Result<()> {
@@ -497,16 +549,18 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Doctor => doctor(&ctx)?,
         Command::Plan(out) => {
-            let config = ctx.load()?;
-            let model = resolve(&config)?;
+            let (config, last_found) = ctx.load_for_generation()?;
+            let public_ip = public_ip::effective(&config.server, last_found);
+            let model = resolve(&config)?.with_public_ip(public_ip);
             let bundle = generate::generate_all(&model, &fs)?;
             print_warnings(&check_certificates(&model)?);
             let plan = parallax_core::plan::plan(&bundle, &out.out, &fs)?;
             print!("{}", plan.render());
         }
         Command::Generate(out) => {
-            let config = ctx.load()?;
-            let model = resolve(&config)?;
+            let (config, last_found) = ctx.load_for_generation()?;
+            let public_ip = public_ip::effective(&config.server, last_found);
+            let model = resolve(&config)?.with_public_ip(public_ip);
             let bundle = generate::generate_all(&model, &fs)?;
             print_warnings(&bundle.warnings);
             parallax_core::plan::write_bundle(&bundle, &out.out, &fs)?;
@@ -530,7 +584,22 @@ fn run() -> anyhow::Result<()> {
                 let (warnings, log) = block_on(async {
                     let mut store = ctx.open_store().await?;
                     let config = store.load().await?;
-                    apply_config(&config, &out.out, today())
+                    let mut known = store.public_ip().await?;
+                    let mut notes = Vec::new();
+                    if public_ip::needed(&config) {
+                        match find_public_ip(&config.server) {
+                            Ok(found) => {
+                                if known != Some(found.address) {
+                                    store.set_public_ip(found.address).await?;
+                                    known = Some(found.address);
+                                }
+                            }
+                            Err(problems) => notes.push(public_ip_lookup_failed(&problems, known)),
+                        }
+                    }
+                    let (warnings, log) = apply_config(&config, &out.out, today(), known)?;
+                    notes.extend(warnings);
+                    anyhow::Ok((notes, log))
                 })?;
                 print_warnings(&warnings);
                 for line in log {
@@ -551,11 +620,15 @@ fn run() -> anyhow::Result<()> {
             Some(Reply::Status {
                 revision,
                 apply_error,
+                public_ip,
             }) => {
                 println!(
                     "daemon at {}: configuration revision {revision}",
                     ctx.socket.display()
                 );
+                if let Some(ip) = public_ip {
+                    println!("home public IP: {ip}");
+                }
                 match apply_error {
                     None => println!("last apply: ok"),
                     Some(e) => bail!("last apply failed: {e}"),
@@ -591,8 +664,16 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
         fs: &RealFs,
         runner: &runner,
     };
-    let config = ctx.load().map_err(|e| format!("{e:#}"));
-    let checks = parallax_core::doctor::diagnose(config.as_ref().map_err(Clone::clone), sys);
+    let loaded = ctx.load_for_generation().map_err(|e| format!("{e:#}"));
+    let config = loaded
+        .as_ref()
+        .map(|(config, _)| config)
+        .map_err(Clone::clone);
+    let mut checks = parallax_core::doctor::diagnose(config.clone(), sys);
+    if let Ok((config, last_found)) = &loaded {
+        let known = public_ip::effective(&config.server, *last_found);
+        checks.push(parallax_core::doctor::public_ip_check(config, known));
+    }
     let mut failed = 0;
     for check in &checks {
         match &check.outcome {

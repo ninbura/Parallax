@@ -50,7 +50,8 @@ socket.
 - **The socket** is `/run/parallax/parallax.sock` (`--socket`,
   `PARALLAX_SOCKET`): directory 0700, socket 0600, owned by the daemon's
   user. One JSON request and one JSON reply per connection, each a single
-  line of at most 16 MiB, each carrying `protocol: 1`; a mismatch is refused
+  line of at most 16 MiB, each carrying `protocol` (2 since the home's
+  public IP joined the replies, ADR 0008); a mismatch is refused
   naming both versions. Requests also name the database the caller means
   (`--db`); a daemon holding another one refuses them. Requests: `status`, `load`, `save` (a whole
   configuration plus the revision it was based on), `apply`,

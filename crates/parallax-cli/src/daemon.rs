@@ -7,6 +7,11 @@
 //! proxy run as tasks and re-read their routes after each apply. The CLI
 //! talks to it over a Unix socket ([`crate::protocol`]).
 //!
+//! When guest templates have `internet`, it looks up the home's public IP
+//! (for their hairpin drop) at startup, every 5 minutes, and when a saved
+//! change alters what the lookup depends on; it re-applies when the address
+//! changes, and keeps the last one found across restarts.
+//!
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
 //! arrive during an apply queue up, and a batch of them shares one apply.
@@ -16,6 +21,7 @@
 //! the database copy; its encryption and writing run on a backup thread of
 //! their own, so they never delay a save.
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +30,8 @@ use anyhow::{anyhow, bail, Context};
 use parallax_core::generate;
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::System;
-use parallax_core::model::ServerConfig;
+use parallax_core::model::{PublicIpServer, ServerConfig};
+use parallax_core::public_ip::{self, Found};
 use parallax_core::reconcile::{self, Reconciler};
 use parallax_core::secret::Secret;
 use parallax_core::Config;
@@ -51,6 +58,8 @@ pub struct Options {
 /// How often automatic backups are looked at; `backup create --if-due`
 /// decides whether one is due.
 const BACKUP_EVERY: Duration = Duration::from_secs(600);
+/// How often the home's public IP is looked up.
+const PUBLIC_IP_EVERY: Duration = Duration::from_secs(300);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -76,6 +85,8 @@ struct View {
     config: Arc<Config>,
     revision: u64,
     apply_error: Option<String>,
+    /// The home's public IP as last found.
+    public_ip: Option<Ipv4Addr>,
 }
 
 /// Work for the engine thread.
@@ -86,6 +97,8 @@ enum Msg {
     BackupTick,
     /// The DNS server and the proxy are up: notify these after each apply.
     Serving(Vec<Arc<Notify>>),
+    /// A lookup of the home's public IP finished, for these inputs.
+    PublicIp(Inputs, Result<Found, Vec<String>>),
     Shutdown,
 }
 
@@ -148,6 +161,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
         }
     };
     let _ = tx.send(Msg::Serving(reloaders));
+    let refresher = tokio::spawn(refresh_public_ip(tx.clone(), views.clone()));
     let server = tokio::spawn(accept(listener, tx.clone(), views, database));
     let timers = tokio::spawn(timers(tx.clone(), opts.reconcile_every));
     log(format!(
@@ -173,6 +187,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     log("shutting down");
     server.abort();
     timers.abort();
+    refresher.abort();
     // Only our own: another daemon may have bound the path since.
     if file_id(&opts.socket) == Some(socket_id) {
         if let Err(e) = std::fs::remove_file(&opts.socket) {
@@ -363,10 +378,12 @@ async fn dispatch(request: Request, tx: &mpsc::UnboundedSender<Msg>, views: &Vie
         Request::Status => Reply::Status {
             revision: view.revision,
             apply_error: view.apply_error,
+            public_ip: public_ip::effective(&view.config.server, view.public_ip),
         },
         Request::Load => Reply::Configuration {
             configuration: Box::new((*view.config).clone()),
             revision: view.revision,
+            public_ip: view.public_ip,
         },
         request => {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -403,6 +420,60 @@ async fn timers(tx: mpsc::UnboundedSender<Msg>, every: Duration) {
     }
 }
 
+/// What a public IP lookup depends on: a change to any of it looks again,
+/// and a result for other inputs than the current ones is stale.
+type Inputs = (bool, String, Ipv4Addr, PublicIpServer, PathBuf);
+
+fn lookup_inputs(config: &Config) -> Inputs {
+    (
+        public_ip::needed(config),
+        config.server.wireguard.endpoint.clone(),
+        config.server.dns.public_resolver,
+        config.server.public_ip.clone(),
+        config.server.proxy.upstream_ca.clone(),
+    )
+}
+
+/// Look up the home's public IP every [`PUBLIC_IP_EVERY`], and when a saved
+/// change alters what the lookup depends on. Startup has just looked. The
+/// lookup blocks for seconds, so it runs here, never on the engine thread.
+async fn refresh_public_ip(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
+    let mut every = tokio::time::interval(PUBLIC_IP_EVERY);
+    every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    every.tick().await;
+    let inputs = |views: &Views| views.borrow().as_ref().map(|v| lookup_inputs(&v.config));
+    let mut last = inputs(&views);
+    loop {
+        tokio::select! {
+            _ = every.tick() => {}
+            changed = views.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let now = inputs(&views);
+                if now == last {
+                    continue;
+                }
+                last = now;
+            }
+        }
+        let config = views.borrow().as_ref().map(|v| Arc::clone(&v.config));
+        let Some(config) = config.filter(|c| public_ip::needed(c)) else {
+            continue;
+        };
+        let asked = lookup_inputs(&config);
+        // A tick that won the race with a change has looked at it already.
+        last = Some(asked.clone());
+        let found =
+            tokio::task::spawn_blocking(move || crate::find_public_ip(&config.server)).await;
+        if let Ok(found) = found {
+            if tx.send(Msg::PublicIp(asked, found)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 fn engine_thread(
     db: &Path,
     out: PathBuf,
@@ -428,6 +499,10 @@ fn engine_thread(
             return;
         }
     };
+    if public_ip::needed(&engine.view.config) {
+        let found = crate::find_public_ip(&engine.view.config.server);
+        engine.note_public_ip(found);
+    }
     // A failed first apply leaves the host as it is (nothing here was set
     // up yet, as far as this process knows); Docker restarts and tries again.
     if let Err(e) = engine.first_apply() {
@@ -486,6 +561,12 @@ struct Engine {
     /// The backup thread's queue.
     backups: std::sync::mpsc::Sender<BackupJob>,
     reloaders: Vec<Arc<Notify>>,
+    /// Why the last public IP lookup failed, so the same failure is
+    /// logged once, not every 5 minutes.
+    public_ip_problems: Option<Vec<String>>,
+    /// The database holds `view.public_ip`; false after a failed write, so
+    /// the next lookup writes it again.
+    public_ip_saved: bool,
 }
 
 impl Engine {
@@ -507,6 +588,7 @@ impl Engine {
             e => e.into(),
         })?;
         let config = rt.block_on(store.load())?;
+        let public_ip = rt.block_on(store.public_ip())?;
         let engine = Engine {
             rt,
             store,
@@ -515,6 +597,7 @@ impl Engine {
                 // Random, so a revision from before a restart never matches.
                 revision: rand::random::<u64>() >> 1,
                 apply_error: None,
+                public_ip,
             },
             publish,
             out,
@@ -522,6 +605,8 @@ impl Engine {
             applied: None,
             reloaders: Vec::new(),
             backups,
+            public_ip_problems: None,
+            public_ip_saved: true,
         };
         engine.publish();
         Ok(engine)
@@ -600,6 +685,18 @@ impl Engine {
                 Msg::Tick => tick = true,
                 Msg::BackupTick => backup_due = true,
                 Msg::Serving(reloaders) => self.reloaders = reloaders,
+                // A save changed the inputs while this lookup ran: the
+                // lookup for the new ones is already on its way.
+                Msg::PublicIp(asked, _) if asked != lookup_inputs(&self.view.config) => {}
+                Msg::PublicIp(_, found) => {
+                    let server = &self.view.config.server;
+                    let before = public_ip::effective(server, self.view.public_ip);
+                    self.note_public_ip(found);
+                    let server = &self.view.config.server;
+                    if public_ip::effective(server, self.view.public_ip) != before {
+                        why.get_or_insert("the home's public IP changed");
+                    }
+                }
                 Msg::Shutdown => {}
             }
         }
@@ -632,7 +729,7 @@ impl Engine {
     fn apply(&mut self, why: &str) -> (Vec<String>, Option<String>) {
         log(format!("applying ({why})"));
         let today = crate::today();
-        match crate::apply_config(&self.view.config, &self.out, today) {
+        match crate::apply_config(&self.view.config, &self.out, today, self.view.public_ip) {
             Ok((warnings, applied)) => {
                 let lines: Vec<String> = warnings
                     .into_iter()
@@ -656,6 +753,44 @@ impl Engine {
                 self.reconciler.failed();
                 self.set_apply_error(Some(e.clone()));
                 (Vec::new(), Some(e))
+            }
+        }
+    }
+
+    /// Take a lookup's result: a new address is published and remembered
+    /// in the database; a failure is logged once.
+    fn note_public_ip(&mut self, found: Result<Found, Vec<String>>) {
+        match found {
+            Ok(found) => {
+                self.public_ip_problems = None;
+                let changed = self.view.public_ip != Some(found.address);
+                if changed {
+                    log(format!(
+                        "the home's public IP is {} (from {})",
+                        found.address, found.source
+                    ));
+                    self.view.public_ip = Some(found.address);
+                    self.publish();
+                }
+                if changed || !self.public_ip_saved {
+                    let saved = self.rt.block_on(self.store.set_public_ip(found.address));
+                    if let Err(e) = &saved {
+                        warn(format!(
+                            "warning: could not remember the home's public IP in the database {}: {e}",
+                            self.store.path().display()
+                        ));
+                    }
+                    self.public_ip_saved = saved.is_ok();
+                }
+            }
+            Err(problems) => {
+                if self.public_ip_problems.as_ref() != Some(&problems) {
+                    warn(format!(
+                        "warning: {}",
+                        crate::public_ip_lookup_failed(&problems, self.view.public_ip)
+                    ));
+                    self.public_ip_problems = Some(problems);
+                }
             }
         }
     }

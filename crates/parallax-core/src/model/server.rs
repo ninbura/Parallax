@@ -21,6 +21,8 @@ pub struct ServerConfig {
     pub proxy: ProxyServer,
     #[serde(default)]
     pub backup: BackupServer,
+    #[serde(default)]
+    pub public_ip: PublicIpServer,
     /// Interface with the default route, used by `internet` grants. Defaults
     /// to the first network's interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,7 +186,8 @@ pub struct ProxyServer {
     /// `privkey.pem` is one certificate, so certbot's `live/<name>` works.
     #[serde(default = "default_proxy_certificates")]
     pub certificates: PathBuf,
-    /// CA bundle that upstream certificates are verified against.
+    /// CA bundle that upstream certificates are verified against, and the
+    /// encrypted DNS providers' of `server.public_ip`.
     #[serde(default = "default_upstream_ca")]
     pub upstream_ca: PathBuf,
 }
@@ -263,6 +266,83 @@ fn default_backup_keep() -> u32 {
 }
 fn default_passphrase_file() -> PathBuf {
     PathBuf::from("/etc/parallax/backup.passphrase")
+}
+
+/// How the gateway learns the home's public IPv4 address, which guest tiers
+/// with `internet` may not reach: through the router it would hairpin back
+/// to the home's port forwards. Only looked up when such a template exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicIpServer {
+    /// A fixed public IP: no lookup at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<Ipv4Addr>,
+    /// Encrypted DNS providers asked for the endpoint's hostname, in order,
+    /// when `server.dns.public_resolver` answers with no public address
+    /// (a resolver that rewrites your own hostname to the LAN address).
+    /// Empty: never asked.
+    #[serde(default)]
+    pub encrypted_dns: Vec<EncryptedDns>,
+}
+
+/// A DNS-over-HTTPS provider, reached by IP address so no lookup comes first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptedDns {
+    /// Quad9: records no client IP addresses (<https://quad9.net/privacy/policy/>).
+    Quad9,
+    /// Cloudflare 1.1.1.1: truncates client IP addresses and deletes them
+    /// within 25 hours
+    /// (<https://developers.cloudflare.com/1.1.1.1/privacy/public-dns-resolver/>).
+    Cloudflare,
+}
+
+impl EncryptedDns {
+    pub const ALL: [EncryptedDns; 2] = [EncryptedDns::Quad9, EncryptedDns::Cloudflare];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EncryptedDns::Quad9 => "quad9",
+            EncryptedDns::Cloudflare => "cloudflare",
+        }
+    }
+
+    /// The provider's addresses, tried in order.
+    pub fn addresses(self) -> &'static [Ipv4Addr] {
+        const QUAD9: [Ipv4Addr; 2] = [Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(149, 112, 112, 112)];
+        const CLOUDFLARE: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(1, 0, 0, 1)];
+        match self {
+            EncryptedDns::Quad9 => &QUAD9,
+            EncryptedDns::Cloudflare => &CLOUDFLARE,
+        }
+    }
+
+    /// The name its certificate is checked against.
+    pub fn tls_name(self) -> &'static str {
+        match self {
+            EncryptedDns::Quad9 => "dns.quad9.net",
+            EncryptedDns::Cloudflare => "cloudflare-dns.com",
+        }
+    }
+}
+
+impl std::fmt::Display for EncryptedDns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for EncryptedDns {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> crate::Result<Self> {
+        EncryptedDns::ALL
+            .into_iter()
+            .find(|p| p.as_str() == s)
+            .ok_or_else(|| crate::Error::Malformed {
+                what: "encrypted DNS provider",
+                detail: format!("'{s}' is not one of quad9, cloudflare"),
+            })
+    }
 }
 
 /// A period of whole minutes, written `30m`, `6h` or `1d`.

@@ -147,7 +147,8 @@ impl Store {
                     proxy_listen, proxy_port, proxy_certificates, proxy_upstream_ca,
                     wan_interface,
                     backup_directory, backup_automatic, backup_interval, backup_keep,
-                    backup_encrypt, backup_passphrase_file
+                    backup_encrypt, backup_passphrase_file,
+                    public_ip_address, public_ip_encrypted_dns
                  FROM server WHERE id = 1",
                 Vec::new(),
             )
@@ -199,6 +200,15 @@ impl Store {
                 },
                 encrypt: r.get(25)?,
                 passphrase_file: PathBuf::from(r.get::<String>(26)?),
+            },
+            public_ip: PublicIpServer {
+                address: parse_opt(at, "public ip address", r.get(27)?)?,
+                encrypted_dns: r
+                    .get::<String>(28)?
+                    .split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| parse(at, "public ip encrypted dns", p))
+                    .collect::<Result<_>>()?,
             },
             wan_interface: r.get(20)?,
         }))
@@ -260,6 +270,20 @@ impl Store {
                 (
                     "backup_passphrase_file",
                     path("server.backup.passphrase_file", &b.passphrase_file)?,
+                ),
+                (
+                    "public_ip_address",
+                    s.public_ip.address.map(|a| a.to_string()).into(),
+                ),
+                (
+                    "public_ip_encrypted_dns",
+                    s.public_ip
+                        .encrypted_dns
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                        .into(),
                 ),
             ],
         )
