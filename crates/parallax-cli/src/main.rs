@@ -487,7 +487,9 @@ fn print_export(export: &Export) {
 /// plainly what's missing before the proxy is handed routes it would refuse.
 /// Returns warnings about unreadable certificates.
 fn check_certificates(model: &Model<'_>) -> anyhow::Result<Vec<String>> {
-    Ok(parallax_proxy::preflight(&generate::proxy::build(model))?)
+    Ok(parallax_proxy::preflight(
+        &generate::proxy::certificate_check(model),
+    )?)
 }
 
 /// Everything short of writing: validate, generate, check certificates.

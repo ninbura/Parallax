@@ -178,11 +178,13 @@ pub fn check_save(
 ) -> Result<Resolved, Vec<String>> {
     let mut resolved = known.clone();
     let mut failed = Vec::new();
-    // Names `old` already had but never found are an old problem: the
-    // regular lookups keep trying them.
+    // Names `old` already had keep what they have; one never found is an
+    // old problem, and the regular lookups keep trying it. Every other name
+    // is asked now, even if an answer for it is lying around (from a
+    // configuration a restore replaced).
     let had = old.map(used).unwrap_or_default();
     for name in used(new) {
-        if resolved.contains_key(name) || had.contains(name) {
+        if had.contains(name) {
             continue;
         }
         match lookup(new, resolver, name) {
@@ -357,6 +359,16 @@ mod tests {
             err[0].contains("resolved to 192.168.1.9, outside every configured network"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_name_new_to_the_configuration_is_always_asked() {
+        // Left over from a configuration a restore replaced.
+        let stale: Resolved = [(NAS.to_string(), vec![Ipv4Addr::new(192, 168, 1, 99)])].into();
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
+        let resolved = check_save(Some(&canonical_config()), &named(), &r, &stale).unwrap();
+        assert_eq!(resolved[NAS], [nas_addr()]);
+        assert_eq!(r.asked.borrow().len(), 1);
     }
 
     #[test]

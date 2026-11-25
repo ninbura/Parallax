@@ -116,8 +116,8 @@ enum Msg {
     Serving(Vec<Arc<Notify>>),
     /// A lookup of the home's public IP finished, for these inputs.
     PublicIp(Inputs, Result<Found, Vec<String>>),
-    /// The named hosts were looked up.
-    Names(Refreshed),
+    /// The named hosts were looked up, for these inputs.
+    Names(NameInputs, Refreshed),
     Shutdown,
 }
 
@@ -537,11 +537,12 @@ async fn refresh_names(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
         let Some(view) = view.filter(|v| !names::used(&v.config).is_empty()) else {
             continue;
         };
-        last = Some(name_inputs(&view.config));
+        let asked = name_inputs(&view.config);
+        last = Some(asked.clone());
         let found =
             tokio::task::spawn_blocking(move || crate::find_names(&view.config, &view.names)).await;
         if let Ok(found) = found {
-            if tx.send(Msg::Names(found)).is_err() {
+            if tx.send(Msg::Names(asked, found)).is_err() {
                 return;
             }
         }
@@ -779,7 +780,10 @@ impl Engine {
                         why.get_or_insert("the home's public IP changed");
                     }
                 }
-                Msg::Names(found) => {
+                // The names, their resolvers or the networks changed while
+                // these lookups ran: the lookups for the new ones are coming.
+                Msg::Names(asked, _) if asked != name_inputs(&self.view.config) => {}
+                Msg::Names(_, found) => {
                     if self.note_names(found) {
                         why.get_or_insert("a named host's address changed");
                     }
@@ -882,8 +886,8 @@ impl Engine {
         }
     }
 
-    /// Take the name lookups' results. A save may have looked up names
-    /// while they ran: those it found stay, and names no longer used go.
+    /// Take the name lookups' results, for the configuration as it is. A
+    /// save that added a name looked it up itself; that answer stays.
     /// Returns whether an address changed.
     fn note_names(&mut self, found: Refreshed) -> bool {
         if found.problems != self.name_problems {
