@@ -109,7 +109,9 @@ masquerade = false
 # snippet for the vhost, because L3 rules gate the port, not the virtual host.
 # `host` is the real address, or a DNS name under a network's domains: the
 # gateway looks it up through that network's upstream_dns and grants what it
-# resolves to (only addresses inside a configured network).
+# resolves to (only addresses inside a configured network, or the home's
+# public IP for a service behind a port forward: there one port per grant,
+# and web ports only as a service with `hostnames`).
 [[service]]
 name = "immich"
 host = "192.168.1.5"

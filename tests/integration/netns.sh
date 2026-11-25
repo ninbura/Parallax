@@ -33,7 +33,8 @@
 # (l) DNS answers each tier only its names, and no private address outside the
 # configured networks, (m) large DNS answers, (o) guests with internet can't reach
 # the home's public IP, and a lookup answered with a private address is refused,
-# (p) hosts granted by DNS name are looked up on save and bad ones refused,
+# (p) hosts granted by DNS name are looked up on save and bad ones refused, (q) names
+# on the home's public IP reach one port forward each, or HTTPS through the proxy,
 # (n) the daemon tears down on SIGTERM, re-applies on SIGHUP and repairs a deleted
 # table, and keeps the home's public IP across the restart. Every change goes through the
 # daemon and takes effect without SIGHUP.
@@ -114,7 +115,7 @@ mkdir -p "$WORK/ca" "$WORK/certs/immich.mydomain.com"
         -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign
     openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
         -subj /CN=immich.mydomain.com -keyout leaf.key -out leaf.csr
-    printf 'subjectAltName=DNS:immich.mydomain.com,DNS:other.mydomain.com\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n' > leaf.ext
+    printf 'subjectAltName=DNS:immich.mydomain.com,DNS:other.mydomain.com,DNS:public.mydomain.com\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n' > leaf.ext
     openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 \
         -extfile leaf.ext -out leaf.pem
 ) >/dev/null 2>&1 || fail "could not make the test certificates"
@@ -174,6 +175,23 @@ serve foreign 0.0.0.0 443 foreign-immich
 serve net 9.9.9.9 80 internet
 serve net 10.99.0.5 80 vlan
 serve net 1.2.3.4 80 home-public
+serve net 1.2.3.4 8080 home-public-other
+# A web server behind the home's public IP (a port forward), with every site on it.
+inns net python3 - "$WORK/ca/leaf.pem" "$WORK/ca/leaf.key" <<'PY' &
+import sys, ssl, http.server
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        body = ("forwarded-" + (self.headers.get("Host") or "").split(":")[0]).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.ThreadingHTTPServer(("1.2.3.4", 443), H)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+PIDS+=($!)
 serve ctr 0.0.0.0 80 container
 # Home DNS: authoritative-ish answers for mydomain.com (big.mydomain.com has 40
 # addresses, more than a 512-byte UDP answer holds); foreign DNS for hisdomain.com;
@@ -184,6 +202,7 @@ inns home dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.
     --address=/immich.mydomain.com/192.168.1.5 --address=/other.mydomain.com/192.168.1.5 \
     --host-record=vlan.mydomain.com,10.99.0.5 --host-record=vlan.mydomain.com,192.168.1.6 \
     --host-record=web.mydomain.com,192.168.1.5 --host-record=away.mydomain.com,10.99.0.5 \
+    --host-record=game.mydomain.com,1.2.3.4 --host-record=public.mydomain.com,1.2.3.4 \
     "${BIG[@]}" >/dev/null 2>&1 &
 PIDS+=($!)
 inns net dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=9.9.9.9 --bind-interfaces \
@@ -696,5 +715,45 @@ grep -q 'applying (the live' "$WORK/daemon.log" || fail "(n) the repair was not 
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(n) guest grants after the repair"
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after the repair"
 pass "(n) SIGTERM tears down; SIGHUP re-applies; a deleted table comes back on its own"
+
+# (q) names on the home's public IP are port forwards: friend (full tunnel, internet,
+# which drops the public IP) reaches the one port it's granted there, and HTTPS by name
+# through the proxy, which connects to the public IP itself. A host grant there (every
+# port) and a raw web port are refused.
+$P config export > "$WORK/current.toml"
+sed -e 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' \
+    -e '0,/^\[\[template\]\]$/s//[[service]]\nname = "forwarded"\nhost = "public.mydomain.com"\nport = 443\nhostnames = ["public.mydomain.com"]\n\n&/' \
+    "$WORK/current.toml" > "$WORK/forward-base.toml"
+grep -q '^address = "1.2.3.4"$' "$WORK/forward-base.toml" && grep -q '^name = "forwarded"$' "$WORK/forward-base.toml" \
+    || fail "(q) could not write the test configuration"
+forward() { # extra friend grants -> a config file
+    sed "s/^grants = \[{ kind = \"internet\" }\]\$/grants = [{ kind = \"internet\" }, $1]/" \
+        "$WORK/forward-base.toml" > "$WORK/forward.toml"
+    grep -qF "$1" "$WORK/forward.toml" || fail "(q) could not grant friend $1"
+    echo "$WORK/forward.toml"
+}
+apply "$(forward '{ kind = "host_port", host = "game.mydomain.com", port = 8080 }, { kind = "service", name = "forwarded" }')"
+# Friend's session may still be handshaking with the daemon (n) restarted.
+for _ in $(seq 10); do [ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] && break; done
+$P status | grep -qx "name game.mydomain.com: 1.2.3.4" || { $P status; fail "(q) game.mydomain.com was not looked up"; }
+[ "$(curl_as $FRIEND http://1.2.3.4:8080/)" = home-public-other ] || fail "(q) friend -> the granted port forward"
+[ "$(curl_as $FRIEND http://1.2.3.4/)" = BLOCKED ] || fail "(q) friend reached another port on the public IP"
+[ "$(short_as $FRIEND game.mydomain.com)" = 1.2.3.4 ] || fail "(q) friend could not look up the forwarded name"
+[ "$(https_as $FRIEND public.mydomain.com 1.2.3.4)" = forwarded-public.mydomain.com ] \
+    || fail "(q) friend -> HTTPS by name through the proxy to the public IP"
+[ "$(https_as $FRIEND other.mydomain.com 1.2.3.4)" = BLOCKED ] || fail "(q) friend reached another site behind the forward"
+[ "$(https_as $FRIEND other.mydomain.com 1.2.3.4 -k)" = BLOCKED ] || fail "(q) friend reached another site (no verify)"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(q) friend lost the internet"
+refused_forward() { # grant, what the refusal must say
+    if $P config import "$(forward "$1")" > "$WORK/forward.err" 2>&1; then
+        fail "(q) a save granting friend $1 was accepted"
+    fi
+    grep -qF "$2" "$WORK/forward.err" || { cat "$WORK/forward.err"; fail "(q) the refusal of $1 doesn't say why"; }
+}
+refused_forward '{ kind = "host", host = "game.mydomain.com" }' "every port there is a port forward"
+refused_forward '{ kind = "host_port", host = "game.mydomain.com", port = 80 }' "grant it as a service with hostnames"
+apply "$WORK/forward-base.toml"
+[ "$(curl_as $FRIEND http://1.2.3.4:8080/)" = BLOCKED ] || fail "(q) the port forward outlived its grant"
+pass "(q) names on the home's public IP: one granted port, HTTPS by name through the proxy; all ports and raw web refused"
 
 echo "ALL PASS"

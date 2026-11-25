@@ -46,6 +46,15 @@ pub enum ReachKind<'a> {
         /// never forwarded directly.
         proxied: bool,
     },
+    /// A port forward on the home's public IP, granted by a name that
+    /// resolves there: out the WAN interface, which the router hairpins
+    /// back in. Always one port ([`crate::names::public_ip_refusal`]).
+    HomePublic {
+        address: Ipv4Addr,
+        port: (Proto, u16),
+        /// Through the HTTPS proxy, which connects to it itself.
+        proxied: bool,
+    },
     Internet,
 }
 
@@ -57,7 +66,9 @@ impl Reach<'_> {
                 Some(m) => m.net_to_virtual(*real).unwrap_or(*real),
                 None => *real,
             }),
-            ReachKind::Internet => None,
+            // Clients reach the public IP over their own internet unless
+            // they send everything through the tunnel.
+            ReachKind::HomePublic { .. } | ReachKind::Internet => None,
         }
     }
 }
@@ -113,7 +124,7 @@ fn network_of_host<'a>(config: &'a Config, host: &Host) -> Option<&'a Network> {
 /// on the box too. Hosts compare as written: a name and an address for the
 /// same machine don't match.
 fn reaches_web_directly(config: &Config, grant: &Grant, host: &Host) -> bool {
-    let web = |proto: Proto, port: u16| port == 443 || (proto == Proto::Tcp && port == 80);
+    let web = names::is_web;
     match grant {
         Grant::AllNetworks => true,
         Grant::Network { name } => network_of_host(config, host).is_some_and(|n| &n.name == name),
@@ -221,19 +232,59 @@ impl<'a> Model<'a> {
 
     /// Hosts named by DNS name that grant nothing right now, and why.
     pub fn name_problems(&self) -> Vec<String> {
-        names::problems(self.config, &self.names)
+        names::problems(self.config, self.public_ip, &self.names)
     }
 
     /// The real addresses `host` stands for: itself, or what its name
-    /// resolved to when that answer is allowed.
+    /// resolved to when that answer is allowed (inside a configured network,
+    /// or the home's public IP).
     pub fn addresses(&self, host: &Host) -> Vec<Ipv4Addr> {
         match host {
             Host::Ip(ip) => vec![*ip],
             Host::Name(name) => match self.names.get(name) {
-                Some(found) if names::refused(self.config, name, found).is_none() => found.clone(),
+                Some(found)
+                    if names::refused(self.config, self.public_ip, name, found).is_none() =>
+                {
+                    found.clone()
+                }
                 _ => Vec::new(),
             },
         }
+    }
+
+    /// The reach for `port` on `ip`, an address `host` stands for: on the
+    /// network that holds it, or a port forward on the home's public IP
+    /// when `template` may have that one.
+    fn reach_at(
+        &self,
+        template: &Template,
+        label: String,
+        ip: Ipv4Addr,
+        port: Option<(Proto, u16)>,
+        proxied: bool,
+    ) -> Option<Reach<'a>> {
+        if let Some(network) = self.network_containing(ip) {
+            return Some(Reach {
+                label,
+                kind: ReachKind::Lan {
+                    network,
+                    real: Ipv4Net::from(ip),
+                    port,
+                    proxied,
+                },
+            });
+        }
+        let port = port.filter(|_| Some(ip) == self.public_ip)?;
+        names::public_ip_refusal(template, Some(port), proxied)
+            .is_none()
+            .then_some(Reach {
+                label,
+                kind: ReachKind::HomePublic {
+                    address: ip,
+                    port,
+                    proxied,
+                },
+            })
     }
 
     pub fn config(&self) -> &'a Config {
@@ -341,47 +392,34 @@ impl<'a> Model<'a> {
                 }
                 Grant::Host { host } => {
                     for ip in self.addresses(host) {
-                        if let Some(n) = self.network_containing(ip) {
-                            push(Reach {
-                                label: host_label(host, ip, ""),
-                                kind: ReachKind::Lan {
-                                    network: n,
-                                    real: Ipv4Net::from(ip),
-                                    port: None,
-                                    proxied: false,
-                                },
-                            });
+                        // Never all ports of the home's public IP: `reach_at`
+                        // gives a port forward one port at a time.
+                        if let Some(r) =
+                            self.reach_at(template, host_label(host, ip, ""), ip, None, false)
+                        {
+                            push(r);
                         }
                     }
                 }
                 Grant::HostPort { host, proto, port } => {
                     for ip in self.addresses(host) {
-                        if let Some(n) = self.network_containing(ip) {
-                            push(Reach {
-                                label: host_label(host, ip, &format!(" {}/{port}", proto.as_str())),
-                                kind: ReachKind::Lan {
-                                    network: n,
-                                    real: Ipv4Net::from(ip),
-                                    port: Some((*proto, *port)),
-                                    proxied: false,
-                                },
-                            });
+                        let label = host_label(host, ip, &format!(" {}/{port}", proto.as_str()));
+                        if let Some(r) =
+                            self.reach_at(template, label, ip, Some((*proto, *port)), false)
+                        {
+                            push(r);
                         }
                     }
                 }
                 Grant::Service { name } => {
                     if let Some(s) = self.config.service(name) {
                         for ip in self.addresses(&s.host) {
-                            if let Some(n) = self.network_containing(ip) {
-                                push(Reach {
-                                    label: format!("service {}", s.name),
-                                    kind: ReachKind::Lan {
-                                        network: n,
-                                        real: Ipv4Net::from(ip),
-                                        port: Some((s.proto, s.port)),
-                                        proxied: s.is_proxied(),
-                                    },
-                                });
+                            let label = format!("service {}", s.name);
+                            let port = Some((s.proto, s.port));
+                            if let Some(r) =
+                                self.reach_at(template, label, ip, port, s.is_proxied())
+                            {
+                                push(r);
                             }
                         }
                     }
@@ -419,7 +457,7 @@ impl<'a> Model<'a> {
             ReachKind::Lan { real, port: p, .. } => {
                 real.contains(&host) && p.is_none_or(|(pr, po)| pr == proto && po == port)
             }
-            ReachKind::Internet => false,
+            ReachKind::HomePublic { .. } | ReachKind::Internet => false,
         })
     }
 

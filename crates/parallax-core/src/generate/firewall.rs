@@ -228,33 +228,56 @@ fn internet_is_public_only(template: &Template) -> bool {
 /// Client-side addresses (virtual where mapped) whose `tcp/443` this
 /// template's tiers send to the HTTPS proxy: each proxied service it's
 /// granted, unless another grant already reaches that host's 443 directly.
+/// A service on the home's public IP is always redirected: nothing reaches
+/// web ports there directly.
 fn proxy_redirects(model: &Model<'_>, template: &Template) -> Vec<ProxyRedirect> {
     let mut out: Vec<ProxyRedirect> = Vec::new();
     for r in model.reaches(template) {
-        let ReachKind::Lan {
-            real,
-            port,
-            proxied: true,
-            ..
-        } = r.kind
-        else {
-            continue;
-        };
-        // Proxied services are validated to be tcp/443.
-        if port.is_some_and(|(proto, p)| model.reaches_directly(template, real.addr(), proto, p)) {
-            continue;
-        }
-        if let Some(client) = r.client_net() {
-            if !out.iter().any(|p| p.client == client) {
-                out.push(ProxyRedirect {
-                    client,
-                    port,
-                    label: r.label,
-                });
+        let (client, port) = match r.kind {
+            ReachKind::Lan {
+                real,
+                port,
+                proxied: true,
+                ..
+            } => {
+                // Proxied services are validated to be tcp/443.
+                if port.is_some_and(|(proto, p)| {
+                    model.reaches_directly(template, real.addr(), proto, p)
+                }) {
+                    continue;
+                }
+                let Some(client) = r.client_net() else {
+                    continue;
+                };
+                (client, port)
             }
+            ReachKind::HomePublic {
+                address,
+                port,
+                proxied: true,
+            } => (Ipv4Net::from(address), Some(port)),
+            _ => continue,
+        };
+        if !out.iter().any(|p| p.client == client) {
+            out.push(ProxyRedirect {
+                client,
+                port,
+                label: r.label,
+            });
         }
     }
     out
+}
+
+/// Some template reaches a port forward on the home's public IP directly:
+/// that goes out the WAN interface, masqueraded like internet traffic.
+fn any_home_public(model: &Model<'_>) -> bool {
+    model.config().templates.iter().any(|t| {
+        model
+            .reaches(t)
+            .iter()
+            .any(|r| matches!(r.kind, ReachKind::HomePublic { proxied: false, .. }))
+    })
 }
 
 struct ProxyRedirect {
@@ -298,7 +321,9 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         }
     }
     let configured: Vec<Ipv4Net> = cfg.networks.iter().map(|n| n.subnet.trunc()).collect();
-    let internet = model.any_internet_grant();
+    // Traffic out the WAN interface: `internet`, or a port forward on the
+    // home's public IP. Both are masqueraded, and both need `lan_real`.
+    let internet = model.any_internet_grant() || any_home_public(model);
     if internet {
         rs.sets.push(AddressSet {
             name: LAN_SET.into(),
@@ -463,6 +488,30 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                     .dst(Match::Cidr(*real))
                     .l4(*port),
                 ),
+                // Like the proxy, a port forward reached through it gets no
+                // direct accept.
+                ReachKind::HomePublic { proxied: true, .. } => {}
+                ReachKind::HomePublic {
+                    address,
+                    port,
+                    proxied: false,
+                } => {
+                    if let Some(wan) = model.wan_interface() {
+                        rs.rules.push(
+                            Rule::new(
+                                Chain::Tier(i),
+                                Action::Accept,
+                                format!(
+                                    "{}: {} (a port forward on the home's public IP)",
+                                    t.name, r.label
+                                ),
+                            )
+                            .oif(wan)
+                            .dst(Match::Cidr(Ipv4Net::from(*address)))
+                            .l4(Some(*port)),
+                        );
+                    }
+                }
                 ReachKind::Internet => {
                     if let Some(wan) = model.wan_interface() {
                         let (not, label) = if internet_is_public_only(t) {

@@ -388,6 +388,82 @@ fn named_hosts_get_what_they_resolved_to() {
 }
 
 #[test]
+fn names_on_the_home_public_ip_are_port_forwards() {
+    // A guest with full tunnel and internet: a game server's port and an
+    // HTTPS service by name, both behind port forwards on the public IP.
+    let mut cfg = canonical_config();
+    cfg.services[0].host = Host::Name("immich.mydomain.com".into());
+    cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
+    let family = &mut cfg.templates[1];
+    family.grants.push(Grant::HostPort {
+        host: Host::Name("game.mydomain.com".into()),
+        proto: Proto::Udp,
+        port: 25565,
+    });
+    family.grants.push(Grant::Internet);
+    family.client.allowed_ips = parallax_core::model::AllowedIpsStrategy::FullTunnel;
+    let home = std::net::Ipv4Addr::new(1, 2, 3, 4);
+    let names: parallax_core::names::Resolved = [
+        ("immich.mydomain.com".to_string(), vec![home]),
+        ("game.mydomain.com".to_string(), vec![home]),
+    ]
+    .into();
+    let model = Model::resolve(&cfg, today())
+        .unwrap()
+        .with_public_ip(Some(home))
+        .with_names(names.clone());
+    assert!(
+        model.name_problems().is_empty(),
+        "{:?}",
+        model.name_problems()
+    );
+    let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    check_golden("variants/home-public-names.nft", &fw.contents);
+    let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
+    check_golden("variants/home-public-names-routes.toml", &routes.contents);
+    // The game port: accepted out the WAN, masqueraded; still in not_public.
+    assert!(fw.contents.contains(
+        "oifname \"eth0\" ip daddr 1.2.3.4 udp dport 25565 accept comment \"family: host game.mydomain.com (1.2.3.4) udp/25565 (a port forward on the home's public IP)\""
+    ), "{}", fw.contents);
+    // HTTPS by name: redirected to the proxy, which connects to the public IP.
+    assert!(fw.contents.contains(
+        "iifname \"wg0\" ip saddr 10.8.2.0/24 ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
+    ), "{}", fw.contents);
+    assert!(
+        routes.contents.contains("upstream = \"1.2.3.4:443\""),
+        "{}",
+        routes.contents
+    );
+    // Nothing else on the public IP: no all-ports accept.
+    assert!(
+        !fw.contents.contains("ip daddr 1.2.3.4 accept"),
+        "{}",
+        fw.contents
+    );
+    // Without `internet` the forward still goes out masqueraded.
+    cfg.templates[1].grants.retain(|g| *g != Grant::Internet);
+    let model = Model::resolve(&cfg, today())
+        .unwrap()
+        .with_public_ip(Some(home))
+        .with_names(names);
+    let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    assert!(
+        fw.contents
+            .contains("ip daddr 1.2.3.4 udp dport 25565 accept"),
+        "{}",
+        fw.contents
+    );
+    assert!(
+        fw.contents
+            .contains("masquerade comment \"internet egress\""),
+        "{}",
+        fw.contents
+    );
+}
+
+#[test]
 fn generation_is_deterministic() {
     let cfg = canonical_config();
     assert_eq!(bundle_for(&cfg), bundle_for(&cfg));

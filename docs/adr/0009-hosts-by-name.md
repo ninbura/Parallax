@@ -1,6 +1,6 @@
 # ADR 0009: Hosts by DNS name
 
-Status: accepted (step 7a).
+Status: accepted (step 7a; the home's public IP since 7a.2).
 
 ## Decision
 
@@ -21,8 +21,27 @@ home's DNS stays the only place a machine's address is written down.
   already sends the zone to, so the gateway and its clients see the same
   answer.
 - **Allowed answers.** Every address must be inside a configured network's
-  real subnet; otherwise the whole answer is refused. A changed or spoofed
-  answer can't open a host Parallax doesn't know about.
+  real subnet, or be the home's public IP (ADR 0008); otherwise the whole
+  answer is refused. A changed or spoofed answer can't open a host Parallax
+  doesn't know about.
+- **The home's public IP is port forwards.** A name that resolves there is
+  a service the router forwards in (no local path or record). Every port
+  there may lead to a different machine, and a web port to every site
+  behind one nginx. So for a template without `all_networks` (which
+  reaches the home anyway):
+  - only one port at a time: a `host` grant there is refused;
+  - no raw web ports (tcp/80, tcp/443, udp/443): web traffic must be a
+    service with `hostnames`, so the HTTPS proxy checks the name and
+    connects to the public IP itself.
+
+  A granted port gets an accept to the public IP out the WAN interface,
+  masqueraded; the router hairpins it to the forward. That's what a guest
+  with full tunnel needs: it otherwise drops the address (ADR 0008). DNS
+  passes the public answer unchanged, so a split-tunnel guest connects
+  over its own internet and the gateway isn't involved (the forward is
+  public anyway). Client configs never route the public IP: it changes.
+  When it does, the old address stops counting as home at once, and the
+  name is looked up again.
 - **An input to generation.** The addresses are passed in
   (`Model::with_names`), like the date and the home's public IP, so the
   ruleset stays deterministic and tests need no DNS. A name with several
@@ -67,6 +86,12 @@ home's DNS stays the only place a machine's address is written down.
   minutes either way.
 - **Refusing every save while a name can't be looked up.** It would lock the
   operator out of unrelated changes whenever the home resolver is down.
+- **Any public address.** A name could point at a VPS too, but then a
+  spoofed answer could open any host on the internet to a guest. Only the
+  home's own address, which Parallax already tracks, is allowed.
+- **Answering a tunnel address for names on the public IP**, so every
+  guest's traffic reaches the gateway. Split-tunnel guests reach the
+  forward anyway, and it would mean rewriting public answers.
 - **Matching a name and an address for the same machine** in the warning
   about grants that bypass the HTTPS proxy. Hosts are compared as written;
   doing it by resolved address would make a validation warning depend on DNS.
