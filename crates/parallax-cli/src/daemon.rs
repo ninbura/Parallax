@@ -964,6 +964,15 @@ impl Engine {
             message: format!("{e:#}"),
         };
         crate::check(&config).map_err(refuse)?;
+        // A name may point at the home's public IP. Nothing looked for it
+        // while nothing needed it, so look before telling where a new name
+        // points (a few seconds at most, and only then).
+        let had = names::used(&self.view.config);
+        if names::used(&config).iter().any(|n| !had.contains(n))
+            && public_ip::effective(&config.server, self.view.public_ip).is_none()
+        {
+            self.note_public_ip(crate::find_public_ip(&config.server));
+        }
         // Blocks this thread for a new name's lookup only (a few seconds at
         // most): known names aren't asked again.
         let resolved = names::check_save(

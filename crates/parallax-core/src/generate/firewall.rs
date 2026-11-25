@@ -228,8 +228,8 @@ fn internet_is_public_only(template: &Template) -> bool {
 /// Client-side addresses (virtual where mapped) whose `tcp/443` this
 /// template's tiers send to the HTTPS proxy: each proxied service it's
 /// granted, unless another grant already reaches that host's 443 directly.
-/// A service on the home's public IP is always redirected: nothing reaches
-/// web ports there directly.
+/// A service on the home's public IP likewise, unless the owner's
+/// `internet` reaches it anyway.
 fn proxy_redirects(model: &Model<'_>, template: &Template) -> Vec<ProxyRedirect> {
     let mut out: Vec<ProxyRedirect> = Vec::new();
     for r in model.reaches(template) {
@@ -255,7 +255,12 @@ fn proxy_redirects(model: &Model<'_>, template: &Template) -> Vec<ProxyRedirect>
                 address,
                 port,
                 proxied: true,
-            } => (Ipv4Net::from(address), Some(port)),
+            } => {
+                if model.reaches_directly(template, address, port.0, port.1) {
+                    continue;
+                }
+                (Ipv4Net::from(address), Some(port))
+            }
             _ => continue,
         };
         if !out.iter().any(|p| p.client == client) {

@@ -263,28 +263,31 @@ impl<'a> Model<'a> {
         port: Option<(Proto, u16)>,
         proxied: bool,
     ) -> Option<Reach<'a>> {
-        if let Some(network) = self.network_containing(ip) {
-            return Some(Reach {
-                label,
-                kind: ReachKind::Lan {
-                    network,
-                    real: Ipv4Net::from(ip),
-                    port,
-                    proxied,
-                },
-            });
+        // First, even where a configured network holds it: the public IP's
+        // rules must apply wherever it is.
+        if Some(ip) == self.public_ip {
+            // Every port of it is never one reach.
+            let port = port?;
+            return names::public_ip_refusal(template, Some(port), proxied)
+                .is_none()
+                .then_some(Reach {
+                    label,
+                    kind: ReachKind::HomePublic {
+                        address: ip,
+                        port,
+                        proxied,
+                    },
+                });
         }
-        let port = port.filter(|_| Some(ip) == self.public_ip)?;
-        names::public_ip_refusal(template, Some(port), proxied)
-            .is_none()
-            .then_some(Reach {
-                label,
-                kind: ReachKind::HomePublic {
-                    address: ip,
-                    port,
-                    proxied,
-                },
-            })
+        self.network_containing(ip).map(|network| Reach {
+            label,
+            kind: ReachKind::Lan {
+                network,
+                real: Ipv4Net::from(ip),
+                port,
+                proxied,
+            },
+        })
     }
 
     pub fn config(&self) -> &'a Config {
@@ -452,12 +455,25 @@ impl<'a> Model<'a> {
         proto: Proto,
         port: u16,
     ) -> bool {
+        // The owner's `internet` (with `all_networks`) reaches the home's
+        // public IP like any public address.
+        if Some(host) == self.public_ip
+            && template.grants.contains(&Grant::AllNetworks)
+            && template.grants.contains(&Grant::Internet)
+        {
+            return true;
+        }
         self.reaches(template).iter().any(|r| match &r.kind {
-            ReachKind::Lan { proxied: true, .. } => false,
+            ReachKind::Lan { proxied: true, .. } | ReachKind::HomePublic { proxied: true, .. } => {
+                false
+            }
             ReachKind::Lan { real, port: p, .. } => {
                 real.contains(&host) && p.is_none_or(|(pr, po)| pr == proto && po == port)
             }
-            ReachKind::HomePublic { .. } | ReachKind::Internet => false,
+            ReachKind::HomePublic {
+                address, port: p, ..
+            } => *address == host && *p == (proto, port),
+            ReachKind::Internet => false,
         })
     }
 

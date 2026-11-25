@@ -441,6 +441,31 @@ fn names_on_the_home_public_ip_are_port_forwards() {
         "{}",
         fw.contents
     );
+    // The owner's template (all_networks + internet) reaches the public IP
+    // anyway: granting it the service adds no redirect to the proxy.
+    let mut owner = cfg.clone();
+    owner.templates[0].grants.push(Grant::Internet);
+    owner.templates[0].grants.push(Grant::Service {
+        name: "immich".into(),
+    });
+    let model = Model::resolve(&owner, today())
+        .unwrap()
+        .with_public_ip(Some(home))
+        .with_names(names.clone());
+    let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    assert!(
+        !fw.contents
+            .contains("ip saddr 10.8.1.0/24 ip daddr 1.2.3.4 tcp dport 443 dnat"),
+        "{}",
+        fw.contents
+    );
+    let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
+    assert!(
+        !routes.contents.contains("10.8.1.0/24"),
+        "{}",
+        routes.contents
+    );
     // Without `internet` the forward still goes out masqueraded.
     cfg.templates[1].grants.retain(|g| *g != Grant::Internet);
     let model = Model::resolve(&cfg, today())
