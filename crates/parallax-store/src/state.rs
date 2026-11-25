@@ -86,7 +86,8 @@ impl Store {
                 Vec::new(),
             )
             .await?;
-            for (name, addresses) in names {
+            // A name without addresses is one never found: nothing to keep.
+            for (name, addresses) in names.iter().filter(|(_, a)| !a.is_empty()) {
                 let value = addresses
                     .iter()
                     .map(Ipv4Addr::to_string)

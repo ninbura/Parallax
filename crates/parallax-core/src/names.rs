@@ -182,9 +182,15 @@ pub fn check_save(
     // old problem, and the regular lookups keep trying it. Every other name
     // is asked now, even if an answer for it is lying around (from a
     // configuration a restore replaced).
+    // A known answer `new` no longer allows (its network was renumbered in
+    // this change) is asked again too.
     let had = old.map(used).unwrap_or_default();
     for name in used(new) {
-        if had.contains(name) {
+        let still_fine = match known.get(name) {
+            Some(addresses) => refused(new, name, addresses).is_none(),
+            None => true,
+        };
+        if had.contains(name) && still_fine {
             continue;
         }
         match lookup(new, resolver, name) {
@@ -354,7 +360,13 @@ mod tests {
         new.networks[0].subnet = "192.168.2.0/24".parse().unwrap();
         new.networks[0].upstream_dns = vec![Ipv4Addr::new(192, 168, 2, 1)];
         new.services[0].host = Host::Ip(Ipv4Addr::new(192, 168, 2, 5));
-        let err = check_save(Some(&old), &new, &FakeResolver::new(), &known).unwrap_err();
+        // Asked again, DNS still has the old address.
+        let r = FakeResolver::new().answer(
+            NAS,
+            Nameserver::Plain(Ipv4Addr::new(192, 168, 2, 1)),
+            &[nas_addr()],
+        );
+        let err = check_save(Some(&old), &new, &r, &known).unwrap_err();
         assert!(
             err[0].contains("resolved to 192.168.1.9, outside every configured network"),
             "{err:?}"
@@ -369,6 +381,21 @@ mod tests {
         let resolved = check_save(Some(&canonical_config()), &named(), &r, &stale).unwrap();
         assert_eq!(resolved[NAS], [nas_addr()]);
         assert_eq!(r.asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn renumbering_a_network_looks_its_names_up_again() {
+        let old = named();
+        let known: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
+        let mut new = old.clone();
+        new.networks[0].subnet = "192.168.2.0/24".parse().unwrap();
+        new.services[0].host = Host::Ip(Ipv4Addr::new(192, 168, 2, 5));
+        let moved = Ipv4Addr::new(192, 168, 2, 9);
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[moved]);
+        assert_eq!(
+            check_save(Some(&old), &new, &r, &known).unwrap()[NAS],
+            [moved]
+        );
     }
 
     #[test]

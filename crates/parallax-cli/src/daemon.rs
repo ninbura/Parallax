@@ -668,7 +668,10 @@ impl Engine {
         })?;
         let config = rt.block_on(store.load())?;
         let public_ip = rt.block_on(store.public_ip())?;
-        let names = rt.block_on(store.names())?;
+        let mut names = rt.block_on(store.names())?;
+        // A name the configuration stopped using offline isn't news.
+        let used = names::used(&config);
+        names.retain(|name, _| used.contains(name.as_str()));
         let engine = Engine {
             rt,
             store,
@@ -1053,7 +1056,13 @@ impl Engine {
             // The rows just copied in: what the database now holds.
             anyhow::Ok((lines, restored))
         })?;
+        // What the restored configuration doesn't use goes; the lookups for
+        // what it adds follow.
+        let used = names::used(&config);
+        let mut resolved = self.view.names.clone();
+        resolved.retain(|name, _| used.contains(name.as_str()));
         self.replace(config);
+        self.remember_names(resolved);
         Ok(lines)
     }
 

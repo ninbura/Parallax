@@ -205,7 +205,12 @@ impl<'a> Model<'a> {
 
     /// What hosts named by DNS name resolved to ([`crate::names`]). A name
     /// missing here, or whose answer isn't allowed, grants nothing.
-    pub fn with_names(mut self, names: Resolved) -> Self {
+    pub fn with_names(mut self, mut names: Resolved) -> Self {
+        // Sorted, so output is the same however the caller built them.
+        for addresses in names.values_mut() {
+            addresses.sort();
+            addresses.dedup();
+        }
         self.names = names;
         self
     }
