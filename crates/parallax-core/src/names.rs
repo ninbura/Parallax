@@ -17,10 +17,11 @@
 //!   template that doesn't reach it anyway (`all_networks` + `internet`) gets
 //!   no `host` grant there, and web ports only as an HTTPS service with
 //!   `hostnames` ([`public_ip_refusal`]).
-//! - **The last good answer stays.** A lookup that fails or is refused
-//!   keeps the addresses found before, and says why. Never fall open, never
-//!   drop a rule silently.
-//! - **Never found** means the grant gives nothing yet, with a warning.
+//! - **Only the latest answer counts.** A lookup that fails, comes back
+//!   empty or is refused leaves the name granting nothing until it resolves
+//!   again, with a warning saying why. An old answer is never kept: a name
+//!   that's gone may have been dropped on purpose, and its address may now
+//!   belong to something else.
 //! - **A save can't add a problem** ([`check_save`]): a new name must
 //!   resolve, and a change mustn't leave a known address outside every
 //!   network. Problems that were already there don't block unrelated
@@ -170,48 +171,30 @@ pub fn lookup(
 /// The outcome of looking every name up.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Refreshed {
-    /// What to use: new answers, or the last good ones where a lookup failed.
+    /// The names that resolved to allowed addresses.
     pub resolved: Resolved,
-    /// Why each failed lookup failed, and what stays in effect.
+    /// Why each other name didn't.
     pub problems: Vec<String>,
 }
 
-/// Look up every name the configuration uses. `known` is what was found
-/// before; names the configuration no longer uses are forgotten.
-pub fn refresh(
-    config: &Config,
-    public_ip: Option<Ipv4Addr>,
-    resolver: &dyn Resolver,
-    known: &Resolved,
-) -> Refreshed {
+/// Look up every name the configuration uses.
+pub fn refresh(config: &Config, public_ip: Option<Ipv4Addr>, resolver: &dyn Resolver) -> Refreshed {
     let mut out = Refreshed::default();
     for name in used(config) {
         match lookup(config, public_ip, resolver, name) {
             Ok(addresses) => {
                 out.resolved.insert(name.to_string(), addresses);
             }
-            // An answer the configuration no longer allows (the public IP
-            // moved) isn't worth keeping: it gives nothing.
-            Err(why) => match known
-                .get(name)
-                .filter(|a| refused(config, public_ip, name, a).is_none())
-            {
-                Some(addresses) => {
-                    out.problems
-                        .push(format!("{why}; keeping the last known {}", list(addresses)));
-                    out.resolved.insert(name.to_string(), addresses.clone());
-                }
-                None => out.problems.push(format!(
-                    "{why}; grants on it give nothing until it resolves"
-                )),
-            },
+            Err(why) => out.problems.push(format!(
+                "{why}; grants on it give nothing until it resolves"
+            )),
         }
     }
     out
 }
 
 /// What's wrong with the names of `config` given what they resolved to:
-/// names never found, known addresses no longer allowed (a network or the
+/// names that didn't resolve, answers no longer allowed (a network or the
 /// public IP changed since), and grants the home's public IP doesn't take
 /// ([`public_ip_refusal`]). Each problem names what stays in effect.
 pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolved) -> Vec<String> {
@@ -219,7 +202,7 @@ pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolve
         .into_iter()
         .filter_map(|name| match resolved.get(name) {
             None => Some(format!(
-                "{name} hasn't been found yet; grants on it give nothing until it resolves"
+                "{name} didn't resolve; grants on it give nothing until it does"
             )),
             Some(addresses) => refused(config, public_ip, name, addresses)
                 .map(|why| format!("{why}; grants on it give nothing")),
@@ -404,33 +387,22 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_lookup_keeps_the_last_good_answer() {
+    fn a_name_that_doesnt_resolve_gives_nothing() {
         let cfg = named();
-        let known: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
-        let r = FakeResolver::new().answer(NAS, home_dns(), &[Ipv4Addr::new(1, 2, 3, 4)]);
-        let out = refresh(&cfg, None, &r, &known);
-        assert_eq!(out.resolved, known);
-        assert!(
-            out.problems[0].ends_with("keeping the last known 192.168.1.9"),
-            "{:?}",
-            out.problems
-        );
-        // Never found: nothing to keep.
-        let out = refresh(&cfg, None, &FakeResolver::new(), &Resolved::new());
-        assert!(out.resolved.is_empty());
-        assert!(
-            out.problems[0].contains("give nothing"),
-            "{:?}",
-            out.problems
-        );
-    }
-
-    #[test]
-    fn names_no_longer_used_are_forgotten() {
-        let known: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
-        let out = refresh(&canonical_config(), None, &FakeResolver::new(), &known);
-        assert!(out.resolved.is_empty());
-        assert!(out.problems.is_empty());
+        let ok = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
+        assert_eq!(refresh(&cfg, None, &ok).resolved[NAS], [nas_addr()]);
+        // Refused, gone (an empty answer), or no answer at all: no address
+        // from an earlier lookup stands in.
+        for r in [
+            FakeResolver::new().answer(NAS, home_dns(), &[Ipv4Addr::new(1, 2, 3, 4)]),
+            FakeResolver::new().answer(NAS, home_dns(), &[]),
+            FakeResolver::new(),
+        ] {
+            let out = refresh(&cfg, None, &r);
+            assert!(out.resolved.is_empty(), "{out:?}");
+            assert!(out.problems[0].ends_with("grants on it give nothing until it resolves"));
+        }
+        assert!(refresh(&canonical_config(), None, &ok).problems.is_empty());
     }
 
     #[test]
@@ -586,7 +558,7 @@ mod tests {
         let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
         let moved = Some(Ipv4Addr::new(1, 2, 3, 5));
         let r = FakeResolver::new().answer(NAS, home_dns(), &[HOME]);
-        let out = refresh(&old, moved, &r, &known);
+        let out = refresh(&old, moved, &r);
         assert!(out.resolved.is_empty(), "the old answer gives nothing now");
         assert!(
             out.problems[0].ends_with("until it resolves"),

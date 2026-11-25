@@ -11,9 +11,10 @@
 //! (for their hairpin drop) at startup, every 5 minutes, and when a saved
 //! change alters what the lookup depends on; it re-applies when the address
 //! changes, and keeps the last one found across restarts. Hosts named by
-//! DNS name are looked up the same way, right after startup and every 5
-//! minutes; a save that adds a name looks it up before saving, and refuses
-//! the change if it doesn't resolve ([`parallax_core::names`]).
+//! DNS name are looked up right after startup, every 5 minutes and when
+//! they change; only the latest answer counts. A save that adds a name looks
+//! it up before saving, and refuses the change if it doesn't resolve
+//! ([`parallax_core::names`]).
 //!
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
@@ -543,7 +544,7 @@ async fn refresh_names(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
         last = Some(asked.clone());
         let found = tokio::task::spawn_blocking(move || {
             let home = public_ip::effective(&view.config.server, view.public_ip);
-            crate::find_names(&view.config, home, &view.names)
+            crate::find_names(&view.config, home)
         })
         .await;
         if let Ok(found) = found {
@@ -649,8 +650,6 @@ struct Engine {
     public_ip_saved: bool,
     /// Why the last name lookups failed, logged once.
     name_problems: Vec<String>,
-    /// The database holds `view.names`; false after a failed write.
-    names_saved: bool,
 }
 
 impl Engine {
@@ -673,10 +672,6 @@ impl Engine {
         })?;
         let config = rt.block_on(store.load())?;
         let public_ip = rt.block_on(store.public_ip())?;
-        let mut names = rt.block_on(store.names())?;
-        // A name the configuration stopped using offline isn't news.
-        let used = names::used(&config);
-        names.retain(|name, _| used.contains(name.as_str()));
         let engine = Engine {
             rt,
             store,
@@ -686,7 +681,9 @@ impl Engine {
                 revision: rand::random::<u64>() >> 1,
                 apply_error: None,
                 public_ip,
-                names,
+                // Looked up right after the first apply: an answer from
+                // before a restart may be stale.
+                names: Resolved::new(),
             },
             publish,
             out,
@@ -697,7 +694,6 @@ impl Engine {
             public_ip_problems: None,
             public_ip_saved: true,
             name_problems: Vec::new(),
-            names_saved: true,
         };
         engine.publish();
         Ok(engine)
@@ -894,9 +890,9 @@ impl Engine {
         }
     }
 
-    /// Take the name lookups' results, for the configuration as it is. A
-    /// save that added a name looked it up itself; that answer stays.
-    /// Returns whether an address changed.
+    /// Take the name lookups' results, for the configuration as it is:
+    /// what they found replaces what was there, and a name that didn't
+    /// resolve grants nothing. Returns whether anything changed.
     fn note_names(&mut self, found: Refreshed) -> bool {
         if found.problems != self.name_problems {
             for problem in &found.problems {
@@ -904,37 +900,30 @@ impl Engine {
             }
             self.name_problems = found.problems;
         }
-        let mut resolved = self.view.names.clone();
-        resolved.extend(found.resolved);
-        let used = names::used(&self.view.config);
-        resolved.retain(|name, _| used.contains(name.as_str()));
-        self.remember_names(resolved)
+        self.set_names(found.resolved)
     }
 
-    /// Publish `resolved` and keep it in the database. Returns whether
-    /// anything changed.
-    fn remember_names(&mut self, resolved: Resolved) -> bool {
-        let changed = resolved != self.view.names;
-        if changed {
-            for (name, addresses) in &resolved {
-                if self.view.names.get(name) != Some(addresses) {
-                    log(format!("{name} is {}", names::list(addresses)));
-                }
-            }
-            self.view.names = resolved;
-            self.publish();
+    /// Publish what the names resolve to now. Returns whether it changed.
+    fn set_names(&mut self, resolved: Resolved) -> bool {
+        if resolved == self.view.names {
+            return false;
         }
-        if changed || !self.names_saved {
-            let saved = self.rt.block_on(self.store.set_names(&self.view.names));
-            if let Err(e) = &saved {
-                warn(format!(
-                    "warning: could not remember the named hosts' addresses in the database {}: {e}",
-                    self.store.path().display()
-                ));
+        for (name, addresses) in &resolved {
+            if self.view.names.get(name) != Some(addresses) {
+                log(format!("{name} is {}", names::list(addresses)));
             }
-            self.names_saved = saved.is_ok();
         }
-        changed
+        for name in self
+            .view
+            .names
+            .keys()
+            .filter(|n| !resolved.contains_key(*n))
+        {
+            log(format!("{name} no longer grants anything"));
+        }
+        self.view.names = resolved;
+        self.publish();
+        true
     }
 
     fn set_apply_error(&mut self, error: Option<String>) {
@@ -992,7 +981,7 @@ impl Engine {
             .block_on(self.store.save(&config))
             .map_err(|e| refuse(e.into()))?;
         self.replace(config);
-        self.remember_names(learned.names);
+        self.set_names(learned.names);
         log(format!(
             "saved a change (configuration revision {})",
             self.view.revision
@@ -1077,7 +1066,7 @@ impl Engine {
         let mut resolved = self.view.names.clone();
         resolved.retain(|name, _| used.contains(name.as_str()));
         self.replace(config);
-        self.remember_names(resolved);
+        self.set_names(resolved);
         Ok(lines)
     }
 

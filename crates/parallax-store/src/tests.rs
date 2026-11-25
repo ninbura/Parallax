@@ -423,47 +423,6 @@ async fn the_public_ip_is_kept_apart_from_the_configuration() {
 }
 
 #[tokio::test]
-async fn resolved_names_are_kept_apart_from_the_configuration() {
-    let dir = TempDir::new();
-    let mut store = Store::create(&dir.db()).await.unwrap();
-    store.save(&canonical_config()).await.unwrap();
-    assert!(store.names().await.unwrap().is_empty());
-    let first: parallax_core::names::Resolved = [
-        (
-            "nas.mydomain.com".to_string(),
-            vec![Ipv4Addr::new(192, 168, 1, 9)],
-        ),
-        (
-            "printer.mydomain.com".to_string(),
-            vec![Ipv4Addr::new(192, 168, 1, 7), Ipv4Addr::new(192, 168, 1, 8)],
-        ),
-    ]
-    .into();
-    store.set_names(&first).await.unwrap();
-    store
-        .set_public_ip(Ipv4Addr::new(1, 2, 3, 4))
-        .await
-        .unwrap();
-    assert_eq!(store.names().await.unwrap(), first);
-    // Replaced whole: a name left out is forgotten; the public IP stays.
-    let second: parallax_core::names::Resolved = [(
-        "nas.mydomain.com".to_string(),
-        vec![Ipv4Addr::new(192, 168, 1, 10)],
-    )]
-    .into();
-    store.set_names(&second).await.unwrap();
-    store.save(&canonical_config()).await.unwrap();
-    drop(store);
-    let mut store = Store::open(&dir.db()).await.unwrap();
-    assert_eq!(store.names().await.unwrap(), second);
-    assert_eq!(
-        store.public_ip().await.unwrap(),
-        Some(Ipv4Addr::new(1, 2, 3, 4))
-    );
-    assert_eq!(store.load().await.unwrap(), canonical_config());
-}
-
-#[tokio::test]
 async fn grants_stored_before_host_names_keep_their_address() {
     let dir = TempDir::new();
     schema_1_database(&dir.db()).await;
