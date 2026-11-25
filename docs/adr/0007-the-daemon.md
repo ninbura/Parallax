@@ -39,10 +39,14 @@ socket.
   applied. If the apply fails, the change stays saved, the caller sees the
   error, and the loop retries.
 - **One writer, in order.** A dedicated engine thread owns the database and
-  does everything that changes state (saves, applies, backups, restores), so
-  blocking work (`nft`, `wg`, `ip`, backup encryption) never stalls DNS or
-  the proxy. Reads (`status`, `load`) are answered from memory without
-  waiting for an apply.
+  does everything that changes state (saves, applies, restores), so blocking
+  work (`nft`, `wg`, `ip`) never stalls DNS or the proxy. Only that has to
+  go one at a time: the nft table and the interface are one global state,
+  and each save is validated against the whole configuration. Reads
+  (`status`, `load`) are answered from memory without waiting for an apply.
+  A backup holds the engine only for the database copy (milliseconds); its
+  encryption, writing and rotation run on a backup thread of their own, so
+  a save never waits behind one. A restore's undo backup stays in line.
 - **The socket** is `/run/parallax/parallax.sock` (`--socket`,
   `PARALLAX_SOCKET`): directory 0700, socket 0600, owned by the daemon's
   user. One JSON request and one JSON reply per connection, each a single
