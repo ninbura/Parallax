@@ -138,6 +138,40 @@ fn internet_grant_and_masquerade_match_golden() {
 }
 
 #[test]
+fn guest_internet_drops_the_home_public_ip() {
+    let mut cfg = canonical_config();
+    cfg.templates[0].grants.push(Grant::Internet);
+    cfg.templates[1].grants.push(Grant::Internet);
+    let home = std::net::Ipv4Addr::new(1, 2, 3, 4);
+    let model = Model::resolve(&cfg, today())
+        .unwrap()
+        .with_public_ip(Some(home));
+    let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    check_golden("variants/hairpin.nft", &fw.contents);
+    let family: Vec<&str> = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("chain tier_family"))
+        .collect();
+    let drop = family
+        .iter()
+        .position(|l| l.contains("ip daddr 1.2.3.4 drop"))
+        .unwrap();
+    let internet = family
+        .iter()
+        .position(|l| l.contains("family: internet"))
+        .unwrap();
+    assert!(drop < internet, "{family:#?}");
+    // The owner's all_networks template reaches the router anyway.
+    assert_eq!(fw.contents.matches("1.2.3.4").count(), 1, "{}", fw.contents);
+    // Unknown: no rule, the rest unchanged.
+    let unknown = bundle_for(&cfg);
+    let unknown = unknown.of_kind(ArtifactKind::Firewall).next().unwrap();
+    assert!(!unknown.contents.contains("hairpin"));
+}
+
+#[test]
 fn proxied_service_gets_no_direct_accept() {
     let mut cfg = canonical_config();
     cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];

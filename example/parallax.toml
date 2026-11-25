@@ -53,7 +53,8 @@ port = 8443
 # fullchain.pem and privkey.pem is one certificate (certbot's live/<name>
 # works); each proxied hostname needs one that covers it.
 certificates = "/etc/parallax/certs"
-# Upstream certificates are verified against this CA bundle.
+# Upstream certificates (and encrypted DNS providers', see [server.public_ip])
+# are verified against this CA bundle.
 upstream_ca = "/etc/ssl/certs/ca-certificates.crt"
 
 [server.backup]
@@ -69,6 +70,16 @@ keep = 14
 # `parallax backup passphrase` and keep a copy in your password manager.
 encrypt = true
 passphrase_file = "/etc/parallax/backup.passphrase"
+
+[server.public_ip]
+# Guest templates with `internet` may not reach the home's own public IP: the
+# router would hairpin it back into your port forwards. Parallax finds it from
+# the endpoint above (an IP, or its hostname through dns.public_resolver).
+# Set a fixed address to skip the lookup:
+# address = "<your public IPv4>"
+# If public_resolver answers your own hostname with a LAN address, ask these
+# over DNS over HTTPS, in order ("quad9", "cloudflare"); off when empty.
+encrypted_dns = []
 
 # A physical network the gateway reaches. `mapped_to` is the collision-free
 # prefix clients see; host bits are preserved (192.168.1.5 -> 198.18.1.5).

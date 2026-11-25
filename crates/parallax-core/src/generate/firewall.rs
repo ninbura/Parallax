@@ -29,6 +29,8 @@
 //!   other templates' rules.
 //! - `internet` reaches public addresses only, unless the template also has
 //!   `all_networks` (then it's everything outside the configured networks).
+//!   Public-only tiers also drop the home's own public IP, which the router
+//!   would hairpin back into the home ([`crate::public_ip`]).
 //! - Tunnel peers are IPv4-only: IPv6 from a tunnel interface is dropped.
 
 use std::fmt::Write as _;
@@ -455,6 +457,19 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                         } else {
                             (LAN_SET, "internet")
                         };
+                        // The router hairpins the home's public IP back to
+                        // its port forwards: what this tier's grants leave out.
+                        if let Some(home) = model.public_ip().filter(|_| internet_is_public_only(t))
+                        {
+                            rs.rules.push(
+                                Rule::new(
+                                    Chain::Tier(i),
+                                    Action::Drop,
+                                    format!("{}: not the home's public IP (hairpin)", t.name),
+                                )
+                                .dst(Match::Cidr(Ipv4Net::from(home))),
+                            );
+                        }
                         rs.rules.push(
                             Rule::new(
                                 Chain::Tier(i),

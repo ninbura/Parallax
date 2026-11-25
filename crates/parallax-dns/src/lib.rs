@@ -15,7 +15,9 @@
 
 mod answer;
 mod error;
+pub mod lookup;
 mod server;
 
 pub use error::{Error, Result};
+pub use lookup::Lookup;
 pub use server::Dns;

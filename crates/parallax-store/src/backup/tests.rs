@@ -47,11 +47,19 @@ async fn restore(file: &Path, passphrase: Option<&Secret>) -> parallax_core::Con
     let target = TempDir::new();
     let mut live = Store::create(&target.db()).await.unwrap();
     live.save(&canonical_config()).await.unwrap();
+    let home = std::net::Ipv4Addr::new(1, 2, 3, 4);
+    live.set_public_ip(home).await.unwrap();
     let staging = crate::TempDir::new_in(&target.0, "restore").unwrap();
     let staged = contents.stage(staging.path()).await.unwrap();
+    staged
+        .set_public_ip(std::net::Ipv4Addr::new(1, 2, 3, 99))
+        .await
+        .unwrap();
     live.replace_with(&staged, Some(&canonical_config()))
         .await
         .unwrap();
+    // This machine's runtime state stays; the backup's is older.
+    assert_eq!(live.public_ip().await.unwrap(), Some(home));
     live.load().await.unwrap()
 }
 

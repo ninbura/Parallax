@@ -24,7 +24,7 @@ use parallax_core::secret::Secret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Error, Result, Store, TempDir, MIGRATIONS};
+use crate::{Error, Result, Store, TempDir, MIGRATIONS, RUNTIME_TABLES};
 
 /// The layout described above. A backup in a newer format is refused.
 pub const FORMAT: u32 = 1;
@@ -217,12 +217,17 @@ impl Store {
                 return Err(Error::Changed(self.path.clone()));
             }
             // Parents before children: delete in reverse, fill in order,
-            // and every reference holds throughout.
+            // and every reference holds throughout. This machine's runtime
+            // state stays: the backup's is older.
+            let tables: Vec<&String> = tables
+                .iter()
+                .filter(|t| !RUNTIME_TABLES.contains(&t.as_str()))
+                .collect();
             for table in tables.iter().rev() {
                 self.exec(&format!("DELETE FROM {table}"), Vec::new())
                     .await?;
             }
-            for table in &tables {
+            for table in tables {
                 let columns: Vec<String> = source
                     .rows(&format!("PRAGMA table_info({table})"), Vec::new())
                     .await?

@@ -36,6 +36,9 @@ keep = 14
 encrypt = true
 passphrase_file = "/etc/parallax/backup.passphrase"
 
+[server.public_ip]
+encrypted_dns = []
+
 # Networks
 
 [[network]]

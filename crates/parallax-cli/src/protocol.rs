@@ -7,6 +7,7 @@
 //! their redacted `Debug`, and nothing logs a message.
 
 use std::io::BufRead;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -15,8 +16,8 @@ use parallax_core::Config;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// The version this build speaks.
-pub const PROTOCOL: u64 = 1;
+/// The version this build speaks. 2: replies carry the home's public IP.
+pub const PROTOCOL: u64 = 2;
 /// The largest message either side accepts, newline included.
 pub const MAX_MESSAGE: usize = 16 << 20;
 
@@ -55,10 +56,14 @@ pub enum Reply {
         revision: u64,
         /// Why the last apply failed; `None` when it worked.
         apply_error: Option<String>,
+        /// The home's public IP as last found; `None` if it never was.
+        public_ip: Option<Ipv4Addr>,
     },
     Configuration {
         configuration: Box<Config>,
         revision: u64,
+        /// What generation also needs: the home's public IP, as last found.
+        public_ip: Option<Ipv4Addr>,
     },
     /// A change was saved (or nothing was asked to change), then applied.
     /// `error` says why the apply failed; the change stays saved either way.
@@ -196,13 +201,20 @@ mod tests {
         };
         assert_eq!(*configuration, config);
         assert_eq!(revision, 7);
-        let Reply::Configuration { configuration, .. } = round_trip(&Reply::Configuration {
+        let Reply::Configuration {
+            configuration,
+            public_ip,
+            ..
+        } = round_trip(&Reply::Configuration {
             configuration: Box::new(config.clone()),
             revision: 1,
-        }) else {
+            public_ip: Some(Ipv4Addr::new(1, 2, 3, 4)),
+        })
+        else {
             panic!("not a configuration");
         };
         assert_eq!(*configuration, config);
+        assert_eq!(public_ip, Some(Ipv4Addr::new(1, 2, 3, 4)));
     }
 
     #[test]
@@ -211,7 +223,7 @@ mod tests {
         let text = String::from_utf8(line).unwrap();
         assert_eq!(
             text,
-            "{\"if_due\":true,\"protocol\":1,\"request\":\"backup_create\"}\n"
+            "{\"if_due\":true,\"protocol\":2,\"request\":\"backup_create\"}\n"
         );
         let Request::BackupRestore { passphrase, .. } = round_trip(&Request::BackupRestore {
             path: "/b.tar".into(),
@@ -237,17 +249,17 @@ mod tests {
 
     #[test]
     fn another_protocol_is_refused_naming_both() {
-        let e = decode::<Request>(b"{\"protocol\":2,\"request\":\"status\"}")
+        let e = decode::<Request>(b"{\"protocol\":1,\"request\":\"status\"}")
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("protocol 1") && e.contains("other side 2"),
+            e.contains("protocol 2") && e.contains("other side 1"),
             "{e}"
         );
         let e = decode::<Request>(b"{\"request\":\"status\"}").unwrap_err();
         assert!(e.to_string().contains("no protocol"), "{e}");
         let e = decode::<Request>(
-            b"{\"protocol\":1,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
+            b"{\"protocol\":2,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
         )
         .unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");

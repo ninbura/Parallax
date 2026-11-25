@@ -434,11 +434,31 @@ fn read(sys: System<'_>, path: &Path) -> Result<String, String> {
     }
 }
 
+/// Whether the guest hairpin drop has the home's public IP to drop:
+/// `known` is the address as last found. Never a failure, since the gateway
+/// runs without it.
+pub fn public_ip_check(config: &Config, known: Option<std::net::Ipv4Addr>) -> Check {
+    let outcome = match (crate::public_ip::needed(config), known) {
+        (false, _) => Outcome::Ok("not needed: no guest template has internet".into()),
+        (true, Some(ip)) => Outcome::Ok(format!(
+            "{ip}; guest templates with internet can't reach it"
+        )),
+        (true, None) => Outcome::Warn(
+            "not known yet: guest templates with internet can reach the home through the router (hairpin). The daemon looks it up at startup and every 5 minutes; if that fails, set server.public_ip.address or server.public_ip.encrypted_dns".into(),
+        ),
+    };
+    Check {
+        name: "public IP".into(),
+        outcome,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::memory::{MemoryFs, RecordingRunner};
     use crate::io::Output;
+    use crate::model::Grant;
     use crate::testing::canonical_config;
 
     const ROOT_STATUS: &str = "Name:\tparallax\nCapEff:\t000001ffffffffff\n";
@@ -789,5 +809,24 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0, "tools");
         assert!(p[0].1.contains("wireguard-tools"), "{}", p[0].1);
+    }
+
+    #[test]
+    fn public_ip_is_a_warning_only_when_guests_need_it() {
+        let mut config = canonical_config();
+        assert!(matches!(
+            public_ip_check(&config, None).outcome,
+            Outcome::Ok(_)
+        ));
+        config.templates[1].grants.push(Grant::Internet);
+        let Outcome::Warn(w) = public_ip_check(&config, None).outcome else {
+            panic!("expected a warning");
+        };
+        assert!(w.contains("server.public_ip.address"), "{w}");
+        let known = public_ip_check(&config, Some(std::net::Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(
+            known.outcome,
+            Outcome::Ok("1.2.3.4; guest templates with internet can't reach it".into())
+        );
     }
 }

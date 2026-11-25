@@ -15,6 +15,7 @@
 pub mod backup;
 mod config;
 mod error;
+mod state;
 mod tempdir;
 
 use std::path::{Path, PathBuf};
@@ -28,7 +29,12 @@ pub use tempdir::TempDir;
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_config.sql"),
     include_str!("../migrations/0002_backup.sql"),
+    include_str!("../migrations/0003_public_ip.sql"),
 ];
+
+/// Tables holding what the daemon learned on this machine, not
+/// configuration: a restore keeps the current rows.
+const RUNTIME_TABLES: &[&str] = &["daemon_state"];
 
 /// How long a write waits for another connection's write to commit.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);

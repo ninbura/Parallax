@@ -38,9 +38,10 @@ hyper-rustls = { version = "0.27.7", default-features = false, features = ["http
 rcgen = "0.14"
 # The DNS server (parallax-dns): hickory's server for UDP/TCP framing,
 # truncation and EDNS, and its resolver (re-exported by the server) for
-# forwarding with a cache and TCP fallback. async-trait: hickory's handler
-# trait needs it.
-hickory-server = { version = "0.26.3", default-features = false, features = ["resolver"] }
+# forwarding with a cache and TCP fallback. https-ring: DNS over HTTPS for
+# the public IP lookup's encrypted fallback, on the ring provider already in
+# use. async-trait: hickory's handler trait needs it.
+hickory-server = { version = "0.26.3", default-features = false, features = ["resolver", "https-ring"] }
 async-trait = "0.1"
 # The database (parallax-store): Turso, the Rust rewrite of SQLite, in
 # SQLite's file format. Pinned exactly while it's before 1.0. No default
