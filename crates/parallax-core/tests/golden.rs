@@ -422,7 +422,7 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     check_golden("variants/home-public-names-routes.toml", &routes.contents);
     // The game port: accepted out the WAN, masqueraded; still in not_public.
     assert!(fw.contents.contains(
-        "oifname \"eth0\" ip daddr 1.2.3.4 udp dport 25565 accept comment \"family: host game.mydomain.com (1.2.3.4) 25565/udp (a port forward on the home's public IP)\""
+        "oifname \"eth0\" ip daddr 1.2.3.4 udp dport 25565 accept comment \"family: host game.mydomain.com (1.2.3.4) (a port forward on the home's public IP)\""
     ), "{}", fw.contents);
     // HTTPS by name: redirected to the proxy, which connects to the public IP.
     assert!(fw.contents.contains(
@@ -513,8 +513,8 @@ fn port_lists_are_one_rule_per_protocol() {
     for line in [
         "oifname \"eth0\" ip daddr 192.168.1.9 tcp dport { 139, 445 } accept comment \"family: service nas-smb\"",
         "oifname \"eth0\" ip daddr 192.168.1.9 udp dport 137-138 accept comment \"family: service nas-smb\"",
-        "oifname \"eth0\" ip daddr 192.168.1.20 tcp dport 25565 accept comment \"family: host 192.168.1.20 25565\"",
-        "oifname \"eth0\" ip daddr 192.168.1.20 udp dport 25565 accept comment \"family: host 192.168.1.20 25565\"",
+        "oifname \"eth0\" ip daddr 192.168.1.20 tcp dport 25565 accept comment \"family: host 192.168.1.20\"",
+        "oifname \"eth0\" ip daddr 192.168.1.20 udp dport 25565 accept comment \"family: host 192.168.1.20\"",
     ] {
         assert!(fw.contents.contains(line), "missing {line}:\n{}", fw.contents);
     }

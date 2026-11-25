@@ -49,6 +49,22 @@ impl PortRange {
     pub fn contains(self, proto: Proto, port: u16) -> bool {
         self.proto == proto && (self.first..=self.last).contains(&port)
     }
+
+    /// Same protocol, and some port in both.
+    pub fn overlaps(self, other: PortRange) -> bool {
+        self.proto == other.proto && self.first <= other.last && other.first <= self.last
+    }
+}
+
+impl std::fmt::Display for PortRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        PortSpec {
+            first: self.first,
+            last: self.last,
+            proto: Some(self.proto),
+        }
+        .fmt(f)
+    }
 }
 
 /// Every range a list of specs stands for, in order, without repeats.

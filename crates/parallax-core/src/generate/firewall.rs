@@ -776,9 +776,21 @@ pub fn render(model: &Model<'_>) -> Result<Vec<Artifact>> {
     Ok(out)
 }
 
+/// Quoted, and at most [`COMMENT_MAX`] bytes: nftables refuses a comment
+/// over 128, and a name can be long.
 fn quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', ""))
+    let s = s.replace('"', "");
+    if s.len() <= COMMENT_MAX {
+        return format!("\"{s}\"");
+    }
+    let mut end = COMMENT_MAX - 3;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("\"{}...\"", &s[..end])
 }
+
+const COMMENT_MAX: usize = 120;
 
 /// nftables renderer.
 pub mod nft {
@@ -1190,6 +1202,18 @@ mod tests {
 
     fn r(proto: Proto, first: u16, last: u16) -> PortRange {
         PortRange { proto, first, last }
+    }
+
+    #[test]
+    fn long_comments_are_cut() {
+        let long = "x".repeat(300);
+        let q = quote(&long);
+        assert_eq!(q.len(), COMMENT_MAX + 2);
+        assert!(q.ends_with("...\""));
+        assert_eq!(
+            quote("family: service immich"),
+            "\"family: service immich\""
+        );
     }
 
     #[test]

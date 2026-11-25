@@ -1144,7 +1144,21 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                         | ReachKind::HomePublic { proxied: true, .. } => " through the HTTPS proxy",
                         _ => "",
                     };
-                    println!("    reaches {}{via}{proxied}", r.label);
+                    let ports = match &r.kind {
+                        ReachKind::Lan {
+                            ports: Some(ports), ..
+                        }
+                        | ReachKind::HomePublic { ports, .. } => format!(
+                            " ({})",
+                            ports
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        _ => String::new(),
+                    };
+                    println!("    reaches {}{ports}{via}{proxied}", r.label);
                 }
                 println!(
                     "    dns: wireguard={} tailscale={} public={}; allowed_ips={:?}",

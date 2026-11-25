@@ -18,8 +18,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The version this build speaks. 2: replies carry the home's public IP.
-/// 3: and what hosts named by DNS name resolved to.
-pub const PROTOCOL: u64 = 3;
+/// 3: and what hosts named by DNS name resolved to. 4: services and host
+/// grants carry port lists.
+pub const PROTOCOL: u64 = 4;
 /// The largest message either side accepts, newline included.
 pub const MAX_MESSAGE: usize = 16 << 20;
 
@@ -238,7 +239,7 @@ mod tests {
         let text = String::from_utf8(line).unwrap();
         assert_eq!(
             text,
-            "{\"if_due\":true,\"protocol\":3,\"request\":\"backup_create\"}\n"
+            "{\"if_due\":true,\"protocol\":4,\"request\":\"backup_create\"}\n"
         );
         let Request::BackupRestore { passphrase, .. } = round_trip(&Request::BackupRestore {
             path: "/b.tar".into(),
@@ -268,13 +269,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("protocol 3") && e.contains("other side 1"),
+            e.contains("protocol 4") && e.contains("other side 1"),
             "{e}"
         );
         let e = decode::<Request>(b"{\"request\":\"status\"}").unwrap_err();
         assert!(e.to_string().contains("no protocol"), "{e}");
         let e = decode::<Request>(
-            b"{\"protocol\":3,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
+            b"{\"protocol\":4,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
         )
         .unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");

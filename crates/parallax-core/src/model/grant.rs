@@ -31,7 +31,7 @@ impl Proto {
     tag = "kind",
     rename_all = "snake_case",
     deny_unknown_fields,
-    from = "GrantToml"
+    try_from = "GrantToml"
 )]
 pub enum Grant {
     /// Every configured network.
@@ -68,8 +68,7 @@ enum GrantToml {
     Host {
         #[serde(alias = "ip")]
         host: Host,
-        #[serde(default)]
-        ports: Vec<PortSpec>,
+        ports: Option<Vec<PortSpec>>,
     },
     HostPort {
         #[serde(alias = "ip")]
@@ -84,12 +83,26 @@ enum GrantToml {
     Internet,
 }
 
-impl From<GrantToml> for Grant {
-    fn from(g: GrantToml) -> Self {
-        match g {
+impl TryFrom<GrantToml> for Grant {
+    type Error = String;
+    fn try_from(g: GrantToml) -> Result<Self, String> {
+        Ok(match g {
             GrantToml::AllNetworks => Grant::AllNetworks,
             GrantToml::Network { name } => Grant::Network { name },
-            GrantToml::Host { host, ports } => Grant::Host { host, ports },
+            // An empty list would mean every port: a list that ended up
+            // empty mustn't open everything.
+            GrantToml::Host {
+                host,
+                ports: Some(ports),
+            } if ports.is_empty() => {
+                return Err(format!(
+                    "host grant for {host}: ports = [] lists no port; leave ports out to reach every port"
+                ))
+            }
+            GrantToml::Host { host, ports } => Grant::Host {
+                host,
+                ports: ports.unwrap_or_default(),
+            },
             // Port 0 is refused by validation, as before.
             GrantToml::HostPort { host, proto, port } => Grant::Host {
                 host,
@@ -101,7 +114,7 @@ impl From<GrantToml> for Grant {
             },
             GrantToml::Service { name } => Grant::Service { name },
             GrantToml::Internet => Grant::Internet,
-        }
+        })
     }
 }
 
@@ -136,6 +149,8 @@ mod tests {
         );
         let e = grant(r#"{ kind = "host", host = "192.168.1.9", port = 53 }"#).unwrap_err();
         assert!(e.contains("unknown field `port`"), "{e}");
+        let e = grant(r#"{ kind = "host", host = "192.168.1.9", ports = [] }"#).unwrap_err();
+        assert!(e.contains("lists no port; leave ports out"), "{e}");
     }
 
     #[test]

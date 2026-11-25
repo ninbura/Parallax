@@ -53,8 +53,8 @@ table inet parallax {
 		oifname "eth0" ip daddr 192.168.1.5 tcp dport 443 accept comment "family: service immich"
 		oifname "eth0" ip daddr 192.168.1.9 tcp dport { 139, 445 } accept comment "family: service nas-smb"
 		oifname "eth0" ip daddr 192.168.1.9 udp dport 137-138 accept comment "family: service nas-smb"
-		oifname "eth0" ip daddr 192.168.1.20 tcp dport 25565 accept comment "family: host 192.168.1.20 25565"
-		oifname "eth0" ip daddr 192.168.1.20 udp dport 25565 accept comment "family: host 192.168.1.20 25565"
+		oifname "eth0" ip daddr 192.168.1.20 tcp dport 25565 accept comment "family: host 192.168.1.20"
+		oifname "eth0" ip daddr 192.168.1.20 udp dport 25565 accept comment "family: host 192.168.1.20"
 		drop comment "family: default deny"
 	}
 

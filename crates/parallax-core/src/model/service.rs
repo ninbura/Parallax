@@ -52,8 +52,7 @@ impl Service {
 struct ServiceToml {
     name: String,
     host: Host,
-    #[serde(default)]
-    ports: Vec<PortSpec>,
+    ports: Option<Vec<PortSpec>>,
     port: Option<u16>,
     proto: Option<Proto>,
     #[serde(default)]
@@ -65,22 +64,22 @@ struct ServiceToml {
 impl TryFrom<ServiceToml> for Service {
     type Error = String;
     fn try_from(s: ServiceToml) -> Result<Self, String> {
-        let ports = match (s.ports.is_empty(), s.port, s.proto) {
-            (false, None, None) => s.ports,
-            (true, Some(port), proto) => vec![PortSpec {
+        let ports = match (s.ports, s.port, s.proto) {
+            (Some(ports), None, None) if !ports.is_empty() => ports,
+            (None, Some(port), proto) => vec![PortSpec {
                 first: port,
                 last: port,
                 proto: Some(proto.unwrap_or_default()),
             }],
-            (true, None, None) => {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
                 return Err(format!(
-                    "service '{}' has no ports; give ports = [\"445/tcp\", ...]",
+                    "service '{}': give ports, or the older port and proto, not both",
                     s.name
                 ))
             }
             _ => {
                 return Err(format!(
-                    "service '{}': give ports, or the older port and proto, not both",
+                    "service '{}' has no ports; give ports = [\"445/tcp\", ...]",
                     s.name
                 ))
             }

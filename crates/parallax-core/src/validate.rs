@@ -158,11 +158,13 @@ fn describe_grant(grant: &Grant) -> String {
     }
 }
 
-/// The label for a reach on `host`: the name with the address it resolved to.
-fn host_label(host: &Host, ip: Ipv4Addr, port: &str) -> String {
+/// The label for a reach on `host`: the name with the address it resolved
+/// to. Not its ports: a rule shows those in its match, and a long list
+/// would overrun a firewall comment.
+fn host_label(host: &Host, ip: Ipv4Addr) -> String {
     match host {
-        Host::Ip(_) => format!("host {ip}{port}"),
-        Host::Name(name) => format!("host {name} ({ip}){port}"),
+        Host::Ip(_) => format!("host {ip}"),
+        Host::Name(name) => format!("host {name} ({ip})"),
     }
 }
 
@@ -408,14 +410,9 @@ impl<'a> Model<'a> {
                 // Never every port of the home's public IP: `reach_at`
                 // gives a port forward named ports only.
                 Grant::Host { host, ports } => {
-                    let suffix = if ports.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {}", port_list(ports))
-                    };
                     let ranges = (!ports.is_empty()).then(|| ranges(ports));
                     for ip in self.addresses(host) {
-                        let label = host_label(host, ip, &suffix);
+                        let label = host_label(host, ip);
                         if let Some(r) = self.reach_at(template, label, ip, ranges.clone(), false) {
                             push(r);
                         }
@@ -448,16 +445,13 @@ impl<'a> Model<'a> {
     /// sibling sites on the same address and port must not inherit them.
     pub fn reaches_service(&self, template: &Template, service: &Service) -> bool {
         let ranges = ranges(&service.ports);
-        self.addresses(&service.host).into_iter().any(|ip| {
-            ranges
-                .iter()
-                .any(|r| self.reaches_directly(template, ip, r.proto, r.first))
-        })
+        self.addresses(&service.host)
+            .into_iter()
+            .any(|ip| ranges.iter().any(|r| self.reaches_range(template, ip, *r)))
     }
 
     /// Does `template` reach `proto/port` on `host` directly, without the
-    /// proxy? Only LAN grants count; `internet` never covers a configured
-    /// network.
+    /// proxy? See [`Model::reaches_range`].
     pub fn reaches_directly(
         &self,
         template: &Template,
@@ -465,6 +459,21 @@ impl<'a> Model<'a> {
         proto: Proto,
         port: u16,
     ) -> bool {
+        self.reaches_range(
+            template,
+            host,
+            PortRange {
+                proto,
+                first: port,
+                last: port,
+            },
+        )
+    }
+
+    /// Does `template` reach any of `range` on `host` directly, without the
+    /// proxy? Only LAN grants and port forwards count; `internet` never
+    /// covers a configured network.
+    pub fn reaches_range(&self, template: &Template, host: Ipv4Addr, range: PortRange) -> bool {
         // The owner's `internet` (with `all_networks`) reaches the home's
         // public IP like any public address.
         if Some(host) == self.public_ip
@@ -481,10 +490,10 @@ impl<'a> Model<'a> {
                 real.contains(&host)
                     && ports
                         .as_ref()
-                        .is_none_or(|ports| ports.iter().any(|r| r.contains(proto, port)))
+                        .is_none_or(|ports| ports.iter().any(|r| r.overlaps(range)))
             }
             ReachKind::HomePublic { address, ports, .. } => {
-                *address == host && ports.iter().any(|r| r.contains(proto, port))
+                *address == host && ports.iter().any(|r| r.overlaps(range))
             }
             ReachKind::Internet => false,
         })
@@ -1385,8 +1394,8 @@ mod tests {
             r.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
             [
                 "service immich",
-                "host nas.mydomain.com (192.168.1.9) 445/tcp",
-                "host nas.mydomain.com (192.168.1.10) 445/tcp"
+                "host nas.mydomain.com (192.168.1.9)",
+                "host nas.mydomain.com (192.168.1.10)"
             ]
         );
         assert_eq!(r[1].client_net(), Some("198.18.1.9/32".parse().unwrap()));
