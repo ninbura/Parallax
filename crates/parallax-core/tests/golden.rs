@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use parallax_core::generate::{self, ArtifactKind, Bundle};
 use parallax_core::io::memory::{MemoryFs, RecordingRunner};
 use parallax_core::io::System;
-use parallax_core::model::{FirewallBackend, Grant, Platform};
+use parallax_core::model::{FirewallBackend, Grant, Host, Platform, Proto};
 use parallax_core::testing::{canonical_config, keypair, today};
 use parallax_core::transport::{self, Transport};
 use parallax_core::{Config, Model};
@@ -209,7 +209,7 @@ fn no_proxy_redirect_where_a_grant_reaches_the_host_directly() {
     let mut cfg = canonical_config();
     cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
     cfg.templates[1].grants.push(Grant::HostPort {
-        ip: "192.168.1.5".parse().unwrap(),
+        host: "192.168.1.5".parse().unwrap(),
         proto: parallax_core::model::Proto::Tcp,
         port: 443,
     });
@@ -326,6 +326,65 @@ fn guest_allowed_ips_are_granted_hosts_only_in_virtual_space() {
             "10.8.0.1/32".parse().unwrap()
         ]
     );
+}
+
+#[test]
+fn named_hosts_get_what_they_resolved_to() {
+    // A service and a game server by name; the NAS's name resolves to two
+    // addresses.
+    let mut cfg = canonical_config();
+    cfg.services[0].host = Host::Name("immich.mydomain.com".into());
+    cfg.templates[1].grants.push(Grant::HostPort {
+        host: Host::Name("game.mydomain.com".into()),
+        proto: Proto::Udp,
+        port: 25565,
+    });
+    cfg.templates[1].grants.push(Grant::Host {
+        host: Host::Name("nas.mydomain.com".into()),
+    });
+    let addr = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
+    let names = [
+        ("immich.mydomain.com", vec![addr("192.168.1.5")]),
+        ("game.mydomain.com", vec![addr("192.168.1.20")]),
+        (
+            "nas.mydomain.com",
+            vec![addr("192.168.1.9"), addr("192.168.1.10")],
+        ),
+    ]
+    .into_iter()
+    .map(|(n, a)| (n.to_string(), a))
+    .collect();
+    let model = Model::resolve(&cfg, today()).unwrap().with_names(names);
+    assert!(
+        model.name_problems().is_empty(),
+        "{:?}",
+        model.name_problems()
+    );
+    let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    check_golden("variants/named-hosts.nft", &fw.contents);
+    let dns = bundle.of_kind(ArtifactKind::DnsRoutes).next().unwrap();
+    check_golden("variants/named-hosts-dns.toml", &dns.contents);
+    let family = model.template("family").unwrap();
+    let ips = generate::client::allowed_ips(&model, family, Platform::Mobile);
+    let ips: Vec<String> = ips.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        ips,
+        [
+            "198.18.1.5/32",
+            "198.18.1.20/32",
+            "198.18.1.9/32",
+            "198.18.1.10/32",
+            "10.8.0.1/32"
+        ]
+    );
+    // Not resolved yet: the grants give nothing, the service included.
+    let unresolved = Model::resolve(&cfg, today()).unwrap();
+    let bundle = generate::generate_all(&unresolved, &fs_with_server_key()).unwrap();
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    assert!(!fw.contents.contains("192.168.1.20"), "{}", fw.contents);
+    assert!(!fw.contents.contains("service immich"), "{}", fw.contents);
+    assert_eq!(unresolved.name_problems().len(), 3);
 }
 
 #[test]
@@ -510,7 +569,7 @@ fn config_export_layout_matches_golden() {
             name: "home".into(),
         },
         Grant::HostPort {
-            ip: std::net::Ipv4Addr::new(192, 168, 1, 10),
+            host: std::net::Ipv4Addr::new(192, 168, 1, 10).into(),
             proto: parallax_core::model::Proto::Udp,
             port: 53,
         },

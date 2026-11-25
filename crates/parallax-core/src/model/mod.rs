@@ -6,6 +6,7 @@
 
 mod config;
 mod grant;
+mod host;
 mod layout;
 mod network;
 mod peer;
@@ -15,6 +16,7 @@ mod template;
 
 pub use config::Config;
 pub use grant::{Grant, Proto};
+pub use host::Host;
 pub use network::Network;
 pub use peer::{Peer, TailscalePeer, TransportKind, WireGuardPeer};
 pub use server::{

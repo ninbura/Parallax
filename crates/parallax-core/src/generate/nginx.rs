@@ -79,7 +79,7 @@ pub fn render(model: &Model<'_>) -> Result<Vec<Artifact>> {
         {
             allow_lines(&mut s, model, t, &transports);
         }
-        if let Some(n) = model.network_containing(svc.host) {
+        if let Some(n) = model.network_of_host(&svc.host) {
             let _ = writeln!(
                 s,
                 "allow {};  # network {} (local clients)",

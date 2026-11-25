@@ -107,6 +107,9 @@ masquerade = false
 
 # Named host:port targets. `nginx_vhost = true` also emits an allow/deny
 # snippet for the vhost, because L3 rules gate the port, not the virtual host.
+# `host` is the real address, or a DNS name under a network's domains: the
+# gateway looks it up through that network's upstream_dns and grants what it
+# resolves to (only addresses inside a configured network).
 [[service]]
 name = "immich"
 host = "192.168.1.5"
@@ -141,6 +144,9 @@ persistent_keepalive = 25
 
 [[template]]
 name = "family"
+# More grants, one per line: a host and one port, by address or by name
+# (the name then also answers in DNS for this template):
+#   { kind = "host_port", host = "game.mydomain.com", proto = "udp", port = 25565 },
 grants = [{ kind = "service", name = "immich" }]
 [template.wireguard]
 pool = "10.8.2.0/24"

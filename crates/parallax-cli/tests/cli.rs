@@ -432,11 +432,11 @@ fn fake_daemon(
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let reply = match request["request"].as_str().unwrap() {
                 "load" => serde_json::json!({
-                    "protocol": 2, "reply": "configuration", "public_ip": null,
+                    "protocol": 3, "reply": "configuration", "public_ip": null, "names": {},
                     "configuration": config, "revision": 3,
                 }),
                 "save" => serde_json::json!({
-                    "protocol": 2, "reply": "applied", "revision": 4,
+                    "protocol": 3, "reply": "applied", "revision": 4,
                     "log": ["applied by the fake daemon"], "error": null,
                 }),
                 other => panic!("unexpected request {other}"),
@@ -479,7 +479,7 @@ fn commands_go_through_a_running_daemon() {
     assert_eq!(seen[2]["revision"], 3, "saved against the loaded revision");
     let peers = seen[2]["configuration"]["peer"].as_array().unwrap();
     assert!(peers.iter().all(|p| p["name"] != "router"), "{peers:?}");
-    assert!(seen.iter().all(|r| r["protocol"] == 2));
+    assert!(seen.iter().all(|r| r["protocol"] == 3));
 }
 
 /// A stale socket file (its daemon is gone) means no daemon.
@@ -567,7 +567,7 @@ fn a_backup_restores_what_changed_since() {
     let file = s.backups().pop().unwrap();
     let (ok, out, _) = s.run(&["backup", "list"]);
     assert!(
-        ok && out.contains("encrypted") && out.contains("schema 3"),
+        ok && out.contains("encrypted") && out.contains("schema 4"),
         "{out}"
     );
 

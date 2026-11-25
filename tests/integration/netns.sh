@@ -33,6 +33,7 @@
 # (l) DNS answers each tier only its names, and no private address outside the
 # configured networks, (m) large DNS answers, (o) guests with internet can't reach
 # the home's public IP, and a lookup answered with a private address is refused,
+# (p) hosts granted by DNS name are looked up on save and bad ones refused,
 # (n) the daemon tears down on SIGTERM, re-applies on SIGHUP and repairs a deleted
 # table, and keeps the home's public IP across the restart. Every change goes through the
 # daemon and takes effect without SIGHUP.
@@ -182,6 +183,7 @@ for i in $(seq 10 49); do BIG+=(--host-record=big.mydomain.com,192.168.1.$i); do
 inns home dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
     --address=/immich.mydomain.com/192.168.1.5 --address=/other.mydomain.com/192.168.1.5 \
     --host-record=vlan.mydomain.com,10.99.0.5 --host-record=vlan.mydomain.com,192.168.1.6 \
+    --host-record=web.mydomain.com,192.168.1.5 --host-record=away.mydomain.com,10.99.0.5 \
     "${BIG[@]}" >/dev/null 2>&1 &
 PIDS+=($!)
 inns net dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=9.9.9.9 --bind-interfaces \
@@ -593,6 +595,36 @@ inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydoma
     || fail "(m) the 512-byte UDP answer was not truncated"
 [ "$(short_as $LAPTOP big.mydomain.com +tcp | grep -c '^198\.18\.1\.')" = 40 ] || fail "(m) big.mydomain.com over TCP"
 pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rewritten"
+
+# (p) a host granted by name: looked up through its network's resolver when the change
+# is saved; the tier reaches that port and may look the name up. A name that doesn't
+# resolve is refused, and so is one that resolves outside every configured network.
+$P config export > "$WORK/named-before.toml"
+grep -q 'host = "192.168.1.5", proto = "tcp", port = 7000' "$WORK/named-before.toml" \
+    || fail "(p) grants written with ip = ... don't export as host = ..."
+named() { # host -> a config granting family tcp/8080 on it
+    sed "/host = \"192.168.1.5\", proto = \"tcp\", port = 7000 }/a\\
+    { kind = \"host_port\", host = \"$1\", port = 8080 }," "$WORK/named-before.toml" > "$WORK/named-$1.toml"
+    echo "$WORK/named-$1.toml"
+}
+[ "$(status_as $GUEST web.mydomain.com)" = REFUSED ] || fail "(p) guest looked up a name it isn't granted"
+apply "$(named web.mydomain.com)"
+$P status | grep -qx "name web.mydomain.com: 192.168.1.5" || { $P status; fail "(p) the name was not looked up on save"; }
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = home-other ] || fail "(p) guest -> the host granted by name"
+[ "$(short_as $GUEST web.mydomain.com)" = 198.18.1.5 ] || fail "(p) guest could not look up the name it's granted"
+refused() { # host, what the refusal must say
+    if $P config import "$(named "$1")" > "$WORK/named.err" 2>&1; then
+        fail "(p) a save granting $1 was accepted"
+    fi
+    grep -qF "$2" "$WORK/named.err" || { cat "$WORK/named.err"; fail "(p) the refusal of $1 doesn't say why"; }
+}
+refused nosuch.mydomain.com "nosuch.mydomain.com"
+refused away.mydomain.com "away.mydomain.com resolved to 10.99.0.5, outside every configured network"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = home-other ] || fail "(p) a refused save changed the gateway"
+apply "$WORK/named-before.toml"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(p) the grant by name outlived its removal"
+$P status | grep -q "^name " && fail "(p) a name no longer used is still listed"
+pass "(p) a host granted by name: looked up on save, reached on its port, its name answers; bad names are refused"
 
 # (o) the home's public IP: guests with internet drop it (the router would hairpin it
 # back into the home); the owner's all_networks template doesn't. The endpoint here

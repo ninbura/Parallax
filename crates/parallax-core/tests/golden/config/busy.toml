@@ -68,7 +68,7 @@ nginx_vhost = true
 name = "personal"
 grants = [
     { kind = "network", name = "home" },
-    { kind = "host_port", ip = "192.168.1.10", proto = "udp", port = 53 },
+    { kind = "host_port", host = "192.168.1.10", proto = "udp", port = 53 },
     { kind = "internet" },
 ]
 visible_networks = ["home"]

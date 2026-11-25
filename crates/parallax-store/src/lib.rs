@@ -30,6 +30,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_config.sql"),
     include_str!("../migrations/0002_backup.sql"),
     include_str!("../migrations/0003_public_ip.sql"),
+    include_str!("../migrations/0004_host_names.sql"),
 ];
 
 /// Tables holding what the daemon learned on this machine, not

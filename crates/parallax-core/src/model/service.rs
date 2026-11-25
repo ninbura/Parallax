@@ -1,16 +1,15 @@
-use std::net::Ipv4Addr;
-
 use serde::{Deserialize, Serialize};
 
-use super::Proto;
+use super::{Host, Proto};
 
 /// A named `host:port` on a network, referenced by [`super::Grant::Service`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
     pub name: String,
-    /// Real address of the host (the engine translates to virtual space where mapped).
-    pub host: Ipv4Addr,
+    /// Real address of the host (the engine translates to virtual space
+    /// where mapped), or a DNS name that resolves to it.
+    pub host: Host,
     #[serde(default)]
     pub proto: Proto,
     pub port: u16,

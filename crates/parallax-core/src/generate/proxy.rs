@@ -78,15 +78,23 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
     let transports = transport::all();
     let mut sites = Vec::new();
     for svc in cfg.services.iter().filter(|s| s.is_proxied()) {
+        // A name that hasn't resolved (or not to an allowed address) has
+        // nowhere to send the proxy; when it has several addresses, the
+        // lowest is the upstream.
+        let Some(upstream) = model.addresses(&svc.host).first().copied() else {
+            continue;
+        };
         let grant = Grant::Service {
             name: svc.name.clone(),
         };
         let mut allowed: Vec<Ipv4Net> = Vec::new();
         // A template that reaches the service directly gets no redirect
         // (see the firewall), so it never comes through the proxy.
-        for t in cfg.templates.iter().filter(|t| {
-            t.grants.contains(&grant) && !model.reaches_directly(t, svc.host, svc.proto, svc.port)
-        }) {
+        for t in cfg
+            .templates
+            .iter()
+            .filter(|t| t.grants.contains(&grant) && !model.reaches_service(t, svc))
+        {
             for tr in &transports {
                 for m in tr.tier_members(model, t) {
                     if !allowed.contains(&m) {
@@ -102,7 +110,7 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
             sites.push(ProxySite {
                 hostname: hostname.clone(),
                 service: svc.name.clone(),
-                upstream: SocketAddrV4::new(svc.host, svc.port),
+                upstream: SocketAddrV4::new(upstream, svc.port),
                 allowed: allowed.clone(),
             });
         }
