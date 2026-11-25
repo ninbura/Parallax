@@ -109,6 +109,8 @@ impl Store {
 
         // Grant and visibility rows have no identity of their own; rewrite them
         // all, which also frees networks and services about to be removed.
+        self.exec("DELETE FROM template_grant_ports", Vec::new())
+            .await?;
         self.exec("DELETE FROM template_grants", Vec::new()).await?;
         self.exec("DELETE FROM template_visible_networks", Vec::new())
             .await?;
@@ -377,7 +379,7 @@ impl Store {
         let mut out = Vec::new();
         let rows = self
             .rows(
-                "SELECT id, name, host, proto, port, nginx_vhost FROM services ORDER BY position",
+                "SELECT id, name, host, nginx_vhost FROM services ORDER BY position",
                 Vec::new(),
             )
             .await?;
@@ -385,11 +387,19 @@ impl Store {
             let id: i64 = r.get(0)?;
             let name: String = r.get(1)?;
             let at = format!("service '{name}'");
+            let ports = self
+                .strings(
+                    "SELECT ports FROM service_ports WHERE service_id = ?1 ORDER BY position",
+                    id,
+                )
+                .await?;
             out.push(Service {
                 host: parse(&at, "host", &r.get::<String>(2)?)?,
-                proto: variant(&at, "proto", &r.get::<String>(3)?)?,
-                port: port(&at, r.get(4)?)?,
-                nginx_vhost: r.get(5)?,
+                ports: ports
+                    .iter()
+                    .map(|p| parse(&at, "ports", p))
+                    .collect::<Result<_>>()?,
+                nginx_vhost: r.get(3)?,
                 hostnames: self
                     .strings(
                         "SELECT hostname FROM service_hostnames WHERE service_id = ?1 ORDER BY position",
@@ -413,11 +423,11 @@ impl Store {
                         ("name", text(&s.name)),
                         ("position", position.into()),
                         ("host", text(&s.host)),
-                        ("proto", variant_text(&s.proto)?),
-                        ("port", s.port.into()),
                         ("nginx_vhost", s.nginx_vhost.into()),
                     ],
                 )
+                .await?;
+            self.replace_list("service_ports", "service_id", id, "ports", &s.ports)
                 .await?;
             self.replace_list(
                 "service_hostnames",
@@ -496,7 +506,7 @@ impl Store {
     async fn load_grants(&self, template_id: i64, at: &str) -> Result<Vec<Grant>> {
         let rows = self
             .rows(
-                "SELECT g.kind, n.name, s.name, g.host, g.proto, g.port
+                "SELECT g.kind, n.name, s.name, g.host, g.position
                  FROM template_grants g
                  LEFT JOIN networks n ON n.id = g.network_id
                  LEFT JOIN services s ON s.id = g.service_id
@@ -523,19 +533,16 @@ impl Store {
                         "grant host",
                         &r.get::<Option<String>>(3)?.ok_or_else(missing)?,
                     )?,
-                },
-                "host_port" => Grant::HostPort {
-                    host: parse(
-                        at,
-                        "grant host",
-                        &r.get::<Option<String>>(3)?.ok_or_else(missing)?,
-                    )?,
-                    proto: variant(
-                        at,
-                        "grant proto",
-                        &r.get::<Option<String>>(4)?.ok_or_else(missing)?,
-                    )?,
-                    port: port(at, r.get::<Option<i64>>(5)?.ok_or_else(missing)?)?,
+                    ports: self
+                        .rows(
+                            "SELECT ports FROM template_grant_ports
+                             WHERE template_id = ?1 AND grant_position = ?2 ORDER BY position",
+                            vec![template_id.into(), r.get::<i64>(4)?.into()],
+                        )
+                        .await?
+                        .iter()
+                        .map(|p| parse(at, "grant ports", &p.get::<String>(0)?))
+                        .collect::<Result<_>>()?,
                 },
                 other => return Err(Error::Stored(format!("{at}: unknown grant kind '{other}'"))),
             });
@@ -594,14 +601,12 @@ impl Store {
             }
             for (position, g) in (0_i64..).zip(&t.grants) {
                 let null = || Value::Null;
-                let (kind, network, service, host, proto, port) = match g {
-                    Grant::AllNetworks => ("all_networks", null(), null(), null(), null(), null()),
-                    Grant::Internet => ("internet", null(), null(), null(), null(), null()),
+                let (kind, network, service, host) = match g {
+                    Grant::AllNetworks => ("all_networks", null(), null(), null()),
+                    Grant::Internet => ("internet", null(), null(), null()),
                     Grant::Network { name } => (
                         "network",
                         lookup(networks, &at, "grant refers to unknown network", name)?.into(),
-                        null(),
-                        null(),
                         null(),
                         null(),
                     ),
@@ -610,23 +615,13 @@ impl Store {
                         null(),
                         lookup(services, &at, "grant refers to unknown service", name)?.into(),
                         null(),
-                        null(),
-                        null(),
                     ),
-                    Grant::Host { host } => ("host", null(), null(), text(host), null(), null()),
-                    Grant::HostPort { host, proto, port } => (
-                        "host_port",
-                        null(),
-                        null(),
-                        text(host),
-                        variant_text(proto)?,
-                        (*port).into(),
-                    ),
+                    Grant::Host { host, .. } => ("host", null(), null(), text(host)),
                 };
                 self.exec(
                     "INSERT INTO template_grants
-                        (template_id, position, kind, network_id, service_id, host, proto, port)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        (template_id, position, kind, network_id, service_id, host)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     vec![
                         id.into(),
                         position.into(),
@@ -634,11 +629,20 @@ impl Store {
                         network,
                         service,
                         host,
-                        proto,
-                        port,
                     ],
                 )
                 .await?;
+                if let Grant::Host { ports, .. } = g {
+                    for (n, p) in (0_i64..).zip(ports) {
+                        self.exec(
+                            "INSERT INTO template_grant_ports
+                                (template_id, grant_position, position, ports)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            vec![id.into(), position.into(), n.into(), text(p)],
+                        )
+                        .await?;
+                    }
+                }
             }
             ids.insert(t.name.clone(), id);
         }

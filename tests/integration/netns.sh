@@ -619,11 +619,12 @@ pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rew
 # is saved; the tier reaches that port and may look the name up. A name that doesn't
 # resolve is refused, and so is one that resolves outside every configured network.
 $P config export > "$WORK/named-before.toml"
-grep -q 'host = "192.168.1.5", proto = "tcp", port = 7000' "$WORK/named-before.toml" \
-    || fail "(p) grants written with ip = ... don't export as host = ..."
-named() { # host -> a config granting family tcp/8080 on it
-    sed "/host = \"192.168.1.5\", proto = \"tcp\", port = 7000 }/a\\
-    { kind = \"host_port\", host = \"$1\", port = 8080 }," "$WORK/named-before.toml" > "$WORK/named-$1.toml"
+grep -q 'host = "192.168.1.5", ports = \["7000/tcp"\]' "$WORK/named-before.toml" \
+    || fail "(p) host_port grants written with ip = ... don't export as host grants with ports"
+named() { # host -> a config granting family a few ports on it, 8080/tcp among them
+    sed "/host = \"192.168.1.5\", ports = \[\"7000\/tcp\"\] }/a\\
+    { kind = \"host\", host = \"$1\", ports = [\"8080\/tcp\", \"5353\/udp\", \"9000-9010\/tcp\"] }," \
+        "$WORK/named-before.toml" > "$WORK/named-$1.toml"
     echo "$WORK/named-$1.toml"
 }
 [ "$(status_as $GUEST web.mydomain.com)" = REFUSED ] || fail "(p) guest looked up a name it isn't granted"
@@ -722,17 +723,17 @@ pass "(n) SIGTERM tears down; SIGHUP re-applies; a deleted table comes back on i
 # port) and a raw web port are refused.
 $P config export > "$WORK/current.toml"
 sed -e 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' \
-    -e '0,/^\[\[template\]\]$/s//[[service]]\nname = "forwarded"\nhost = "public.mydomain.com"\nport = 443\nhostnames = ["public.mydomain.com"]\n\n&/' \
+    -e '0,/^\[\[template\]\]$/s//[[service]]\nname = "forwarded"\nhost = "public.mydomain.com"\nports = ["443\/tcp"]\nhostnames = ["public.mydomain.com"]\n\n&/' \
     "$WORK/current.toml" > "$WORK/forward-base.toml"
 grep -q '^address = "1.2.3.4"$' "$WORK/forward-base.toml" && grep -q '^name = "forwarded"$' "$WORK/forward-base.toml" \
     || fail "(q) could not write the test configuration"
 forward() { # extra friend grants -> a config file
-    sed "s/^grants = \[{ kind = \"internet\" }\]\$/grants = [{ kind = \"internet\" }, $1]/" \
+    sed "s|^grants = \[{ kind = \"internet\" }\]\$|grants = [{ kind = \"internet\" }, $1]|" \
         "$WORK/forward-base.toml" > "$WORK/forward.toml"
     grep -qF "$1" "$WORK/forward.toml" || fail "(q) could not grant friend $1"
     echo "$WORK/forward.toml"
 }
-apply "$(forward '{ kind = "host_port", host = "game.mydomain.com", port = 8080 }, { kind = "service", name = "forwarded" }')"
+apply "$(forward '{ kind = "host", host = "game.mydomain.com", ports = ["8080/tcp"] }, { kind = "service", name = "forwarded" }')"
 # Friend's session may still be handshaking with the daemon (n) restarted.
 for _ in $(seq 10); do [ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] && break; done
 $P status | grep -qx "name game.mydomain.com: 1.2.3.4" || { $P status; fail "(q) game.mydomain.com was not looked up"; }
@@ -751,7 +752,7 @@ refused_forward() { # grant, what the refusal must say
     grep -qF "$2" "$WORK/forward.err" || { cat "$WORK/forward.err"; fail "(q) the refusal of $1 doesn't say why"; }
 }
 refused_forward '{ kind = "host", host = "game.mydomain.com" }' "every port there is a port forward"
-refused_forward '{ kind = "host_port", host = "game.mydomain.com", port = 80 }' "grant it as a service with hostnames"
+refused_forward '{ kind = "host", host = "game.mydomain.com", ports = ["80/tcp"] }' "grant it as a service with hostnames"
 apply "$WORK/forward-base.toml"
 [ "$(curl_as $FRIEND http://1.2.3.4:8080/)" = BLOCKED ] || fail "(q) the port forward outlived its grant"
 pass "(q) names on the home's public IP: one granted port, HTTPS by name through the proxy; all ports and raw web refused"

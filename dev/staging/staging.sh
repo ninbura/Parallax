@@ -391,7 +391,7 @@ smoke() {
     # (the staging.test zone) when saved, then put back as it was.
     px config export -o /etc/parallax/smoke-named.toml 2>/dev/null
     cp "$STATE/config/smoke-named.toml" "$STATE/config/smoke-named-before.toml"
-    sed -i 's/^grants = \[{ kind = "service", name = "immich" }\]$/grants = [{ kind = "service", name = "immich" }, { kind = "host_port", host = "nas.staging.test", port = 80 }]/' \
+    sed -i 's/^grants = \[{ kind = "service", name = "immich" }\]$/grants = [{ kind = "service", name = "immich" }, { kind = "host", host = "nas.staging.test", ports = ["80\/tcp"] }]/' \
         "$STATE/config/smoke-named.toml"
     if grep -q 'host = "nas.staging.test"' "$STATE/config/smoke-named.toml" \
         && px config import /etc/parallax/smoke-named.toml >/dev/null 2>&1; then

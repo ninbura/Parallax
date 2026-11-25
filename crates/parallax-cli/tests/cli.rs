@@ -196,7 +196,7 @@ fn peer_lifecycle_stores_no_private_key() {
     let (ok, out, _) = s.run(&["peer", "show", "tablet"]);
     assert!(ok);
     assert!(
-        out.contains("reaches service immich as 198.18.1.5/32"),
+        out.contains("reaches service immich (443/tcp) as 198.18.1.5/32"),
         "{out}"
     );
 
@@ -262,7 +262,7 @@ fn peer_show_marks_proxied_services() {
     let (ok, out, err) = s.run(&["peer", "show", "sister-phone"]);
     assert!(ok, "{err}");
     assert!(
-        out.contains("reaches service immich as 198.18.1.5/32 through the HTTPS proxy"),
+        out.contains("reaches service immich (443/tcp) as 198.18.1.5/32 through the HTTPS proxy"),
         "{out}"
     );
 }
@@ -432,11 +432,11 @@ fn fake_daemon(
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let reply = match request["request"].as_str().unwrap() {
                 "load" => serde_json::json!({
-                    "protocol": 3, "reply": "configuration", "public_ip": null, "names": {},
+                    "protocol": 4, "reply": "configuration", "public_ip": null, "names": {},
                     "configuration": config, "revision": 3,
                 }),
                 "save" => serde_json::json!({
-                    "protocol": 3, "reply": "applied", "revision": 4,
+                    "protocol": 4, "reply": "applied", "revision": 4,
                     "log": ["applied by the fake daemon"], "error": null,
                 }),
                 other => panic!("unexpected request {other}"),
@@ -479,7 +479,7 @@ fn commands_go_through_a_running_daemon() {
     assert_eq!(seen[2]["revision"], 3, "saved against the loaded revision");
     let peers = seen[2]["configuration"]["peer"].as_array().unwrap();
     assert!(peers.iter().all(|p| p["name"] != "router"), "{peers:?}");
-    assert!(seen.iter().all(|r| r["protocol"] == 3));
+    assert!(seen.iter().all(|r| r["protocol"] == 4));
 }
 
 /// A stale socket file (its daemon is gone) means no daemon.
@@ -567,7 +567,7 @@ fn a_backup_restores_what_changed_since() {
     let file = s.backups().pop().unwrap();
     let (ok, out, _) = s.run(&["backup", "list"]);
     assert!(
-        ok && out.contains("encrypted") && out.contains("schema 4"),
+        ok && out.contains("encrypted") && out.contains("schema 5"),
         "{out}"
     );
 

@@ -73,8 +73,9 @@ pub struct Network {
     pub masquerade: bool,
 }
 
-pub struct Service { name, host: Host, proto: Proto, port: u16, nginx_vhost: bool,
+pub struct Service { name, host: Host, ports: Vec<PortSpec>, nginx_vhost: bool,
                      hostnames: Vec<String> }
+pub struct PortSpec { first: u16, last: u16, proto: Option<Proto> }   // "445/tcp", "137-138/udp", "25565" (both)
 pub enum Host { Ip(Ipv4Addr), Name(String) }   // TOML: a string either way
 
 pub struct Template {
@@ -88,7 +89,7 @@ pub struct Template {
 }
 
 #[serde(tag = "kind")]
-pub enum Grant { AllNetworks, Network{name}, Host{host}, HostPort{host,proto,port}, Service{name}, Internet }
+pub enum Grant { AllNetworks, Network{name}, Host{host, ports}, Service{name}, Internet }
 pub enum DnsMode { Split, TunnelWide, None }
 pub enum AllowedIpsStrategy { MappedSubnets, GrantsOnly, FullTunnel }
 
@@ -102,6 +103,16 @@ pub struct Peer {
     pub tailscale: Option<TailscalePeer>, // node_id?, address?  (M2)
 }
 ```
+
+Ports are lists, written the way ufw writes them: `445/tcp`, `137-138/udp`,
+or a bare `25565` for TCP and UDP. A service is a named host and its ports
+(SMB is one service with four ports), granted to any number of templates; a
+grant itself has no name, since it's only the link between a template and
+what it reaches. A `host` grant is the inline form for one-offs: with
+`ports` it opens those, without them every port. The firewall matches one
+set of ports per protocol per rule (`tcp dport { 139, 445 }`). Older
+configurations still import: a service's single `port`/`proto`, and
+`host_port` grants (now a `host` grant with one port).
 
 Two additions relative to the handoff, both small and flagged:
 
@@ -207,7 +218,7 @@ accept (`ReachKind::Lan { proxied: true }`). Instead, for each tier with a
 service's address, as clients see it (virtual where mapped), to the proxy
 (`server.proxy`, `10.8.0.1:8443` by default). The rule comes before NETMAP,
 since NAT takes the first match. A tier that already reaches that host's 443
-directly (`all_networks`, its network, `host`, a matching `host_port`) gets
+directly (`all_networks`, its network, a `host` grant covering tcp/443) gets
 no redirect: the proxy would add nothing. Only tiers with a redirect may
 reach the proxy port in INPUT. The firewall works per tier and the proxy per
 hostname: when a tier loses one of several proxied hostnames, its other
@@ -288,7 +299,7 @@ server (crate `parallax-dns`, built on hickory, a task in the daemon) reads
   peer's key. A source outside every tier is refused.
 - **What it may ask.** A network grant (or `all_networks`) gives the
   network's `domains`; a `service` grant gives the service's `hostnames`.
-  A `host` or `host_port` grant on a name gives that name (one granted by
+  A `host` grant on a name gives that name (one granted by
   address gives none), and so does a granted service whose host is a name.
   Names outside every zone go
   to `server.dns.public_resolver`, only for templates with `dns.public`.

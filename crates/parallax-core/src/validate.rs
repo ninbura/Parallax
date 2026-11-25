@@ -41,17 +41,18 @@ pub enum ReachKind<'a> {
         network: &'a Network,
         /// Real-space destination prefix (a /32 for hosts).
         real: Ipv4Net,
-        port: Option<(Proto, u16)>,
+        /// `None`: every port.
+        ports: Option<Vec<PortRange>>,
         /// Reached only through the HTTPS proxy (a service with hostnames),
         /// never forwarded directly.
         proxied: bool,
     },
     /// A port forward on the home's public IP, granted by a name that
     /// resolves there: out the WAN interface, which the router hairpins
-    /// back in. Always one port ([`crate::names::public_ip_refusal`]).
+    /// back in. Always named ports ([`crate::names::public_ip_refusal`]).
     HomePublic {
         address: Ipv4Addr,
-        port: (Proto, u16),
+        ports: Vec<PortRange>,
         /// Through the HTTPS proxy, which connects to it itself.
         proxied: bool,
     },
@@ -124,21 +125,25 @@ fn network_of_host<'a>(config: &'a Config, host: &Host) -> Option<&'a Network> {
 /// on the box too. Hosts compare as written: a name and an address for the
 /// same machine don't match.
 fn reaches_web_directly(config: &Config, grant: &Grant, host: &Host) -> bool {
-    let web = names::is_web;
+    let web = |ports: &[PortSpec]| ranges(ports).into_iter().any(names::covers_web);
     match grant {
         Grant::AllNetworks => true,
         Grant::Network { name } => network_of_host(config, host).is_some_and(|n| &n.name == name),
-        Grant::Host { host: h } => h == host,
-        Grant::HostPort {
-            host: h,
-            proto,
-            port,
-        } => h == host && web(*proto, *port),
+        Grant::Host { host: h, ports } => h == host && (ports.is_empty() || web(ports)),
         Grant::Service { name } => config
             .service(name)
-            .is_some_and(|s| !s.is_proxied() && &s.host == host && web(s.proto, s.port)),
+            .is_some_and(|s| !s.is_proxied() && &s.host == host && web(&s.ports)),
         Grant::Internet => false,
     }
+}
+
+/// `139/tcp, 445/tcp`, for messages and labels.
+fn port_list(ports: &[PortSpec]) -> String {
+    ports
+        .iter()
+        .map(PortSpec::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A grant as written in the config, for messages.
@@ -146,20 +151,20 @@ fn describe_grant(grant: &Grant) -> String {
     match grant {
         Grant::AllNetworks => "all_networks".into(),
         Grant::Network { name } => format!("network '{name}'"),
-        Grant::Host { host } => format!("host {host}"),
-        Grant::HostPort { host, proto, port } => {
-            format!("host_port {host} {}/{port}", proto.as_str())
-        }
+        Grant::Host { host, ports } if ports.is_empty() => format!("host {host}"),
+        Grant::Host { host, ports } => format!("host {host} {}", port_list(ports)),
         Grant::Service { name } => format!("service '{name}'"),
         Grant::Internet => "internet".into(),
     }
 }
 
-/// The label for a reach on `host`: the name with the address it resolved to.
-fn host_label(host: &Host, ip: Ipv4Addr, port: &str) -> String {
+/// The label for a reach on `host`: the name with the address it resolved
+/// to. Not its ports: a rule shows those in its match, and a long list
+/// would overrun a firewall comment.
+fn host_label(host: &Host, ip: Ipv4Addr) -> String {
     match host {
-        Host::Ip(_) => format!("host {ip}{port}"),
-        Host::Name(name) => format!("host {name} ({ip}){port}"),
+        Host::Ip(_) => format!("host {ip}"),
+        Host::Name(name) => format!("host {name} ({ip})"),
     }
 }
 
@@ -180,6 +185,15 @@ fn host_problem(config: &Config, host: &Host) -> Option<String> {
             )
         }),
     }
+}
+
+/// A port list built in code (an older `port = 0`, the GUI) rather than
+/// parsed: port 0, or a range that runs backwards.
+fn ports_problem(ports: &[PortSpec]) -> Option<String> {
+    ports
+        .iter()
+        .find(|p| p.first == 0 || p.first > p.last)
+        .map(|p| format!("'{p}' is not a port or range of ports (1-65535)"))
 }
 
 fn overlaps(a: Ipv4Net, b: Ipv4Net) -> bool {
@@ -260,21 +274,21 @@ impl<'a> Model<'a> {
         template: &Template,
         label: String,
         ip: Ipv4Addr,
-        port: Option<(Proto, u16)>,
+        ports: Option<Vec<PortRange>>,
         proxied: bool,
     ) -> Option<Reach<'a>> {
         // First, even where a configured network holds it: the public IP's
         // rules must apply wherever it is.
         if Some(ip) == self.public_ip {
-            // Every port of it is never one reach.
-            let port = port?;
-            return names::public_ip_refusal(template, Some(port), proxied)
+            // Every port of it is never a reach.
+            let ports = ports?;
+            return names::public_ip_refusal(template, Some(&ports), proxied)
                 .is_none()
                 .then_some(Reach {
                     label,
                     kind: ReachKind::HomePublic {
                         address: ip,
-                        port,
+                        ports,
                         proxied,
                     },
                 });
@@ -284,7 +298,7 @@ impl<'a> Model<'a> {
             kind: ReachKind::Lan {
                 network,
                 real: Ipv4Net::from(ip),
-                port,
+                ports,
                 proxied,
             },
         })
@@ -374,7 +388,7 @@ impl<'a> Model<'a> {
                             kind: ReachKind::Lan {
                                 network: n,
                                 real: n.subnet.trunc(),
-                                port: None,
+                                ports: None,
                                 proxied: false,
                             },
                         });
@@ -387,29 +401,19 @@ impl<'a> Model<'a> {
                             kind: ReachKind::Lan {
                                 network: n,
                                 real: n.subnet.trunc(),
-                                port: None,
+                                ports: None,
                                 proxied: false,
                             },
                         });
                     }
                 }
-                Grant::Host { host } => {
+                // Never every port of the home's public IP: `reach_at`
+                // gives a port forward named ports only.
+                Grant::Host { host, ports } => {
+                    let ranges = (!ports.is_empty()).then(|| ranges(ports));
                     for ip in self.addresses(host) {
-                        // Never all ports of the home's public IP: `reach_at`
-                        // gives a port forward one port at a time.
-                        if let Some(r) =
-                            self.reach_at(template, host_label(host, ip, ""), ip, None, false)
-                        {
-                            push(r);
-                        }
-                    }
-                }
-                Grant::HostPort { host, proto, port } => {
-                    for ip in self.addresses(host) {
-                        let label = host_label(host, ip, &format!(" {}/{port}", proto.as_str()));
-                        if let Some(r) =
-                            self.reach_at(template, label, ip, Some((*proto, *port)), false)
-                        {
+                        let label = host_label(host, ip);
+                        if let Some(r) = self.reach_at(template, label, ip, ranges.clone(), false) {
                             push(r);
                         }
                     }
@@ -418,9 +422,9 @@ impl<'a> Model<'a> {
                     if let Some(s) = self.config.service(name) {
                         for ip in self.addresses(&s.host) {
                             let label = format!("service {}", s.name);
-                            let port = Some((s.proto, s.port));
+                            let ports = Some(ranges(&s.ports));
                             if let Some(r) =
-                                self.reach_at(template, label, ip, port, s.is_proxied())
+                                self.reach_at(template, label, ip, ports, s.is_proxied())
                             {
                                 push(r);
                             }
@@ -440,14 +444,14 @@ impl<'a> Model<'a> {
     /// Proxied reaches don't count: the proxy connects from the gateway, and
     /// sibling sites on the same address and port must not inherit them.
     pub fn reaches_service(&self, template: &Template, service: &Service) -> bool {
+        let ranges = ranges(&service.ports);
         self.addresses(&service.host)
             .into_iter()
-            .any(|ip| self.reaches_directly(template, ip, service.proto, service.port))
+            .any(|ip| ranges.iter().any(|r| self.reaches_range(template, ip, *r)))
     }
 
     /// Does `template` reach `proto/port` on `host` directly, without the
-    /// proxy? Only LAN grants count; `internet` never covers a configured
-    /// network.
+    /// proxy? See [`Model::reaches_range`].
     pub fn reaches_directly(
         &self,
         template: &Template,
@@ -455,6 +459,21 @@ impl<'a> Model<'a> {
         proto: Proto,
         port: u16,
     ) -> bool {
+        self.reaches_range(
+            template,
+            host,
+            PortRange {
+                proto,
+                first: port,
+                last: port,
+            },
+        )
+    }
+
+    /// Does `template` reach any of `range` on `host` directly, without the
+    /// proxy? Only LAN grants and port forwards count; `internet` never
+    /// covers a configured network.
+    pub fn reaches_range(&self, template: &Template, host: Ipv4Addr, range: PortRange) -> bool {
         // The owner's `internet` (with `all_networks`) reaches the home's
         // public IP like any public address.
         if Some(host) == self.public_ip
@@ -467,12 +486,15 @@ impl<'a> Model<'a> {
             ReachKind::Lan { proxied: true, .. } | ReachKind::HomePublic { proxied: true, .. } => {
                 false
             }
-            ReachKind::Lan { real, port: p, .. } => {
-                real.contains(&host) && p.is_none_or(|(pr, po)| pr == proto && po == port)
+            ReachKind::Lan { real, ports, .. } => {
+                real.contains(&host)
+                    && ports
+                        .as_ref()
+                        .is_none_or(|ports| ports.iter().any(|r| r.overlaps(range)))
             }
-            ReachKind::HomePublic {
-                address, port: p, ..
-            } => *address == host && *p == (proto, port),
+            ReachKind::HomePublic { address, ports, .. } => {
+                *address == host && ports.iter().any(|r| r.overlaps(range))
+            }
             ReachKind::Internet => false,
         })
     }
@@ -839,12 +861,17 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         if let Some(problem) = host_problem(config, &s.host) {
             errors.push(format!("{ctx}: host {problem}"));
         }
-        if s.port == 0 {
-            errors.push(format!("{ctx}: port must not be 0"));
-        }
-        if s.is_proxied() && (s.proto != Proto::Tcp || s.port != 443) {
+        if s.ports.is_empty() {
             errors.push(format!(
-                "{ctx}: hostnames are for HTTPS services; set proto = \"tcp\" and port = 443"
+                "{ctx}: has no ports; give ports = [\"445/tcp\", ...]"
+            ));
+        }
+        if let Some(problem) = ports_problem(&s.ports) {
+            errors.push(format!("{ctx}: {problem}"));
+        }
+        if s.is_proxied() && s.single_port() != Some((Proto::Tcp, 443)) {
+            errors.push(format!(
+                "{ctx}: hostnames are for HTTPS services; set ports = [\"443/tcp\"]"
             ));
         }
         let network = network_of_host(config, &s.host);
@@ -951,12 +978,12 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                         errors.push(format!("{ctx}: grant refers to unknown network '{name}'"));
                     }
                 }
-                Grant::Host { host } | Grant::HostPort { host, .. } => {
+                Grant::Host { host, ports } => {
                     if let Some(problem) = host_problem(config, host) {
                         errors.push(format!("{ctx}: grant host {problem}"));
                     }
-                    if let Grant::HostPort { port: 0, .. } = g {
-                        errors.push(format!("{ctx}: grant for {host} has port 0"));
+                    if let Some(problem) = ports_problem(ports) {
+                        errors.push(format!("{ctx}: grant for {host}: {problem}"));
                     }
                 }
                 Grant::Service { name } => {
@@ -1239,6 +1266,7 @@ mod tests {
         let e = errors_of(|c| {
             c.templates[0].grants = vec![Grant::Host {
                 host: "10.99.0.1".parse().unwrap(),
+                ports: Vec::new(),
             }]
         });
         assert!(has(&e, "not inside any configured network"), "{e:?}");
@@ -1284,14 +1312,47 @@ mod tests {
     }
 
     #[test]
+    fn port_lists_are_checked() {
+        let e = errors_of(|c| c.services[0].ports.clear());
+        assert!(has(&e, "service 'immich': has no ports"), "{e:?}");
+        // An older `port = 0` comes in as a port list with port 0.
+        let e = errors_of(|c| {
+            c.templates[1].grants.push(Grant::Host {
+                host: "192.168.1.9".parse().unwrap(),
+                ports: vec![PortSpec::one(Proto::Tcp, 0)],
+            })
+        });
+        assert!(
+            has(
+                &e,
+                "template 'family': grant for 192.168.1.9: '0/tcp' is not a port"
+            ),
+            "{e:?}"
+        );
+        let e = errors_of(|c| {
+            c.services[0].ports = vec![PortSpec {
+                first: 200,
+                last: 100,
+                proto: None,
+            }]
+        });
+        assert!(has(&e, "'200-100' is not a port or range"), "{e:?}");
+        // A proxied service is exactly 443/tcp: a bare 443 (TCP and UDP) isn't.
+        let e = errors_of(|c| {
+            c.services[0].hostnames = vec!["immich.mydomain.com".into()];
+            c.services[0].ports = vec!["443".parse().unwrap()];
+        });
+        assert!(has(&e, "set ports = [\"443/tcp\"]"), "{e:?}");
+    }
+
+    #[test]
     fn named_hosts_must_be_names_under_a_zone() {
         let e = errors_of(|c| c.services[0].host = Host::Name("immich.mydomain.com".into()));
         assert!(e.is_empty(), "{e:?}");
         let e = errors_of(|c| {
-            c.templates[1].grants.push(Grant::HostPort {
+            c.templates[1].grants.push(Grant::Host {
                 host: Host::Name("game.otherdomain.com".into()),
-                proto: Proto::Udp,
-                port: 25565,
+                ports: vec![PortSpec::one(Proto::Udp, 25565)],
             })
         });
         assert!(
@@ -1310,10 +1371,9 @@ mod tests {
     #[test]
     fn a_name_reaches_what_it_resolved_to() {
         let mut cfg = canonical_config();
-        cfg.templates[1].grants.push(Grant::HostPort {
+        cfg.templates[1].grants.push(Grant::Host {
             host: Host::Name("nas.mydomain.com".into()),
-            proto: Proto::Tcp,
-            port: 445,
+            ports: vec![PortSpec::one(Proto::Tcp, 445)],
         });
         let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
         let family = m.template("family").unwrap();
@@ -1334,8 +1394,8 @@ mod tests {
             r.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
             [
                 "service immich",
-                "host nas.mydomain.com (192.168.1.9) tcp/445",
-                "host nas.mydomain.com (192.168.1.10) tcp/445"
+                "host nas.mydomain.com (192.168.1.9)",
+                "host nas.mydomain.com (192.168.1.10)"
             ]
         );
         assert_eq!(r[1].client_net(), Some("198.18.1.9/32".parse().unwrap()));
@@ -1491,12 +1551,12 @@ mod tests {
     fn hostnames_need_https() {
         let e = errors_of(|c| {
             proxy_immich(c);
-            c.services[0].port = 8443;
+            c.services[0].ports = vec![PortSpec::one(Proto::Tcp, 8443)];
         });
         assert!(has(&e, "hostnames are for HTTPS services"), "{e:?}");
         let e = errors_of(|c| {
             proxy_immich(c);
-            c.services[0].proto = Proto::Udp;
+            c.services[0].ports = vec![PortSpec::one(Proto::Udp, 443)];
         });
         assert!(has(&e, "hostnames are for HTTPS services"), "{e:?}");
     }
@@ -1509,21 +1569,21 @@ mod tests {
             Grant::Network {
                 name: "home".into(),
             },
-            Grant::Host { host: host.clone() },
-            Grant::HostPort {
+            Grant::Host {
                 host: host.clone(),
-                proto: Proto::Tcp,
-                port: 80,
+                ports: Vec::new(),
             },
-            Grant::HostPort {
+            Grant::Host {
                 host: host.clone(),
-                proto: Proto::Udp,
-                port: 443,
+                ports: vec![PortSpec::one(Proto::Tcp, 80)],
             },
-            Grant::HostPort {
+            Grant::Host {
                 host: host.clone(),
-                proto: Proto::Tcp,
-                port: 443,
+                ports: vec![PortSpec::one(Proto::Udp, 443)],
+            },
+            Grant::Host {
+                host: host.clone(),
+                ports: vec![PortSpec::one(Proto::Tcp, 443)],
             },
             Grant::Service {
                 name: "plain-web".into(),
@@ -1534,7 +1594,7 @@ mod tests {
             proxy_immich(&mut cfg);
             let mut plain = cfg.services[0].clone();
             plain.name = "plain-web".into();
-            plain.port = 80;
+            plain.ports = vec![PortSpec::one(Proto::Tcp, 80)];
             plain.hostnames = Vec::new();
             let mut photos = cfg.services[0].clone();
             photos.name = "photos".into();
@@ -1560,10 +1620,9 @@ mod tests {
         }
         // Neither another port nor a second proxied site on the same box bypasses.
         let mut cfg = with_services();
-        cfg.templates[1].grants.push(Grant::HostPort {
+        cfg.templates[1].grants.push(Grant::Host {
             host,
-            proto: Proto::Tcp,
-            port: 22,
+            ports: vec![PortSpec::one(Proto::Tcp, 22)],
         });
         cfg.templates[1].grants.push(Grant::Service {
             name: "photos".into(),

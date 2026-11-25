@@ -4,7 +4,7 @@ Status: accepted (step 7a; the home's public IP since 7a.2).
 
 ## Decision
 
-A service's `host` and a `host`/`host_port` grant's `host` may be a DNS name
+A service's `host` and a `host` grant's `host` may be a DNS name
 instead of an address (`host = "nas.mydomain.com"`). The gateway looks the
 name up and grants exactly the addresses it has, on the grant's ports. The
 home's DNS stays the only place a machine's address is written down.

@@ -67,5 +67,5 @@ and unaffected; raw IPs always work; Android allows per-app VPN exemptions.
   router instead of the shim. Pick a tunnel range you're unlikely to visit. The
   same goes for `198.18.0.0/15` on a device running a proxy app that hands
   out fake addresses from it (Clash, Surge).
-- A `host` or `host_port` grant gives a name only when it's written with one
+- A `host` grant gives a name only when it's written with one
   (`host = "nas.mydomain.com"`); one written with an address gives none.

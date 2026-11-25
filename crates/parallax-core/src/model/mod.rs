@@ -10,6 +10,7 @@ mod host;
 mod layout;
 mod network;
 mod peer;
+mod ports;
 mod server;
 mod service;
 mod template;
@@ -19,6 +20,7 @@ pub use grant::{Grant, Proto};
 pub use host::Host;
 pub use network::Network;
 pub use peer::{Peer, TailscalePeer, TransportKind, WireGuardPeer};
+pub use ports::{ranges, PortRange, PortSpec};
 pub use server::{
     BackupServer, DerpMode, DnsServer, EncryptedDns, FirewallBackend, FirewallServer,
     HeadscaleServer, Interval, ProxyServer, PublicIpServer, ServerConfig, WireGuardServer,

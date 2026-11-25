@@ -79,8 +79,11 @@ pub(crate) fn everything_config() -> Config {
     c.services.push(Service {
         name: "photos".into(),
         host: Host::Name("photos.mydomain.com".into()),
-        proto: Proto::Udp,
-        port: 8443,
+        ports: vec![
+            "8443/udp".parse().unwrap(),
+            "137-138/udp".parse().unwrap(),
+            "25565".parse().unwrap(),
+        ],
         nginx_vhost: false,
         hostnames: vec!["photos.mydomain.com".into(), "img.mydomain.com".into()],
     });
@@ -90,11 +93,11 @@ pub(crate) fn everything_config() -> Config {
         Grant::Network { name: "lab".into() },
         Grant::Host {
             host: Ipv4Addr::new(192, 168, 1, 9).into(),
+            ports: Vec::new(),
         },
-        Grant::HostPort {
+        Grant::Host {
             host: Host::Name("dns.lab.mydomain.com".into()),
-            proto: Proto::Udp,
-            port: 53,
+            ports: vec![PortSpec::one(Proto::Udp, 53)],
         },
         Grant::Service {
             name: "photos".into(),
@@ -423,7 +426,7 @@ async fn the_public_ip_is_kept_apart_from_the_configuration() {
 }
 
 #[tokio::test]
-async fn grants_stored_before_host_names_keep_their_address() {
+async fn grants_and_services_from_before_port_lists_keep_their_ports() {
     let dir = TempDir::new();
     schema_1_database(&dir.db()).await;
     {
@@ -439,7 +442,11 @@ async fn grants_stored_before_host_names_keep_their_address() {
              VALUES (1, 'guests', 0, '10.8.2.0/24', 'guest', 0, 'split', 'split', 0,
                 'mapped_subnets');
              INSERT INTO template_grants (template_id, position, kind, ip, proto, port)
-             VALUES (1, 0, 'host_port', '192.168.1.9', 'udp', 25565);",
+             VALUES (1, 0, 'host_port', '192.168.1.9', 'udp', 25565);
+             INSERT INTO template_grants (template_id, position, kind, ip)
+             VALUES (1, 1, 'host', '192.168.1.10');
+             INSERT INTO services (id, name, position, host, proto, port, nginx_vhost)
+             VALUES (1, 'smb', 0, '192.168.1.9', 'tcp', 445, 0);",
         )
         .await
         .unwrap();
@@ -454,12 +461,21 @@ async fn grants_stored_before_host_names_keep_their_address() {
     let loaded = store.load().await.unwrap();
     assert_eq!(
         loaded.templates[0].grants,
-        [Grant::HostPort {
-            host: Ipv4Addr::new(192, 168, 1, 9).into(),
-            proto: Proto::Udp,
-            port: 25565,
-        }]
+        [
+            Grant::Host {
+                host: Ipv4Addr::new(192, 168, 1, 9).into(),
+                ports: vec![PortSpec::one(Proto::Udp, 25565)],
+            },
+            Grant::Host {
+                host: Ipv4Addr::new(192, 168, 1, 10).into(),
+                ports: Vec::new(),
+            }
+        ]
     );
+    assert_eq!(loaded.services[0].ports, [PortSpec::one(Proto::Tcp, 445)]);
+    // And it saves back in the new shape.
+    store.save(&loaded).await.unwrap();
+    assert_eq!(store.load().await.unwrap(), loaded);
 }
 
 #[tokio::test]

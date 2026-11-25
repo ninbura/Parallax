@@ -115,13 +115,19 @@ masquerade = false
 [[service]]
 name = "immich"
 host = "192.168.1.5"
-proto = "tcp"
-port = 443
+# Like ufw: "445/tcp", "137-138/udp", or a bare "25565" for TCP and UDP.
+ports = ["443/tcp"]
 nginx_vhost = true
 # HTTPS names this service answers to. With them set, `service` grants reach
 # it only through Parallax's HTTPS proxy, which lets these names through and
 # nothing else, so a template can't use the other sites on the same box.
 # hostnames = ["immich.mydomain.com"]
+
+# A service with several ports: SMB on the NAS, defined once, granted by name.
+# [[service]]
+# name = "nas-smb"
+# host = "nas.mydomain.com"
+# ports = ["137-138/udp", "139/tcp", "445/tcp"]
 
 # Templates are the policy classes. The WireGuard pool *is* the trust tier:
 # firewall and nginx rules match the pool, so adding a peer needs no new rule.
@@ -148,7 +154,9 @@ persistent_keepalive = 25
 name = "family"
 # More grants, one per line: a host and one port, by address or by name
 # (the name then also answers in DNS for this template):
-#   { kind = "host_port", host = "game.mydomain.com", proto = "udp", port = 25565 },
+#   { kind = "service", name = "nas-smb" },
+#   { kind = "host", host = "game.mydomain.com", ports = ["25565"] },
+# A host grant without ports reaches every port of it.
 grants = [{ kind = "service", name = "immich" }]
 [template.wireguard]
 pool = "10.8.2.0/24"

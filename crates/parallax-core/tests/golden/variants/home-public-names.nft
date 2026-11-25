@@ -66,7 +66,7 @@ table inet parallax {
 	}
 
 	chain tier_family {
-		oifname "eth0" ip daddr 1.2.3.4 udp dport 25565 accept comment "family: host game.mydomain.com (1.2.3.4) udp/25565 (a port forward on the home's public IP)"
+		oifname "eth0" ip daddr 1.2.3.4 udp dport 25565 accept comment "family: host game.mydomain.com (1.2.3.4) (a port forward on the home's public IP)"
 		oifname "eth0" ip daddr != @not_public accept comment "family: internet (public addresses)"
 		drop comment "family: default deny"
 	}

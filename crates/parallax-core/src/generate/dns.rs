@@ -236,7 +236,7 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
                 }
                 // A host granted by name may look that name up; one granted
                 // by address has no name.
-                Grant::Host { host } | Grant::HostPort { host, .. } => {
+                Grant::Host { host, .. } => {
                     if let Some(h) = host.name() {
                         if !names.iter().any(|n| n == h) {
                             names.push(h.to_string());
@@ -464,8 +464,7 @@ mod tests {
         cfg.services.push(Service {
             name: "printer".into(),
             host: addr("192.168.1.9").into(),
-            proto: crate::model::Proto::Tcp,
-            port: 631,
+            ports: vec![crate::model::PortSpec::one(crate::model::Proto::Tcp, 631)],
             nginx_vhost: false,
             hostnames: Vec::new(),
         });
