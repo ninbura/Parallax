@@ -56,13 +56,15 @@ pub enum Reply {
         revision: u64,
         /// Why the last apply failed; `None` when it worked.
         apply_error: Option<String>,
-        /// The home's public IP as last found; `None` if it never was.
+        /// The home's public IP in effect: the configured one, else the
+        /// last one found. `None` if neither.
         public_ip: Option<Ipv4Addr>,
     },
     Configuration {
         configuration: Box<Config>,
         revision: u64,
-        /// What generation also needs: the home's public IP, as last found.
+        /// What generation also needs: the home's public IP as a lookup
+        /// last found it.
         public_ip: Option<Ipv4Addr>,
     },
     /// A change was saved (or nothing was asked to change), then applied.

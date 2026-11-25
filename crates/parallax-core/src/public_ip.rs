@@ -48,28 +48,49 @@ pub struct Found {
     pub source: String,
 }
 
-/// Find the address. `Err` lists why each way tried failed.
-pub fn find(server: &ServerConfig, resolver: &dyn Resolver) -> Result<Found, Vec<String>> {
+/// The endpoint's host: an IPv4 address, a hostname, or a bracketed IPv6 address.
+fn endpoint_host(server: &ServerConfig) -> &str {
+    let endpoint = &server.wireguard.endpoint;
+    endpoint
+        .rsplit_once(':')
+        .map_or(endpoint.as_str(), |(host, _)| host)
+}
+
+/// The address the configuration itself gives, with no lookup: a fixed
+/// `server.public_ip.address`, or an IPv4 endpoint.
+pub fn configured(server: &ServerConfig) -> Option<Found> {
     if let Some(address) = server.public_ip.address {
-        return Ok(Found {
+        return Some(Found {
             address,
             source: "server.public_ip.address".into(),
         });
     }
+    endpoint_host(server)
+        .parse::<Ipv4Addr>()
+        .ok()
+        .map(|address| Found {
+            address,
+            source: format!("the endpoint {}", server.wireguard.endpoint),
+        })
+}
+
+/// What generation uses: the configured address when there is one (it's
+/// right the moment it's saved), otherwise the last one a lookup found.
+pub fn effective(server: &ServerConfig, last_found: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    configured(server).map(|f| f.address).or(last_found)
+}
+
+/// Find the address. `Err` lists why each way tried failed.
+pub fn find(server: &ServerConfig, resolver: &dyn Resolver) -> Result<Found, Vec<String>> {
+    if let Some(found) = configured(server) {
+        return Ok(found);
+    }
     let endpoint = &server.wireguard.endpoint;
-    let host = endpoint
-        .rsplit_once(':')
-        .map_or(endpoint.as_str(), |(host, _)| host);
+    let host = endpoint_host(server);
     if host.starts_with('[') {
         return Err(vec![format!(
             "the endpoint {endpoint} is an IPv6 address; set server.public_ip.address to the home's public IPv4 address"
         )]);
-    }
-    if let Ok(address) = host.parse::<Ipv4Addr>() {
-        return Ok(Found {
-            address,
-            source: format!("the endpoint {endpoint}"),
-        });
     }
     let mut problems = Vec::new();
     let via = std::iter::once(Nameserver::Plain(server.dns.public_resolver)).chain(
@@ -170,6 +191,18 @@ mod tests {
         let r = FakeResolver::new();
         assert_eq!(find(&s, &r).unwrap().address, Ipv4Addr::new(203, 0, 113, 9));
         assert!(r.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_configured_address_wins_over_the_last_found() {
+        let last = Some(Ipv4Addr::new(1, 2, 3, 5));
+        assert_eq!(effective(&server(), last), last, "a hostname endpoint");
+        let mut s = server();
+        s.public_ip.address = Some(HOME);
+        assert_eq!(effective(&s, last), Some(HOME));
+        let mut s = server();
+        s.wireguard.endpoint = "1.2.3.6:51820".into();
+        assert_eq!(effective(&s, last), Some(Ipv4Addr::new(1, 2, 3, 6)));
     }
 
     #[test]

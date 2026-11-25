@@ -97,8 +97,8 @@ enum Msg {
     BackupTick,
     /// The DNS server and the proxy are up: notify these after each apply.
     Serving(Vec<Arc<Notify>>),
-    /// A lookup of the home's public IP finished.
-    PublicIp(Result<Found, Vec<String>>),
+    /// A lookup of the home's public IP finished, for these inputs.
+    PublicIp(Inputs, Result<Found, Vec<String>>),
     Shutdown,
 }
 
@@ -378,7 +378,7 @@ async fn dispatch(request: Request, tx: &mpsc::UnboundedSender<Msg>, views: &Vie
         Request::Status => Reply::Status {
             revision: view.revision,
             apply_error: view.apply_error,
-            public_ip: view.public_ip,
+            public_ip: public_ip::effective(&view.config.server, view.public_ip),
         },
         Request::Load => Reply::Configuration {
             configuration: Box::new((*view.config).clone()),
@@ -420,13 +420,17 @@ async fn timers(tx: mpsc::UnboundedSender<Msg>, every: Duration) {
     }
 }
 
-/// What a public IP lookup depends on: a change to any of it looks again.
-fn lookup_inputs(config: &Config) -> (bool, String, Ipv4Addr, PublicIpServer) {
+/// What a public IP lookup depends on: a change to any of it looks again,
+/// and a result for other inputs than the current ones is stale.
+type Inputs = (bool, String, Ipv4Addr, PublicIpServer, PathBuf);
+
+fn lookup_inputs(config: &Config) -> Inputs {
     (
         public_ip::needed(config),
         config.server.wireguard.endpoint.clone(),
         config.server.dns.public_resolver,
         config.server.public_ip.clone(),
+        config.server.proxy.upstream_ca.clone(),
     )
 }
 
@@ -457,10 +461,11 @@ async fn refresh_public_ip(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
         let Some(config) = config.filter(|c| public_ip::needed(c)) else {
             continue;
         };
+        let asked = lookup_inputs(&config);
         let found =
             tokio::task::spawn_blocking(move || crate::find_public_ip(&config.server)).await;
         if let Ok(found) = found {
-            if tx.send(Msg::PublicIp(found)).is_err() {
+            if tx.send(Msg::PublicIp(asked, found)).is_err() {
                 return;
             }
         }
@@ -557,6 +562,9 @@ struct Engine {
     /// Why the last public IP lookup failed, so the same failure is
     /// logged once, not every 5 minutes.
     public_ip_problems: Option<Vec<String>>,
+    /// The database holds `view.public_ip`; false after a failed write, so
+    /// the next lookup writes it again.
+    public_ip_saved: bool,
 }
 
 impl Engine {
@@ -596,6 +604,7 @@ impl Engine {
             reloaders: Vec::new(),
             backups,
             public_ip_problems: None,
+            public_ip_saved: true,
         };
         engine.publish();
         Ok(engine)
@@ -674,8 +683,15 @@ impl Engine {
                 Msg::Tick => tick = true,
                 Msg::BackupTick => backup_due = true,
                 Msg::Serving(reloaders) => self.reloaders = reloaders,
-                Msg::PublicIp(found) => {
-                    if self.note_public_ip(found) {
+                // A save changed the inputs while this lookup ran: the
+                // lookup for the new ones is already on its way.
+                Msg::PublicIp(asked, _) if asked != lookup_inputs(&self.view.config) => {}
+                Msg::PublicIp(_, found) => {
+                    let server = &self.view.config.server;
+                    let before = public_ip::effective(server, self.view.public_ip);
+                    self.note_public_ip(found);
+                    let server = &self.view.config.server;
+                    if public_ip::effective(server, self.view.public_ip) != before {
                         why.get_or_insert("the home's public IP changed");
                     }
                 }
@@ -739,27 +755,31 @@ impl Engine {
         }
     }
 
-    /// Take a lookup's result. Returns true when the address changed (it's
-    /// then remembered in the database and published).
-    fn note_public_ip(&mut self, found: Result<Found, Vec<String>>) -> bool {
+    /// Take a lookup's result: a new address is published and remembered
+    /// in the database; a failure is logged once.
+    fn note_public_ip(&mut self, found: Result<Found, Vec<String>>) {
         match found {
             Ok(found) => {
                 self.public_ip_problems = None;
-                if self.view.public_ip == Some(found.address) {
-                    return false;
-                }
-                log(format!(
-                    "the home's public IP is {} (from {})",
-                    found.address, found.source
-                ));
-                if let Err(e) = self.rt.block_on(self.store.set_public_ip(found.address)) {
-                    warn(format!(
-                        "warning: could not remember the home's public IP in the database: {e}"
+                let changed = self.view.public_ip != Some(found.address);
+                if changed {
+                    log(format!(
+                        "the home's public IP is {} (from {})",
+                        found.address, found.source
                     ));
+                    self.view.public_ip = Some(found.address);
+                    self.publish();
                 }
-                self.view.public_ip = Some(found.address);
-                self.publish();
-                true
+                if changed || !self.public_ip_saved {
+                    let saved = self.rt.block_on(self.store.set_public_ip(found.address));
+                    if let Err(e) = &saved {
+                        warn(format!(
+                            "warning: could not remember the home's public IP in the database {}: {e}",
+                            self.store.path().display()
+                        ));
+                    }
+                    self.public_ip_saved = saved.is_ok();
+                }
             }
             Err(problems) => {
                 if self.public_ip_problems.as_ref() != Some(&problems) {
@@ -769,7 +789,6 @@ impl Engine {
                     ));
                     self.public_ip_problems = Some(problems);
                 }
-                false
             }
         }
     }

@@ -595,10 +595,10 @@ inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydoma
 pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rewritten"
 
 # (o) the home's public IP: guests with internet drop it (the router would hairpin it
-# back into the home); the owner's all_networks template doesn't. First the endpoint's
-# address is taken as is; a fixed address replaces it on save. Then the endpoint
-# becomes a hostname the public resolver answers with a private address: refused,
-# and the last known address stays.
+# back into the home); the owner's all_networks template doesn't. The endpoint's
+# address counts as is, and a fixed address the moment it's saved. A hostname is
+# looked up and re-applied when it changes; an answer with a private address is
+# refused, and the last address found stays.
 public_ip_is() { # address
     for _ in $(seq 50); do $P status | grep -qx "home public IP: $1" && return 0; sleep 0.1; done
     $P status; return 1
@@ -607,21 +607,30 @@ public_ip_is 203.0.113.1 || fail "(o) the endpoint's address was not taken as th
 $P config export > "$WORK/public-ip.toml"
 sed -i 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' "$WORK/public-ip.toml"
 apply "$WORK/public-ip.toml"
-public_ip_is 1.2.3.4 || fail "(o) a saved public_ip.address was not looked at"
-grep -q "applying (the home's public IP changed)" "$WORK/daemon.log" || fail "(o) no re-apply for the new address"
+public_ip_is 1.2.3.4 || fail "(o) a saved public_ip.address is not in effect"
 [ "$(curl_as $FRIEND http://1.2.3.4/)" = BLOCKED ] || fail "(o) friend reached the home's public IP"
 [ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(o) friend lost the internet"
 [ "$(curl_as $LAPTOP http://1.2.3.4/)" = home-public ] || fail "(o) personal (all_networks) can't reach the home's public IP"
-sed -e '/^address = "1.2.3.4"$/d' -e 's/^endpoint = .*/endpoint = "rebind.example.org:51820"/' \
-    "$WORK/public-ip.toml" > "$WORK/public-ip-rebind.toml"
+# A hostname the public resolver answers with 9.9.9.9 (dnsmasq answers all of example.org).
+sed -e '/^address = "1.2.3.4"$/d' -e 's/^endpoint = .*/endpoint = "home.example.org:51820"/' \
+    "$WORK/public-ip.toml" > "$WORK/public-ip-name.toml"
+apply "$WORK/public-ip-name.toml"
+public_ip_is 9.9.9.9 || fail "(o) the endpoint's hostname was not looked up"
+for _ in $(seq 50); do grep -q "applying (the home's public IP changed)" "$WORK/daemon.log" && break; sleep 0.1; done
+grep -q "applying (the home's public IP changed)" "$WORK/daemon.log" || fail "(o) no re-apply for the looked-up address"
+sleep 0.3
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(o) friend reached the looked-up public IP"
+[ "$(curl_as $FRIEND http://1.2.3.4/)" = home-public ] || fail "(o) the old address is still dropped"
+sed -e 's/^endpoint = .*/endpoint = "rebind.example.org:51820"/' \
+    "$WORK/public-ip-name.toml" > "$WORK/public-ip-rebind.toml"
 apply "$WORK/public-ip-rebind.toml"
 for _ in $(seq 50); do grep -q "isn't a public address" "$WORK/daemon.log" && break; sleep 0.1; done
 grep -q "rebind.example.org through 9.9.9.9: answered 192.168.1.5, which isn't a public address" "$WORK/daemon.log" \
     || fail "(o) a private answer was not refused"
-grep -q "keeping the last known 1.2.3.4" "$WORK/daemon.log" || fail "(o) the last known address was not kept"
-public_ip_is 1.2.3.4 || fail "(o) the address changed after a refused answer"
-[ "$(curl_as $FRIEND http://1.2.3.4/)" = BLOCKED ] || fail "(o) friend reached the home's public IP after a refused lookup"
-pass "(o) guests drop the home's public IP; a fixed address applies on save; a private answer is refused"
+grep -q "keeping the last known 9.9.9.9" "$WORK/daemon.log" || fail "(o) the last known address was not kept"
+public_ip_is 9.9.9.9 || fail "(o) the address changed after a refused answer"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(o) friend reached the home's public IP after a refused lookup"
+pass "(o) guests drop the home's public IP: configured, looked up and re-applied on change; a private answer is refused"
 
 # (n) the daemon's lifecycle: SIGTERM takes the gateway down and removes the socket;
 # a new daemon re-applies on SIGHUP and puts back a table someone deleted.
@@ -638,8 +647,8 @@ start_daemon 1
 for _ in $(seq 10); do [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] && break; done
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after a restart"
 # The lookup still fails (see (o)); the address from before the restart stays.
-public_ip_is 1.2.3.4 || fail "(n) the home's public IP was lost in the restart"
-[ "$(curl_as $FRIEND http://1.2.3.4/)" = BLOCKED ] || fail "(n) friend reached the home's public IP after a restart"
+public_ip_is 9.9.9.9 || fail "(n) the home's public IP was lost in the restart"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(n) friend reached the home's public IP after a restart"
 before=$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log" || true)
 kill -HUP "$(cat "$WORK/daemon.pid")"
 for _ in $(seq 50); do [ "$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log")" -gt "$before" ] && break; sleep 0.1; done

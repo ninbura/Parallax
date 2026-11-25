@@ -472,14 +472,16 @@ pub(crate) fn preview(config: &Config, today: Date) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Generate, write and reconcile the live gateway. Returns the warnings and
-/// the apply log.
+/// Generate, write and reconcile the live gateway. `last_found` is the
+/// home's public IP as a lookup last found it. Returns the warnings and the
+/// apply log.
 pub(crate) fn apply_config(
     config: &Config,
     out: &Path,
     today: Date,
-    public_ip: Option<Ipv4Addr>,
+    last_found: Option<Ipv4Addr>,
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let public_ip = public_ip::effective(&config.server, last_found);
     let model = Model::resolve(config, today)
         .map_err(|e| anyhow!("{e}"))?
         .with_public_ip(public_ip);
@@ -547,7 +549,8 @@ fn run() -> anyhow::Result<()> {
         }
         Command::Doctor => doctor(&ctx)?,
         Command::Plan(out) => {
-            let (config, public_ip) = ctx.load_for_generation()?;
+            let (config, last_found) = ctx.load_for_generation()?;
+            let public_ip = public_ip::effective(&config.server, last_found);
             let model = resolve(&config)?.with_public_ip(public_ip);
             let bundle = generate::generate_all(&model, &fs)?;
             print_warnings(&check_certificates(&model)?);
@@ -555,7 +558,8 @@ fn run() -> anyhow::Result<()> {
             print!("{}", plan.render());
         }
         Command::Generate(out) => {
-            let (config, public_ip) = ctx.load_for_generation()?;
+            let (config, last_found) = ctx.load_for_generation()?;
+            let public_ip = public_ip::effective(&config.server, last_found);
             let model = resolve(&config)?.with_public_ip(public_ip);
             let bundle = generate::generate_all(&model, &fs)?;
             print_warnings(&bundle.warnings);
@@ -666,8 +670,9 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
         .map(|(config, _)| config)
         .map_err(Clone::clone);
     let mut checks = parallax_core::doctor::diagnose(config.clone(), sys);
-    if let Ok((config, known)) = &loaded {
-        checks.push(parallax_core::doctor::public_ip_check(config, *known));
+    if let Ok((config, last_found)) = &loaded {
+        let known = public_ip::effective(&config.server, *last_found);
+        checks.push(parallax_core::doctor::public_ip_check(config, known));
     }
     let mut failed = 0;
     for check in &checks {

@@ -155,7 +155,10 @@ It finds it, in order:
 1. `server.public_ip.address`, if you set one. No lookup at all.
 2. The endpoint, if it's an IPv4 address.
 3. The endpoint's hostname through `server.dns.public_resolver`. Only an
-   answer that is one public address counts.
+   answer that is one public address counts. Parallax trusts that resolver:
+   one that answers your hostname with some other public address (a block
+   page) gets that address dropped instead of yours. If yours might, set
+   the address.
 4. Encrypted DNS (DNS over HTTPS), if you turn it on; see below.
 
 The daemon looks at startup, every 5 minutes, and when you change one of

@@ -25,9 +25,13 @@ generation, like the date, so the ruleset stays deterministic.
   Certificates are checked against `server.proxy.upstream_ca`. Quad9 is the
   suggested first: it records no client IP addresses; Cloudflare truncates
   them and deletes them within 25 hours.
+- **The configuration wins.** A fixed address or an IPv4 endpoint is in
+  effect the moment it's saved (`public_ip::effective`); only a hostname
+  waits for a lookup. `plan` and `generate` use the same rule.
 - **When.** The daemon looks at startup (before the first apply), every 5
   minutes, and when a saved change alters what the lookup depends on; it
-  re-applies only when the address changes. `parallax apply` without a
+  re-applies only when the address in effect changes. A result for
+  settings that changed while it ran is dropped. `parallax apply` without a
   daemon looks too. Each lookup gives up after 3 seconds per nameserver,
   and runs off the engine thread, so saves never wait on it.
 - **Kept across restarts** in the `daemon_state` table: runtime state, not
