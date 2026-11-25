@@ -185,24 +185,47 @@ pub struct L4 {
     pub ports: Vec<(u16, u16)>,
 }
 
-/// One port match per protocol for `ports` (`None`: every port, so one rule
-/// without a port match), TCP first.
+/// iptables' `multiport` takes at most 15 ports per rule, a range counting
+/// as two; longer lists become several rules (in both backends, so they
+/// render alike).
+const MULTIPORT_MAX: usize = 15;
+
+/// The port matches for `ports` (`None`: every port, so one rule without a
+/// port match): per protocol, TCP first, each at most [`MULTIPORT_MAX`].
 fn port_matches(ports: Option<&[PortRange]>) -> Vec<Option<L4>> {
     let Some(ports) = ports else {
         return vec![None];
     };
-    [Proto::Tcp, Proto::Udp]
-        .into_iter()
-        .filter_map(|proto| {
-            let mut set: Vec<(u16, u16)> = Vec::new();
-            for r in ports.iter().filter(|r| r.proto == proto) {
-                if !set.contains(&(r.first, r.last)) {
-                    set.push((r.first, r.last));
-                }
+    let mut out = Vec::new();
+    for proto in [Proto::Tcp, Proto::Udp] {
+        let mut set: Vec<(u16, u16)> = Vec::new();
+        for r in ports.iter().filter(|r| r.proto == proto) {
+            if !set.contains(&(r.first, r.last)) {
+                set.push((r.first, r.last));
             }
-            (!set.is_empty()).then_some(Some(L4 { proto, ports: set }))
-        })
-        .collect()
+        }
+        let mut chunk: Vec<(u16, u16)> = Vec::new();
+        let mut weight = 0;
+        for p in set {
+            let w = if p.0 == p.1 { 1 } else { 2 };
+            if weight + w > MULTIPORT_MAX {
+                out.push(Some(L4 {
+                    proto,
+                    ports: std::mem::take(&mut chunk),
+                }));
+                weight = 0;
+            }
+            chunk.push(p);
+            weight += w;
+        }
+        if !chunk.is_empty() {
+            out.push(Some(L4 {
+                proto,
+                ports: chunk,
+            }));
+        }
+    }
+    out
 }
 
 /// A named address set: Tailscale tiers, configured networks, non-public space.
@@ -1158,5 +1181,30 @@ pub mod iptables {
             }
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(proto: Proto, first: u16, last: u16) -> PortRange {
+        PortRange { proto, first, last }
+    }
+
+    #[test]
+    fn port_lists_split_at_fifteen_ports() {
+        // 14 single ports and a range: 16, so the range starts a second rule.
+        let mut ports: Vec<PortRange> = (1..=14).map(|p| r(Proto::Tcp, p, p)).collect();
+        ports.push(r(Proto::Tcp, 100, 110));
+        ports.push(r(Proto::Udp, 53, 53));
+        let m = port_matches(Some(&ports));
+        let sizes: Vec<(Proto, usize)> = m
+            .iter()
+            .flatten()
+            .map(|l| (l.proto, l.ports.len()))
+            .collect();
+        assert_eq!(sizes, [(Proto::Tcp, 14), (Proto::Tcp, 1), (Proto::Udp, 1)]);
+        assert_eq!(port_matches(None), [None]);
     }
 }
