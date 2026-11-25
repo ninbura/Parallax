@@ -10,9 +10,11 @@
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
 //! arrive during an apply queue up, and a batch of them shares one apply.
-//! It runs off the async threads, so blocking work (`nft`, `wg`, `ip`,
-//! backup encryption) never stalls DNS or the proxy. Reads (`status`,
-//! `load`) are answered from the last published view without waiting.
+//! It runs off the async threads, so blocking work (`nft`, `wg`, `ip`) never
+//! stalls DNS or the proxy. Reads (`status`, `load`) are answered from the
+//! last published view without waiting. A backup holds the engine only for
+//! the database copy; its encryption and writing run on a backup thread of
+//! their own, so they never delay a save.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -408,7 +410,18 @@ fn engine_thread(
     mut rx: mpsc::UnboundedReceiver<Msg>,
     ready: oneshot::Sender<anyhow::Result<()>>,
 ) {
-    let mut engine = match Engine::start(db, out, publish) {
+    let (jobs, queue) = std::sync::mpsc::channel::<BackupJob>();
+    let writer = match std::thread::Builder::new()
+        .name("parallax-backup".into())
+        .spawn(move || queue.into_iter().for_each(finish_backup))
+    {
+        Ok(writer) => writer,
+        Err(e) => {
+            let _ = ready.send(Err(anyhow!("starting the backup thread: {e}")));
+            return;
+        }
+    };
+    let mut engine = match Engine::start(db, out, publish, jobs) {
         Ok(engine) => engine,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -432,6 +445,32 @@ fn engine_thread(
         }
     }
     engine.teardown();
+    // Let a backup being written finish: the process ends when this returns.
+    drop(engine);
+    let _ = writer.join();
+}
+
+/// A backup whose database copy is taken, and who asked for it (`None`:
+/// the timer, which logs instead).
+type BackupJob = (crate::backup::Taken, Option<oneshot::Sender<Reply>>);
+
+/// On the backup thread: write it, then answer or log.
+fn finish_backup((taken, reply): BackupJob) {
+    let written = taken.write();
+    match reply {
+        Some(reply) => {
+            let _ = reply.send(match written {
+                Ok(lines) => Reply::Done { lines },
+                Err(e) => Reply::Error {
+                    message: format!("{e:#}"),
+                },
+            });
+        }
+        None => match written {
+            Ok(lines) => lines.iter().for_each(log),
+            Err(e) => warn(format!("warning: automatic backup failed: {e:#}")),
+        },
+    }
 }
 
 struct Engine {
@@ -444,6 +483,8 @@ struct Engine {
     reconciler: Reconciler,
     /// What the last successful apply set up, for teardown.
     applied: Option<ServerConfig>,
+    /// The backup thread's queue.
+    backups: std::sync::mpsc::Sender<BackupJob>,
     reloaders: Vec<Arc<Notify>>,
 }
 
@@ -452,6 +493,7 @@ impl Engine {
         db: &Path,
         out: PathBuf,
         publish: watch::Sender<Option<View>>,
+        backups: std::sync::mpsc::Sender<BackupJob>,
     ) -> anyhow::Result<Engine> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -479,6 +521,7 @@ impl Engine {
             reconciler: Reconciler::new(),
             applied: None,
             reloaders: Vec::new(),
+            backups,
         };
         engine.publish();
         Ok(engine)
@@ -543,15 +586,7 @@ impl Engine {
                             let _ = reply.send(refused);
                         }
                     },
-                    Request::BackupCreate { if_due } => {
-                        let answer = match self.backup(if_due) {
-                            Ok(lines) => Reply::Done { lines },
-                            Err(e) => Reply::Error {
-                                message: format!("{e:#}"),
-                            },
-                        };
-                        let _ = reply.send(answer);
-                    }
+                    Request::BackupCreate { if_due } => self.backup(if_due, Some(reply)),
                     // Answered from the view by the socket task.
                     Request::Status | Request::Load => {
                         let _ = reply.send(Reply::Error {
@@ -588,10 +623,7 @@ impl Engine {
             }
         }
         if backup_due {
-            match self.backup(true) {
-                Ok(lines) => lines.iter().for_each(log),
-                Err(e) => warn(format!("warning: automatic backup failed: {e:#}")),
-            }
+            self.backup(true, None);
         }
         false
     }
@@ -740,12 +772,35 @@ impl Engine {
         Ok(lines)
     }
 
-    fn backup(&mut self, if_due: bool) -> anyhow::Result<Vec<String>> {
-        self.rt.block_on(crate::backup::create(
-            &self.store,
-            &self.view.config,
-            if_due,
-        ))
+    /// Copy the database here, then hand the backup to the backup thread.
+    /// The answer goes to `reply`, or to the log for the timer.
+    fn backup(&mut self, if_due: bool, reply: Option<oneshot::Sender<Reply>>) {
+        let taken = crate::backup::prepare(&self.view.config, if_due).and_then(|pending| {
+            pending
+                .map(|p| self.rt.block_on(p.take(&self.store)))
+                .transpose()
+        });
+        match taken {
+            // If the backup thread is gone, write it here rather than lose it.
+            Ok(Some(taken)) => {
+                if let Err(std::sync::mpsc::SendError(job)) = self.backups.send((taken, reply)) {
+                    finish_backup(job);
+                }
+            }
+            Ok(None) => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Reply::Done { lines: Vec::new() });
+                }
+            }
+            Err(e) => match reply {
+                Some(reply) => {
+                    let _ = reply.send(Reply::Error {
+                        message: format!("{e:#}"),
+                    });
+                }
+                None => warn(format!("warning: automatic backup failed: {e:#}")),
+            },
+        }
     }
 
     /// Take down what the last successful apply set up; nothing if none did.

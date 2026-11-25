@@ -112,7 +112,10 @@ fn create_command(ctx: &Ctx, if_due: bool) -> anyhow::Result<()> {
         None => block_on(async {
             let mut store = ctx.open_store().await?;
             let config = store.load().await?;
-            create(&store, &config, if_due).await
+            match prepare(&config, if_due)? {
+                Some(pending) => pending.take(&store).await?.write(),
+                None => Ok(Vec::new()),
+            }
         })?,
     };
     for line in lines {
@@ -121,13 +124,28 @@ fn create_command(ctx: &Ctx, if_due: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Back up `store` as `config` says, and rotate. Returns what it did, one
-/// line each; nothing when `if_due` finds no backup due.
-pub(crate) async fn create(
-    store: &Store,
-    config: &Config,
+/// A backup that is due, before the database is copied. Backing up runs in
+/// three steps so the daemon holds its database only for the copy:
+/// [`prepare`] (quick checks), [`Pending::take`] (the copy, milliseconds),
+/// [`Taken::write`] (the slow part: encryption, writing, rotation), which
+/// the daemon runs on its own thread.
+pub(crate) struct Pending {
+    settings: BackupServer,
+    key_file: PathBuf,
+    passphrase: Option<Secret>,
+    newest: Option<backup::Listed>,
     if_due: bool,
-) -> anyhow::Result<Vec<String>> {
+}
+
+/// A backup whose database copy is taken, ready to write.
+pub(crate) struct Taken {
+    pending: Pending,
+    snapshot: backup::Snapshot,
+}
+
+/// Whether a backup is due as `config` says, and what it needs. `None`: an
+/// `if_due` run with nothing due.
+pub(crate) fn prepare(config: &Config, if_due: bool) -> anyhow::Result<Option<Pending>> {
     let settings = &config.server.backup;
     // The newest not from the future: one written while the clock was ahead
     // would otherwise stay "newest" and never match.
@@ -139,7 +157,7 @@ pub(crate) async fn create(
     };
     if if_due {
         if !settings.automatic {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         // Look at the database once per interval: since the newest backup,
         // or since a look that found nothing new, whichever is later. Times
@@ -152,7 +170,7 @@ pub(crate) async fn create(
             .filter(|&t| t <= now)
             .max();
         if last.is_some_and(|t| now - t < settings.interval.as_secs()) {
-            return Ok(Vec::new());
+            return Ok(None);
         }
     }
     let passphrase = backup_passphrase(settings)?;
@@ -167,46 +185,71 @@ pub(crate) async fn create(
             key_file.display()
         );
     }
-    let snapshot = store
-        .snapshot(&config.server.wireguard.private_key_file)
-        .await?;
-    if if_due {
-        let unchanged = newest
-            .as_ref()
-            // The whole file, so a damaged newest backup is replaced, not trusted.
-            .and_then(|n| backup::verify(&n.path).ok())
-            .is_some_and(|m| {
-                m.contents_sha256 == snapshot.contents_sha256()
-                    && m.encrypted == passphrase.is_some()
-            });
-        if unchanged {
-            backup::record_check(&settings.directory, SystemTime::now())?;
-            return Ok(Vec::new());
-        }
+    Ok(Some(Pending {
+        settings: settings.clone(),
+        key_file: key_file.clone(),
+        passphrase,
+        newest,
+        if_due,
+    }))
+}
+
+impl Pending {
+    /// Copy the database and the server key.
+    pub(crate) async fn take(self, store: &Store) -> anyhow::Result<Taken> {
+        let snapshot = store.snapshot(&self.key_file).await?;
+        Ok(Taken {
+            pending: self,
+            snapshot,
+        })
     }
-    let (path, manifest) = backup::write(
-        &snapshot,
-        &settings.directory,
-        passphrase.as_ref(),
-        SystemTime::now(),
-    )?;
-    let mut lines = vec![format!(
-        "wrote {} ({})",
-        path.display(),
-        if manifest.encrypted {
-            "encrypted"
-        } else {
-            "not encrypted"
+}
+
+impl Taken {
+    /// Write the backup (skipping an `if_due` one identical to the newest)
+    /// and rotate. Returns what it did, one line each.
+    pub(crate) fn write(self) -> anyhow::Result<Vec<String>> {
+        let Taken { pending, snapshot } = self;
+        let settings = &pending.settings;
+        if pending.if_due {
+            let unchanged = pending
+                .newest
+                .as_ref()
+                // The whole file, so a damaged newest backup is replaced, not trusted.
+                .and_then(|n| backup::verify(&n.path).ok())
+                .is_some_and(|m| {
+                    m.contents_sha256 == snapshot.contents_sha256()
+                        && m.encrypted == pending.passphrase.is_some()
+                });
+            if unchanged {
+                backup::record_check(&settings.directory, SystemTime::now())?;
+                return Ok(Vec::new());
+            }
         }
-    )];
-    for old in backup::rotate(&settings.directory, settings.keep as usize, &path)? {
-        lines.push(format!(
-            "deleted {} (keeping {})",
-            old.display(),
-            settings.keep
-        ));
+        let (path, manifest) = backup::write(
+            &snapshot,
+            &settings.directory,
+            pending.passphrase.as_ref(),
+            SystemTime::now(),
+        )?;
+        let mut lines = vec![format!(
+            "wrote {} ({})",
+            path.display(),
+            if manifest.encrypted {
+                "encrypted"
+            } else {
+                "not encrypted"
+            }
+        )];
+        for old in backup::rotate(&settings.directory, settings.keep as usize, &path)? {
+            lines.push(format!(
+                "deleted {} (keeping {})",
+                old.display(),
+                settings.keep
+            ));
+        }
+        Ok(lines)
     }
-    Ok(lines)
 }
 
 fn list(ctx: &Ctx, directory: Option<PathBuf>) -> anyhow::Result<()> {
