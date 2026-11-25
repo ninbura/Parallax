@@ -27,12 +27,7 @@ impl Proto {
 ///
 /// TOML form: `grants = [{ kind = "service", name = "immich" }]`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "snake_case",
-    deny_unknown_fields,
-    try_from = "GrantToml"
-)]
+#[serde(tag = "kind", rename_all = "snake_case", try_from = "GrantToml")]
 pub enum Grant {
     /// Every configured network.
     AllNetworks,

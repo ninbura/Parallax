@@ -105,8 +105,9 @@ impl std::str::FromStr for PortSpec {
             None => (s, None),
         };
         let port = |p: &str| {
-            p.parse::<u16>()
-                .ok()
+            Some(p)
+                .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|p| p.parse::<u16>().ok())
                 .filter(|p| *p != 0)
                 .ok_or_else(|| format!("'{s}': '{p}' is not a port (1-65535)"))
         };
@@ -175,6 +176,8 @@ mod tests {
             ("445/sctp", "neither tcp nor udp"),
             ("200-100", "runs backwards"),
             ("http", "not a port"),
+            ("+80/tcp", "not a port"),
+            ("80-+90", "not a port"),
             ("", "not a port"),
         ] {
             let e = spec(bad).unwrap_err();

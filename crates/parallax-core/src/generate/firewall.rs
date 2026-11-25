@@ -198,10 +198,19 @@ fn port_matches(ports: Option<&[PortRange]>) -> Vec<Option<L4>> {
     };
     let mut out = Vec::new();
     for proto in [Proto::Tcp, Proto::Udp] {
+        // Sorted, with overlapping and adjacent ranges merged: nft refuses
+        // overlapping elements in a set.
+        let mut wanted: Vec<(u16, u16)> = ports
+            .iter()
+            .filter(|r| r.proto == proto)
+            .map(|r| (r.first, r.last))
+            .collect();
+        wanted.sort_unstable();
         let mut set: Vec<(u16, u16)> = Vec::new();
-        for r in ports.iter().filter(|r| r.proto == proto) {
-            if !set.contains(&(r.first, r.last)) {
-                set.push((r.first, r.last));
+        for (first, last) in wanted {
+            match set.last_mut() {
+                Some(prev) if first <= prev.1.saturating_add(1) => prev.1 = prev.1.max(last),
+                _ => set.push((first, last)),
             }
         }
         let mut chunk: Vec<(u16, u16)> = Vec::new();
@@ -1217,9 +1226,34 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_ranges_merge() {
+        let ports = [
+            r(Proto::Tcp, 80, 90),
+            r(Proto::Tcp, 80, 80),
+            r(Proto::Tcp, 91, 95),
+            r(Proto::Tcp, 22, 22),
+            r(Proto::Udp, 80, 80),
+        ];
+        let m = port_matches(Some(&ports));
+        let sets: Vec<(Proto, Vec<(u16, u16)>)> = m
+            .into_iter()
+            .flatten()
+            .map(|l| (l.proto, l.ports))
+            .collect();
+        assert_eq!(
+            sets,
+            [
+                (Proto::Tcp, vec![(22, 22), (80, 95)]),
+                (Proto::Udp, vec![(80, 80)])
+            ]
+        );
+    }
+
+    #[test]
     fn port_lists_split_at_fifteen_ports() {
-        // 14 single ports and a range: 16, so the range starts a second rule.
-        let mut ports: Vec<PortRange> = (1..=14).map(|p| r(Proto::Tcp, p, p)).collect();
+        // 14 single ports (not adjacent, so nothing merges) and a range:
+        // 16, so the range starts a second rule.
+        let mut ports: Vec<PortRange> = (1..=14).map(|p| r(Proto::Tcp, p * 2, p * 2)).collect();
         ports.push(r(Proto::Tcp, 100, 110));
         ports.push(r(Proto::Udp, 53, 53));
         let m = port_matches(Some(&ports));

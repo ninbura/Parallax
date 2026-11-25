@@ -523,6 +523,29 @@ mod tests {
     }
 
     #[test]
+    fn a_range_that_takes_in_a_web_port_is_raw_web() {
+        let mut cfg = named();
+        let at_home: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        cfg.templates[1].grants.push(Grant::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec!["70-90/tcp".parse().unwrap()],
+        });
+        let found = problems(&cfg, Some(HOME), &at_home);
+        assert!(has_web(&found), "{found:?}");
+        // 70-90/udp takes in no web port.
+        cfg.templates[1].grants.pop();
+        cfg.templates[1].grants.push(Grant::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec!["70-90/udp".parse().unwrap()],
+        });
+        assert!(problems(&cfg, Some(HOME), &at_home).is_empty());
+    }
+
+    fn has_web(found: &[String]) -> bool {
+        found.iter().any(|p| p.contains("service with hostnames"))
+    }
+
+    #[test]
     fn a_save_cant_add_a_raw_web_grant_on_the_public_ip() {
         let old = named();
         let known: Resolved = [(NAS.to_string(), vec![HOME])].into();

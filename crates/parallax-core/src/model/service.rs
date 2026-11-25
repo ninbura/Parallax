@@ -77,9 +77,16 @@ impl TryFrom<ServiceToml> for Service {
                     s.name
                 ))
             }
+            (None, None, Some(_)) => {
+                return Err(format!(
+                    "service '{}': proto needs a port; or list ports, like 445/tcp",
+                    s.name
+                ))
+            }
+            // No double quotes in these: the parser hides quoted text.
             _ => {
                 return Err(format!(
-                    "service '{}' has no ports; give ports = [\"445/tcp\", ...]",
+                    "service '{}' has no ports; list them in ports, like 445/tcp or 137-138/udp",
                     s.name
                 ))
             }
@@ -91,5 +98,53 @@ impl TryFrom<ServiceToml> for Service {
             nginx_vhost: s.nginx_vhost,
             hostnames: s.hostnames,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Config;
+    use crate::testing::canonical_config;
+
+    /// The canonical configuration with its one service written as `service`.
+    fn with_service(service: &str) -> crate::Result<Config> {
+        let text = canonical_config().to_toml()?;
+        let start = text.find("[[service]]").unwrap_or(0);
+        let end = text[start..].find("\n\n").map_or(text.len(), |e| start + e);
+        Config::from_toml(&format!("{}{}{}", &text[..start], service, &text[end..]))
+    }
+
+    #[test]
+    fn older_single_ports_still_read() {
+        let c = with_service("[[service]]\nname = \"immich\"\nhost = \"192.168.1.5\"\nport = 443")
+            .unwrap();
+        assert_eq!(c.services[0].ports, [PortSpec::one(Proto::Tcp, 443)]);
+        let c = with_service(
+            "[[service]]\nname = \"immich\"\nhost = \"192.168.1.5\"\nproto = \"udp\"\nport = 53",
+        )
+        .unwrap();
+        assert_eq!(c.services[0].ports, [PortSpec::one(Proto::Udp, 53)]);
+    }
+
+    #[test]
+    fn ports_and_the_older_spelling_dont_mix() {
+        for (service, why) in [
+            ("ports = [\"443/tcp\"]\nport = 443", "not both"),
+            ("ports = []\nport = 443", "not both"),
+            ("proto = \"tcp\"", "proto needs a port"),
+            (
+                "ports = []",
+                "has no ports; list them in ports, like 445/tcp",
+            ),
+            ("", "has no ports; list them in ports, like 445/tcp"),
+        ] {
+            let e = with_service(&format!(
+                "[[service]]\nname = \"immich\"\nhost = \"192.168.1.5\"\n{service}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains(why), "{service}: {e}");
+        }
     }
 }
