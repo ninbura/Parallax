@@ -462,6 +462,8 @@ async fn refresh_public_ip(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
             continue;
         };
         let asked = lookup_inputs(&config);
+        // A tick that won the race with a change has looked at it already.
+        last = Some(asked.clone());
         let found =
             tokio::task::spawn_blocking(move || crate::find_public_ip(&config.server)).await;
         if let Ok(found) = found {

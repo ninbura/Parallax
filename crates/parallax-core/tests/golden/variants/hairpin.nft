@@ -28,8 +28,8 @@ table inet parallax {
 	set not_public {
 		type ipv4_addr
 		flags interval
-		comment "private, reserved and configured prefixes: not the internet"
-		elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 }
+		comment "private, reserved and configured prefixes, and the home's public IP: not the internet"
+		elements = { 0.0.0.0/8, 1.2.3.4, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3 }
 	}
 
 	chain input {
@@ -66,7 +66,6 @@ table inet parallax {
 
 	chain tier_family {
 		oifname "eth0" ip daddr 192.168.1.5 tcp dport 443 accept comment "family: service immich"
-		ip daddr 1.2.3.4 drop comment "family: not the home's public IP (hairpin)"
 		oifname "eth0" ip daddr != @not_public accept comment "family: internet (public addresses)"
 		drop comment "family: default deny"
 	}

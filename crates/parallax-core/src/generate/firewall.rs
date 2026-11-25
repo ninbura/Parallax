@@ -29,8 +29,8 @@
 //!   other templates' rules.
 //! - `internet` reaches public addresses only, unless the template also has
 //!   `all_networks` (then it's everything outside the configured networks).
-//!   Public-only tiers also drop the home's own public IP, which the router
-//!   would hairpin back into the home ([`crate::public_ip`]).
+//!   Public-only tiers also exclude the home's own public IP, which the
+//!   router would hairpin back into the home ([`crate::public_ip`]).
 //! - Tunnel peers are IPv4-only: IPv6 from a tunnel interface is dropped.
 
 use std::fmt::Write as _;
@@ -311,12 +311,25 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         .iter()
         .any(|t| t.grants.contains(&Grant::Internet) && internet_is_public_only(t))
     {
-        // nft rejects overlapping intervals, so merge first.
-        let all: Vec<Ipv4Net> = NOT_PUBLIC.iter().chain(&configured).copied().collect();
+        // The home's public IP too: the router would hairpin it back into
+        // the home. A set member, not a drop rule, so a grant listed after
+        // `internet` that covers it still works. nft rejects overlapping
+        // intervals, so merge first.
+        let home = model.public_ip().map(Ipv4Net::from);
+        let all: Vec<Ipv4Net> = NOT_PUBLIC
+            .iter()
+            .chain(&configured)
+            .chain(&home)
+            .copied()
+            .collect();
         rs.sets.push(AddressSet {
             name: NOT_PUBLIC_SET.into(),
             elements: Ipv4Net::aggregate(&all),
-            comment: "private, reserved and configured prefixes: not the internet".into(),
+            comment: match home {
+                Some(_) => "private, reserved and configured prefixes, and the home's public IP: not the internet",
+                None => "private, reserved and configured prefixes: not the internet",
+            }
+            .into(),
         });
     }
 
@@ -457,19 +470,6 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                         } else {
                             (LAN_SET, "internet")
                         };
-                        // The router hairpins the home's public IP back to
-                        // its port forwards: what this tier's grants leave out.
-                        if let Some(home) = model.public_ip().filter(|_| internet_is_public_only(t))
-                        {
-                            rs.rules.push(
-                                Rule::new(
-                                    Chain::Tier(i),
-                                    Action::Drop,
-                                    format!("{}: not the home's public IP (hairpin)", t.name),
-                                )
-                                .dst(Match::Cidr(Ipv4Net::from(home))),
-                            );
-                        }
                         rs.rules.push(
                             Rule::new(
                                 Chain::Tier(i),

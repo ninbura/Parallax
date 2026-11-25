@@ -595,15 +595,17 @@ inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydoma
 pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rewritten"
 
 # (o) the home's public IP: guests with internet drop it (the router would hairpin it
-# back into the home); the owner's all_networks template doesn't. The endpoint's
-# address counts as is, and a fixed address the moment it's saved. A hostname is
-# looked up and re-applied when it changes; an answer with a private address is
-# refused, and the last address found stays.
+# back into the home); the owner's all_networks template doesn't. The endpoint here
+# is a documentation address, so not the public IP; a fixed address counts the moment
+# it's saved. A hostname is looked up and re-applied when it changes; an answer with
+# a private address is refused, and the last address found stays.
 public_ip_is() { # address
     for _ in $(seq 50); do $P status | grep -qx "home public IP: $1" && return 0; sleep 0.1; done
     $P status; return 1
 }
-public_ip_is 203.0.113.1 || fail "(o) the endpoint's address was not taken as the public IP"
+$P status | grep -q "home public IP" && fail "(o) the private endpoint was taken as the public IP"
+grep -q "the endpoint 203.0.113.1:51820 is not a public address" "$WORK/daemon.log" \
+    || fail "(o) the daemon did not say why the public IP is unknown"
 $P config export > "$WORK/public-ip.toml"
 sed -i 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' "$WORK/public-ip.toml"
 apply "$WORK/public-ip.toml"

@@ -388,8 +388,8 @@ When a guest template has `internet`, the daemon also keeps the home's
 public IP (ADR 0008): it looks it up at startup, every 5 minutes and when a
 saved change alters what the lookup depends on, re-applies when it changes,
 and keeps the last one found in the `daemon_state` table. The address is an
-input to generation (`Model::with_public_ip`), like the date; those tiers
-drop it ahead of their `internet` accept, because the router would hairpin
-it back into the home. The lookup logic is `parallax_core::public_ip`,
+input to generation (`Model::with_public_ip`), like the date; it joins the
+`not_public` set those tiers' `internet` accept excludes, because the router
+would hairpin it back into the home. The lookup logic is `parallax_core::public_ip`,
 behind the `Resolver` trait in `io.rs`; `parallax_dns::Lookup` is the real
 one (plain DNS, and DNS over HTTPS by IP address).

@@ -149,26 +149,22 @@ fn guest_internet_drops_the_home_public_ip() {
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     check_golden("variants/hairpin.nft", &fw.contents);
-    let family: Vec<&str> = fw
+    // In the not_public set, which only public-only tiers use: the owner's
+    // all_networks template (lan_real) reaches the router anyway, and a grant
+    // listed after `internet` that covers the address still works.
+    let set: Vec<&str> = fw
         .contents
         .lines()
-        .skip_while(|l| !l.contains("chain tier_family"))
+        .skip_while(|l| !l.contains("set not_public"))
+        .take_while(|l| !l.trim().starts_with('}'))
         .collect();
-    let drop = family
-        .iter()
-        .position(|l| l.contains("ip daddr 1.2.3.4 drop"))
-        .unwrap();
-    let internet = family
-        .iter()
-        .position(|l| l.contains("family: internet"))
-        .unwrap();
-    assert!(drop < internet, "{family:#?}");
-    // The owner's all_networks template reaches the router anyway.
+    assert!(set.iter().any(|l| l.contains("1.2.3.4")), "{set:#?}");
     assert_eq!(fw.contents.matches("1.2.3.4").count(), 1, "{}", fw.contents);
-    // Unknown: no rule, the rest unchanged.
+    // Unknown: not in the set.
     let unknown = bundle_for(&cfg);
     let unknown = unknown.of_kind(ArtifactKind::Firewall).next().unwrap();
-    assert!(!unknown.contents.contains("hairpin"));
+    assert!(!unknown.contents.contains("1.2.3.4"));
+    assert!(!unknown.contents.contains("home's public IP"));
 }
 
 #[test]

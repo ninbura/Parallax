@@ -153,7 +153,7 @@ it.
 It finds it, in order:
 
 1. `server.public_ip.address`, if you set one. No lookup at all.
-2. The endpoint, if it's an IPv4 address.
+2. The endpoint, if it's a public IPv4 address.
 3. The endpoint's hostname through `server.dns.public_resolver`. Only an
    answer that is one public address counts. Parallax trusts that resolver:
    one that answers your hostname with some other public address (a block

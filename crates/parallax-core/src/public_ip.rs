@@ -8,7 +8,7 @@
 //!
 //! [`find`] asks, in order, and takes the first that works:
 //! 1. `server.public_ip.address`, when set: no lookup.
-//! 2. The WireGuard endpoint's host, when it's an IPv4 address.
+//! 2. The WireGuard endpoint's host, when it's a public IPv4 address.
 //! 3. The endpoint's hostname through `server.dns.public_resolver` (plain
 //!    DNS). Often the home router, which may answer the home's own name
 //!    with the LAN address; an answer that isn't one public address is
@@ -57,7 +57,8 @@ fn endpoint_host(server: &ServerConfig) -> &str {
 }
 
 /// The address the configuration itself gives, with no lookup: a fixed
-/// `server.public_ip.address`, or an IPv4 endpoint.
+/// `server.public_ip.address`, or a public IPv4 endpoint. A private one (a
+/// lab, double NAT) isn't the home's public IP.
 pub fn configured(server: &ServerConfig) -> Option<Found> {
     if let Some(address) = server.public_ip.address {
         return Some(Found {
@@ -68,6 +69,7 @@ pub fn configured(server: &ServerConfig) -> Option<Found> {
     endpoint_host(server)
         .parse::<Ipv4Addr>()
         .ok()
+        .filter(|a| is_public(*a))
         .map(|address| Found {
             address,
             source: format!("the endpoint {}", server.wireguard.endpoint),
@@ -90,6 +92,11 @@ pub fn find(server: &ServerConfig, resolver: &dyn Resolver) -> Result<Found, Vec
     if host.starts_with('[') {
         return Err(vec![format!(
             "the endpoint {endpoint} is an IPv6 address; set server.public_ip.address to the home's public IPv4 address"
+        )]);
+    }
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return Err(vec![format!(
+            "the endpoint {endpoint} is not a public address (a lab, or double NAT?); set server.public_ip.address to the home's public IPv4 address"
         )]);
     }
     let mut problems = Vec::new();
@@ -185,12 +192,23 @@ mod tests {
     }
 
     #[test]
-    fn an_ip_endpoint_is_used_as_is() {
+    fn a_public_ip_endpoint_is_used_as_is() {
         let mut s = server();
-        s.wireguard.endpoint = "203.0.113.9:51820".into();
+        s.wireguard.endpoint = "1.2.3.9:51820".into();
         let r = FakeResolver::new();
-        assert_eq!(find(&s, &r).unwrap().address, Ipv4Addr::new(203, 0, 113, 9));
+        assert_eq!(find(&s, &r).unwrap().address, Ipv4Addr::new(1, 2, 3, 9));
         assert!(r.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_private_ip_endpoint_is_not_the_public_ip() {
+        let mut s = server();
+        s.wireguard.endpoint = "192.168.1.5:51820".into();
+        let r = FakeResolver::new();
+        let problems = find(&s, &r).unwrap_err();
+        assert!(problems[0].contains("not a public address"), "{problems:?}");
+        assert!(r.asked.borrow().is_empty());
+        assert_eq!(effective(&s, None), None);
     }
 
     #[test]

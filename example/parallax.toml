@@ -74,7 +74,7 @@ passphrase_file = "/etc/parallax/backup.passphrase"
 [server.public_ip]
 # Guest templates with `internet` may not reach the home's own public IP: the
 # router would hairpin it back into your port forwards. Parallax finds it from
-# the endpoint above (an IP, or its hostname through dns.public_resolver).
+# the endpoint above (a public IP, or its hostname through dns.public_resolver).
 # Set a fixed address to skip the lookup:
 # address = "<your public IPv4>"
 # If public_resolver answers your own hostname with a LAN address, ask these

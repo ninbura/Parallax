@@ -8,13 +8,15 @@ A guest template with `internet` (and not `all_networks`) reaches public
 addresses only. The home's own public address is public too, but the router
 hairpins traffic sent to it back into the home's port forwards, so a guest
 would reach what its grants leave out. Each such template's chain drops the
-home's public IP ahead of its `internet` accept. The address is an input to
+home's public IP: it's in the set of addresses its `internet` accept
+excludes. The address is an input to
 generation, like the date, so the ruleset stays deterministic.
 
 - **Only when needed.** No such template, no lookup at all.
 - **Where it comes from, in order:** `server.public_ip.address` (a fixed
-  address, no lookup); the WireGuard endpoint's host when it's an IPv4
-  address; the endpoint's hostname through `server.dns.public_resolver`
+  address, no lookup); the WireGuard endpoint's host when it's a public
+  IPv4 address (a private one is a lab or double NAT, not the home's
+  public IP); the endpoint's hostname through `server.dns.public_resolver`
   (plain DNS), accepted only when the answer is exactly one public address;
   then each `server.public_ip.encrypted_dns` provider in order (DNS over
   HTTPS, off by default). Providers are tried one after another, never
@@ -25,6 +27,9 @@ generation, like the date, so the ruleset stays deterministic.
   Certificates are checked against `server.proxy.upstream_ca`. Quad9 is the
   suggested first: it records no client IP addresses; Cloudflare truncates
   them and deletes them within 25 hours.
+- **A set member, not a rule.** The address joins the `not_public` set
+  that public-only `internet` accepts exclude, so a grant listed after
+  `internet` that covers it (a network on public space) still works.
 - **The configuration wins.** A fixed address or an IPv4 endpoint is in
   effect the moment it's saved (`public_ip::effective`); only a hostname
   waits for a lookup. `plan` and `generate` use the same rule.
