@@ -51,7 +51,7 @@ table inet parallax {
 
 	chain tier_family {
 		oifname "eth0" ip daddr 192.168.1.5 tcp dport 443 accept comment "family: service immich"
-		oifname "eth0" ip daddr 192.168.1.20 udp dport 25565 accept comment "family: host game.mydomain.com (192.168.1.20) udp/25565"
+		oifname "eth0" ip daddr 192.168.1.20 udp dport 25565 accept comment "family: host game.mydomain.com (192.168.1.20) 25565/udp"
 		oifname "eth0" ip daddr 192.168.1.9 accept comment "family: host nas.mydomain.com (192.168.1.9)"
 		oifname "eth0" ip daddr 192.168.1.10 accept comment "family: host nas.mydomain.com (192.168.1.10)"
 		drop comment "family: default deny"

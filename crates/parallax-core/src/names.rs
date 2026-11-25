@@ -1,5 +1,5 @@
 //! Hosts named by DNS name: `host = "nas.mydomain.com"` in a service or a
-//! `host`/`host_port` grant.
+//! `host` grant.
 //!
 //! A name is looked up through the home resolvers of the network whose zone
 //! holds it (validation makes sure one does), and grants the addresses it
@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use crate::io::{Nameserver, Resolver};
-use crate::model::{Config, Grant, Host, Network, Proto, Template};
+use crate::model::{ranges, Config, Grant, Host, Network, PortRange, Proto, Template};
 
 /// The addresses each name was last found to have, sorted. Names that were
 /// never found are absent.
@@ -45,7 +45,7 @@ pub fn used(config: &Config) -> BTreeSet<&str> {
         .iter()
         .flat_map(|t| &t.grants)
         .filter_map(|g| match g {
-            Grant::Host { host } | Grant::HostPort { host, .. } => Some(host),
+            Grant::Host { host, .. } => Some(host),
             _ => None,
         });
     services.chain(grants).filter_map(Host::name).collect()
@@ -104,28 +104,28 @@ pub fn refused(
 }
 
 /// Plain HTTP on tcp/80, and HTTPS or HTTP/3 on 443: ports a web server
-/// answers for every site it hosts.
-pub(crate) fn is_web(proto: Proto, port: u16) -> bool {
-    port == 443 || (proto == Proto::Tcp && port == 80)
+/// answers for every site it hosts. Does `range` take one in?
+pub(crate) fn covers_web(range: PortRange) -> bool {
+    range.contains(range.proto, 443) || range.contains(Proto::Tcp, 80)
 }
 
-/// Why `template` may not reach `port` (`None`: every port) on the home's
+/// Why `template` may not reach `ports` (`None`: every port) on the home's
 /// public IP, if it may not. `proxied`: through the HTTPS proxy, which
 /// checks the name. A template with `all_networks` and `internet` reaches
 /// the home's public IP anyway and isn't limited.
 pub fn public_ip_refusal(
     template: &Template,
-    port: Option<(Proto, u16)>,
+    ports: Option<&[PortRange]>,
     proxied: bool,
 ) -> Option<&'static str> {
     if template.grants.contains(&Grant::AllNetworks) && template.grants.contains(&Grant::Internet) {
         return None;
     }
-    match port {
+    match ports {
         None => Some(
-            "every port there is a port forward, so a host grant would open them all; grant one port with host_port",
+            "every port there is a port forward, so a grant without ports would open them all; list its ports",
         ),
-        Some((proto, port)) if !proxied && is_web(proto, port) => Some(
+        Some(ports) if !proxied && ports.iter().copied().any(covers_web) => Some(
             "web ports there serve every site behind the forward; grant it as a service with hostnames, so the HTTPS proxy checks the name",
         ),
         Some(_) => None,
@@ -213,19 +213,28 @@ pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolve
     };
     for t in &config.templates {
         for g in &t.grants {
-            let (what, host, port, proxied) = match g {
-                Grant::Host { host } => (format!("host {host}"), host, None, false),
-                Grant::HostPort { host, proto, port } => (
-                    format!("host_port {host} {}/{port}", proto.as_str()),
+            let (what, host, ports, proxied) = match g {
+                Grant::Host { host, ports } if ports.is_empty() => {
+                    (format!("host {host}"), host, None, false)
+                }
+                Grant::Host { host, ports } => (
+                    format!(
+                        "host {host} {}",
+                        ports
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                     host,
-                    Some((*proto, *port)),
+                    Some(ranges(ports)),
                     false,
                 ),
                 Grant::Service { name } => match config.service(name) {
                     Some(s) => (
                         format!("service '{name}'"),
                         &s.host,
-                        Some((s.proto, s.port)),
+                        Some(ranges(&s.ports)),
                         s.is_proxied(),
                     ),
                     None => continue,
@@ -234,7 +243,7 @@ pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolve
             };
             let Some(name) = host.name() else { continue };
             let at_home = resolved.get(name).is_some_and(|a| a.contains(&home));
-            if let Some(why) = public_ip_refusal(t, port, proxied).filter(|_| at_home) {
+            if let Some(why) = public_ip_refusal(t, ports.as_deref(), proxied).filter(|_| at_home) {
                 out.push(format!(
                     "template '{}': grant {what}: {name} is the home's public IP {home}, and {why}; it gives nothing there",
                     t.name
@@ -313,7 +322,7 @@ pub fn list(addresses: &[Ipv4Addr]) -> String {
 mod tests {
     use super::*;
     use crate::io::memory::FakeResolver;
-    use crate::model::Proto;
+    use crate::model::{PortSpec, Proto};
     use crate::testing::canonical_config;
 
     const NAS: &str = "nas.mydomain.com";
@@ -329,10 +338,9 @@ mod tests {
     /// The canonical scenario with `family` granted the NAS's SMB port by name.
     fn named() -> Config {
         let mut cfg = canonical_config();
-        cfg.templates[1].grants.push(Grant::HostPort {
+        cfg.templates[1].grants.push(Grant::Host {
             host: Host::Name(NAS.into()),
-            proto: Proto::Tcp,
-            port: 445,
+            ports: vec![PortSpec::one(Proto::Tcp, 445)],
         });
         cfg
     }
@@ -343,6 +351,7 @@ mod tests {
         cfg.services[0].host = Host::Name("immich.mydomain.com".into());
         cfg.templates[0].grants.push(Grant::Host {
             host: Host::Name(NAS.into()),
+            ports: Vec::new(),
         });
         assert_eq!(
             used(&cfg).into_iter().collect::<Vec<_>>(),
@@ -485,11 +494,11 @@ mod tests {
         assert!(problems(&cfg, Some(HOME), &at_home).is_empty());
         cfg.templates[1].grants.push(Grant::Host {
             host: Host::Name(NAS.into()),
+            ports: Vec::new(),
         });
-        cfg.templates[1].grants.push(Grant::HostPort {
+        cfg.templates[1].grants.push(Grant::Host {
             host: Host::Name(NAS.into()),
-            proto: Proto::Udp,
-            port: 443,
+            ports: vec![PortSpec::one(Proto::Udp, 443)],
         });
         let found = problems(&cfg, Some(HOME), &at_home);
         assert_eq!(found.len(), 2, "{found:?}");
@@ -498,7 +507,7 @@ mod tests {
             "{found:?}"
         );
         assert!(
-            found[1].starts_with("template 'family': grant host_port nas.mydomain.com udp/443:"),
+            found[1].starts_with("template 'family': grant host nas.mydomain.com 443/udp:"),
             "{found:?}"
         );
         assert!(found[1].contains("service with hostnames"), "{found:?}");
@@ -518,15 +527,14 @@ mod tests {
         let old = named();
         let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
         let mut new = old.clone();
-        new.templates[1].grants.push(Grant::HostPort {
+        new.templates[1].grants.push(Grant::Host {
             host: Host::Name(NAS.into()),
-            proto: Proto::Tcp,
-            port: 80,
+            ports: vec![PortSpec::one(Proto::Tcp, 80)],
         });
         let err =
             check_save(Some(&old), &new, Some(HOME), &FakeResolver::new(), &known).unwrap_err();
         assert!(
-            err[0].contains("grant host_port nas.mydomain.com tcp/80"),
+            err[0].contains("grant host nas.mydomain.com 80/tcp"),
             "{err:?}"
         );
         // A proxied HTTPS service there is how web traffic gets in.

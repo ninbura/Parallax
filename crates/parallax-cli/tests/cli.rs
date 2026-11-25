@@ -567,7 +567,7 @@ fn a_backup_restores_what_changed_since() {
     let file = s.backups().pop().unwrap();
     let (ok, out, _) = s.run(&["backup", "list"]);
     assert!(
-        ok && out.contains("encrypted") && out.contains("schema 4"),
+        ok && out.contains("encrypted") && out.contains("schema 5"),
         "{out}"
     );
 

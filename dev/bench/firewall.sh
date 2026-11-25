@@ -110,7 +110,7 @@ TOML
         cat <<TOML
 [[template]]
 name = "pad$i"
-grants = [{ kind = "host_port", ip = "192.168.1.$((i % 200 + 20))", port = 80 }]
+grants = [{ kind = "host", host = "192.168.1.$((i % 200 + 20))", ports = ["80/tcp"] }]
 [template.wireguard]
 pool = "10.8.$((i + 10)).0/24"
 [template.headscale]
@@ -120,7 +120,7 @@ TOML
     cat <<TOML
 [[template]]
 name = "bench"
-grants = [{ kind = "host_port", ip = "192.168.1.5", port = 5201 }, { kind = "host_port", ip = "192.168.1.5", proto = "udp", port = 5201 }]
+grants = [{ kind = "host", host = "192.168.1.5", ports = ["5201"] }]
 [template.wireguard]
 pool = "10.8.2.0/24"
 [template.headscale]

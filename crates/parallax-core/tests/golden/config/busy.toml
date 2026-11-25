@@ -58,8 +58,7 @@ masquerade = false
 [[service]]
 name = "immich"
 host = "192.168.1.5"
-proto = "tcp"
-port = 443
+ports = ["443/tcp"]
 nginx_vhost = true
 
 # Templates
@@ -68,7 +67,7 @@ nginx_vhost = true
 name = "personal"
 grants = [
     { kind = "network", name = "home" },
-    { kind = "host_port", host = "192.168.1.10", proto = "udp", port = 53 },
+    { kind = "host", host = "192.168.1.10", ports = ["53/udp"] },
     { kind = "internet" },
 ]
 visible_networks = ["home"]

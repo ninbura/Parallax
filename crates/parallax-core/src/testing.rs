@@ -67,8 +67,7 @@ pub fn canonical_config() -> Config {
         services: vec![Service {
             name: "immich".into(),
             host: Host::Ip(Ipv4Addr::new(192, 168, 1, 5)),
-            proto: Proto::Tcp,
-            port: 443,
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
             nginx_vhost: true,
             hostnames: Vec::new(),
         }],

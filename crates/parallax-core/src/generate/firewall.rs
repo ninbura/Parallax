@@ -39,7 +39,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use ipnet::Ipv4Net;
 
 use super::{Artifact, ArtifactKind};
-use crate::model::{FirewallBackend, Grant, Proto, Template};
+use crate::model::{FirewallBackend, Grant, PortRange, Proto, Template};
 use crate::transport::{self, TierSource};
 use crate::validate::{Model, ReachKind};
 use crate::Result;
@@ -110,7 +110,7 @@ pub struct Rule {
     /// Match IPv6 packets only (all other matches here are IPv4).
     pub ipv6: bool,
     pub icmp_echo: bool,
-    pub l4: Option<(Proto, u16)>,
+    pub l4: Option<L4>,
     pub action: Action,
     pub comment: String,
 }
@@ -155,7 +155,15 @@ impl Rule {
         self.dst = m;
         self
     }
+    /// One port on one protocol.
     fn l4(mut self, l4: Option<(Proto, u16)>) -> Self {
+        self.l4 = l4.map(|(proto, port)| L4 {
+            proto,
+            ports: vec![(port, port)],
+        });
+        self
+    }
+    fn ports(mut self, l4: Option<L4>) -> Self {
         self.l4 = l4;
         self
     }
@@ -167,6 +175,34 @@ impl Rule {
         self.ipv6 = true;
         self
     }
+}
+
+/// Destination ports on one protocol: single ports and ranges (`first`
+/// to `last`), matched as one set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L4 {
+    pub proto: Proto,
+    pub ports: Vec<(u16, u16)>,
+}
+
+/// One port match per protocol for `ports` (`None`: every port, so one rule
+/// without a port match), TCP first.
+fn port_matches(ports: Option<&[PortRange]>) -> Vec<Option<L4>> {
+    let Some(ports) = ports else {
+        return vec![None];
+    };
+    [Proto::Tcp, Proto::Udp]
+        .into_iter()
+        .filter_map(|proto| {
+            let mut set: Vec<(u16, u16)> = Vec::new();
+            for r in ports.iter().filter(|r| r.proto == proto) {
+                if !set.contains(&(r.first, r.last)) {
+                    set.push((r.first, r.last));
+                }
+            }
+            (!set.is_empty()).then_some(Some(L4 { proto, ports: set }))
+        })
+        .collect()
 }
 
 /// A named address set: Tailscale tiers, configured networks, non-public space.
@@ -233,40 +269,36 @@ fn internet_is_public_only(template: &Template) -> bool {
 fn proxy_redirects(model: &Model<'_>, template: &Template) -> Vec<ProxyRedirect> {
     let mut out: Vec<ProxyRedirect> = Vec::new();
     for r in model.reaches(template) {
-        let (client, port) = match r.kind {
+        // Proxied services are validated to be exactly tcp/443.
+        let client = match r.kind {
             ReachKind::Lan {
                 real,
-                port,
                 proxied: true,
                 ..
             } => {
-                // Proxied services are validated to be tcp/443.
-                if port.is_some_and(|(proto, p)| {
-                    model.reaches_directly(template, real.addr(), proto, p)
-                }) {
+                if model.reaches_directly(template, real.addr(), Proto::Tcp, HTTPS) {
                     continue;
                 }
                 let Some(client) = r.client_net() else {
                     continue;
                 };
-                (client, port)
+                client
             }
             ReachKind::HomePublic {
                 address,
-                port,
                 proxied: true,
+                ..
             } => {
-                if model.reaches_directly(template, address, port.0, port.1) {
+                if model.reaches_directly(template, address, Proto::Tcp, HTTPS) {
                     continue;
                 }
-                (Ipv4Net::from(address), Some(port))
+                Ipv4Net::from(address)
             }
             _ => continue,
         };
         if !out.iter().any(|p| p.client == client) {
             out.push(ProxyRedirect {
                 client,
-                port,
                 label: r.label,
             });
         }
@@ -285,9 +317,11 @@ fn any_home_public(model: &Model<'_>) -> bool {
     })
 }
 
+/// The port proxied services are on.
+const HTTPS: u16 = 443;
+
 struct ProxyRedirect {
     client: Ipv4Net,
-    port: Option<(Proto, u16)>,
     label: String,
 }
 
@@ -399,9 +433,9 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
             let ReachKind::Lan {
                 network,
                 real,
-                port,
+                ports,
                 proxied: false,
-            } = r.kind
+            } = &r.kind
             else {
                 continue;
             };
@@ -409,22 +443,24 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                 continue;
             };
             for tr in &transports {
-                rs.rules.push(
-                    Rule::new(
-                        Chain::Input,
-                        Action::Accept,
-                        format!(
-                            "{}/{}: {} (on the gateway host)",
-                            t.name,
-                            tr.kind(),
-                            r.label
-                        ),
-                    )
-                    .iif(tr.ingress_interface(server))
-                    .src(tier_src(tr.as_ref(), t))
-                    .dst(Match::Cidr(Ipv4Net::from(g)))
-                    .l4(port),
-                );
+                for l4 in port_matches(ports.as_deref()) {
+                    rs.rules.push(
+                        Rule::new(
+                            Chain::Input,
+                            Action::Accept,
+                            format!(
+                                "{}/{}: {} (on the gateway host)",
+                                t.name,
+                                tr.kind(),
+                                r.label
+                            ),
+                        )
+                        .iif(tr.ingress_interface(server))
+                        .src(tier_src(tr.as_ref(), t))
+                        .dst(Match::Cidr(Ipv4Net::from(g)))
+                        .ports(l4),
+                    );
+                }
             }
         }
     }
@@ -481,40 +517,47 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                 ReachKind::Lan {
                     network,
                     real,
-                    port,
+                    ports,
                     proxied: false,
-                } => rs.rules.push(
-                    Rule::new(
-                        Chain::Tier(i),
-                        Action::Accept,
-                        format!("{}: {}", t.name, r.label),
-                    )
-                    .oif(&network.interface)
-                    .dst(Match::Cidr(*real))
-                    .l4(*port),
-                ),
+                } => {
+                    for l4 in port_matches(ports.as_deref()) {
+                        rs.rules.push(
+                            Rule::new(
+                                Chain::Tier(i),
+                                Action::Accept,
+                                format!("{}: {}", t.name, r.label),
+                            )
+                            .oif(&network.interface)
+                            .dst(Match::Cidr(*real))
+                            .ports(l4),
+                        );
+                    }
+                }
                 // Like the proxy, a port forward reached through it gets no
                 // direct accept.
                 ReachKind::HomePublic { proxied: true, .. } => {}
                 ReachKind::HomePublic {
                     address,
-                    port,
+                    ports,
                     proxied: false,
                 } => {
                     if let Some(wan) = model.wan_interface() {
-                        rs.rules.push(
-                            Rule::new(
-                                Chain::Tier(i),
-                                Action::Accept,
-                                format!(
-                                    "{}: {} (a port forward on the home's public IP)",
-                                    t.name, r.label
-                                ),
-                            )
-                            .oif(wan)
-                            .dst(Match::Cidr(Ipv4Net::from(*address)))
-                            .l4(Some(*port)),
-                        );
+                        // Never `None`: a port forward always has its ports.
+                        for l4 in port_matches(Some(ports)).into_iter().flatten() {
+                            rs.rules.push(
+                                Rule::new(
+                                    Chain::Tier(i),
+                                    Action::Accept,
+                                    format!(
+                                        "{}: {} (a port forward on the home's public IP)",
+                                        t.name, r.label
+                                    ),
+                                )
+                                .oif(wan)
+                                .dst(Match::Cidr(Ipv4Net::from(*address)))
+                                .ports(Some(l4)),
+                            );
+                        }
                     }
                 }
                 ReachKind::Internet => {
@@ -597,7 +640,7 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                     .iif(tr.ingress_interface(server))
                     .src(tier_src(tr.as_ref(), t))
                     .dst(Match::Cidr(p.client))
-                    .l4(p.port),
+                    .l4(Some((Proto::Tcp, HTTPS))),
                 );
             }
         }
@@ -784,8 +827,26 @@ pub mod nft {
         if r.icmp_echo {
             parts.push("icmp type echo-request".into());
         }
-        if let Some((proto, port)) = r.l4 {
-            parts.push(format!("{} dport {port}", proto.as_str()));
+        if let Some(l4) = &r.l4 {
+            let one = |(a, b): (u16, u16)| {
+                if a == b {
+                    a.to_string()
+                } else {
+                    format!("{a}-{b}")
+                }
+            };
+            let ports = match l4.ports[..] {
+                [single] => one(single),
+                _ => format!(
+                    "{{ {} }}",
+                    l4.ports
+                        .iter()
+                        .map(|p| one(*p))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            parts.push(format!("{} dport {ports}", l4.proto.as_str()));
         }
         parts.push(match &r.action {
             Action::Accept => "accept".into(),
@@ -997,8 +1058,26 @@ pub mod iptables {
                         if r.icmp_echo {
                             parts.push("-p icmp --icmp-type echo-request".into());
                         }
-                        if let Some((proto, port)) = r.l4 {
-                            parts.push(format!("-p {} --dport {port}", proto.as_str()));
+                        if let Some(l4) = &r.l4 {
+                            let one = |(a, b): (u16, u16)| {
+                                if a == b {
+                                    a.to_string()
+                                } else {
+                                    format!("{a}:{b}")
+                                }
+                            };
+                            let proto = l4.proto.as_str();
+                            parts.push(match l4.ports[..] {
+                                [single] => format!("-p {proto} --dport {}", one(single)),
+                                _ => format!(
+                                    "-p {proto} -m multiport --dports {}",
+                                    l4.ports
+                                        .iter()
+                                        .map(|p| one(*p))
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                ),
+                            });
                         }
                         if !r.comment.is_empty() {
                             parts.push(format!("-m comment --comment {}", quote(&r.comment)));

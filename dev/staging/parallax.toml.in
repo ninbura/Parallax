@@ -51,8 +51,7 @@ masquerade = true
 [[service]]
 name = "immich"
 host = "192.168.201.5"
-proto = "tcp"
-port = 80
+ports = ["80/tcp"]
 
 # Reaches every network.
 [[template]]

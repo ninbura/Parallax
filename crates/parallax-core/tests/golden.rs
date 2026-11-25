@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use parallax_core::generate::{self, ArtifactKind, Bundle};
 use parallax_core::io::memory::{MemoryFs, RecordingRunner};
 use parallax_core::io::System;
-use parallax_core::model::{FirewallBackend, Grant, Host, Platform, Proto};
+use parallax_core::model::{FirewallBackend, Grant, Host, Platform, PortSpec, Proto};
 use parallax_core::testing::{canonical_config, keypair, today};
 use parallax_core::transport::{self, Transport};
 use parallax_core::{Config, Model};
@@ -208,10 +208,9 @@ fn proxied_service_gets_no_direct_accept() {
 fn no_proxy_redirect_where_a_grant_reaches_the_host_directly() {
     let mut cfg = canonical_config();
     cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
-    cfg.templates[1].grants.push(Grant::HostPort {
+    cfg.templates[1].grants.push(Grant::Host {
         host: "192.168.1.5".parse().unwrap(),
-        proto: parallax_core::model::Proto::Tcp,
-        port: 443,
+        ports: vec![PortSpec::one(parallax_core::model::Proto::Tcp, 443)],
     });
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
@@ -334,13 +333,13 @@ fn named_hosts_get_what_they_resolved_to() {
     // addresses.
     let mut cfg = canonical_config();
     cfg.services[0].host = Host::Name("immich.mydomain.com".into());
-    cfg.templates[1].grants.push(Grant::HostPort {
+    cfg.templates[1].grants.push(Grant::Host {
         host: Host::Name("game.mydomain.com".into()),
-        proto: Proto::Udp,
-        port: 25565,
+        ports: vec![PortSpec::one(Proto::Udp, 25565)],
     });
     cfg.templates[1].grants.push(Grant::Host {
         host: Host::Name("nas.mydomain.com".into()),
+        ports: Vec::new(),
     });
     let addr = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
     let names = [
@@ -395,10 +394,9 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     cfg.services[0].host = Host::Name("immich.mydomain.com".into());
     cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
     let family = &mut cfg.templates[1];
-    family.grants.push(Grant::HostPort {
+    family.grants.push(Grant::Host {
         host: Host::Name("game.mydomain.com".into()),
-        proto: Proto::Udp,
-        port: 25565,
+        ports: vec![PortSpec::one(Proto::Udp, 25565)],
     });
     family.grants.push(Grant::Internet);
     family.client.allowed_ips = parallax_core::model::AllowedIpsStrategy::FullTunnel;
@@ -424,7 +422,7 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     check_golden("variants/home-public-names-routes.toml", &routes.contents);
     // The game port: accepted out the WAN, masqueraded; still in not_public.
     assert!(fw.contents.contains(
-        "oifname \"eth0\" ip daddr 1.2.3.4 udp dport 25565 accept comment \"family: host game.mydomain.com (1.2.3.4) udp/25565 (a port forward on the home's public IP)\""
+        "oifname \"eth0\" ip daddr 1.2.3.4 udp dport 25565 accept comment \"family: host game.mydomain.com (1.2.3.4) 25565/udp (a port forward on the home's public IP)\""
     ), "{}", fw.contents);
     // HTTPS by name: redirected to the proxy, which connects to the public IP.
     assert!(fw.contents.contains(
@@ -485,6 +483,57 @@ fn names_on_the_home_public_ip_are_port_forwards() {
             .contains("masquerade comment \"internet egress\""),
         "{}",
         fw.contents
+    );
+}
+
+#[test]
+fn port_lists_are_one_rule_per_protocol() {
+    // SMB as a service, granted to the guests: four ports, two protocols.
+    let mut cfg = canonical_config();
+    let mut smb = cfg.services[0].clone();
+    smb.name = "nas-smb".into();
+    smb.host = "192.168.1.9".parse().unwrap();
+    smb.nginx_vhost = false;
+    smb.ports = ["137-138/udp", "139/tcp", "445/tcp"]
+        .iter()
+        .map(|p| p.parse().unwrap())
+        .collect();
+    cfg.services.push(smb);
+    cfg.templates[1].grants.push(Grant::Service {
+        name: "nas-smb".into(),
+    });
+    // And a game server's port on TCP and UDP, inline.
+    cfg.templates[1].grants.push(Grant::Host {
+        host: "192.168.1.20".parse().unwrap(),
+        ports: vec!["25565".parse().unwrap()],
+    });
+    let fw = bundle_for(&cfg);
+    let fw = fw.of_kind(ArtifactKind::Firewall).next().unwrap();
+    check_golden("variants/port-lists.nft", &fw.contents);
+    for line in [
+        "oifname \"eth0\" ip daddr 192.168.1.9 tcp dport { 139, 445 } accept comment \"family: service nas-smb\"",
+        "oifname \"eth0\" ip daddr 192.168.1.9 udp dport 137-138 accept comment \"family: service nas-smb\"",
+        "oifname \"eth0\" ip daddr 192.168.1.20 tcp dport 25565 accept comment \"family: host 192.168.1.20 25565\"",
+        "oifname \"eth0\" ip daddr 192.168.1.20 udp dport 25565 accept comment \"family: host 192.168.1.20 25565\"",
+    ] {
+        assert!(fw.contents.contains(line), "missing {line}:\n{}", fw.contents);
+    }
+    cfg.server.firewall.backend = FirewallBackend::IptablesNft;
+    let bundle = bundle_for(&cfg);
+    let rules = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    assert!(
+        rules
+            .contents
+            .contains("-d 192.168.1.9/32 -p tcp -m multiport --dports 139,445 "),
+        "{}",
+        rules.contents
+    );
+    assert!(
+        rules
+            .contents
+            .contains("-d 192.168.1.9/32 -p udp --dport 137:138 "),
+        "{}",
+        rules.contents
     );
 }
 
@@ -669,10 +718,9 @@ fn config_export_layout_matches_golden() {
         Grant::Network {
             name: "home".into(),
         },
-        Grant::HostPort {
+        Grant::Host {
             host: std::net::Ipv4Addr::new(192, 168, 1, 10).into(),
-            proto: parallax_core::model::Proto::Udp,
-            port: 53,
+            ports: vec![PortSpec::one(Proto::Udp, 53)],
         },
         Grant::Internet,
     ];

@@ -55,8 +55,7 @@ masquerade = false
 [[service]]
 name = "immich"
 host = "192.168.1.5"
-proto = "tcp"
-port = 443
+ports = ["443/tcp"]
 nginx_vhost = true
 
 # Templates

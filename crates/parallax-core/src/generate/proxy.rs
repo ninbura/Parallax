@@ -16,10 +16,13 @@ use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
 use super::{Artifact, ArtifactKind};
-use crate::model::Grant;
+use crate::model::{Grant, Proto};
 use crate::transport;
 use crate::validate::Model;
 use crate::{Error, Result};
+
+/// The port of every proxied service: validated to be exactly `443/tcp`.
+const HTTPS: u16 = 443;
 
 /// Where the routes file lives, relative to the output directory.
 pub const PATH: &str = "proxy/routes.toml";
@@ -96,7 +99,7 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
             t.grants.contains(&grant)
                 && addresses
                     .iter()
-                    .any(|ip| !model.reaches_directly(t, *ip, svc.proto, svc.port))
+                    .any(|ip| !model.reaches_directly(t, *ip, Proto::Tcp, HTTPS))
         }) {
             for tr in &transports {
                 for m in tr.tier_members(model, t) {
@@ -113,7 +116,7 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
             sites.push(ProxySite {
                 hostname: hostname.clone(),
                 service: svc.name.clone(),
-                upstream: SocketAddrV4::new(upstream, svc.port),
+                upstream: SocketAddrV4::new(upstream, HTTPS),
                 allowed: allowed.clone(),
             });
         }
@@ -147,7 +150,7 @@ pub fn certificate_check(model: &Model<'_>) -> ProxyRoutes {
             routes.sites.push(ProxySite {
                 hostname: hostname.clone(),
                 service: svc.name.clone(),
-                upstream: SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, svc.port),
+                upstream: SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, HTTPS),
                 allowed: Vec::new(),
             });
         }
@@ -212,6 +215,7 @@ mod tests {
         cfg.services[0].host = crate::model::Host::Name("immich.mydomain.com".into());
         cfg.templates[1].grants.push(Grant::Host {
             host: "192.168.1.5".parse().unwrap(),
+            ports: Vec::new(),
         });
         let found = [(
             "immich.mydomain.com".to_string(),
