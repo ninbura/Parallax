@@ -498,17 +498,19 @@ async fn refresh_public_ip(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
     }
 }
 
-/// What the name lookups depend on: the names, and the networks that say
-/// which resolvers to ask and which answers are allowed.
-type NameInputs = (Vec<String>, Vec<Network>);
+/// What the name lookups depend on: the names, the networks that say which
+/// resolvers to ask and which answers are allowed, and the home's public
+/// IP (an answer may be it).
+type NameInputs = (Vec<String>, Vec<Network>, Option<Ipv4Addr>);
 
-fn name_inputs(config: &Config) -> NameInputs {
+fn name_inputs(view: &View) -> NameInputs {
     (
-        names::used(config)
+        names::used(&view.config)
             .into_iter()
             .map(str::to_string)
             .collect(),
-        config.networks.clone(),
+        view.config.networks.clone(),
+        public_ip::effective(&view.config.server, view.public_ip),
     )
 }
 
@@ -518,7 +520,7 @@ fn name_inputs(config: &Config) -> NameInputs {
 async fn refresh_names(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
     let mut every = tokio::time::interval(NAMES_EVERY);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let inputs = |views: &Views| views.borrow().as_ref().map(|v| name_inputs(&v.config));
+    let inputs = |views: &Views| views.borrow().as_ref().map(name_inputs);
     let mut last = inputs(&views);
     loop {
         tokio::select! {
@@ -538,9 +540,13 @@ async fn refresh_names(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
         let Some(view) = view.filter(|v| !names::used(&v.config).is_empty()) else {
             continue;
         };
-        let asked = name_inputs(&view.config);
+        let asked = name_inputs(&view);
         last = Some(asked.clone());
-        let found = tokio::task::spawn_blocking(move || crate::find_names(&view.config)).await;
+        let found = tokio::task::spawn_blocking(move || {
+            let home = public_ip::effective(&view.config.server, view.public_ip);
+            crate::find_names(&view.config, home)
+        })
+        .await;
         if let Ok(found) = found {
             if tx.send(Msg::Names(asked, found)).is_err() {
                 return;
@@ -780,7 +786,7 @@ impl Engine {
                 }
                 // The names, their resolvers or the networks changed while
                 // these lookups ran: the lookups for the new ones are coming.
-                Msg::Names(asked, _) if asked != name_inputs(&self.view.config) => {}
+                Msg::Names(asked, _) if asked != name_inputs(&self.view) => {}
                 Msg::Names(_, found) => {
                     if self.note_names(found) {
                         why.get_or_insert("a named host's address changed");
@@ -947,11 +953,21 @@ impl Engine {
             message: format!("{e:#}"),
         };
         crate::check(&config).map_err(refuse)?;
+        // A name may point at the home's public IP. Nothing looked for it
+        // while nothing needed it, so look before telling where a new name
+        // points (a few seconds at most, and only then).
+        let had = names::used(&self.view.config);
+        if names::used(&config).iter().any(|n| !had.contains(n))
+            && public_ip::effective(&config.server, self.view.public_ip).is_none()
+        {
+            self.note_public_ip(crate::find_public_ip(&config.server));
+        }
         // Blocks this thread for a new name's lookup only (a few seconds at
         // most): known names aren't asked again.
         let resolved = names::check_save(
             Some(&self.view.config),
             &config,
+            public_ip::effective(&config.server, self.view.public_ip),
             &crate::lookup(&config.server),
             &self.view.names,
         )

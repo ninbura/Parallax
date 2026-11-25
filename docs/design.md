@@ -118,9 +118,12 @@ Two additions relative to the handoff, both small and flagged:
 Grants are written against real addresses, or DNS names that resolve to
 them (ADR 0009): a name is looked up through the resolvers of the network
 whose zone holds it, and grants what it resolved to when every address is
-inside a configured network. Those addresses are an input to generation
+inside a configured network or is the home's public IP. The public IP is
+port forwards: a template that doesn't reach everything gets one port at
+a time there, and web ports only through the HTTPS proxy
+(`ReachKind::HomePublic`). Those addresses are an input to generation
 (`Model::with_names`), like the date. `Model::reaches(template)` resolves
-them to `Reach { label, kind: Lan { network, real, port, proxied } | Internet }` and
+them to `Reach { label, kind: Lan { network, real, port, proxied } | HomePublic { address, port, proxied } | Internet }` and
 `Reach::client_net()` translates to virtual space for clients, nginx and (M2)
 Headscale ACLs. The nftables FORWARD chain matches real addresses because it
 runs after PREROUTING NETMAP.

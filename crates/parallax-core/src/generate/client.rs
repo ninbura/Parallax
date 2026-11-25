@@ -47,6 +47,9 @@ pub fn allowed_ips(model: &Model<'_>, template: &Template, platform: Platform) -
             for r in model.reaches(template) {
                 match r.kind {
                     ReachKind::Internet => push(DEFAULT_ROUTE),
+                    // The client reaches the home's public IP over its own
+                    // internet; routing it here would go stale when it changes.
+                    ReachKind::HomePublic { .. } => {}
                     ReachKind::Lan { .. } => {
                         if let Some(n) = r.client_net() {
                             push(n);

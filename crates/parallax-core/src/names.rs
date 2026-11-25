@@ -8,8 +8,15 @@
 //! deterministic and tests need no DNS.
 //!
 //! - **Only allowed answers.** Every address must be inside a configured
-//!   network's real subnet; otherwise the whole answer is refused, so a
-//!   changed or spoofed answer can't open a host Parallax doesn't know.
+//!   network's real subnet, or be the home's public IP (a service behind a
+//!   port forward); otherwise the whole answer is refused, so a changed or
+//!   spoofed answer can't open a host Parallax doesn't know.
+//! - **The home's public IP, one port at a time.** There every port is a
+//!   port forward, maybe each to another machine, and a raw web port
+//!   reaches every site behind it without the proxy's name check. So a
+//!   template that doesn't reach it anyway (`all_networks` + `internet`) gets
+//!   no `host` grant there, and web ports only as an HTTPS service with
+//!   `hostnames` ([`public_ip_refusal`]).
 //! - **Only the latest answer counts.** A lookup that fails, comes back
 //!   empty or is refused leaves the name granting nothing until it resolves
 //!   again, with a warning saying why. An old answer is never kept: a name
@@ -24,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use crate::io::{Nameserver, Resolver};
-use crate::model::{Config, Grant, Host, Network};
+use crate::model::{Config, Grant, Host, Network, Proto, Template};
 
 /// The addresses each name was last found to have, sorted. Names that were
 /// never found are absent.
@@ -66,22 +73,63 @@ pub fn network_of<'a>(config: &'a Config, name: &str) -> Option<&'a Network> {
         .map(|(_, n)| n)
 }
 
-/// Why `addresses` can't be granted for `name`, if they can't.
-pub fn refused(config: &Config, name: &str, addresses: &[Ipv4Addr]) -> Option<String> {
+/// Why `addresses` can't be granted for `name`, if they can't. Each must be
+/// inside a configured network or be `public_ip`, the home's public IP.
+pub fn refused(
+    config: &Config,
+    public_ip: Option<Ipv4Addr>,
+    name: &str,
+    addresses: &[Ipv4Addr],
+) -> Option<String> {
     if addresses.is_empty() {
         return Some(format!("{name} has no IPv4 address"));
     }
     let outside: Vec<String> = addresses
         .iter()
-        .filter(|a| !config.networks.iter().any(|n| n.subnet.contains(*a)))
+        .filter(|a| {
+            Some(**a) != public_ip && !config.networks.iter().any(|n| n.subnet.contains(*a))
+        })
         .map(Ipv4Addr::to_string)
         .collect();
     (!outside.is_empty()).then(|| {
+        let home = match public_ip {
+            Some(ip) => format!("the home's public IP {ip}"),
+            None => "the home's public IP (not known yet)".to_string(),
+        };
         format!(
-            "{name} resolved to {}, outside every configured network",
+            "{name} resolved to {}, outside every configured network and not {home}",
             outside.join(", ")
         )
     })
+}
+
+/// Plain HTTP on tcp/80, and HTTPS or HTTP/3 on 443: ports a web server
+/// answers for every site it hosts.
+pub(crate) fn is_web(proto: Proto, port: u16) -> bool {
+    port == 443 || (proto == Proto::Tcp && port == 80)
+}
+
+/// Why `template` may not reach `port` (`None`: every port) on the home's
+/// public IP, if it may not. `proxied`: through the HTTPS proxy, which
+/// checks the name. A template with `all_networks` and `internet` reaches
+/// the home's public IP anyway and isn't limited.
+pub fn public_ip_refusal(
+    template: &Template,
+    port: Option<(Proto, u16)>,
+    proxied: bool,
+) -> Option<&'static str> {
+    if template.grants.contains(&Grant::AllNetworks) && template.grants.contains(&Grant::Internet) {
+        return None;
+    }
+    match port {
+        None => Some(
+            "every port there is a port forward, so a host grant would open them all; grant one port with host_port",
+        ),
+        Some((proto, port)) if !proxied && is_web(proto, port) => Some(
+            "web ports there serve every site behind the forward; grant it as a service with hostnames, so the HTTPS proxy checks the name",
+        ),
+        Some(_) => None,
+    }
 }
 
 /// Look `name` up through its network's resolvers, in order: the first
@@ -89,6 +137,7 @@ pub fn refused(config: &Config, name: &str, addresses: &[Ipv4Addr]) -> Option<St
 /// [`refused`] has nothing against them.
 pub fn lookup(
     config: &Config,
+    public_ip: Option<Ipv4Addr>,
     resolver: &dyn Resolver,
     name: &str,
 ) -> Result<Vec<Ipv4Addr>, String> {
@@ -100,7 +149,7 @@ pub fn lookup(
             Ok(mut addresses) => {
                 addresses.sort();
                 addresses.dedup();
-                return match refused(config, name, &addresses) {
+                return match refused(config, public_ip, name, &addresses) {
                     Some(why) => Err(format!("{why} (asked {upstream})")),
                     None => Ok(addresses),
                 };
@@ -129,10 +178,10 @@ pub struct Refreshed {
 }
 
 /// Look up every name the configuration uses.
-pub fn refresh(config: &Config, resolver: &dyn Resolver) -> Refreshed {
+pub fn refresh(config: &Config, public_ip: Option<Ipv4Addr>, resolver: &dyn Resolver) -> Refreshed {
     let mut out = Refreshed::default();
     for name in used(config) {
-        match lookup(config, resolver, name) {
+        match lookup(config, public_ip, resolver, name) {
             Ok(addresses) => {
                 out.resolved.insert(name.to_string(), addresses);
             }
@@ -145,19 +194,55 @@ pub fn refresh(config: &Config, resolver: &dyn Resolver) -> Refreshed {
 }
 
 /// What's wrong with the names of `config` given what they resolved to:
-/// names that didn't resolve, and answers no longer inside a network (a
-/// network changed since). Each problem names what stays in effect.
-pub fn problems(config: &Config, resolved: &Resolved) -> Vec<String> {
-    used(config)
+/// names that didn't resolve, answers no longer allowed (a network or the
+/// public IP changed since), and grants the home's public IP doesn't take
+/// ([`public_ip_refusal`]). Each problem names what stays in effect.
+pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolved) -> Vec<String> {
+    let mut out: Vec<String> = used(config)
         .into_iter()
         .filter_map(|name| match resolved.get(name) {
             None => Some(format!(
                 "{name} didn't resolve; grants on it give nothing until it does"
             )),
-            Some(addresses) => refused(config, name, addresses)
+            Some(addresses) => refused(config, public_ip, name, addresses)
                 .map(|why| format!("{why}; grants on it give nothing")),
         })
-        .collect()
+        .collect();
+    let Some(home) = public_ip else {
+        return out;
+    };
+    for t in &config.templates {
+        for g in &t.grants {
+            let (what, host, port, proxied) = match g {
+                Grant::Host { host } => (format!("host {host}"), host, None, false),
+                Grant::HostPort { host, proto, port } => (
+                    format!("host_port {host} {}/{port}", proto.as_str()),
+                    host,
+                    Some((*proto, *port)),
+                    false,
+                ),
+                Grant::Service { name } => match config.service(name) {
+                    Some(s) => (
+                        format!("service '{name}'"),
+                        &s.host,
+                        Some((s.proto, s.port)),
+                        s.is_proxied(),
+                    ),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let Some(name) = host.name() else { continue };
+            let at_home = resolved.get(name).is_some_and(|a| a.contains(&home));
+            if let Some(why) = public_ip_refusal(t, port, proxied).filter(|_| at_home) {
+                out.push(format!(
+                    "template '{}': grant {what}: {name} is the home's public IP {home}, and {why}; it gives nothing there",
+                    t.name
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Before saving `new` over `old`: look up the names `new` adds, and refuse
@@ -166,6 +251,7 @@ pub fn problems(config: &Config, resolved: &Resolved) -> Vec<String> {
 pub fn check_save(
     old: Option<&Config>,
     new: &Config,
+    public_ip: Option<Ipv4Addr>,
     resolver: &dyn Resolver,
     known: &Resolved,
 ) -> Result<Resolved, Vec<String>> {
@@ -180,16 +266,19 @@ pub fn check_save(
     let had = old.map(used).unwrap_or_default();
     for name in used(new) {
         let still_fine = match known.get(name) {
-            Some(addresses) => refused(new, name, addresses).is_none(),
+            Some(addresses) => refused(new, public_ip, name, addresses).is_none(),
             None => true,
         };
         if had.contains(name) && still_fine {
             continue;
         }
-        match lookup(new, resolver, name) {
+        match lookup(new, public_ip, resolver, name) {
             Ok(addresses) => {
                 resolved.insert(name.to_string(), addresses);
             }
+            // A name `old` had: whether this change made it worse is for
+            // the comparison of problems below, not the lookup.
+            Err(_) if had.contains(name) => {}
             Err(why) => failed.push(why),
         }
     }
@@ -197,9 +286,9 @@ pub fn check_save(
         return Err(failed);
     }
     let before: BTreeSet<String> = old
-        .map(|old| problems(old, known).into_iter().collect())
+        .map(|old| problems(old, public_ip, known).into_iter().collect())
         .unwrap_or_default();
-    let added: Vec<String> = problems(new, &resolved)
+    let added: Vec<String> = problems(new, public_ip, &resolved)
         .into_iter()
         .filter(|p| !before.contains(p))
         .collect();
@@ -266,7 +355,7 @@ mod tests {
     fn the_zone_picks_the_resolvers() {
         let cfg = named();
         let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
-        assert_eq!(lookup(&cfg, &r, NAS), Ok(vec![nas_addr()]));
+        assert_eq!(lookup(&cfg, None, &r, NAS), Ok(vec![nas_addr()]));
         assert_eq!(*r.asked.borrow(), [(NAS.to_string(), home_dns())]);
     }
 
@@ -276,11 +365,11 @@ mod tests {
         let second = Ipv4Addr::new(192, 168, 1, 2);
         cfg.networks[0].upstream_dns.push(second);
         let r = FakeResolver::new().answer(NAS, Nameserver::Plain(second), &[nas_addr()]);
-        assert_eq!(lookup(&cfg, &r, NAS), Ok(vec![nas_addr()]));
+        assert_eq!(lookup(&cfg, None, &r, NAS), Ok(vec![nas_addr()]));
         assert_eq!(r.asked.borrow().len(), 2);
         // An empty answer is an answer: nobody else is asked.
         let r = FakeResolver::new().answer(NAS, home_dns(), &[]);
-        let why = lookup(&cfg, &r, NAS).unwrap_err();
+        let why = lookup(&cfg, None, &r, NAS).unwrap_err();
         assert!(why.contains("has no IPv4 address"), "{why}");
         assert_eq!(r.asked.borrow().len(), 1);
     }
@@ -290,10 +379,10 @@ mod tests {
         let cfg = named();
         let r =
             FakeResolver::new().answer(NAS, home_dns(), &[nas_addr(), Ipv4Addr::new(8, 8, 8, 8)]);
-        let why = lookup(&cfg, &r, NAS).unwrap_err();
+        let why = lookup(&cfg, None, &r, NAS).unwrap_err();
         assert_eq!(
             why,
-            "nas.mydomain.com resolved to 8.8.8.8, outside every configured network (asked 192.168.1.1)"
+            "nas.mydomain.com resolved to 8.8.8.8, outside every configured network and not the home's public IP (not known yet) (asked 192.168.1.1)"
         );
     }
 
@@ -301,7 +390,7 @@ mod tests {
     fn a_name_that_doesnt_resolve_gives_nothing() {
         let cfg = named();
         let ok = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
-        assert_eq!(refresh(&cfg, &ok).resolved[NAS], [nas_addr()]);
+        assert_eq!(refresh(&cfg, None, &ok).resolved[NAS], [nas_addr()]);
         // Refused, gone (an empty answer), or no answer at all: no address
         // from an earlier lookup stands in.
         for r in [
@@ -309,28 +398,35 @@ mod tests {
             FakeResolver::new().answer(NAS, home_dns(), &[]),
             FakeResolver::new(),
         ] {
-            let out = refresh(&cfg, &r);
+            let out = refresh(&cfg, None, &r);
             assert!(out.resolved.is_empty(), "{out:?}");
             assert!(out.problems[0].ends_with("grants on it give nothing until it resolves"));
         }
-        assert!(refresh(&canonical_config(), &ok).problems.is_empty());
+        assert!(refresh(&canonical_config(), None, &ok).problems.is_empty());
     }
 
     #[test]
     fn a_save_must_resolve_new_names() {
         let old = canonical_config();
         let new = named();
-        let err = check_save(Some(&old), &new, &FakeResolver::new(), &Resolved::new()).unwrap_err();
+        let err = check_save(
+            Some(&old),
+            &new,
+            None,
+            &FakeResolver::new(),
+            &Resolved::new(),
+        )
+        .unwrap_err();
         assert!(
             err[0].starts_with("can't look up nas.mydomain.com"),
             "{err:?}"
         );
         let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
-        let resolved = check_save(Some(&old), &new, &r, &Resolved::new()).unwrap();
+        let resolved = check_save(Some(&old), &new, None, &r, &Resolved::new()).unwrap();
         assert_eq!(resolved[NAS], [nas_addr()]);
         // Known names aren't asked again.
         let r = FakeResolver::new();
-        check_save(Some(&new), &new, &r, &resolved).unwrap();
+        check_save(Some(&new), &new, None, &r, &resolved).unwrap();
         assert!(r.asked.borrow().is_empty());
     }
 
@@ -348,7 +444,7 @@ mod tests {
             Nameserver::Plain(Ipv4Addr::new(192, 168, 2, 1)),
             &[nas_addr()],
         );
-        let err = check_save(Some(&old), &new, &r, &known).unwrap_err();
+        let err = check_save(Some(&old), &new, None, &r, &known).unwrap_err();
         assert!(
             err[0].contains("resolved to 192.168.1.9, outside every configured network"),
             "{err:?}"
@@ -360,9 +456,84 @@ mod tests {
         // Left over from a configuration a restore replaced.
         let stale: Resolved = [(NAS.to_string(), vec![Ipv4Addr::new(192, 168, 1, 99)])].into();
         let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
-        let resolved = check_save(Some(&canonical_config()), &named(), &r, &stale).unwrap();
+        let resolved = check_save(Some(&canonical_config()), &named(), None, &r, &stale).unwrap();
         assert_eq!(resolved[NAS], [nas_addr()]);
         assert_eq!(r.asked.borrow().len(), 1);
+    }
+
+    const HOME: Ipv4Addr = Ipv4Addr::new(1, 2, 3, 4);
+
+    #[test]
+    fn the_home_public_ip_is_an_allowed_answer() {
+        let cfg = named();
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[HOME]);
+        assert_eq!(lookup(&cfg, Some(HOME), &r, NAS), Ok(vec![HOME]));
+        let why = lookup(&cfg, None, &r, NAS).unwrap_err();
+        assert!(
+            why.contains("not the home's public IP (not known yet)"),
+            "{why}"
+        );
+        let why = lookup(&cfg, Some(Ipv4Addr::new(1, 2, 3, 5)), &r, NAS).unwrap_err();
+        assert!(why.contains("not the home's public IP 1.2.3.5"), "{why}");
+    }
+
+    #[test]
+    fn the_home_public_ip_takes_single_ports_and_no_raw_web() {
+        let mut cfg = named();
+        let at_home: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        // tcp/445 by name: fine.
+        assert!(problems(&cfg, Some(HOME), &at_home).is_empty());
+        cfg.templates[1].grants.push(Grant::Host {
+            host: Host::Name(NAS.into()),
+        });
+        cfg.templates[1].grants.push(Grant::HostPort {
+            host: Host::Name(NAS.into()),
+            proto: Proto::Udp,
+            port: 443,
+        });
+        let found = problems(&cfg, Some(HOME), &at_home);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found[0].starts_with("template 'family': grant host nas.mydomain.com: nas.mydomain.com is the home's public IP 1.2.3.4, and every port there is a port forward"),
+            "{found:?}"
+        );
+        assert!(
+            found[1].starts_with("template 'family': grant host_port nas.mydomain.com udp/443:"),
+            "{found:?}"
+        );
+        assert!(found[1].contains("service with hostnames"), "{found:?}");
+        // On the LAN the same grants are fine.
+        let at_lan: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
+        assert!(problems(&cfg, Some(HOME), &at_lan).is_empty());
+        // `all_networks` alone doesn't reach the public IP: still limited.
+        cfg.templates[1].grants.push(Grant::AllNetworks);
+        assert_eq!(problems(&cfg, Some(HOME), &at_home).len(), 2);
+        // With `internet` too it reaches everything, and isn't.
+        cfg.templates[1].grants.push(Grant::Internet);
+        assert!(problems(&cfg, Some(HOME), &at_home).is_empty());
+    }
+
+    #[test]
+    fn a_save_cant_add_a_raw_web_grant_on_the_public_ip() {
+        let old = named();
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        let mut new = old.clone();
+        new.templates[1].grants.push(Grant::HostPort {
+            host: Host::Name(NAS.into()),
+            proto: Proto::Tcp,
+            port: 80,
+        });
+        let err =
+            check_save(Some(&old), &new, Some(HOME), &FakeResolver::new(), &known).unwrap_err();
+        assert!(
+            err[0].contains("grant host_port nas.mydomain.com tcp/80"),
+            "{err:?}"
+        );
+        // A proxied HTTPS service there is how web traffic gets in.
+        let mut new = old.clone();
+        new.services[0].host = Host::Name(NAS.into());
+        new.services[0].hostnames = vec![NAS.into()];
+        assert!(check_save(Some(&old), &new, Some(HOME), &FakeResolver::new(), &known).is_ok());
     }
 
     #[test]
@@ -375,9 +546,28 @@ mod tests {
         let moved = Ipv4Addr::new(192, 168, 2, 9);
         let r = FakeResolver::new().answer(NAS, home_dns(), &[moved]);
         assert_eq!(
-            check_save(Some(&old), &new, &r, &known).unwrap()[NAS],
+            check_save(Some(&old), &new, None, &r, &known).unwrap()[NAS],
             [moved]
         );
+    }
+
+    #[test]
+    fn a_moved_public_ip_doesnt_block_other_changes() {
+        // The name pointed at the old public IP; DNS hasn't caught up.
+        let old = named();
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        let moved = Some(Ipv4Addr::new(1, 2, 3, 5));
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[HOME]);
+        let out = refresh(&old, moved, &r);
+        assert!(out.resolved.is_empty(), "the old answer gives nothing now");
+        assert!(
+            out.problems[0].ends_with("until it resolves"),
+            "{:?}",
+            out.problems
+        );
+        let mut new = old.clone();
+        new.peers.pop();
+        assert!(check_save(Some(&old), &new, moved, &r, &known).is_ok());
     }
 
     #[test]
@@ -388,7 +578,7 @@ mod tests {
         new.peers.pop();
         let r = FakeResolver::new();
         assert_eq!(
-            check_save(Some(&old), &new, &r, &Resolved::new()),
+            check_save(Some(&old), &new, None, &r, &Resolved::new()),
             Ok(Resolved::new())
         );
         assert!(r.asked.borrow().is_empty());

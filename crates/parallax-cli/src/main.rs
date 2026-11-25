@@ -324,7 +324,8 @@ impl Ctx {
     pub(crate) fn load_for_generation(&self) -> anyhow::Result<(Config, Learned)> {
         let (config, revision, mut learned) = self.load_full()?;
         if revision.is_none() {
-            learned.names = find_names(&config).resolved;
+            let home = public_ip::effective(&config.server, learned.public_ip);
+            learned.names = find_names(&config, home).resolved;
         }
         Ok((config, learned))
     }
@@ -536,8 +537,9 @@ pub(crate) fn find_public_ip(server: &ServerConfig) -> Result<public_ip::Found, 
 
 /// Look up every host named by DNS name ([`parallax_core::names`]).
 /// Blocks for up to a few seconds per resolver it asks.
-pub(crate) fn find_names(config: &Config) -> names::Refreshed {
-    names::refresh(config, &lookup(&config.server))
+/// `public_ip` is the home's public IP in effect, where a name may point.
+pub(crate) fn find_names(config: &Config, public_ip: Option<Ipv4Addr>) -> names::Refreshed {
+    names::refresh(config, public_ip, &lookup(&config.server))
 }
 
 /// The real resolver.
@@ -566,7 +568,7 @@ pub(crate) fn public_ip_lookup_failed(problems: &[String], known: Option<Ipv4Add
 
 /// Guests need the home's public IP and it was never found.
 fn public_ip_unknown(config: &Config, public_ip: Option<Ipv4Addr>) -> Option<String> {
-    (public_ip.is_none() && public_ip::needed(config)).then(|| {
+    (public_ip.is_none() && public_ip::hairpin(config)).then(|| {
         "the home's public IP isn't known: until it is, guest templates with internet can reach the home through the router (hairpin). Set server.public_ip.address, or server.public_ip.encrypted_dns if your resolver rewrites your own hostname".to_string()
     })
 }
@@ -646,7 +648,8 @@ fn run() -> anyhow::Result<()> {
                             Err(problems) => notes.push(public_ip_lookup_failed(&problems, known)),
                         }
                     }
-                    let found = find_names(&config);
+                    let home = public_ip::effective(&config.server, known);
+                    let found = find_names(&config, home);
                     notes.extend(found.problems);
                     let learned = Learned {
                         public_ip: known,
@@ -1137,7 +1140,8 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                         .map(|n| format!(" as {n}"))
                         .unwrap_or_default();
                     let proxied = match r.kind {
-                        ReachKind::Lan { proxied: true, .. } => " through the HTTPS proxy",
+                        ReachKind::Lan { proxied: true, .. }
+                        | ReachKind::HomePublic { proxied: true, .. } => " through the HTTPS proxy",
                         _ => "",
                     };
                     println!("    reaches {}{via}{proxied}", r.label);

@@ -4,7 +4,8 @@
 //! own public address is public too, but the router hairpins traffic sent
 //! to it back into the home's port forwards, so the guest would reach
 //! exactly what its grants leave out. Such tiers drop it, and for that the
-//! gateway has to know it ([`needed`]).
+//! gateway has to know it ([`hairpin`]). Hosts named by DNS name need it
+//! too: a name that resolves to it is a port forward ([`crate::names`]).
 //!
 //! [`find`] asks, in order, and takes the first that works:
 //! 1. `server.public_ip.address`, when set: no lookup.
@@ -25,13 +26,20 @@ use crate::generate::firewall::NOT_PUBLIC;
 use crate::io::{Nameserver, Resolver};
 use crate::model::{Config, Grant, ServerConfig};
 
-/// Whether some template needs the address: one with `internet` that
-/// reaches public addresses only (no `all_networks`).
-pub fn needed(config: &Config) -> bool {
+/// Whether some template needs the address for the hairpin drop: one with
+/// `internet` that reaches public addresses only (no `all_networks`).
+pub fn hairpin(config: &Config) -> bool {
     config
         .templates
         .iter()
         .any(|t| t.grants.contains(&Grant::Internet) && !t.grants.contains(&Grant::AllNetworks))
+}
+
+/// Whether to look the address up: for the hairpin drop, or to tell a
+/// host named by DNS name that resolves to it (a port forward) from one
+/// that resolves somewhere Parallax doesn't know ([`crate::names`]).
+pub fn needed(config: &Config) -> bool {
+    hairpin(config) || !crate::names::used(config).is_empty()
 }
 
 /// Not private, reserved, shared (CGNAT) or otherwise outside the internet.
@@ -180,6 +188,12 @@ mod tests {
         assert!(!needed(&cfg), "all_networks reaches the router anyway");
         cfg.templates[1].grants.push(Grant::Internet);
         assert!(needed(&cfg));
+        assert!(hairpin(&cfg));
+        // A host named by DNS name may point at it, without any hairpin.
+        let mut cfg = canonical_config();
+        cfg.services[0].host = crate::model::Host::Name("immich.mydomain.com".into());
+        assert!(needed(&cfg));
+        assert!(!hairpin(&cfg));
     }
 
     #[test]
