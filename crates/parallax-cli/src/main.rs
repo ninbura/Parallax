@@ -19,7 +19,9 @@ use parallax_core::doctor::Outcome;
 use parallax_core::generate::{self, Export};
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
-use parallax_core::model::{Peer, Platform, ServerConfig, TransportKind};
+use parallax_core::model::{
+    AllowedIpsStrategy, DnsMode, Peer, Platform, ServerConfig, TransportKind,
+};
 use parallax_core::names::{self, Resolved};
 use parallax_core::public_ip;
 use parallax_core::secret::PrivateKey;
@@ -38,7 +40,7 @@ mod protocol;
 #[command(
     name = "parallax",
     version,
-    about = "WireGuard + Headscale gateway with subnet remapping, DNS rewriting and template-based access policies"
+    about = "WireGuard + Headscale gateway with subnet remapping, DNS rewriting and grant-based access policies"
 )]
 struct Cli {
     /// The database: the source of truth for the configuration.
@@ -155,8 +157,18 @@ enum PeerCommand {
     /// Add a peer: allocates an address, generates keys, prints the one-time client config.
     Add {
         name: String,
-        #[arg(short, long)]
-        template: String,
+        /// A grant it gets (repeat, or separate with commas). Without any,
+        /// it reaches only what grants for everyone give.
+        #[arg(short, long = "grant", value_delimiter = ',')]
+        grants: Vec<String>,
+        /// DNS of its config: split, tunnel_wide or none (default:
+        /// server.wireguard.peer_defaults).
+        #[arg(long)]
+        dns: Option<DnsMode>,
+        /// What its config routes: mapped_subnets, grants_only or full_tunnel
+        /// (default: server.wireguard.peer_defaults).
+        #[arg(long)]
+        allowed_ips: Option<AllowedIpsStrategy>,
         #[arg(long, default_value = "wireguard")]
         transport: TransportKind,
         /// Keep the private key in the configuration so configs can be regenerated.
@@ -569,7 +581,7 @@ pub(crate) fn public_ip_lookup_failed(problems: &[String], known: Option<Ipv4Add
 /// Guests need the home's public IP and it was never found.
 fn public_ip_unknown(config: &Config, public_ip: Option<Ipv4Addr>) -> Option<String> {
     (public_ip.is_none() && public_ip::hairpin(config)).then(|| {
-        "the home's public IP isn't known: until it is, guest templates with internet can reach the home through the router (hairpin). Set server.public_ip.address, or server.public_ip.encrypted_dns if your resolver rewrites your own hostname".to_string()
+        "the home's public IP isn't known: until it is, guests with internet can reach the home through the router (hairpin). Set server.public_ip.address, or server.public_ip.encrypted_dns if your resolver rewrites your own hostname".to_string()
     })
 }
 
@@ -587,10 +599,10 @@ fn run() -> anyhow::Result<()> {
             let model = resolve(&config)?;
             print_warnings(model.warnings());
             println!(
-                "{}: valid ({} networks, {} templates, {} peers, {} active)",
+                "{}: valid ({} networks, {} grants, {} peers, {} active)",
                 db.display(),
                 config.networks.len(),
-                config.templates.len(),
+                config.grants.len(),
                 config.peers.len(),
                 model.active_peers().count()
             );
@@ -846,11 +858,11 @@ fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
                 .with_context(|| format!("reading {}", file.display()))?;
             let config = prepare(&text).with_context(|| format!("importing {}", file.display()))?;
             let summary = format!(
-                "imported {} into {} ({} networks, {} templates, {} peers)",
+                "imported {} into {} ({} networks, {} grants, {} peers)",
                 file.display(),
                 db.display(),
                 config.networks.len(),
-                config.templates.len(),
+                config.grants.len(),
                 config.peers.len()
             );
             if ctx.ask(&Request::Status)?.is_some() {
@@ -1042,7 +1054,9 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
     match command {
         PeerCommand::Add {
             name,
-            template,
+            grants,
+            dns,
+            allowed_ips,
             transport: kind,
             keep_private_key,
             preshared_key,
@@ -1053,14 +1067,17 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
             let (_, learned) = ctx.load_for_generation()?;
             let ((peer, export), saved) = ctx.update(|config| {
                 let model = resolve(config)?;
-                let t = model.template(&template)?;
                 let tr = transport::by_kind(kind);
                 let opts = ProvisionOptions {
                     retain_private_key: keep_private_key,
                     preshared_key,
                     expires,
                 };
-                let peer = tr.provision(&model, t, &name, &OsKeyGenerator, &opts)?;
+                let mut peer = tr.provision(&model, &grants, &name, &OsKeyGenerator, &opts)?;
+                if let Some(w) = peer.wireguard.as_mut() {
+                    w.dns = dns.unwrap_or(w.dns);
+                    w.allowed_ips = allowed_ips.unwrap_or(w.allowed_ips);
+                }
 
                 // One-time export against a model that includes the new peer.
                 let mut with_peer = config.clone();
@@ -1079,9 +1096,13 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
             })?;
 
             eprintln!(
-                "added peer '{}' (template {}, {}, address {})",
+                "added peer '{}' (grants {}, {}, address {})",
                 peer.name,
-                peer.template,
+                if peer.grants.is_empty() {
+                    "none".to_string()
+                } else {
+                    peer.grants.join(",")
+                },
                 peer.transport,
                 peer.wireguard
                     .as_ref()
@@ -1118,15 +1139,16 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                 None => config.peers.iter().collect(),
             };
             for p in peers {
-                let t = model.template(&p.template)?;
+                let tier = model.tier_of(p);
                 let addr = match p.transport {
                     TransportKind::WireGuard => p.wireguard.as_ref().and_then(|w| w.address),
                     TransportKind::Tailscale => p.tailscale.as_ref().and_then(|t| t.address),
                 };
                 println!(
-                    "{}  template={}  transport={}  address={}  active={}{}",
+                    "{}  grants={}  transport={}  address={}  active={}{}",
                     p.name,
-                    p.template,
+                    tier.map(|t| t.label().replace('+', ","))
+                        .unwrap_or_else(|| "-".into()),
                     p.transport,
                     addr.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
                     p.is_active(model.today()),
@@ -1134,7 +1156,7 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                         .map(|e| format!("  expires={e}"))
                         .unwrap_or_default()
                 );
-                for r in model.reaches(t) {
+                for r in tier.map(|t| model.reaches(t)).unwrap_or_default() {
                     let via = r
                         .client_net()
                         .map(|n| format!(" as {n}"))
@@ -1160,13 +1182,18 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                     };
                     println!("    reaches {}{ports}{via}{proxied}", r.label);
                 }
-                println!(
-                    "    dns: wireguard={} tailscale={} public={}; allowed_ips={:?}",
-                    t.dns.wireguard.as_str(),
-                    t.dns.tailscale.as_str(),
-                    t.dns.public,
-                    t.client.allowed_ips
-                );
+                let public = tier.is_some_and(|t| t.has(&parallax_core::Rule::PublicDns));
+                match &p.wireguard {
+                    Some(w) => println!(
+                        "    dns: {} public={public}; allowed_ips={}",
+                        w.dns.as_str(),
+                        w.allowed_ips.as_str()
+                    ),
+                    None => println!(
+                        "    dns: {} public={public}",
+                        model.server().headscale.dns.as_str()
+                    ),
+                }
             }
         }
     }

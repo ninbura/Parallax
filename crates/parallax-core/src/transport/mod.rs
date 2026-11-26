@@ -12,18 +12,10 @@ use ipnet::Ipv4Net;
 
 use crate::generate::{Artifact, Export};
 use crate::io::{KeyGenerator, System};
-use crate::model::{Peer, Platform, ServerConfig, Template, TransportKind};
+use crate::model::{Peer, Platform, ServerConfig, TransportKind};
+use crate::tier::Tier;
 use crate::validate::Model;
 use crate::Result;
-
-/// How the firewall identifies members of a template on a transport.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TierSource {
-    /// A static prefix: the template's WireGuard pool. The address *is* the tier.
-    Cidr(Ipv4Net),
-    /// A named nftables set of node addresses, kept in sync from the control plane.
-    Set(String),
-}
 
 /// Options for [`Transport::provision`].
 #[derive(Debug, Clone, Default)]
@@ -46,19 +38,32 @@ pub trait Transport {
     /// trailing default-deny and for return routes on the LAN router.
     fn source_range(&self, server: &ServerConfig) -> Ipv4Net;
 
-    /// How the firewall matches members of `template`.
-    fn tier_source(&self, server: &ServerConfig, template: &Template) -> TierSource;
+    /// The named address set holding `tier`'s members on this transport,
+    /// which the firewall matches them by.
+    fn set_name(&self, tier: &Tier<'_>) -> String {
+        format!("{}_tier_{}", self.set_prefix(), tier.index)
+    }
 
-    /// Concrete prefixes of the template's members for L7 allow-lists
-    /// (WireGuard: the pool; Tailscale: one /32 per known node).
-    fn tier_members(&self, model: &Model<'_>, template: &Template) -> Vec<Ipv4Net>;
+    /// `wg`, `ts`: starts this transport's set names.
+    fn set_prefix(&self) -> &'static str;
 
-    /// Create identity, credentials and address for a new device. Returns the
-    /// peer to insert into the configuration; nothing is persisted here.
+    /// Whether the members are known when the ruleset is generated. Then
+    /// FORWARD picks a tier's chain by looking the source address up in
+    /// one verdict map; otherwise by the tier's set, which the control
+    /// plane keeps in sync without a new ruleset (Tailscale, M2).
+    fn members_known(&self) -> bool;
+
+    /// The tier's active members, one /32 each (Tailscale: the nodes known
+    /// so far), for the firewall's sets and the L7 allow-lists.
+    fn tier_members(&self, model: &Model<'_>, tier: &Tier<'_>) -> Vec<Ipv4Net>;
+
+    /// Create identity, credentials and address for a new device with
+    /// `grants`. Returns the peer to insert into the configuration; nothing
+    /// is persisted here.
     fn provision(
         &self,
         model: &Model<'_>,
-        template: &Template,
+        grants: &[String],
         name: &str,
         keys: &dyn KeyGenerator,
         opts: &ProvisionOptions,

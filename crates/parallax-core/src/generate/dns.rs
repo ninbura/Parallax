@@ -9,7 +9,7 @@
 //! checked against the tier the source address belongs to: a tier gets the
 //! zones of the networks it's granted, the hostnames of the services it's
 //! granted and the names of hosts it's granted by name, and public names
-//! only with `dns.public`. Everything else is
+//! only with a `public_dns` rule. Everything else is
 //! refused. DNS is convenience, never enforcement: the firewall and the proxy
 //! are the gate, this only keeps a guest from using the gateway's resolver
 //! for names it has no business with.
@@ -20,7 +20,7 @@ use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
 use super::{Artifact, ArtifactKind};
-use crate::model::Grant;
+use crate::model::Rule;
 use crate::netmap::Mapping;
 use crate::transport;
 use crate::validate::Model;
@@ -34,7 +34,7 @@ pub const PATH: &str = "dns/routes.toml";
 #[serde(deny_unknown_fields)]
 pub struct DnsRoutes {
     pub listen: SocketAddrV4,
-    /// Where public names go, for tiers with `public`.
+    /// Where public names go, for tiers with `public_dns`.
     pub public_resolver: Ipv4Addr,
     /// Real subnets of configured networks without `mapped_to`: home answers
     /// there pass unchanged. Any other private or reserved address in a home
@@ -70,12 +70,13 @@ pub struct DnsMapping {
     pub virt: Ipv4Net,
 }
 
-/// What one template's members may look up.
+/// What one tier's members may look up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsTier {
-    pub template: String,
-    /// Tunnel source prefixes of the template's members.
+    /// Its grants (`family+photos`), for logs.
+    pub tier: String,
+    /// Tunnel source addresses of the tier's members.
     pub members: Vec<Ipv4Net>,
     /// Whole zones (every name in them).
     #[serde(default)]
@@ -208,7 +209,7 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
         .collect();
     let transports = transport::all();
     let mut tiers = Vec::new();
-    for t in &cfg.templates {
+    for t in model.tiers() {
         let mut members: Vec<Ipv4Net> = Vec::new();
         for tr in &transports {
             for m in tr.tier_members(model, t) {
@@ -219,11 +220,11 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
         }
         let mut tier_zones: Vec<String> = Vec::new();
         let mut names: Vec<String> = Vec::new();
-        for g in &t.grants {
-            let granted: Vec<&str> = match g {
-                Grant::AllNetworks => cfg.networks.iter().map(|n| n.name.as_str()).collect(),
-                Grant::Network { name } => vec![name.as_str()],
-                Grant::Service { name } => {
+        for rule in &t.rules {
+            let granted: Vec<&str> = match rule {
+                Rule::AllNetworks => cfg.networks.iter().map(|n| n.name.as_str()).collect(),
+                Rule::Network { name } => vec![name.as_str()],
+                Rule::Service { name } => {
                     if let Some(svc) = cfg.services.iter().find(|s| &s.name == name) {
                         let own = svc.host.name().map(str::to_string);
                         for h in svc.hostnames.iter().chain(&own) {
@@ -236,7 +237,7 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
                 }
                 // A host granted by name may look that name up; one granted
                 // by address has no name.
-                Grant::Host { host, .. } => {
+                Rule::Host { host, .. } => {
                     if let Some(h) = host.name() {
                         if !names.iter().any(|n| n == h) {
                             names.push(h.to_string());
@@ -244,7 +245,7 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
                     }
                     Vec::new()
                 }
-                Grant::Internet => Vec::new(),
+                Rule::Internet | Rule::PublicDns => Vec::new(),
             };
             for z in zones
                 .iter()
@@ -259,11 +260,11 @@ pub fn build(model: &Model<'_>) -> DnsRoutes {
             continue;
         }
         tiers.push(DnsTier {
-            template: t.name.clone(),
+            tier: t.label(),
             members,
             zones: tier_zones,
             names,
-            public: t.dns.public,
+            public: t.has(&Rule::PublicDns),
         });
     }
     DnsRoutes {
@@ -332,7 +333,7 @@ mod tests {
         let family = &routes.tiers[1];
         assert_eq!(
             family.members,
-            vec!["10.8.2.0/24".parse::<Ipv4Net>().unwrap()]
+            vec!["10.8.2.1/32".parse::<Ipv4Net>().unwrap()]
         );
         assert!(family.zones.is_empty());
         assert_eq!(family.names, vec!["immich.mydomain.com"]);
@@ -381,7 +382,7 @@ mod tests {
     #[test]
     fn a_public_tier_never_sends_hidden_zone_names_out() {
         let mut cfg = proxied();
-        cfg.templates[1].dns.public = true;
+        cfg.grants[1].rules.push(Rule::PublicDns);
         let model = Model::resolve(&cfg, today()).unwrap();
         let routes = build(&model);
         assert_eq!(routes.route(addr("10.8.2.1"), "example.org"), Route::Public);
@@ -404,7 +405,7 @@ mod tests {
             domains: vec!["lab.mydomain.com".into()],
             masquerade: false,
         });
-        cfg.templates[0].grants = vec![Grant::Network {
+        cfg.grants[0].rules = vec![Rule::Network {
             name: "home".into(),
         }];
         let model = Model::resolve(&cfg, today()).unwrap();
@@ -438,7 +439,7 @@ mod tests {
         });
         cfg.services[0].host = addr("192.168.50.5").into();
         cfg.services[0].hostnames = vec!["immich.lab.mydomain.com".into()];
-        cfg.templates[1].grants.push(Grant::Network {
+        cfg.grants[1].rules.push(Rule::Network {
             name: "home".into(),
         });
         let model = Model::resolve(&cfg, today()).unwrap();
@@ -468,7 +469,7 @@ mod tests {
             nginx_vhost: false,
             hostnames: Vec::new(),
         });
-        cfg.templates[1].grants = vec![Grant::Service {
+        cfg.grants[1].rules = vec![Rule::Service {
             name: "printer".into(),
         }];
         let model = Model::resolve(&cfg, today()).unwrap();

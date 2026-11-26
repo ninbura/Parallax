@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
+use super::{DnsMode, PeerDefaults};
 use crate::secret::PublicKey;
 
 /// Gateway-wide settings.
@@ -36,7 +37,7 @@ pub struct WireGuardServer {
     pub interface: String,
     #[serde(default = "default_wg_port")]
     pub listen_port: u16,
-    /// All template pools are carved from here. The gateway takes its first host.
+    /// Every WireGuard peer's address comes from here. The gateway takes its first host.
     pub supernet: Ipv4Net,
     /// `host:port` clients connect to.
     pub endpoint: String,
@@ -45,6 +46,9 @@ pub struct WireGuardServer {
     /// 0600 file holding the gateway's private key. Never stored in this model.
     #[serde(default = "default_wg_key_file")]
     pub private_key_file: PathBuf,
+    /// Client settings for new peers.
+    #[serde(default)]
+    pub peer_defaults: PeerDefaults,
 }
 
 fn default_wg_interface() -> String {
@@ -81,6 +85,10 @@ pub struct HeadscaleServer {
     pub derp: DerpMode,
     #[serde(default = "default_router_name")]
     pub subnet_router_node: String,
+    /// DNS mode of Tailscale nodes. Headscale's split DNS is tailnet-wide,
+    /// so one setting for all of them.
+    #[serde(default)]
+    pub dns: DnsMode,
 }
 
 impl Default for HeadscaleServer {
@@ -91,6 +99,7 @@ impl Default for HeadscaleServer {
             api_key_file: default_hs_key_file(),
             derp: DerpMode::default(),
             subnet_router_node: default_router_name(),
+            dns: DnsMode::default(),
         }
     }
 }
@@ -129,7 +138,7 @@ pub struct DnsServer {
     pub listen: Option<Ipv4Addr>,
     #[serde(default = "default_dns_port")]
     pub port: u16,
-    /// Catch-all resolver for tunnel-wide-fallback templates.
+    /// Resolver for public names, for peers granted `public_dns`.
     #[serde(default = "default_public_resolver")]
     pub public_resolver: Ipv4Addr,
 }
@@ -270,7 +279,7 @@ fn default_passphrase_file() -> PathBuf {
 
 /// How the gateway learns the home's public IPv4 address, which guest tiers
 /// with `internet` may not reach: through the router it would hairpin back
-/// to the home's port forwards. Only looked up when such a template exists.
+/// to the home's port forwards. Only looked up when something needs it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicIpServer {

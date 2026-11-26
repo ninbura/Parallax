@@ -24,7 +24,7 @@ pub fn keypair(n: u8) -> KeyPair {
 }
 
 /// The canonical scenario from the design: home LAN 192.168.1.0/24 mapped to
-/// 198.18.1.0/24, templates `personal` and `family`, three WireGuard peers.
+/// 198.18.1.0/24, grants `personal` and `family`, three WireGuard peers.
 pub fn canonical_config() -> Config {
     let server_key = keypair(200);
     let router = keypair(1);
@@ -39,6 +39,7 @@ pub fn canonical_config() -> Config {
                 endpoint: "vpn.mydomain.com:51820".into(),
                 public_key: server_key.public,
                 private_key_file: "/etc/parallax/wg-server.key".into(),
+                peer_defaults: PeerDefaults::default(),
             },
             headscale: HeadscaleServer {
                 server_url: "https://headscale.mydomain.com".into(),
@@ -71,58 +72,24 @@ pub fn canonical_config() -> Config {
             nginx_vhost: true,
             hostnames: Vec::new(),
         }],
-        templates: vec![
-            Template {
+        grants: vec![
+            Grant {
                 name: "personal".into(),
-                wireguard: WireGuardTemplate {
-                    pool: "10.8.1.0/24".parse().unwrap(),
-                },
-                headscale: HeadscaleIdentity {
-                    user: Some("gabriel".into()),
-                    tag: None,
-                },
-                grants: vec![Grant::AllNetworks],
-                visible_networks: None,
-                dns: DnsPolicy {
-                    wireguard: DnsMode::Split,
-                    tailscale: DnsMode::Split,
-                    public: true,
-                },
-                client: ClientDefaults {
-                    allowed_ips: AllowedIpsStrategy::MappedSubnets,
-                    mtu: None,
-                    persistent_keepalive: Some(25),
-                },
+                everyone: false,
+                rules: vec![Rule::AllNetworks, Rule::PublicDns],
             },
-            Template {
+            Grant {
                 name: "family".into(),
-                wireguard: WireGuardTemplate {
-                    pool: "10.8.2.0/24".parse().unwrap(),
-                },
-                headscale: HeadscaleIdentity {
-                    user: None,
-                    tag: Some("tag:family".into()),
-                },
-                grants: vec![Grant::Service {
+                everyone: false,
+                rules: vec![Rule::Service {
                     name: "immich".into(),
                 }],
-                visible_networks: None,
-                dns: DnsPolicy {
-                    wireguard: DnsMode::TunnelWide,
-                    tailscale: DnsMode::Split,
-                    public: false,
-                },
-                client: ClientDefaults {
-                    allowed_ips: AllowedIpsStrategy::GrantsOnly,
-                    mtu: None,
-                    persistent_keepalive: Some(25),
-                },
             },
         ],
         peers: vec![
             Peer {
                 name: "router".into(),
-                template: "personal".into(),
+                grants: vec!["personal".into()],
                 transport: TransportKind::WireGuard,
                 enabled: true,
                 expires: None,
@@ -131,12 +98,17 @@ pub fn canonical_config() -> Config {
                     address: Some(Ipv4Addr::new(10, 8, 1, 1)),
                     private_key: None,
                     preshared_key: None,
+                    dns: DnsMode::Split,
+                    allowed_ips: AllowedIpsStrategy::MappedSubnets,
+                    mtu: None,
+                    persistent_keepalive: Some(25),
+                    visible_networks: None,
                 }),
                 tailscale: None,
             },
             Peer {
                 name: "laptop".into(),
-                template: "personal".into(),
+                grants: vec!["personal".into()],
                 transport: TransportKind::WireGuard,
                 enabled: true,
                 expires: None,
@@ -145,12 +117,17 @@ pub fn canonical_config() -> Config {
                     address: Some(Ipv4Addr::new(10, 8, 1, 2)),
                     private_key: Some(laptop.private),
                     preshared_key: None,
+                    dns: DnsMode::Split,
+                    allowed_ips: AllowedIpsStrategy::MappedSubnets,
+                    mtu: None,
+                    persistent_keepalive: Some(25),
+                    visible_networks: None,
                 }),
                 tailscale: None,
             },
             Peer {
                 name: "sister-phone".into(),
-                template: "family".into(),
+                grants: vec!["family".into()],
                 transport: TransportKind::WireGuard,
                 enabled: true,
                 expires: Some(Date::new(2027, 12, 31).unwrap()),
@@ -159,9 +136,23 @@ pub fn canonical_config() -> Config {
                     address: Some(Ipv4Addr::new(10, 8, 2, 1)),
                     private_key: Some(sister.private),
                     preshared_key: Some(crate::secret::PresharedKey::from_bytes([9; 32])),
+                    dns: DnsMode::TunnelWide,
+                    allowed_ips: AllowedIpsStrategy::GrantsOnly,
+                    mtu: None,
+                    persistent_keepalive: Some(25),
+                    visible_networks: None,
                 }),
                 tailscale: None,
             },
         ],
     }
+}
+
+/// The tier of `model` whose grants are `label` (`family`, `family+photos`).
+pub fn tier<'m, 'a>(model: &'m crate::Model<'a>, label: &str) -> &'m crate::Tier<'a> {
+    model
+        .tiers()
+        .iter()
+        .find(|t| t.label() == label)
+        .unwrap_or_else(|| panic!("no tier '{label}'"))
 }

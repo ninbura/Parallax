@@ -1,14 +1,14 @@
 //! The one TOML layout `config export` and `config edit` write, so every
 //! exported file reads the same way and diffs stay small:
 //!
-//! - Sections in model order (server, networks, services, templates, peers),
+//! - Sections in model order (server, networks, services, grants, peers),
 //!   each under a `# Heading`, with a blank line between blocks.
-//! - Each `[[network]]`, `[[template]]`, ... entry is one block without blank
+//! - Each `[[network]]`, `[[grant]]`, ... entry is one block without blank
 //!   lines. Its plain keys come first, then its sub-tables: on one line
 //!   (`dns = { ... }`) when that line fits in [`WIDTH`] for every entry of the
-//!   section, otherwise as a `[template.dns]` header in every entry, so all
-//!   entries of a section look alike. A list of tables (`grants`) is one line for a
-//!   single item, one item per line otherwise, so adding a grant is a
+//!   section, otherwise as a `[peer.wireguard]` header in every entry, so all
+//!   entries of a section look alike. A list of tables (`rules`) is one line for a
+//!   single item, one item per line otherwise, so adding a rule is a
 //!   one-line change.
 //! - The server's sub-tables are always `[server.x]` blocks: they're
 //!   settings, read and edited one at a time.
@@ -143,7 +143,7 @@ fn heading(out: &mut String, key: &str) {
         "server" => "Server",
         "network" => "Networks",
         "service" => "Services",
-        "template" => "Templates",
+        "grant" => "Grants",
         "peer" => "Peers",
         _ => return,
     };

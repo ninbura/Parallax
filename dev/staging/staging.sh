@@ -9,7 +9,7 @@
 #   apply                      re-apply the configuration (`parallax apply` through the daemon)
 #   export                     write the configuration as TOML to $STAGING_STATE/config/export.toml (0600)
 #   import FILE                replace the configuration with a TOML file (applies on save)
-#   peer NAME TEMPLATE [PLAT]  add a peer (private key kept; applies on save), show its QR
+#   peer NAME GRANT [PLAT]     add a peer (private key kept; applies on save), show its QR
 #   qr NAME [PLATFORM]         write $STAGING_STATE/qr/NAME-PLATFORM.png and print the QR
 #   smoke                      end-to-end checks from a client namespace through the tunnel
 #   status                     container, WireGuard and firewall summary
@@ -31,7 +31,7 @@ case "$STATE" in /*/*) ;; *) echo "staging: STAGING_STATE must be an absolute pa
 export STAGING_STATE="$STATE"   # compose.yml mounts from it
 CONFIG="$STATE/config/parallax.toml"
 CONTAINER=parallax-staging
-GATEWAY=10.9.0.1   # the tunnel gateway address, from the template's supernet 10.9.0.0/16
+GATEWAY=10.9.0.1   # the tunnel gateway address, from the supernet 10.9.0.0/16
 COMPOSE=(docker compose -f "$DIR/compose.yml")
 
 say() { echo "staging: $*"; }
@@ -206,12 +206,12 @@ import_config() { # file: copied into the mounted config directory, imported, re
 }
 
 # Adds the peer if it's missing; the daemon applies it on save.
-add_peer() { # name template platform
+add_peer() { # name grant platform [peer add options...]
     running || die "gateway not running (staging.sh up)"
     if has_peer "$1"; then
         say "peer $1 already exists"
     else
-        px peer add "$1" --template "$2" --platform "$3" --keep-private-key >/dev/null
+        px peer add "$1" --grant "$2" --platform "$3" --keep-private-key "${@:4}" >/dev/null
         say "added peer $1 ($2)"
     fi
 }
@@ -267,7 +267,7 @@ smoke() {
     pass_db() { echo "PASS: $*"; }
     fail_db() { echo "FAIL: $*"; ok=0; }
     add_peer smoke-personal personal linux
-    add_peer smoke-guest guest linux
+    add_peer smoke-guest guest linux --dns tunnel_wide --allowed-ips grants_only
     trap 'smoke_cleanup' EXIT
     echo "--- database"
     if [ -f "$CONFIG.imported" ] && [ ! -f "$CONFIG" ]; then pass_db "the first start imported parallax.toml and renamed it"
@@ -297,7 +297,7 @@ smoke() {
     iface="$(cfg interface)"
     px peer remove smoke-transient >/dev/null 2>&1 || true
     peers="$(wg show "$iface" peers | grep -c . || true)"
-    if px peer add smoke-transient --template guest >/dev/null 2>&1 \
+    if px peer add smoke-transient --grant guest >/dev/null 2>&1 \
         && [ "$(wg show "$iface" peers | grep -c .)" = $((peers + 1)) ]; then pass_db "a change applies without SIGHUP"
     else fail_db "the new peer is not on $iface after peer add"; fi
     px peer remove smoke-transient >/dev/null 2>&1 || true
@@ -360,7 +360,7 @@ smoke() {
     [ "$(resolve nas.staging.test)" = 198.19.202.5 ] && pass "dns: nas.staging.test -> 198.19.202.5" \
         || fail "dns: nas.staging.test -> '$(resolve nas.staging.test)'"
     local public; public="$(resolve example.com)"
-    [[ "$public" =~ ^[0-9.]+$ ]] && pass "dns: public name for personal (dns.public) -> $public" \
+    [[ "$public" =~ ^[0-9.]+$ ]] && pass "dns: public name for personal (public_dns) -> $public" \
         || fail "dns: example.com for personal -> '$public'"
     expect "by name through the DNS server" "lan1-immich" --resolve "immich.staging.test:80:$(resolve immich.staging.test)" \
         http://immich.staging.test/
@@ -372,7 +372,7 @@ smoke() {
     echo "--- guest"
     me="$(client_iface smoke-guest wgg)"
     expect "granted service" "lan1-immich" http://198.19.201.5/
-    # The guest's only grant is a service without hostnames: no names, and dns.public is off.
+    # The guest's only grant is a service without hostnames: no names, and no public_dns.
     for name in immich.staging.test nas.staging.test example.com; do
         [ "$(status "$name")" = REFUSED ] && pass "dns: $name refused to the guest" \
             || fail "dns: $name for the guest: '$(status "$name")', wanted REFUSED"
@@ -431,7 +431,7 @@ case "$cmd" in
         ;;
     import) [ $# -ge 1 ] || die "usage: staging.sh import FILE"; import_config "$1"; say "imported and applied" ;;
     peer)
-        [ $# -ge 2 ] || die "usage: staging.sh peer NAME TEMPLATE [PLATFORM]"
+        [ $# -ge 2 ] || die "usage: staging.sh peer NAME GRANT [PLATFORM]"
         add_peer "$1" "$2" "${3:-mobile}"
         qr "$1" "${3:-mobile}"
         ;;

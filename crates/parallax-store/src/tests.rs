@@ -45,7 +45,7 @@ async fn round_trip(config: &Config) -> Config {
     Store::open(&dir.db()).await.unwrap().load().await.unwrap()
 }
 
-/// Every optional field set, every grant kind, both visibility forms.
+/// Every optional field set, every rule kind, both visibility forms.
 pub(crate) fn everything_config() -> Config {
     let mut c = canonical_config();
     c.server.wan_interface = Some("eth1".into());
@@ -87,38 +87,45 @@ pub(crate) fn everything_config() -> Config {
         nginx_vhost: false,
         hostnames: vec!["photos.mydomain.com".into(), "img.mydomain.com".into()],
     });
-    let t = &mut c.templates[0];
-    t.grants = vec![
-        Grant::AllNetworks,
-        Grant::Network { name: "lab".into() },
-        Grant::Host {
+    c.server.wireguard.peer_defaults = PeerDefaults {
+        dns: DnsMode::None,
+        allowed_ips: AllowedIpsStrategy::GrantsOnly,
+        mtu: Some(1400),
+        persistent_keepalive: Some(15),
+    };
+    c.server.headscale.dns = DnsMode::TunnelWide;
+    c.grants[0].rules = vec![
+        Rule::AllNetworks,
+        Rule::Network { name: "lab".into() },
+        Rule::Host {
             host: Ipv4Addr::new(192, 168, 1, 9).into(),
             ports: Vec::new(),
         },
-        Grant::Host {
+        Rule::Host {
             host: Host::Name("dns.lab.mydomain.com".into()),
             ports: vec![PortSpec::one(Proto::Udp, 53)],
         },
-        Grant::Service {
+        Rule::Service {
             name: "photos".into(),
         },
-        Grant::Internet,
+        Rule::Internet,
+        Rule::PublicDns,
     ];
-    t.visible_networks = Some(vec!["lab".into(), "home".into()]);
-    t.dns = DnsPolicy {
-        wireguard: DnsMode::TunnelWide,
-        tailscale: DnsMode::None,
-        public: true,
-    };
-    t.client = ClientDefaults {
-        allowed_ips: AllowedIpsStrategy::FullTunnel,
-        mtu: Some(1380),
-        persistent_keepalive: Some(25),
-    };
-    c.templates[1].visible_networks = Some(Vec::new());
+    c.grants.push(Grant {
+        name: "public".into(),
+        everyone: true,
+        rules: Vec::new(),
+    });
+    let wg = c.peers[0].wireguard.as_mut().unwrap();
+    wg.visible_networks = Some(vec!["lab".into(), "home".into()]);
+    wg.dns = DnsMode::TunnelWide;
+    wg.allowed_ips = AllowedIpsStrategy::FullTunnel;
+    wg.mtu = Some(1380);
+    c.peers[1].grants = vec!["family".into(), "personal".into()];
+    c.peers[2].wireguard.as_mut().unwrap().visible_networks = Some(Vec::new());
     c.peers.push(Peer {
         name: "tv".into(),
-        template: "family".into(),
+        grants: vec!["family".into()],
         transport: TransportKind::Tailscale,
         enabled: false,
         expires: Some(today()),
@@ -127,7 +134,7 @@ pub(crate) fn everything_config() -> Config {
     });
     c.peers.push(Peer {
         name: "tablet".into(),
-        template: "family".into(),
+        grants: Vec::new(),
         transport: TransportKind::Tailscale,
         enabled: true,
         expires: None,
@@ -203,18 +210,21 @@ async fn saving_keeps_ids_and_follows_renames_and_removals() {
     let laptop = id_of(&store, "peers", "laptop").await;
     let home = id_of(&store, "networks", "home").await;
 
-    // Rename a template its peers move to, drop a network and a service the
-    // grants no longer mention, reorder and edit peers.
-    config.templates[1].name = "guests".into();
+    // Rename a grant its peers move to, drop a network and a service the
+    // rules no longer mention, reorder and edit peers.
+    config.grants[1].name = "guests".into();
     for p in &mut config.peers {
-        if p.template == "family" {
-            p.template = "guests".into();
+        for g in &mut p.grants {
+            if g == "family" {
+                *g = "guests".into();
+            }
         }
     }
-    config.templates[0]
-        .grants
-        .retain(|g| !matches!(g, Grant::Network { .. } | Grant::Service { .. }));
-    config.templates[0].visible_networks = None;
+    config.grants[0]
+        .rules
+        .retain(|r| !matches!(r, Rule::Network { .. } | Rule::Service { .. }));
+    config.peers[0].wireguard.as_mut().unwrap().visible_networks = None;
+    config.grants.retain(|g| g.name != "public");
     config.networks.retain(|n| n.name != "lab");
     config.services.retain(|s| s.name != "photos");
     config.peers.reverse();
@@ -236,13 +246,13 @@ async fn a_failed_save_changes_nothing() {
 
     let mut broken = config.clone();
     broken.peers.clear();
-    broken.templates[0].grants.push(Grant::Network {
+    broken.grants[0].rules.push(Rule::Network {
         name: "nowhere".into(),
     });
     let err = store.save(&broken).await.unwrap_err();
     assert!(
         err.to_string()
-            .contains("template 'personal': grant refers to unknown network 'nowhere'"),
+            .contains("grant 'personal': rule refers to unknown network 'nowhere'"),
         "{err}"
     );
     assert_eq!(store.load().await.unwrap(), config);
@@ -460,13 +470,13 @@ async fn grants_and_services_from_before_port_lists_keep_their_ports() {
     assert_eq!(store.schema_version().await.unwrap(), LATEST);
     let loaded = store.load().await.unwrap();
     assert_eq!(
-        loaded.templates[0].grants,
+        loaded.grants[0].rules,
         [
-            Grant::Host {
+            Rule::Host {
                 host: Ipv4Addr::new(192, 168, 1, 9).into(),
                 ports: vec![PortSpec::one(Proto::Udp, 25565)],
             },
-            Grant::Host {
+            Rule::Host {
                 host: Ipv4Addr::new(192, 168, 1, 10).into(),
                 ports: Vec::new(),
             }
@@ -485,10 +495,10 @@ async fn duplicate_names_are_refused_before_anything_is_written() {
     let config = canonical_config();
     store.save(&config).await.unwrap();
     let mut twice = config.clone();
-    twice.templates.push(twice.templates[0].clone());
+    twice.grants.push(twice.grants[0].clone());
     let err = store.save(&twice).await.unwrap_err();
     assert!(
-        matches!(&err, Error::Invalid(m) if m == "template 'personal' is defined twice"),
+        matches!(&err, Error::Invalid(m) if m == "grant 'personal' is defined twice"),
         "{err}"
     );
     assert_eq!(store.load().await.unwrap(), config);
@@ -531,4 +541,149 @@ async fn update_saves_the_change_or_nothing() {
         .unwrap_err();
     assert!(matches!(err, Error::Invalid(_)), "{err}");
     assert_eq!(store.load().await.unwrap().peers.len(), 2);
+}
+
+/// The canonical configuration as Parallax stored it before grants replaced
+/// templates (schema 5), with a third, unattached template that has a port
+/// list and `dns.public`, and every template on tunnel-wide Tailscale DNS.
+async fn schema_5_database(path: &Path) {
+    let db = turso::Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    for sql in &crate::MIGRATIONS[..5] {
+        conn.execute_batch(sql).await.unwrap();
+    }
+    conn.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+         INSERT INTO schema_version (version) VALUES (5);",
+    )
+    .await
+    .unwrap();
+    let c = canonical_config();
+    let key = |n: usize| c.peers[n].wireguard.as_ref().unwrap();
+    conn.execute(
+        "INSERT INTO server (id, wireguard_interface, wireguard_listen_port,
+            wireguard_supernet, wireguard_endpoint, wireguard_public_key,
+            wireguard_private_key_file, headscale_interface, headscale_server_url,
+            headscale_api_key_file, headscale_derp, headscale_subnet_router_node,
+            dns_port, dns_public_resolver, firewall_backend,
+            firewall_docker_coexistence, proxy_port, proxy_certificates,
+            proxy_upstream_ca)
+         VALUES (1, 'wg0', 51820, '10.8.0.0/16', 'vpn.mydomain.com:51820', ?1,
+            '/etc/parallax/wg-server.key', 'tailscale0', 'https://headscale.mydomain.com',
+            '/etc/parallax/headscale-api.key', 'embedded', 'parallax-gateway',
+            53, '1.1.1.1', 'nftables', 1, 8443, '/etc/parallax/certs',
+            '/etc/ssl/certs/ca-certificates.crt')",
+        (c.server.wireguard.public_key.to_base64(),),
+    )
+    .await
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO networks (id, name, position, interface, subnet, mapped_to, masquerade)
+         VALUES (1, 'home', 0, 'eth0', '192.168.1.0/24', '198.18.1.0/24', 0);
+         INSERT INTO network_upstream_dns (network_id, position, address)
+         VALUES (1, 0, '192.168.1.1');
+         INSERT INTO network_domains (network_id, position, domain)
+         VALUES (1, 0, 'mydomain.com');
+         INSERT INTO services (id, name, position, host, nginx_vhost)
+         VALUES (1, 'immich', 0, '192.168.1.5', 1);
+         INSERT INTO service_ports (service_id, position, ports) VALUES (1, 0, '443/tcp');
+         INSERT INTO templates (id, name, position, wireguard_pool, headscale_user,
+            headscale_tag, visible_networks_limited, dns_wireguard, dns_tailscale,
+            dns_public, client_allowed_ips, client_mtu, client_persistent_keepalive)
+         VALUES
+            (1, 'personal', 0, '10.8.1.0/24', 'someone', NULL, 0, 'split',
+                'tunnel_wide', 1, 'mapped_subnets', NULL, 25),
+            (2, 'family', 1, '10.8.2.0/24', NULL, 'tag:family', 1, 'tunnel_wide',
+                'tunnel_wide', 0, 'grants_only', NULL, 25),
+            (3, 'spare', 2, '10.8.3.0/24', 'spare', NULL, 0, 'split',
+                'tunnel_wide', 1, 'mapped_subnets', 1380, NULL);
+         INSERT INTO template_grants (template_id, position, kind, network_id, service_id, host)
+         VALUES (1, 0, 'all_networks', NULL, NULL, NULL),
+            (2, 0, 'service', NULL, 1, NULL),
+            (3, 0, 'host', NULL, NULL, '192.168.1.9'),
+            (3, 1, 'network', 1, NULL, NULL);
+         INSERT INTO template_grant_ports (template_id, grant_position, position, ports)
+         VALUES (3, 0, 0, '25565/udp'), (3, 0, 1, '25565/tcp');",
+    )
+    .await
+    .unwrap();
+    for (n, template) in [(0, 1), (1, 1), (2, 2)] {
+        let p = &c.peers[n];
+        let w = key(n);
+        conn.execute(
+            "INSERT INTO peers (id, name, position, template_id, transport, enabled, expires,
+                wireguard_public_key, wireguard_address, wireguard_private_key,
+                wireguard_preshared_key, tailscale)
+             VALUES (?1, ?2, ?1, ?3, 'wireguard', 1, ?4, ?5, ?6, ?7, ?8, 0)",
+            vec![
+                turso::Value::from(n as i64),
+                p.name.clone().into(),
+                turso::Value::from(template),
+                p.expires.map(|d| d.to_string()).into(),
+                w.public_key.to_base64().into(),
+                w.address.map(|a| a.to_string()).into(),
+                w.private_key.as_ref().map(|k| k.expose_base64()).into(),
+                w.preshared_key.as_ref().map(|k| k.expose_base64()).into(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    let mut rows = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+}
+
+#[tokio::test]
+async fn templates_become_grants_with_the_same_access() {
+    let dir = TempDir::new();
+    schema_5_database(&dir.db()).await;
+    let mut store = Store::open(&dir.db()).await.unwrap();
+    assert_eq!(store.schema_version().await.unwrap(), LATEST);
+    let loaded = store.load().await.unwrap();
+
+    let mut expected = canonical_config();
+    // `family` showed no network: its peer keeps that.
+    expected.peers[2]
+        .wireguard
+        .as_mut()
+        .unwrap()
+        .visible_networks = Some(Vec::new());
+    expected.server.headscale.dns = DnsMode::TunnelWide;
+    expected.grants.push(Grant {
+        name: "spare".into(),
+        everyone: false,
+        rules: vec![
+            Rule::Host {
+                host: Ipv4Addr::new(192, 168, 1, 9).into(),
+                ports: vec![
+                    PortSpec::one(Proto::Udp, 25565),
+                    PortSpec::one(Proto::Tcp, 25565),
+                ],
+            },
+            Rule::Network {
+                name: "home".into(),
+            },
+            Rule::PublicDns,
+        ],
+    });
+    assert_eq!(loaded, expected);
+    // No template table is left behind.
+    let left = store
+        .rows(
+            "SELECT name FROM sqlite_schema WHERE type = 'table'
+             AND (name LIKE 'template%' OR name LIKE 'migrate%')",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert!(left.is_empty(), "{} tables left behind", left.len());
+    // And it saves back in the new shape.
+    store.save(&loaded).await.unwrap();
+    assert_eq!(store.load().await.unwrap(), loaded);
 }

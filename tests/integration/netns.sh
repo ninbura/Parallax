@@ -20,8 +20,9 @@
 #           another VLAN)
 #   ctr     172.17.0.2, a "container" behind the gateway's Docker bridge
 #
-# Templates: personal (all_networks + internet, public DNS), family (the proxied
-# Immich, a service on the gateway host, two echo ports), friend (internet only).
+# Grants: personal (all_networks + internet, public DNS), family (the proxied
+# Immich, a service on the gateway host, two echo ports), friend (internet only),
+# one peer each; (r) combines them and adds a grant for everyone.
 #
 # Assertions: (a) mapped virtual IP lands on the real host, (b) the DNS server
 # answers in virtual space, (c) guest reaches only its grants even with 0.0.0.0/0
@@ -36,7 +37,9 @@
 # (p) hosts granted by DNS name are looked up on save and bad ones refused, (q) names
 # on the home's public IP reach one port forward each, or HTTPS through the proxy,
 # (n) the daemon tears down on SIGTERM, re-applies on SIGHUP and repairs a deleted
-# table, and keeps the home's public IP across the restart. Every change goes through the
+# table, and keeps the home's public IP across the restart, (r) a peer with two grants
+# reaches both and nothing more, a grant for everyone reaches every peer, and changing
+# grants keeps addresses and client configs. Every change goes through the
 # daemon and takes effect without SIGHUP.
 set -euo pipefail
 
@@ -247,43 +250,26 @@ hostnames = ["immich.mydomain.com"]
 name = "gwapp"
 host = "192.168.1.1"
 port = 9090
-[[template]]
+[[grant]]
 name = "personal"
-grants = [{ kind = "all_networks" }, { kind = "internet" }]
-[template.wireguard]
-pool = "10.8.1.0/24"
-[template.headscale]
-user = "tester"
-[template.dns]
-public = true
-[[template]]
+rules = [{ kind = "all_networks" }, { kind = "internet" }, { kind = "public_dns" }]
+[[grant]]
 name = "family"
-grants = [$FAMILY_GRANTS]
-[template.wireguard]
-pool = "10.8.2.0/24"
-[template.headscale]
-tag = "tag:family"
-[template.dns]
-wireguard = "tunnel_wide"
-[template.client]
-allowed_ips = "grants_only"
-[[template]]
+rules = [$FAMILY_GRANTS]
+[[grant]]
 name = "friend"
-grants = [{ kind = "internet" }]
-[template.wireguard]
-pool = "10.8.3.0/24"
-[template.headscale]
-tag = "tag:friend"
-[template.client]
-allowed_ips = "full_tunnel"
+rules = [{ kind = "internet" }]
 TOML
 SOCK="$WORK/run/parallax.sock"
 P="$PARALLAX --db $WORK/parallax.db --socket $SOCK"
 $P config import "$WORK/parallax.toml" >/dev/null
 $P keygen --write-config >/dev/null
-$P peer add laptop --template personal --keep-private-key --platform linux > "$WORK/laptop.conf" 2>/dev/null
-$P peer add guest --template family --keep-private-key --platform mobile > "$WORK/guest.conf" 2>/dev/null
-$P peer add friend --template friend --keep-private-key --platform linux > "$WORK/friend.conf" 2>/dev/null
+# Addresses come from the supernet in order: 10.8.0.2, .3, .4.
+$P peer add laptop --grant personal --keep-private-key --platform linux > "$WORK/laptop.conf" 2>/dev/null
+$P peer add guest --grant family --dns tunnel_wide --allowed-ips grants_only --keep-private-key \
+    --platform mobile > "$WORK/guest.conf" 2>/dev/null
+$P peer add friend --grant friend --allowed-ips full_tunnel --keep-private-key --platform linux \
+    > "$WORK/friend.conf" 2>/dev/null
 $P validate >/dev/null
 inns gw $P doctor > "$WORK/doctor" || { cat "$WORK/doctor"; fail "doctor rejects the gateway namespace"; }
 # Root in a user namespace (as under rootless Docker) must be refused. That root
@@ -338,18 +324,18 @@ mkclient() { # iface, conf, addr
         allowed-ips 0.0.0.0/0 persistent-keepalive 5
     inns client ip link set "$1" up
 }
-mkclient wgp "$WORK/laptop.conf" 10.8.1.1
-mkclient wgf "$WORK/guest.conf" 10.8.2.1
-mkclient wgx "$WORK/friend.conf" 10.8.3.1
+mkclient wgp "$WORK/laptop.conf" 10.8.0.2
+mkclient wgf "$WORK/guest.conf" 10.8.0.3
+mkclient wgx "$WORK/friend.conf" 10.8.0.4
 # Split tunnel routes for the laptop: virtual range, the gateway and the test's internet hosts.
 for dst in 198.18.1.0/24 10.8.0.1/32 9.9.9.9/32 10.99.0.5/32 1.2.3.4/32; do
-    inns client ip route add $dst dev wgp src 10.8.1.1
+    inns client ip route add $dst dev wgp src 10.8.0.2
 done
 # Guest and friend send everything through their tunnel (full tunnel), in their own
 # routing tables so all three tunnels coexist in one namespace.
-inns client ip rule add from 10.8.2.1 table 200
+inns client ip rule add from 10.8.0.3 table 200
 inns client ip route add default dev wgf table 200
-inns client ip rule add from 10.8.3.1 table 201
+inns client ip rule add from 10.8.0.4 table 201
 inns client ip route add default dev wgx table 201
 sleep 1
 
@@ -362,7 +348,7 @@ https_as() { # src, name, address, [curl args...]  -> body or "BLOCKED"
     curl_as "$src" --cacert "$CA" --resolve "$name:443:$addr" "$@" "https://$name/"
 }
 
-LAPTOP=10.8.1.1 GUEST=10.8.2.1 FRIEND=10.8.3.1
+LAPTOP=10.8.0.2 GUEST=10.8.0.3 FRIEND=10.8.0.4
 
 # (a) mapped virtual IP lands on the real host
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(a) personal -> 198.18.1.5:8080"
@@ -398,7 +384,7 @@ pass "(d) reapply is idempotent"
 # addresses, and are live on wg0 when each command returns (one writer, no SIGHUP)
 ADDS=()
 for i in $(seq 8); do
-    $P peer add "dev$i" --template family >/dev/null 2>"$WORK/add$i.err" &
+    $P peer add "dev$i" --grant family >/dev/null 2>"$WORK/add$i.err" &
     ADDS+=($!)
 done
 for i in $(seq 8); do
@@ -439,7 +425,7 @@ CODE=$(https_as $GUEST immich.mydomain.com 198.18.1.5 --http2 -H 'Host: other.my
 [ "$(curl_as $GUEST http://198.18.1.5:443/)" = BLOCKED ] || fail "(g) guest spoke plain HTTP to 443"
 pass "(g) guest reaches immich by name through the proxy; raw IP, sibling vhost, Host and :authority mismatches fail"
 
-# (h) internet: public addresses only, except for an all_networks template
+# (h) internet: public addresses only, except for an all_networks tier
 [ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(h) friend -> a public address"
 [ "$(curl_as $FRIEND http://10.99.0.5/)" = BLOCKED ] || fail "(h) friend reached a private subnet through the router"
 [ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(h) friend reached a configured network"
@@ -472,7 +458,7 @@ inns client ip -6 addr add fd00:8::2/128 dev wgf nodad
 inns client ip -6 route add fd00:1::/64 dev wgf
 inns client wg set wgf peer "$GW_PUB" allowed-ips 0.0.0.0/0,::/0
 GUEST_PUB=$(inns client wg show wgf public-key)
-widen() { inns gw wg set wg0 peer "$GUEST_PUB" allowed-ips 10.8.2.1/32,fd00:8::2/128; }
+widen() { inns gw wg set wg0 peer "$GUEST_PUB" allowed-ips 10.8.0.3/32,fd00:8::2/128; }
 ping6_as() { inns client ping -6 -c 1 -W 2 -I fd00:8::2 "$1" >/dev/null 2>&1 && echo reached || echo BLOCKED; }
 widen
 inns gw nft flush chain inet parallax input
@@ -507,10 +493,10 @@ def https(src, addr):
         return b"home-immich" in s.recv(4096)
     return ask
 cases = [
-    ("guest-lan", tcp, "10.8.2.1", "198.18.1.5"),
-    ("guest-gateway", tcp, "10.8.2.1", "198.18.1.1"),
-    ("guest-proxy", https, "10.8.2.1", "198.18.1.5"),
-    ("laptop-lan", tcp, "10.8.1.1", "198.18.1.5"),
+    ("guest-lan", tcp, "10.8.0.3", "198.18.1.5"),
+    ("guest-gateway", tcp, "10.8.0.3", "198.18.1.1"),
+    ("guest-proxy", https, "10.8.0.3", "198.18.1.5"),
+    ("laptop-lan", tcp, "10.8.0.2", "198.18.1.5"),
 ]
 results = {}
 def run(name, kind, src, addr):
@@ -537,32 +523,32 @@ PY
 PIDS+=($!)
 for _ in $(seq 50); do [ "$(grep -c '^open' "$WORK/hold.out")" = 4 ] && break; sleep 0.1; done
 [ "$(grep -c '^open' "$WORK/hold.out")" = 4 ] || { cat "$WORK/hold.out"; fail "(k) could not open the held connections"; }
-# The whole configuration (peers included), and a copy whose family template
-# keeps only its gwapp grant.
+# The whole configuration (peers included), and a copy whose family grant
+# keeps only its gwapp rule.
 $P config export > "$WORK/full.toml"
 python3 - "$WORK/full.toml" > "$WORK/revoked.toml" <<'PY'
-# `config export` writes several grants one per line inside `grants = [`.
+# `config export` writes several rules one per line inside `rules = [`.
 import sys
-template, in_grants = None, False
+grant, in_rules = None, False
 for line in open(sys.argv[1]):
     if line.startswith("[["):
-        template = None
-    elif line.startswith("name = ") and template is None:
-        template = line.split('"')[1]
-    if line.startswith("grants = ["):
-        in_grants = line.rstrip().endswith("[")
-    elif in_grants and line.startswith("]"):
-        in_grants = False
-    elif in_grants and template == "family" and '"gwapp"' not in line:
+        grant = None
+    elif line.startswith("name = ") and grant is None:
+        grant = line.split('"')[1]
+    if line.startswith("rules = ["):
+        in_rules = line.rstrip().endswith("[")
+    elif in_rules and line.startswith("]"):
+        in_rules = False
+    elif in_rules and grant == "family" and '"gwapp"' not in line:
         continue
     sys.stdout.write(line)
 PY
 python3 - "$WORK/full.toml" "$WORK/revoked.toml" <<'PY' || fail "(k) could not write the revoked config"
 import sys, tomllib
-def grants(path):
-    t = next(t for t in tomllib.load(open(path, "rb"))["template"] if t["name"] == "family")
-    return t["grants"]
-full, revoked = grants(sys.argv[1]), grants(sys.argv[2])
+def rules(path):
+    g = next(g for g in tomllib.load(open(path, "rb"))["grant"] if g["name"] == "family")
+    return g["rules"]
+full, revoked = rules(sys.argv[1]), rules(sys.argv[2])
 assert len(full) == 4 and revoked == [{"kind": "service", "name": "gwapp"}], (full, revoked)
 PY
 apply "$WORK/revoked.toml"
@@ -591,7 +577,7 @@ short_as() { # src, name, [dig args...]
     local src=$1 name=$2; shift 2
     inns client dig +short +time=2 +tries=1 -b "$src" @10.8.0.1 "$name" "$@" || true
 }
-[ "$(short_as $LAPTOP example.org)" = 9.9.9.9 ] || fail "(l) personal (dns.public) could not look up a public name"
+[ "$(short_as $LAPTOP example.org)" = 9.9.9.9 ] || fail "(l) personal (public_dns) could not look up a public name"
 [ -z "$(short_as $LAPTOP rebind.example.org)" ] || fail "(l) a public name answered with a private address"
 [ "$(status_as $LAPTOP rebind.example.org)" = NOERROR ] || fail "(l) rebind.example.org: wanted an empty NOERROR"
 [ "$(status_as $LAPTOP immich.mydomain.com AAAA)" = NOERROR ] && [ -z "$(short_as $LAPTOP immich.mydomain.com AAAA)" ] \
@@ -599,9 +585,9 @@ short_as() { # src, name, [dig args...]
 [ "$(short_as $LAPTOP vlan.mydomain.com)" = 198.18.1.6 ] \
     || fail "(l) vlan.mydomain.com: wanted only 198.18.1.6, not the address on no configured network"
 [ "$(status_as $GUEST other.mydomain.com)" = REFUSED ] || fail "(l) guest looked up a sibling vhost's name"
-[ "$(status_as $GUEST example.org)" = REFUSED ] || fail "(l) guest (dns.public off) looked up a public name"
+[ "$(status_as $GUEST example.org)" = REFUSED ] || fail "(l) guest (no public_dns) looked up a public name"
 [ "$(status_as $GUEST example.org +tcp)" = REFUSED ] || fail "(l) guest looked up a public name over TCP"
-[ "$(status_as $FRIEND example.org)" = REFUSED ] || fail "(l) friend (internet, dns.public off) looked up a public name"
+[ "$(status_as $FRIEND example.org)" = REFUSED ] || fail "(l) friend (internet, no public_dns) looked up a public name"
 [ "$(status_as $FRIEND immich.mydomain.com)" = REFUSED ] || fail "(l) friend looked up a home name"
 ST=$(inns gw dig +time=2 +tries=1 @10.8.0.1 immich.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
 [ "$ST" = REFUSED ] || fail "(l) a source outside every tier got '$ST'"
@@ -647,7 +633,7 @@ $P status | grep -q "^name " && fail "(p) a name no longer used is still listed"
 pass "(p) a host granted by name: looked up on save, reached on its port, its name answers; bad names are refused"
 
 # (o) the home's public IP: guests with internet drop it (the router would hairpin it
-# back into the home); the owner's all_networks template doesn't. The endpoint here
+# back into the home); the owner's all_networks tier doesn't. The endpoint here
 # is a documentation address, so not the public IP; a fixed address counts the moment
 # it's saved. A hostname is looked up and re-applied when it changes; an answer with
 # a private address is refused, and the last address found stays.
@@ -723,12 +709,12 @@ pass "(n) SIGTERM tears down; SIGHUP re-applies; a deleted table comes back on i
 # port) and a raw web port are refused.
 $P config export > "$WORK/current.toml"
 sed -e 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' \
-    -e '0,/^\[\[template\]\]$/s//[[service]]\nname = "forwarded"\nhost = "public.mydomain.com"\nports = ["443\/tcp"]\nhostnames = ["public.mydomain.com"]\n\n&/' \
+    -e '0,/^\[\[grant\]\]$/s//[[service]]\nname = "forwarded"\nhost = "public.mydomain.com"\nports = ["443\/tcp"]\nhostnames = ["public.mydomain.com"]\n\n&/' \
     "$WORK/current.toml" > "$WORK/forward-base.toml"
 grep -q '^address = "1.2.3.4"$' "$WORK/forward-base.toml" && grep -q '^name = "forwarded"$' "$WORK/forward-base.toml" \
     || fail "(q) could not write the test configuration"
 forward() { # extra friend grants -> a config file
-    sed "s|^grants = \[{ kind = \"internet\" }\]\$|grants = [{ kind = \"internet\" }, $1]|" \
+    sed "s|^rules = \[{ kind = \"internet\" }\]\$|rules = [{ kind = \"internet\" }, $1]|" \
         "$WORK/forward-base.toml" > "$WORK/forward.toml"
     grep -qF "$1" "$WORK/forward.toml" || fail "(q) could not grant friend $1"
     echo "$WORK/forward.toml"
@@ -756,5 +742,38 @@ refused_forward '{ kind = "host", host = "game.mydomain.com", ports = ["80/tcp"]
 apply "$WORK/forward-base.toml"
 [ "$(curl_as $FRIEND http://1.2.3.4:8080/)" = BLOCKED ] || fail "(q) the port forward outlived its grant"
 pass "(q) names on the home's public IP: one granted port, HTTPS by name through the proxy; all ports and raw web refused"
+
+# (r) grants combine: friend also gets family and reaches both, nothing more; a grant
+# for everyone reaches every peer without being attached; and none of it changes an
+# address or what a client config holds (only comments may differ).
+FRIEND_CONF=$($P export friend --platform linux 2>/dev/null | grep -v '^#')
+sed '/^name = "friend"$/{n;s/^grants = \["friend"\]$/grants = ["friend", "family"]/}' \
+    "$WORK/forward-base.toml" > "$WORK/union.toml"
+grep -q '^grants = \["friend", "family"\]$' "$WORK/union.toml" || fail "(r) could not give friend two grants"
+apply "$WORK/union.toml"
+$P peer show friend | grep -q '^friend  grants=family,friend  .*address=10.8.0.4 ' \
+    || { $P peer show friend; fail "(r) friend's grants or address"; }
+[ "$(https_as $FRIEND immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(r) friend -> family's Immich"
+[ "$(curl_as $FRIEND http://198.18.1.1:9090/)" = gw-self ] || fail "(r) friend -> family's service on the gateway"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(r) friend lost its own internet"
+[ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(r) friend reached what neither grant gives"
+[ "$(short_as $FRIEND immich.mydomain.com)" = 198.18.1.5 ] || fail "(r) friend could not look up family's name"
+[ "$(curl_as $GUEST http://9.9.9.9/)" = BLOCKED ] || fail "(r) guest got friend's internet"
+sed '/^# Peers$/i\
+[[grant]]\
+name = "everyone-web"\
+everyone = true\
+rules = [{ kind = "host", host = "192.168.1.5", ports = ["8080/tcp"] }]\
+' "$WORK/union.toml" > "$WORK/everyone.toml"
+apply "$WORK/everyone.toml"
+for src in $LAPTOP $GUEST $FRIEND; do
+    [ "$(curl_as $src http://198.18.1.5:8080/)" = home-other ] || fail "(r) $src missed the grant for everyone"
+done
+[ "$($P export friend --platform linux 2>/dev/null | grep -v '^#')" = "$FRIEND_CONF" ] \
+    || fail "(r) friend's client config changed with its grants"
+apply "$WORK/forward-base.toml"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(r) the grant for everyone outlived its removal"
+[ "$(https_as $FRIEND immich.mydomain.com 198.18.1.5)" = BLOCKED ] || fail "(r) friend kept family after it was detached"
+pass "(r) two grants reach their union and nothing more; a grant for everyone reaches every peer; addresses and client configs stay"
 
 echo "ALL PASS"

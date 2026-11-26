@@ -143,12 +143,12 @@ Workable choices:
 
 ## The home's public IP (guests with `internet`)
 
-A guest template with `internet` reaches public addresses only. Your own
+A guest with an `internet` rule reaches public addresses only. Your own
 public IP is public too, but your router hairpins traffic sent to it back
 into your port forwards, so a guest would reach the services its grants
-leave out. Parallax drops it for those templates, and for that it has to
-know it. Templates with `all_networks` reach your networks anyway and keep
-it.
+leave out. Parallax drops it for those peers, and for that it has to
+know it. Peers whose grants include `all_networks` reach your networks
+anyway and keep it.
 
 It finds it, in order:
 
@@ -190,26 +190,49 @@ Cloudflare truncates them and deletes them within 25 hours. Both are reached
 by IP address, so there's no lookup before the lookup, and their
 certificates are checked against `server.proxy.upstream_ca`.
 
-## Public names and `dns.public`
+## Grants
 
-Parallax's DNS server answers each template only the names it may reach: the
-zones of its granted networks and the hostnames of its granted services.
-Names outside your zones are answered only for templates with
-`dns.public = true`, through `server.dns.public_resolver` (default `1.1.1.1`):
+What a device reaches is set by **grants**: named bundles of rules
+(`all_networks`, `network`, `host` with ports, `service`, `internet`,
+`public_dns`). A peer has any number of them and reaches what they give
+together; rules only add. A grant with `everyone = true` applies to every
+peer, current and future:
 
 ```toml
-[[template]]
-name = "personal"
-# ...
-[template.dns]
-public = true
+[[grant]]
+name = "family"
+rules = [{ kind = "service", name = "immich" }]
+
+[[grant]]
+name = "public"
+everyone = true
+rules = [{ kind = "public_dns" }]
 ```
 
-It's off by default, so a guest's lookups don't leave through your
-connection. The official mobile WireGuard apps send every query to the
-gateway, so a phone on a template without it resolves only that template's
-home names while connected; `parallax export` warns about it. Tailscale
-splits DNS natively on phones (M2), so Tailscale guests lose nothing.
+A peer's address never encodes its access, so changing its grants needs no
+new client config. Configurations written with `[[template]]` (before
+grants) still import: each template becomes a grant of the same name, and
+each peer keeps its template's access and client settings.
+
+## Public names and `public_dns`
+
+Parallax's DNS server answers each peer only the names it may reach: the
+zones of its granted networks and the hostnames of its granted services.
+Names outside your zones are answered only for peers with a `public_dns`
+rule in their grants, through `server.dns.public_resolver` (default
+`1.1.1.1`):
+
+```toml
+[[grant]]
+name = "personal"
+rules = [{ kind = "all_networks" }, { kind = "public_dns" }]
+```
+
+Without it, a guest's lookups don't leave through your connection. The
+official mobile WireGuard apps send every query to the gateway, so a phone
+without it resolves only its granted home names while connected;
+`parallax export` warns about it. Tailscale splits DNS natively on phones
+(M2), so Tailscale guests lose nothing.
 
 ## Networks that block outbound DNS
 
@@ -266,9 +289,15 @@ See [docs/backup.md](backup.md).
 ## Adding a device
 
 ```sh
-sudo docker compose exec parallax parallax peer add laptop --template personal --platform linux
-sudo docker compose exec parallax parallax peer add sister-phone --template family --platform mobile
+sudo docker compose exec parallax parallax peer add laptop --grant personal --platform linux
+sudo docker compose exec parallax parallax peer add sister-phone --grant family \
+    --dns tunnel_wide --allowed-ips grants_only --platform mobile
 ```
+
+`--grant` takes one or more grants (repeat it, or separate with commas).
+`--dns` and `--allowed-ips` set what the client config does; without them
+the peer gets `[server.wireguard.peer_defaults]`. The address is the next
+free one in `server.wireguard.supernet`.
 
 `peer add` prints the client config once, with the private key, and stores
 only the public key unless you pass `--keep-private-key`. The gateway accepts
@@ -302,8 +331,8 @@ hold any retained private keys, so keep exports private: `config export -o
 redirect (`> file`) creates the file with your shell's umask.
 
 Export and edit always write one layout: sections in order (server,
-networks, services, templates, peers), one block per entry, short settings
-on one line (`dns = { ... }`), and one grant per line. Comments aren't kept:
+networks, services, grants, peers), one block per entry, short settings
+on one line, and one rule per line. Comments aren't kept:
 the database doesn't store them, so keep notes elsewhere (the GUI will have a
 place for them).
 
@@ -315,9 +344,9 @@ Every artifact is regenerated from scratch; nothing else under
 
 ## nginx
 
-Include the generated snippets in vhosts. `nginx/snippets/parallax-<template>.conf`
-holds `allow` lines for a tier; `nginx/snippets/parallax-service-<name>.conf`
-(for services marked `nginx_vhost = true`) holds every tier that reaches the
+Include the generated snippets in vhosts. `nginx/snippets/parallax-<grant>.conf`
+holds `allow` lines for every peer with that grant; `nginx/snippets/parallax-service-<name>.conf`
+(for services marked `nginx_vhost = true`) holds every peer that reaches the
 service, the local LAN, and `deny all`. Parallax does not reload nginx; copy
 the snippets (or bind-mount the output directory) and reload yourself.
 
@@ -339,7 +368,7 @@ one: point `server.proxy.certificates` at a folder you keep current.
   lines, commented out.
 - Renewals are picked up within a minute; no restart.
 - `parallax plan` and `apply` fail, naming the hostname, when no certificate
-  covers a proxied hostname some template is granted.
+  covers a proxied hostname someone is granted.
 
 The proxy verifies the upstream's certificate against the hostname, using
 `server.proxy.upstream_ca` (the system bundle by default). An nginx with a

@@ -440,17 +440,17 @@ fn read(sys: System<'_>, path: &Path) -> Result<String, String> {
 pub fn public_ip_check(config: &Config, known: Option<std::net::Ipv4Addr>) -> Check {
     let outcome = match (crate::public_ip::hairpin(config), known) {
         (false, _) if !crate::public_ip::needed(config) => {
-            Outcome::Ok("not needed: no guest template has internet, and no host is named by DNS name".into())
+            Outcome::Ok("not needed: no guest tier has internet, and no host is named by DNS name".into())
         }
         (false, Some(ip)) => Outcome::Ok(format!("{ip}; hosts named by DNS name may point at it (port forwards)")),
         (false, None) => Outcome::Ok(
             "not known yet; a host named by DNS name that points at it gives nothing until it is".into(),
         ),
         (true, Some(ip)) => Outcome::Ok(format!(
-            "{ip}; guest templates with internet can't reach it"
+            "{ip}; guests with internet can't reach it"
         )),
         (true, None) => Outcome::Warn(
-            "not known yet: guest templates with internet can reach the home through the router (hairpin). The daemon looks it up at startup and every 5 minutes; if that fails, set server.public_ip.address or server.public_ip.encrypted_dns".into(),
+            "not known yet: guests with internet can reach the home through the router (hairpin). The daemon looks it up at startup and every 5 minutes; if that fails, set server.public_ip.address or server.public_ip.encrypted_dns".into(),
         ),
     };
     Check {
@@ -464,7 +464,7 @@ mod tests {
     use super::*;
     use crate::io::memory::{MemoryFs, RecordingRunner};
     use crate::io::Output;
-    use crate::model::Grant;
+    use crate::model::Rule;
     use crate::testing::canonical_config;
 
     const ROOT_STATUS: &str = "Name:\tparallax\nCapEff:\t000001ffffffffff\n";
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn invalid_configuration_lists_errors_and_still_checks_interfaces() {
         let mut cfg = canonical_config();
-        cfg.templates.clear();
+        cfg.grants.clear();
         cfg.peers.clear();
         cfg.networks[0].subnet = "10.8.0.0/24".parse().unwrap();
         let checks = run_with(Ok(&cfg), &healthy_fs(), &RecordingRunner::new());
@@ -824,7 +824,7 @@ mod tests {
             public_ip_check(&config, None).outcome,
             Outcome::Ok(_)
         ));
-        config.templates[1].grants.push(Grant::Internet);
+        config.grants[1].rules.push(Rule::Internet);
         let Outcome::Warn(w) = public_ip_check(&config, None).outcome else {
             panic!("expected a warning");
         };
@@ -832,7 +832,7 @@ mod tests {
         let known = public_ip_check(&config, Some(std::net::Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(
             known.outcome,
-            Outcome::Ok("1.2.3.4; guest templates with internet can't reach it".into())
+            Outcome::Ok("1.2.3.4; guests with internet can't reach it".into())
         );
     }
 }

@@ -169,7 +169,7 @@ fn apply_firewall(
             // window with empty chains, and a failed restore changes nothing.
             sys.runner
                 .run_checked("iptables-restore", &["--noflush", &main_str], None)?;
-            // Chains of templates that no longer exist: nothing jumps to them
+            // Chains of tiers that no longer exist: nothing jumps to them
             // since the restore, so they can go.
             let listing = sys
                 .runner

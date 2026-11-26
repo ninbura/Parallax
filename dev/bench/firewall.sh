@@ -7,9 +7,9 @@
 # Needs root, nft, wg, ip, iperf3 and python3. Arguments are the
 # builds to compare, as label=path (default: new=<this checkout>/target/release/parallax):
 #   dev/bench/firewall.sh main=/tmp/main/parallax new=target/release/parallax
-# Each build runs twice: as configured, and with PADDING templates ahead of
-# the peer's.
-# Tunables: PADDING (templates placed before the peer's; 50),
+# Each build runs twice: as configured, and with PADDING other tiers (one
+# peer each, with its own template or grant) ahead of the peer's.
+# Tunables: PADDING (tiers placed before the peer's; 50),
 # SECONDS_PER_RUN (10), RUNS (3), STREAMS (1), MODE (tcp, or udp: 1200-byte
 # datagrams at full speed). TCP over WireGuard is merged into large packets
 # (GRO) before the firewall sees it, so rules run once per ~64 KB; UDP shows
@@ -88,8 +88,14 @@ inns bgw sysctl -qw net.ipv4.ip_forward=1
 inns bhome iperf3 -s -D --logfile "$WORK/iperf3-server.log"
 
 # ---------------------------------------------------------------- configs
-config() { # padding templates -> config on stdout. The peer's template comes last,
-    # so its packets walk past every padding rule first.
+# One key per padding peer, the same for every scenario.
+PAD_KEYS=()
+for i in $(seq 1 "$PADDING"); do PAD_KEYS+=("$(wg genkey | wg pubkey)"); done
+
+config() { # padding tiers -> config on stdout. Written with templates, which
+    # every build reads (newer ones convert each to a grant). Each padding
+    # template has a peer, so it's a tier on builds with grants too; the
+    # peer's template comes last.
     cat <<TOML
 [server.wireguard]
 supernet = "10.8.0.0/16"
@@ -115,6 +121,15 @@ grants = [{ kind = "host", host = "192.168.1.$((i % 200 + 20))", ports = ["80/tc
 pool = "10.8.$((i + 10)).0/24"
 [template.headscale]
 tag = "tag:pad$i"
+TOML
+    done
+    for i in $(seq 1 "$1"); do
+        cat <<TOML
+[[peer]]
+name = "pad$i"
+template = "pad$i"
+transport = "wireguard"
+wireguard = { public_key = "${PAD_KEYS[$((i - 1))]}", address = "10.8.$((i + 10)).1" }
 TOML
     done
     cat <<TOML
@@ -150,20 +165,24 @@ scenario() { # label, binary, padding
         "${px[@]}" keygen --write-config >/dev/null
         GW_PUB=$(wg pubkey < "$WORK/wg-server.key")
     fi
-    "${px[@]}" peer add bench --template bench --keep-private-key --platform linux \
+    local access=--template   # builds with grants take --grant
+    "${px[@]}" peer add --help | grep -q -- '--grant' && access=--grant
+    "${px[@]}" peer add bench "$access" bench --keep-private-key --platform linux \
         > "$WORK/$label.conf" 2>/dev/null
+    local addr
+    addr=$(sed -n 's|^Address = \(.*\)/32$|\1|p' "$WORK/$label.conf")
     inns bgw "${px[@]}" apply -o "$OUT" >/dev/null
     local rules
-    # Forward rules in all, including each template's chain: what a packet
-    # would walk without the per-template chains.
+    # Forward rules in all, including each tier's chain: what a packet
+    # would walk without the per-tier chains.
     rules=$(inns bgw nft list table inet parallax | sed -n '/chain forward/,/chain prerouting/p' | grep -c 'comment')
     inns bclient ip link del wgb 2>/dev/null || true
     inns bclient ip link add wgb type wireguard
-    inns bclient ip addr add 10.8.2.1/32 dev wgb
+    inns bclient ip addr add "$addr/32" dev wgb
     inns bclient wg set wgb private-key <(sed -n 's/^PrivateKey = //p' "$WORK/$label.conf") \
         peer "$GW_PUB" endpoint 203.0.113.1:51820 allowed-ips 198.18.1.0/24
     inns bclient ip link set wgb up
-    inns bclient ip route add 198.18.1.0/24 dev wgb src 10.8.2.1
+    inns bclient ip route add 198.18.1.0/24 dev wgb src "$addr"
     inns bclient iperf3 -c 198.18.1.5 -t 2 -P "$STREAMS" >/dev/null   # warm up, handshake
     for run in $(seq 1 "$RUNS"); do
         local before after

@@ -27,11 +27,13 @@ pub mod public_ip;
 pub mod reconcile;
 pub mod secret;
 pub mod testing;
+pub mod tier;
 pub mod transport;
 pub mod validate;
 
 pub use error::{Error, Result};
 pub use model::*;
+pub use tier::Tier;
 pub use validate::Model;
 
 /// Tailscale's carrier-grade NAT range; every Tailscale node has an address here.

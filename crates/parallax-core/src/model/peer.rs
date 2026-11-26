@@ -2,6 +2,7 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
+use super::{AllowedIpsStrategy, DnsMode, PeerDefaults};
 use crate::date::Date;
 use crate::secret::{PresharedKey, PrivateKey, PublicKey};
 
@@ -49,7 +50,10 @@ impl std::str::FromStr for TransportKind {
 #[serde(deny_unknown_fields)]
 pub struct Peer {
     pub name: String,
-    pub template: String,
+    /// Names of the grants it has, besides every `everyone` grant. None:
+    /// it reaches only what those give.
+    #[serde(default)]
+    pub grants: Vec<String>,
     pub transport: TransportKind,
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -73,12 +77,13 @@ impl Peer {
     }
 }
 
-/// WireGuard identity of a peer.
+/// WireGuard identity of a peer, and how its exported config is set up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireGuardPeer {
     pub public_key: PublicKey,
-    /// Address from the template pool, allocated by `peer add`.
+    /// Address from `server.wireguard.supernet`, allocated by `peer add`.
+    /// It says nothing about access, so changing grants never changes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<Ipv4Addr>,
     /// Retained only when the operator opted into config regeneration.
@@ -86,6 +91,35 @@ pub struct WireGuardPeer {
     pub private_key: Option<PrivateKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preshared_key: Option<PresharedKey>,
+    #[serde(default)]
+    pub dns: DnsMode,
+    #[serde(default)]
+    pub allowed_ips: AllowedIpsStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_keepalive: Option<u16>,
+    /// Networks whose mappings the client gets routes and routing domains
+    /// for. `None`: every network. Not access: grants decide that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_networks: Option<Vec<String>>,
+}
+
+impl WireGuardPeer {
+    /// A new identity with the client settings of `defaults`.
+    pub fn new(public_key: PublicKey, defaults: &PeerDefaults) -> Self {
+        WireGuardPeer {
+            public_key,
+            address: None,
+            private_key: None,
+            preshared_key: None,
+            dns: defaults.dns,
+            allowed_ips: defaults.allowed_ips,
+            mtu: defaults.mtu,
+            persistent_keepalive: defaults.persistent_keepalive,
+            visible_networks: None,
+        }
+    }
 }
 
 /// Tailscale identity of a peer (M2: driven through the Headscale API).

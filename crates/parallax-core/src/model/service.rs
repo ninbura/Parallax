@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{Host, PortSpec, Proto};
 
-/// A named host and its ports, referenced by [`super::Grant::Service`]:
-/// defined once, granted to any number of templates.
+/// A named host and its ports, referenced by [`super::Rule::Service`]:
+/// defined once, used by any number of grants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ServiceToml")]
 pub struct Service {
@@ -17,10 +17,10 @@ pub struct Service {
     /// per-service `allow/deny` snippet for the operator to `include`.
     #[serde(default)]
     pub nginx_vhost: bool,
-    /// HTTPS names this service answers to. When set, a `service` grant
+    /// HTTPS names this service answers to. When set, a `service` rule
     /// reaches it only through Parallax's HTTPS proxy, which lets these names
     /// through and nothing else. One address and port often serves many
-    /// sites, so the firewall alone can't limit a template to one of them.
+    /// sites, so the firewall alone can't limit a peer to one of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hostnames: Vec<String>,
 }

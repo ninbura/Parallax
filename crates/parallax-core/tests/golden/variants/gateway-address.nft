@@ -6,16 +6,30 @@ table inet parallax {}
 delete table inet parallax
 
 table inet parallax {
-	set ts_personal {
+	set wg_tier_0 {
 		type ipv4_addr
 		flags interval
-		comment "tailscale nodes of template personal (synced from Headscale)"
+		comment "wireguard peers of tier personal"
+		elements = { 10.8.1.1, 10.8.1.2 }
 	}
 
-	set ts_family {
+	set ts_tier_0 {
 		type ipv4_addr
 		flags interval
-		comment "tailscale nodes of template family (synced from Headscale)"
+		comment "tailscale nodes of tier personal (synced from Headscale)"
+	}
+
+	set wg_tier_1 {
+		type ipv4_addr
+		flags interval
+		comment "wireguard peers of tier family"
+		elements = { 10.8.2.1 }
+	}
+
+	set ts_tier_1 {
+		type ipv4_addr
+		flags interval
+		comment "tailscale nodes of tier family (synced from Headscale)"
 	}
 
 	chain input {
@@ -28,10 +42,10 @@ table inet parallax {
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 udp dport 53 accept comment "dns shim"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 tcp dport 53 accept comment "dns shim"
 		iifname { "wg0", "tailscale0" } icmp type echo-request accept comment "ping the gateway"
-		iifname "wg0" ip saddr 10.8.1.0/24 ip daddr 192.168.1.5 accept comment "personal/wireguard: network home (on the gateway host)"
-		iifname "tailscale0" ip saddr @ts_personal ip daddr 192.168.1.5 accept comment "personal/tailscale: network home (on the gateway host)"
-		iifname "wg0" ip saddr 10.8.2.0/24 ip daddr 192.168.1.5 tcp dport 443 accept comment "family/wireguard: service immich (on the gateway host)"
-		iifname "tailscale0" ip saddr @ts_family ip daddr 192.168.1.5 tcp dport 443 accept comment "family/tailscale: service immich (on the gateway host)"
+		iifname "wg0" ip saddr @wg_tier_0 ip daddr 192.168.1.5 accept comment "personal/wireguard: network home (on the gateway host)"
+		iifname "tailscale0" ip saddr @ts_tier_0 ip daddr 192.168.1.5 accept comment "personal/tailscale: network home (on the gateway host)"
+		iifname "wg0" ip saddr @wg_tier_1 ip daddr 192.168.1.5 tcp dport 443 accept comment "family/wireguard: service immich (on the gateway host)"
+		iifname "tailscale0" ip saddr @ts_tier_1 ip daddr 192.168.1.5 tcp dport 443 accept comment "family/tailscale: service immich (on the gateway host)"
 		iifname { "wg0", "tailscale0" } drop comment "tunnel peers may not reach anything else on the gateway host"
 	}
 
@@ -41,19 +55,19 @@ table inet parallax {
 		ct state invalid drop comment "invalid state"
 		ct direction reply accept comment "replies"
 		ct state related accept comment "related (ICMP errors)"
-		iifname "wg0" ip saddr vmap { 10.8.1.0/24 : jump tier_personal, 10.8.2.0/24 : jump tier_family } comment "wireguard: each template's chain, by source address"
-		iifname "tailscale0" ip saddr @ts_personal jump tier_personal comment "personal/tailscale"
-		iifname "tailscale0" ip saddr @ts_family jump tier_family comment "family/tailscale"
+		iifname "wg0" ip saddr vmap { 10.8.1.1 : jump tier_0, 10.8.1.2 : jump tier_0, 10.8.2.1 : jump tier_1 } comment "wireguard: each peer's tier chain, by source address"
+		iifname "tailscale0" ip saddr @ts_tier_0 jump tier_0 comment "personal/tailscale"
+		iifname "tailscale0" ip saddr @ts_tier_1 jump tier_1 comment "family/tailscale"
 		iifname "wg0" drop comment "wireguard: unknown source"
 		iifname "tailscale0" drop comment "tailscale: unknown source"
 	}
 
-	chain tier_personal {
+	chain tier_0 {
 		oifname "eth0" ip daddr 192.168.1.0/24 accept comment "personal: network home"
 		drop comment "personal: default deny"
 	}
 
-	chain tier_family {
+	chain tier_1 {
 		oifname "eth0" ip daddr 192.168.1.5 tcp dport 443 accept comment "family: service immich"
 		drop comment "family: default deny"
 	}

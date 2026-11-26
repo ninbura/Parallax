@@ -9,42 +9,51 @@ use std::fmt::Write as _;
 use ipnet::Ipv4Net;
 
 use super::Export;
-use crate::model::{AllowedIpsStrategy, DnsMode, Peer, Platform, Template, TransportKind};
+use crate::model::{
+    AllowedIpsStrategy, DnsMode, Peer, Platform, Rule, TransportKind, WireGuardPeer,
+};
 use crate::validate::{Model, ReachKind};
 use crate::{Error, Result};
 
 /// `0.0.0.0/0`: route everything through the tunnel.
 const DEFAULT_ROUTE: Ipv4Net = Ipv4Net::new_assert(std::net::Ipv4Addr::UNSPECIFIED, 0);
 
-/// The DNS mode a platform actually gets, given the template's wish.
-pub fn effective_dns_mode(template: &Template, platform: Platform) -> DnsMode {
-    match (template.dns.wireguard, platform) {
+/// The DNS mode a platform actually gets, given the peer's wish.
+pub fn effective_dns_mode(client: &WireGuardPeer, platform: Platform) -> DnsMode {
+    match (client.dns, platform) {
         (DnsMode::Split, Platform::Mobile) => DnsMode::TunnelWide,
         (mode, _) => mode,
     }
 }
 
-/// The courtesy `AllowedIPs` for a template on WireGuard.
-pub fn allowed_ips(model: &Model<'_>, template: &Template, platform: Platform) -> Vec<Ipv4Net> {
+/// The courtesy `AllowedIPs` for a WireGuard peer (none for another kind).
+pub fn allowed_ips(model: &Model<'_>, peer: &Peer, platform: Platform) -> Vec<Ipv4Net> {
     let mut out: Vec<Ipv4Net> = Vec::new();
+    let Some(client) = &peer.wireguard else {
+        return out;
+    };
     let mut push = |n: Ipv4Net| {
         if !out.iter().any(|o| o.contains(&n)) {
             out.retain(|o| !n.contains(o));
             out.push(n);
         }
     };
-    match template.client.allowed_ips {
+    match client.allowed_ips {
         AllowedIpsStrategy::FullTunnel => {
             push(DEFAULT_ROUTE);
             return out;
         }
         AllowedIpsStrategy::MappedSubnets => {
-            for n in model.visible_networks(template) {
+            for n in model.visible_networks(client) {
                 push(n.client_subnet().trunc());
             }
         }
         AllowedIpsStrategy::GrantsOnly => {
-            for r in model.reaches(template) {
+            let reaches = model
+                .tier_of(peer)
+                .map(|t| model.reaches(t))
+                .unwrap_or_default();
+            for r in reaches {
                 match r.kind {
                     ReachKind::Internet => push(DEFAULT_ROUTE),
                     // The client reaches the home's public IP over its own
@@ -59,7 +68,7 @@ pub fn allowed_ips(model: &Model<'_>, template: &Template, platform: Platform) -
             }
         }
     }
-    if effective_dns_mode(template, platform) != DnsMode::None {
+    if effective_dns_mode(client, platform) != DnsMode::None {
         push(Ipv4Net::from(model.shim_address()));
     }
     out
@@ -86,18 +95,20 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
             peer.name
         ),
     })?;
-    let template = model.template(&peer.template)?;
+    let tier = model.tier_of(peer);
+    let public_dns = tier.is_some_and(|t| t.has(&Rule::PublicDns));
     let server = model.server();
     let shim = model.shim_address();
-    let mode = effective_dns_mode(template, platform);
-    let domains = model.routing_domains(template);
+    let mode = effective_dns_mode(wg, platform);
+    let domains = model.routing_domains(wg);
     let mut warnings = Vec::new();
     let mut s = String::new();
 
+    // No grants here: they can change without a new export.
     let _ = writeln!(
         s,
-        "# Parallax peer \"{}\" (template \"{}\", {} flavour)",
-        peer.name, template.name, platform
+        "# Parallax peer \"{}\" ({} flavour)",
+        peer.name, platform
     );
     s.push_str("# AllowedIPs are a courtesy for split tunnelling; the gateway enforces access server-side.\n");
     s.push_str("[Interface]\n");
@@ -114,15 +125,13 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
         }
     }
     let _ = writeln!(s, "Address = {address}/32");
-    if let Some(mtu) = template.client.mtu {
+    if let Some(mtu) = wg.mtu {
         let _ = writeln!(s, "MTU = {mtu}");
     }
 
     match mode {
         DnsMode::None => {
-            s.push_str(
-                "# DNS: none (template policy). Mapped raw IPs work without any resolver.\n",
-            );
+            s.push_str("# DNS: none (peer setting). Mapped raw IPs work without any resolver.\n");
         }
         DnsMode::TunnelWide => {
             let _ = writeln!(s, "DNS = {shim}");
@@ -131,27 +140,27 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
                 s.push_str("# Names on the network you are visiting will not resolve while connected (mDNS/Bonjour,\n");
                 s.push_str("# e.g. casting and AirPlay, is multicast and unaffected; raw IPs always work; Android can\n");
                 s.push_str("# exempt apps). For real split DNS on a phone use the Tailscale transport instead.\n");
-                if template.dns.wireguard == DnsMode::Split {
+                if wg.dns == DnsMode::Split {
                     warnings.push(format!(
-                        "template '{}' asks for split DNS but the mobile WireGuard apps cannot do it; this export sends all DNS to the gateway",
-                        template.name
+                        "peer '{}' asks for split DNS but the mobile WireGuard apps cannot do it; this export sends all DNS to the gateway",
+                        peer.name
                     ));
                 }
             } else {
-                s.push_str("# DNS is tunnel-wide by template policy.\n");
+                s.push_str("# DNS is tunnel-wide by peer setting.\n");
             }
-            if template.dns.public {
+            if public_dns {
                 s.push_str("# The gateway answers public names through its public resolver.\n");
             } else {
-                s.push_str("# Only this template's home names resolve while connected: the gateway refuses public\n# names for it (template dns.public is off).\n");
+                s.push_str("# Only this peer's granted home names resolve while connected: the gateway refuses public\n# names for it (no public_dns rule in its grants).\n");
                 let fix = if platform == Platform::Mobile {
-                    "turn dns.public on, or use Tailscale, which splits DNS on phones"
+                    "give it a grant with a public_dns rule, or use Tailscale, which splits DNS on phones"
                 } else {
-                    "turn dns.public on, or set dns.wireguard = \"split\" to keep public names local"
+                    "give it a grant with a public_dns rule, or set its dns = \"split\" to keep public names local"
                 };
                 warnings.push(format!(
-                    "template '{}' has dns.public off and this export sends all DNS to the gateway, so the device resolves only the template's home names while connected; {fix}",
-                    template.name
+                    "peer '{}' has no public_dns rule and this export sends all DNS to the gateway, so the device resolves only its granted home names while connected; {fix}",
+                    peer.name
                 ));
             }
         }
@@ -223,8 +232,8 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
             }
             if domains.is_empty() {
                 warnings.push(format!(
-                    "template '{}' uses split DNS but no visible network declares domains; nothing is routed to the shim",
-                    template.name
+                    "peer '{}' uses split DNS but no visible network declares domains; nothing is routed to the shim",
+                    peer.name
                 ));
             }
         }
@@ -236,13 +245,13 @@ pub fn render(model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Expo
         let _ = writeln!(s, "PresharedKey = {}", psk.expose_base64());
     }
     let _ = writeln!(s, "Endpoint = {}", server.wireguard.endpoint);
-    let ips = allowed_ips(model, template, platform)
+    let ips = allowed_ips(model, peer, platform)
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     let _ = writeln!(s, "AllowedIPs = {ips}");
-    if let Some(k) = template.client.persistent_keepalive {
+    if let Some(k) = wg.persistent_keepalive {
         let _ = writeln!(s, "PersistentKeepalive = {k}");
     }
 

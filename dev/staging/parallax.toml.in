@@ -20,6 +20,11 @@ endpoint = "@ENDPOINT@:@PORT@"
 public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 private_key_file = "/etc/parallax/wg-server.key"
 
+[server.wireguard.peer_defaults]
+dns = "split"
+allowed_ips = "mapped_subnets"
+persistent_keepalive = 25
+
 [server.headscale]
 server_url = "https://headscale.staging.test"
 subnet_router_node = "parallax-staging"
@@ -53,33 +58,12 @@ name = "immich"
 host = "192.168.201.5"
 ports = ["80/tcp"]
 
-# Reaches every network.
-[[template]]
+# Reaches every network, and public names.
+[[grant]]
 name = "personal"
-grants = [{ kind = "all_networks" }]
-[template.wireguard]
-pool = "10.9.1.0/24"
-[template.headscale]
-user = "staging"
-[template.dns]
-wireguard = "split"
-tailscale = "split"
-public = true
-[template.client]
-allowed_ips = "mapped_subnets"
-persistent_keepalive = 25
+rules = [{ kind = "all_networks" }, { kind = "public_dns" }]
 
 # Reaches exactly one service.
-[[template]]
+[[grant]]
 name = "guest"
-grants = [{ kind = "service", name = "immich" }]
-[template.wireguard]
-pool = "10.9.2.0/24"
-[template.headscale]
-tag = "tag:guest"
-[template.dns]
-wireguard = "tunnel_wide"
-tailscale = "split"
-[template.client]
-allowed_ips = "grants_only"
-persistent_keepalive = 25
+rules = [{ kind = "service", name = "immich" }]

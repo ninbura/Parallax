@@ -31,7 +31,7 @@ impl Store {
             server,
             networks: self.load_networks().await?,
             services: self.load_services().await?,
-            templates: self.load_templates().await?,
+            grants: self.load_grants().await?,
             peers: self.load_peers().await?,
         })
     }
@@ -104,29 +104,34 @@ impl Store {
         // kept name would overwrite the first.
         unique("network", config.networks.iter().map(|n| &n.name))?;
         unique("service", config.services.iter().map(|s| &s.name))?;
-        unique("template", config.templates.iter().map(|t| &t.name))?;
+        unique("grant", config.grants.iter().map(|g| &g.name))?;
         unique("peer", config.peers.iter().map(|p| &p.name))?;
 
-        // Grant and visibility rows have no identity of their own; rewrite them
-        // all, which also frees networks and services about to be removed.
-        self.exec("DELETE FROM template_grant_ports", Vec::new())
-            .await?;
-        self.exec("DELETE FROM template_grants", Vec::new()).await?;
-        self.exec("DELETE FROM template_visible_networks", Vec::new())
-            .await?;
+        // Rule, attachment and visibility rows have no identity of their
+        // own; rewrite them all, which also frees grants, networks and
+        // services about to be removed.
+        for table in [
+            "grant_rule_ports",
+            "grant_rules",
+            "peer_grants",
+            "peer_visible_networks",
+        ] {
+            self.exec(&format!("DELETE FROM {table}"), Vec::new())
+                .await?;
+        }
 
         self.save_server(&config.server).await?;
         let networks = self.save_networks(&config.networks).await?;
         let services = self.save_services(&config.services).await?;
-        let templates = self
-            .save_templates(&config.templates, &networks, &services)
+        let grants = self
+            .save_grants(&config.grants, &networks, &services)
             .await?;
-        self.save_peers(&config.peers, &templates).await?;
+        self.save_peers(&config.peers, &grants, &networks).await?;
 
         // Removals last, children first: by now nothing kept points at them.
         self.delete_missing("peers", config.peers.iter().map(|p| &p.name))
             .await?;
-        self.delete_missing("templates", config.templates.iter().map(|t| &t.name))
+        self.delete_missing("grants", config.grants.iter().map(|g| &g.name))
             .await?;
         self.delete_missing("services", config.services.iter().map(|s| &s.name))
             .await?;
@@ -150,7 +155,9 @@ impl Store {
                     wan_interface,
                     backup_directory, backup_automatic, backup_interval, backup_keep,
                     backup_encrypt, backup_passphrase_file,
-                    public_ip_address, public_ip_encrypted_dns
+                    public_ip_address, public_ip_encrypted_dns,
+                    wireguard_peer_dns, wireguard_peer_allowed_ips, wireguard_peer_mtu,
+                    wireguard_peer_persistent_keepalive, headscale_dns
                  FROM server WHERE id = 1",
                 Vec::new(),
             )
@@ -167,6 +174,16 @@ impl Store {
                 endpoint: r.get(3)?,
                 public_key: parse(at, "wireguard public key", &r.get::<String>(4)?)?,
                 private_key_file: PathBuf::from(r.get::<String>(5)?),
+                peer_defaults: PeerDefaults {
+                    dns: variant(at, "wireguard peer dns", &r.get::<String>(29)?)?,
+                    allowed_ips: variant(at, "wireguard peer allowed_ips", &r.get::<String>(30)?)?,
+                    mtu: small_opt(at, "wireguard peer mtu", r.get(31)?)?,
+                    persistent_keepalive: small_opt(
+                        at,
+                        "wireguard peer persistent_keepalive",
+                        r.get(32)?,
+                    )?,
+                },
             },
             headscale: HeadscaleServer {
                 interface: r.get(6)?,
@@ -174,6 +191,7 @@ impl Store {
                 api_key_file: PathBuf::from(r.get::<String>(8)?),
                 derp: variant(at, "headscale derp", &r.get::<String>(9)?)?,
                 subnet_router_node: r.get(10)?,
+                dns: variant(at, "headscale dns", &r.get::<String>(33)?)?,
             },
             dns: DnsServer {
                 listen: parse_opt(at, "dns listen", r.get(11)?)?,
@@ -242,6 +260,17 @@ impl Store {
                 ),
                 ("headscale_derp", variant_text(&h.derp)?),
                 ("headscale_subnet_router_node", text(&h.subnet_router_node)),
+                ("headscale_dns", variant_text(&h.dns)?),
+                ("wireguard_peer_dns", variant_text(&w.peer_defaults.dns)?),
+                (
+                    "wireguard_peer_allowed_ips",
+                    variant_text(&w.peer_defaults.allowed_ips)?,
+                ),
+                ("wireguard_peer_mtu", w.peer_defaults.mtu.into()),
+                (
+                    "wireguard_peer_persistent_keepalive",
+                    w.peer_defaults.persistent_keepalive.into(),
+                ),
                 ("dns_listen", s.dns.listen.map(|a| a.to_string()).into()),
                 ("dns_port", s.dns.port.into()),
                 ("dns_public_resolver", text(s.dns.public_resolver)),
@@ -442,185 +471,120 @@ impl Store {
         Ok(ids)
     }
 
-    // --- templates ------------------------------------------------------
+    // --- grants ---------------------------------------------------------
 
-    async fn load_templates(&self) -> Result<Vec<Template>> {
+    async fn load_grants(&self) -> Result<Vec<Grant>> {
         let mut out = Vec::new();
         let rows = self
             .rows(
-                "SELECT id, name, wireguard_pool, headscale_user, headscale_tag,
-                    visible_networks_limited, dns_wireguard, dns_tailscale, dns_public,
-                    client_allowed_ips, client_mtu, client_persistent_keepalive
-                 FROM templates ORDER BY position",
+                "SELECT id, name, everyone FROM grants ORDER BY position",
                 Vec::new(),
             )
             .await?;
         for r in rows {
             let id: i64 = r.get(0)?;
             let name: String = r.get(1)?;
-            let at = format!("template '{name}'");
-            let limited: bool = r.get(5)?;
-            let visible_networks = if limited {
-                Some(
-                    self.strings(
-                        "SELECT n.name FROM template_visible_networks v
-                         JOIN networks n ON n.id = v.network_id
-                         WHERE v.template_id = ?1 ORDER BY v.position",
-                        id,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            out.push(Template {
-                wireguard: WireGuardTemplate {
-                    pool: parse(&at, "wireguard pool", &r.get::<String>(2)?)?,
-                },
-                headscale: HeadscaleIdentity {
-                    user: r.get(3)?,
-                    tag: r.get(4)?,
-                },
-                grants: self.load_grants(id, &at).await?,
-                visible_networks,
-                dns: DnsPolicy {
-                    wireguard: variant(&at, "dns wireguard", &r.get::<String>(6)?)?,
-                    tailscale: variant(&at, "dns tailscale", &r.get::<String>(7)?)?,
-                    public: r.get(8)?,
-                },
-                client: ClientDefaults {
-                    allowed_ips: variant(&at, "client allowed_ips", &r.get::<String>(9)?)?,
-                    mtu: small_opt(&at, "client mtu", r.get(10)?)?,
-                    persistent_keepalive: small_opt(
-                        &at,
-                        "client persistent_keepalive",
-                        r.get(11)?,
-                    )?,
-                },
+            let at = format!("grant '{name}'");
+            out.push(Grant {
+                rules: self.load_rules(id, &at).await?,
+                everyone: r.get(2)?,
                 name,
             });
         }
         Ok(out)
     }
 
-    async fn load_grants(&self, template_id: i64, at: &str) -> Result<Vec<Grant>> {
+    async fn load_rules(&self, grant_id: i64, at: &str) -> Result<Vec<Rule>> {
         let rows = self
             .rows(
                 "SELECT g.kind, n.name, s.name, g.host, g.position
-                 FROM template_grants g
+                 FROM grant_rules g
                  LEFT JOIN networks n ON n.id = g.network_id
                  LEFT JOIN services s ON s.id = g.service_id
-                 WHERE g.template_id = ?1 ORDER BY g.position",
-                vec![template_id.into()],
+                 WHERE g.grant_id = ?1 ORDER BY g.position",
+                vec![grant_id.into()],
             )
             .await?;
-        let mut grants = Vec::new();
+        let mut rules = Vec::new();
         for r in rows {
             let kind: String = r.get(0)?;
-            let missing = || Error::Stored(format!("{at}: {kind} grant is incomplete"));
-            grants.push(match kind.as_str() {
-                "all_networks" => Grant::AllNetworks,
-                "internet" => Grant::Internet,
-                "network" => Grant::Network {
+            let missing = || Error::Stored(format!("{at}: {kind} rule is incomplete"));
+            rules.push(match kind.as_str() {
+                "all_networks" => Rule::AllNetworks,
+                "internet" => Rule::Internet,
+                "public_dns" => Rule::PublicDns,
+                "network" => Rule::Network {
                     name: r.get::<Option<String>>(1)?.ok_or_else(missing)?,
                 },
-                "service" => Grant::Service {
+                "service" => Rule::Service {
                     name: r.get::<Option<String>>(2)?.ok_or_else(missing)?,
                 },
-                "host" => Grant::Host {
+                "host" => Rule::Host {
                     host: parse(
                         at,
-                        "grant host",
+                        "rule host",
                         &r.get::<Option<String>>(3)?.ok_or_else(missing)?,
                     )?,
                     ports: self
                         .rows(
-                            "SELECT ports FROM template_grant_ports
-                             WHERE template_id = ?1 AND grant_position = ?2 ORDER BY position",
-                            vec![template_id.into(), r.get::<i64>(4)?.into()],
+                            "SELECT ports FROM grant_rule_ports
+                             WHERE grant_id = ?1 AND rule_position = ?2 ORDER BY position",
+                            vec![grant_id.into(), r.get::<i64>(4)?.into()],
                         )
                         .await?
                         .iter()
-                        .map(|p| parse(at, "grant ports", &p.get::<String>(0)?))
+                        .map(|p| parse(at, "rule ports", &p.get::<String>(0)?))
                         .collect::<Result<_>>()?,
                 },
-                other => return Err(Error::Stored(format!("{at}: unknown grant kind '{other}'"))),
+                other => return Err(Error::Stored(format!("{at}: unknown rule kind '{other}'"))),
             });
         }
-        Ok(grants)
+        Ok(rules)
     }
 
-    async fn save_templates(
+    async fn save_grants(
         &self,
-        templates: &[Template],
+        grants: &[Grant],
         networks: &BTreeMap<String, i64>,
         services: &BTreeMap<String, i64>,
     ) -> Result<BTreeMap<String, i64>> {
         let mut ids = BTreeMap::new();
-        for (position, t) in (0_i64..).zip(templates) {
-            let at = format!("template '{}'", t.name);
+        for (position, g) in (0_i64..).zip(grants) {
+            let at = format!("grant '{}'", g.name);
             let id = self
                 .upsert(
-                    "templates",
+                    "grants",
                     "name",
                     &[
-                        ("name", text(&t.name)),
+                        ("name", text(&g.name)),
                         ("position", position.into()),
-                        ("wireguard_pool", text(t.wireguard.pool)),
-                        ("headscale_user", t.headscale.user.clone().into()),
-                        ("headscale_tag", t.headscale.tag.clone().into()),
-                        (
-                            "visible_networks_limited",
-                            t.visible_networks.is_some().into(),
-                        ),
-                        ("dns_wireguard", variant_text(&t.dns.wireguard)?),
-                        ("dns_tailscale", variant_text(&t.dns.tailscale)?),
-                        ("dns_public", t.dns.public.into()),
-                        ("client_allowed_ips", variant_text(&t.client.allowed_ips)?),
-                        ("client_mtu", t.client.mtu.into()),
-                        (
-                            "client_persistent_keepalive",
-                            t.client.persistent_keepalive.into(),
-                        ),
+                        ("everyone", g.everyone.into()),
                     ],
                 )
                 .await?;
-            for (position, n) in (0_i64..).zip(t.visible_networks.iter().flatten()) {
-                let network = lookup(
-                    networks,
-                    &at,
-                    "visible_networks mentions unknown network",
-                    n,
-                )?;
-                self.exec(
-                    "INSERT INTO template_visible_networks (template_id, position, network_id)
-                     VALUES (?1, ?2, ?3)",
-                    vec![id.into(), position.into(), network.into()],
-                )
-                .await?;
-            }
-            for (position, g) in (0_i64..).zip(&t.grants) {
+            for (position, rule) in (0_i64..).zip(&g.rules) {
                 let null = || Value::Null;
-                let (kind, network, service, host) = match g {
-                    Grant::AllNetworks => ("all_networks", null(), null(), null()),
-                    Grant::Internet => ("internet", null(), null(), null()),
-                    Grant::Network { name } => (
+                let (kind, network, service, host) = match rule {
+                    Rule::AllNetworks => ("all_networks", null(), null(), null()),
+                    Rule::Internet => ("internet", null(), null(), null()),
+                    Rule::PublicDns => ("public_dns", null(), null(), null()),
+                    Rule::Network { name } => (
                         "network",
-                        lookup(networks, &at, "grant refers to unknown network", name)?.into(),
+                        lookup(networks, &at, "rule refers to unknown network", name)?.into(),
                         null(),
                         null(),
                     ),
-                    Grant::Service { name } => (
+                    Rule::Service { name } => (
                         "service",
                         null(),
-                        lookup(services, &at, "grant refers to unknown service", name)?.into(),
+                        lookup(services, &at, "rule refers to unknown service", name)?.into(),
                         null(),
                     ),
-                    Grant::Host { host, .. } => ("host", null(), null(), text(host)),
+                    Rule::Host { host, .. } => ("host", null(), null(), text(host)),
                 };
                 self.exec(
-                    "INSERT INTO template_grants
-                        (template_id, position, kind, network_id, service_id, host)
+                    "INSERT INTO grant_rules
+                        (grant_id, position, kind, network_id, service_id, host)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     vec![
                         id.into(),
@@ -632,11 +596,11 @@ impl Store {
                     ],
                 )
                 .await?;
-                if let Grant::Host { ports, .. } = g {
+                if let Rule::Host { ports, .. } = rule {
                     for (n, p) in (0_i64..).zip(ports) {
                         self.exec(
-                            "INSERT INTO template_grant_ports
-                                (template_id, grant_position, position, ports)
+                            "INSERT INTO grant_rule_ports
+                                (grant_id, rule_position, position, ports)
                              VALUES (?1, ?2, ?3, ?4)",
                             vec![id.into(), position.into(), n.into(), text(p)],
                         )
@@ -644,7 +608,7 @@ impl Store {
                     }
                 }
             }
-            ids.insert(t.name.clone(), id);
+            ids.insert(g.name.clone(), id);
         }
         Ok(ids)
     }
@@ -654,25 +618,63 @@ impl Store {
     async fn load_peers(&self) -> Result<Vec<Peer>> {
         let rows = self
             .rows(
-                "SELECT p.name, t.name, p.transport, p.enabled, p.expires,
-                    p.wireguard_public_key, p.wireguard_address, p.wireguard_private_key,
-                    p.wireguard_preshared_key, p.tailscale, p.tailscale_node_id, p.tailscale_address
-                 FROM peers p JOIN templates t ON t.id = p.template_id
-                 ORDER BY p.position",
+                "SELECT id, name, transport, enabled, expires,
+                    wireguard_public_key, wireguard_address, wireguard_private_key,
+                    wireguard_preshared_key, tailscale, tailscale_node_id, tailscale_address,
+                    wireguard_dns, wireguard_allowed_ips, wireguard_mtu,
+                    wireguard_persistent_keepalive, wireguard_visible_networks_limited
+                 FROM peers ORDER BY position",
                 Vec::new(),
             )
             .await?;
         let mut out = Vec::new();
         for r in rows {
-            let name: String = r.get(0)?;
+            let id: i64 = r.get(0)?;
+            let name: String = r.get(1)?;
             let at = format!("peer '{name}'");
             let wireguard = match r.get::<Option<String>>(5)? {
-                Some(public_key) => Some(WireGuardPeer {
-                    public_key: parse(&at, "wireguard public key", &public_key)?,
-                    address: parse_opt(&at, "wireguard address", r.get(6)?)?,
-                    private_key: secret_opt(&at, "wireguard private key", r.get(7)?)?,
-                    preshared_key: secret_opt(&at, "wireguard preshared key", r.get(8)?)?,
-                }),
+                Some(public_key) => {
+                    let missing = |what: &str| Error::Stored(format!("{at}: no wireguard {what}"));
+                    let limited: bool = r
+                        .get::<Option<bool>>(16)?
+                        .ok_or_else(|| missing("visible networks"))?;
+                    Some(WireGuardPeer {
+                        public_key: parse(&at, "wireguard public key", &public_key)?,
+                        address: parse_opt(&at, "wireguard address", r.get(6)?)?,
+                        private_key: secret_opt(&at, "wireguard private key", r.get(7)?)?,
+                        preshared_key: secret_opt(&at, "wireguard preshared key", r.get(8)?)?,
+                        dns: variant(
+                            &at,
+                            "wireguard dns",
+                            &r.get::<Option<String>>(12)?.ok_or_else(|| missing("dns"))?,
+                        )?,
+                        allowed_ips: variant(
+                            &at,
+                            "wireguard allowed_ips",
+                            &r.get::<Option<String>>(13)?
+                                .ok_or_else(|| missing("allowed_ips"))?,
+                        )?,
+                        mtu: small_opt(&at, "wireguard mtu", r.get(14)?)?,
+                        persistent_keepalive: small_opt(
+                            &at,
+                            "wireguard persistent_keepalive",
+                            r.get(15)?,
+                        )?,
+                        visible_networks: if limited {
+                            Some(
+                                self.strings(
+                                    "SELECT n.name FROM peer_visible_networks v
+                                     JOIN networks n ON n.id = v.network_id
+                                     WHERE v.peer_id = ?1 ORDER BY v.position",
+                                    id,
+                                )
+                                .await?,
+                            )
+                        } else {
+                            None
+                        },
+                    })
+                }
                 None => None,
             };
             let tailscale = if r.get::<bool>(9)? {
@@ -691,7 +693,14 @@ impl Store {
                 None
             };
             out.push(Peer {
-                template: r.get(1)?,
+                grants: self
+                    .strings(
+                        "SELECT g.name FROM peer_grants pg
+                         JOIN grants g ON g.id = pg.grant_id
+                         WHERE pg.peer_id = ?1 ORDER BY pg.position",
+                        id,
+                    )
+                    .await?,
                 transport: variant(&at, "transport", &r.get::<String>(2)?)?,
                 enabled: r.get(3)?,
                 expires: parse_opt(&at, "expires", r.get(4)?)?,
@@ -703,10 +712,14 @@ impl Store {
         Ok(out)
     }
 
-    async fn save_peers(&self, peers: &[Peer], templates: &BTreeMap<String, i64>) -> Result<()> {
+    async fn save_peers(
+        &self,
+        peers: &[Peer],
+        grants: &BTreeMap<String, i64>,
+        networks: &BTreeMap<String, i64>,
+    ) -> Result<()> {
         for (position, p) in (0_i64..).zip(peers) {
             let at = format!("peer '{}'", p.name);
-            let template = lookup(templates, &at, "refers to unknown template", &p.template)?;
             let wg = p.wireguard.as_ref();
             let ts = p.tailscale.as_ref();
             let node_id = ts
@@ -719,45 +732,85 @@ impl Store {
                     })
                 })
                 .transpose()?;
-            self.upsert(
-                "peers",
-                "name",
-                &[
-                    ("name", text(&p.name)),
-                    ("position", position.into()),
-                    ("template_id", template.into()),
-                    ("transport", variant_text(&p.transport)?),
-                    ("enabled", p.enabled.into()),
-                    ("expires", p.expires.map(|d| d.to_string()).into()),
-                    (
-                        "wireguard_public_key",
-                        wg.map(|w| w.public_key.to_base64()).into(),
-                    ),
-                    (
-                        "wireguard_address",
-                        wg.and_then(|w| w.address).map(|a| a.to_string()).into(),
-                    ),
-                    (
-                        "wireguard_private_key",
-                        wg.and_then(|w| w.private_key.as_ref())
-                            .map(|k| k.expose_base64())
-                            .into(),
-                    ),
-                    (
-                        "wireguard_preshared_key",
-                        wg.and_then(|w| w.preshared_key.as_ref())
-                            .map(|k| k.expose_base64())
-                            .into(),
-                    ),
-                    ("tailscale", ts.is_some().into()),
-                    ("tailscale_node_id", node_id.into()),
-                    (
-                        "tailscale_address",
-                        ts.and_then(|t| t.address).map(|a| a.to_string()).into(),
-                    ),
-                ],
-            )
-            .await?;
+            let id = self
+                .upsert(
+                    "peers",
+                    "name",
+                    &[
+                        ("name", text(&p.name)),
+                        ("position", position.into()),
+                        ("transport", variant_text(&p.transport)?),
+                        ("enabled", p.enabled.into()),
+                        ("expires", p.expires.map(|d| d.to_string()).into()),
+                        (
+                            "wireguard_public_key",
+                            wg.map(|w| w.public_key.to_base64()).into(),
+                        ),
+                        (
+                            "wireguard_address",
+                            wg.and_then(|w| w.address).map(|a| a.to_string()).into(),
+                        ),
+                        (
+                            "wireguard_private_key",
+                            wg.and_then(|w| w.private_key.as_ref())
+                                .map(|k| k.expose_base64())
+                                .into(),
+                        ),
+                        (
+                            "wireguard_preshared_key",
+                            wg.and_then(|w| w.preshared_key.as_ref())
+                                .map(|k| k.expose_base64())
+                                .into(),
+                        ),
+                        (
+                            "wireguard_dns",
+                            wg.map(|w| variant_text(&w.dns)).transpose()?.into(),
+                        ),
+                        (
+                            "wireguard_allowed_ips",
+                            wg.map(|w| variant_text(&w.allowed_ips)).transpose()?.into(),
+                        ),
+                        ("wireguard_mtu", wg.and_then(|w| w.mtu).into()),
+                        (
+                            "wireguard_persistent_keepalive",
+                            wg.and_then(|w| w.persistent_keepalive).into(),
+                        ),
+                        (
+                            "wireguard_visible_networks_limited",
+                            wg.map(|w| w.visible_networks.is_some()).into(),
+                        ),
+                        ("tailscale", ts.is_some().into()),
+                        ("tailscale_node_id", node_id.into()),
+                        (
+                            "tailscale_address",
+                            ts.and_then(|t| t.address).map(|a| a.to_string()).into(),
+                        ),
+                    ],
+                )
+                .await?;
+            for (position, g) in (0_i64..).zip(&p.grants) {
+                let grant = lookup(grants, &at, "refers to unknown grant", g)?;
+                self.exec(
+                    "INSERT INTO peer_grants (peer_id, position, grant_id) VALUES (?1, ?2, ?3)",
+                    vec![id.into(), position.into(), grant.into()],
+                )
+                .await?;
+            }
+            let visible = wg.and_then(|w| w.visible_networks.as_ref());
+            for (position, n) in (0_i64..).zip(visible.into_iter().flatten()) {
+                let network = lookup(
+                    networks,
+                    &at,
+                    "visible_networks mentions unknown network",
+                    n,
+                )?;
+                self.exec(
+                    "INSERT INTO peer_visible_networks (peer_id, position, network_id)
+                     VALUES (?1, ?2, ?3)",
+                    vec![id.into(), position.into(), network.into()],
+                )
+                .await?;
+            }
         }
         Ok(())
     }

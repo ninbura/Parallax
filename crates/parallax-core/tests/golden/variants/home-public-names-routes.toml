@@ -10,4 +10,4 @@ upstream_ca = "/etc/ssl/certs/ca-certificates.crt"
 hostname = "immich.mydomain.com"
 service = "immich"
 upstream = "1.2.3.4:443"
-allowed = ["10.8.2.0/24"]
+allowed = ["10.8.2.1/32"]

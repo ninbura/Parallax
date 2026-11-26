@@ -363,6 +363,8 @@ async fn tables_come_after_the_tables_they_point_at() {
     let tables = store.tables().await.unwrap();
     let at = |name: &str| tables.iter().position(|t| t == name).unwrap();
     assert!(at("late_parent") < at("late_child"), "{tables:?}");
-    assert!(at("networks") < at("template_grants"), "{tables:?}");
-    assert!(at("templates") < at("peers"), "{tables:?}");
+    assert!(at("networks") < at("grant_rules"), "{tables:?}");
+    // Rebuilt by migration 6, after the tables pointing at it.
+    assert!(at("peers") < at("peer_grants"), "{tables:?}");
+    assert!(at("grants") < at("peer_grants"), "{tables:?}");
 }

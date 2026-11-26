@@ -1,19 +1,20 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Network, Peer, ServerConfig, Service, Template};
+use super::{Grant, Network, Peer, ServerConfig, Service};
 
 /// The whole configuration. Stored in the database (`parallax-store`); TOML
-/// is its import/export form.
+/// is its import/export form. Files from before grants replaced templates
+/// still read ([`super::legacy`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "super::legacy::ConfigToml")]
 pub struct Config {
     pub server: ServerConfig,
     #[serde(default, rename = "network")]
     pub networks: Vec<Network>,
     #[serde(default, rename = "service")]
     pub services: Vec<Service>,
-    #[serde(default, rename = "template")]
-    pub templates: Vec<Template>,
+    #[serde(default, rename = "grant")]
+    pub grants: Vec<Grant>,
     #[serde(default, rename = "peer")]
     pub peers: Vec<Peer>,
 }
@@ -49,8 +50,8 @@ impl Config {
     pub fn network(&self, name: &str) -> Option<&Network> {
         self.networks.iter().find(|n| n.name == name)
     }
-    pub fn template(&self, name: &str) -> Option<&Template> {
-        self.templates.iter().find(|t| t.name == name)
+    pub fn grant(&self, name: &str) -> Option<&Grant> {
+        self.grants.iter().find(|g| g.name == name)
     }
     pub fn service(&self, name: &str) -> Option<&Service> {
         self.services.iter().find(|s| s.name == name)

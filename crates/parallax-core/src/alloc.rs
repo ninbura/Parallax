@@ -1,5 +1,7 @@
-//! WireGuard address allocation: lowest free host of the template pool,
-//! skipping the gateway address and every address already held by a peer.
+//! WireGuard address allocation: lowest free host of the supernet, skipping
+//! the gateway's own addresses and every address already held by a peer.
+//! An address says nothing about access (grants do), so a peer keeps it
+//! whatever its grants become.
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -17,9 +19,8 @@ fn reserved(config: &Config) -> BTreeSet<Ipv4Addr> {
         .filter_map(|p| p.wireguard.as_ref().and_then(|w| w.address))
         .collect();
     set.insert(config.server.wireguard.gateway_address());
-    if let Some(listen) = config.server.dns.listen {
-        set.insert(listen);
-    }
+    set.extend(config.server.dns.listen);
+    set.extend(config.server.proxy.listen);
     set
 }
 
@@ -28,16 +29,10 @@ pub fn pick(pool: Ipv4Net, taken: &BTreeSet<Ipv4Addr>) -> Option<Ipv4Addr> {
     pool.hosts().find(|a| !taken.contains(a))
 }
 
-/// Allocate an address for a new WireGuard peer of `template`.
-pub fn allocate(config: &Config, template: &str) -> Result<Ipv4Addr> {
-    let t = config.template(template).ok_or_else(|| Error::NotFound {
-        kind: "template",
-        name: template.to_string(),
-    })?;
-    pick(t.wireguard.pool, &reserved(config)).ok_or_else(|| Error::PoolExhausted {
-        template: template.to_string(),
-        pool: t.wireguard.pool,
-    })
+/// Allocate an address for a new WireGuard peer.
+pub fn allocate(config: &Config) -> Result<Ipv4Addr> {
+    let supernet = config.server.wireguard.supernet;
+    pick(supernet, &reserved(config)).ok_or(Error::PoolExhausted { pool: supernet })
 }
 
 /// Give every WireGuard peer without an address one. Returns `(peer, address)` pairs.
@@ -53,11 +48,7 @@ pub fn allocate_missing(config: &mut Config) -> Result<Vec<(String, Ipv4Addr)>> 
         .map(|p| p.name.clone())
         .collect();
     for name in names {
-        let template = config
-            .peer(&name)
-            .map(|p| p.template.clone())
-            .unwrap_or_default();
-        let addr = allocate(config, &template)?;
+        let addr = allocate(config)?;
         if let Some(w) = config.peer_mut(&name).and_then(|p| p.wireguard.as_mut()) {
             w.address = Some(addr);
         }

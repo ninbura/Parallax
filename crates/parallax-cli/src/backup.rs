@@ -625,9 +625,9 @@ fn show_changes(
     let new = restored.to_toml()?;
     if before.is_none() {
         println!(
-            "the database holds no configuration yet; the backup brings {} networks, {} templates, {} peers",
+            "the database holds no configuration yet; the backup brings {} networks, {} grants, {} peers",
             restored.networks.len(),
-            restored.templates.len(),
+            restored.grants.len(),
             restored.peers.len()
         );
     } else if old == new {
