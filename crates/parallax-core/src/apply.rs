@@ -195,13 +195,15 @@ fn apply_firewall(
                     .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
             }
             // Sets of tiers that no longer exist: no rule uses them since the
-            // restore. Prefixed as the transports name them (and as builds
-            // before grants did: `ts_<template>`).
+            // restore.
             let live = sys.runner.run("ipset", &["list", "-n"], None)?;
-            for name in live.stdout.lines().map(str::trim).filter(|n| {
-                (n.starts_with("wg_") || n.starts_with("ts_"))
-                    && !rs.sets.iter().any(|s| s.name == *n)
-            }) {
+            let grants: Vec<&str> = model
+                .config()
+                .grants
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect();
+            for name in stale_sets(&live.stdout, &rs.sets, &grants) {
                 sys.runner.run("ipset", &["destroy", name], None)?;
             }
             for (table, builtin, own) in CHAINS {
@@ -252,6 +254,43 @@ fn apply_firewall(
         }
     }
     Ok(())
+}
+
+/// Sets in an `ipset list -n` listing that Parallax made and the new ruleset
+/// no longer has: a transport's prefix and a tier key, as
+/// [`Transport::set_name`] names them, or `ts_<template>` from builds before
+/// grants (each template became the grant of its name). Anything else
+/// listed is someone else's.
+///
+/// [`Transport::set_name`]: crate::transport::Transport::set_name
+fn stale_sets<'a>(
+    listing: &'a str,
+    keep: &[crate::generate::firewall::AddressSet],
+    grants: &[&str],
+) -> Vec<&'a str> {
+    let prefixes: Vec<&str> = crate::transport::all()
+        .iter()
+        .map(|t| t.set_prefix())
+        .collect();
+    let tier_key =
+        |key: &str| key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let legacy: Vec<String> = grants
+        .iter()
+        .map(|g| format!("ts_{}", g.replace('-', "_")))
+        .collect();
+    let ours = |name: &str| {
+        legacy.iter().any(|l| l == name)
+            || prefixes.iter().any(|p| {
+                name.strip_prefix(p)
+                    .and_then(|rest| rest.strip_prefix('_'))
+                    .is_some_and(tier_key)
+            })
+    };
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|n| ours(n) && !keep.iter().any(|s| s.name == *n))
+        .collect()
 }
 
 /// Before the firewall changes: take a live WireGuard peer off the
@@ -344,6 +383,7 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test")]
 
     use super::*;
+    use crate::generate::firewall::AddressSet;
     use crate::io::memory::{MemoryFs, RecordingRunner};
     use crate::io::Output;
 
@@ -419,5 +459,28 @@ mod tests {
             "{lines:#?}"
         );
         assert!(!lines.iter().any(|l| l.ends_with(" remove")), "{lines:#?}");
+    }
+
+    /// Only sets named as Parallax names them go, now or before grants; an
+    /// operator's own `wg_external_allow` and `ts_other` stay.
+    #[test]
+    fn cleanup_destroys_only_parallaxs_own_sets() {
+        let keep = [AddressSet {
+            name: "wg_0123456789abcdef".into(),
+            elements: Vec::new(),
+            comment: String::new(),
+        }];
+        let listing = "wg_0123456789abcdef\nwg_fedcba9876543210\nts_00000000000000ff\n\
+                       wg_external_allow\nts_family\nts_home_lab\nts_other\nwg_0123456789ABCDEF\nwg_0123456789abcde\n\
+                       not_public\nparallax-swap\n";
+        assert_eq!(
+            stale_sets(listing, &keep, &["family", "home-lab"]),
+            [
+                "wg_fedcba9876543210",
+                "ts_00000000000000ff",
+                "ts_family",
+                "ts_home_lab"
+            ]
+        );
     }
 }
