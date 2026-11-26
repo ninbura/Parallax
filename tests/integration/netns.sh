@@ -64,6 +64,9 @@ WORK=$(mktemp -d /tmp/parallax-it.XXXXXX)
 PIDS=()
 CREATED=() # only these are cleaned up: a run that lost a race for a name leaves the winner's alone
 cleanup() {
+    # A second signal (Ctrl-C twice, `timeout` signalling the process group, CI
+    # cancelling) would end bash mid-cleanup and leave the namespaces behind.
+    trap '' INT TERM HUP
     set +e
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
     # $! above is the backgrounded `inns` subshell, not the server it starts: kill
