@@ -346,7 +346,7 @@ const FOLLOW_WINDOW_MS: u64 = 10_000;
 
 /// Print records as they match; with `follow`, keep showing new ones.
 fn show_records(ctx: &Ctx, query: Query, follow: bool) -> anyhow::Result<()> {
-    let records = read_records(ctx, &query)?;
+    let records = read_history(ctx, &query)?;
     for (_, r) in &records {
         println!("{}", record_line(r));
     }
@@ -364,7 +364,8 @@ fn show_records(ctx: &Ctx, query: Query, follow: bool) -> anyhow::Result<()> {
         let since = now_ms().saturating_sub(FOLLOW_WINDOW_MS);
         let window = Query {
             since: Some(since.max(query.since.unwrap_or(0))),
-            limit: 10_000,
+            before: None,
+            limit: PAGE,
             ..query.clone()
         };
         let mut fresh = read_records(ctx, &window)?;
@@ -376,6 +377,39 @@ fn show_records(ctx: &Ctx, query: Query, follow: bool) -> anyhow::Result<()> {
         }
         shown.retain(|(_, time)| *time + 2 * FOLLOW_WINDOW_MS >= since);
     }
+}
+
+/// Records per request: each answer stays far below the socket's limit on
+/// a message, however many are asked for.
+const PAGE: u32 = 5000;
+
+/// The newest `query.limit` records, oldest first, read a page at a time
+/// from the newest back.
+fn read_history(ctx: &Ctx, query: &Query) -> anyhow::Result<Vec<(i64, Record)>> {
+    let mut pages: Vec<Vec<(i64, Record)>> = Vec::new();
+    let mut left = query.limit;
+    let mut before = None;
+    while left > 0 {
+        let page = read_records(
+            ctx,
+            &Query {
+                before,
+                limit: left.min(PAGE),
+                ..query.clone()
+            },
+        )?;
+        let Some((oldest, _)) = page.first() else {
+            break;
+        };
+        before = Some(*oldest);
+        left = left.saturating_sub(page.len() as u32);
+        let full = page.len() as u32 == PAGE;
+        pages.push(page);
+        if !full {
+            break;
+        }
+    }
+    Ok(pages.into_iter().rev().flatten().collect())
 }
 
 /// Through the daemon, which holds logs.db; without one, from the file.
@@ -485,6 +519,7 @@ fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
                 peer,
                 kinds: kind,
                 since: since.map(|s| now.saturating_sub(s.as_secs().saturating_mul(1000))),
+                before: None,
                 limit,
             };
             return show_records(ctx, query, follow);

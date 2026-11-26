@@ -44,7 +44,8 @@ impl std::fmt::Debug for Writer {
     }
 }
 
-/// Which records to read: the newest `limit` that match.
+/// Which records to read: the newest `limit` that match, older than
+/// `before` (an id) if given, for reading history a page at a time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
@@ -53,6 +54,8 @@ pub struct Query {
     pub kinds: Vec<RecordKind>,
     /// Unix milliseconds.
     pub since: Option<u64>,
+    #[serde(default)]
+    pub before: Option<i64>,
     pub limit: u32,
 }
 
@@ -105,6 +108,10 @@ impl Logs {
         if let Some(since) = query.since {
             params.push(int(since).into());
             conditions.push(format!("time >= ?{}", params.len()));
+        }
+        if let Some(before) = query.before {
+            params.push(before.into());
+            conditions.push(format!("id < ?{}", params.len()));
         }
         let filter = if conditions.is_empty() {
             String::new()

@@ -132,6 +132,23 @@ async fn queries_filter_and_give_the_newest() {
         .await,
         [8, 9, 10]
     );
+    // A page older than an id.
+    let ids: Vec<i64> = logs
+        .query(&all())
+        .await
+        .unwrap()
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        q(Query {
+            before: Some(ids[3]),
+            limit: 2,
+            ..all()
+        })
+        .await,
+        [2, 3]
+    );
     // The newest few, still oldest first.
     assert_eq!(q(Query { limit: 3, ..all() }).await, [8, 9, 10]);
 }

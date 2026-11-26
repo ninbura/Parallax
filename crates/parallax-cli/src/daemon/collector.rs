@@ -26,6 +26,9 @@ use super::{log, warn, Views};
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 /// ...or once this many wait.
 const BATCH: usize = 2000;
+/// Batches waiting for the writer before new ones are dropped: a few
+/// seconds of a flood.
+const QUEUE: usize = 32;
 /// How long a read waits before the thread checks whether to stop.
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// Room for bursts between reads: what the kernel drops past this is
@@ -265,13 +268,36 @@ struct Source {
     runtime: tokio::runtime::Handle,
 }
 
+/// What a feed lost, reported at most once a second.
+#[derive(Default)]
+struct Lost {
+    /// Times the kernel's buffer overflowed (`ENOBUFS`).
+    overflows: u64,
+    /// Records dropped because the writer was behind.
+    records: u64,
+}
+
 impl Source {
+    /// Read on this thread, write on another: the reader only drains the
+    /// kernel and attributes, so a slow write never backs the kernel up.
     fn run(self) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<logging::Record>>(QUEUE);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for batch in rx {
+                    self.write(&batch);
+                }
+            });
+            self.read(tx);
+        });
+    }
+
+    fn read(&self, tx: std::sync::mpsc::SyncSender<Vec<logging::Record>>) {
         let mut buf = vec![0u8; 256 * 1024];
         let mut batch = Vec::new();
         let mut flushed = Instant::now();
-        let mut lost: u64 = 0;
-        let mut reported_lost = 0;
+        let mut lost = Lost::default();
+        let mut reported = Lost::default();
         let mut open = logging::OpenFlows::default();
         while !self.stop.load(Ordering::Relaxed) {
             match rustix::net::recv(&self.socket, &mut buf[..], RecvFlags::empty()) {
@@ -289,7 +315,7 @@ impl Source {
                 }
                 Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
                 // The kernel dropped events while we were behind.
-                Err(rustix::io::Errno::NOBUFS) => lost += 1,
+                Err(rustix::io::Errno::NOBUFS) => lost.overflows += 1,
                 Err(e) => {
                     warn(format!(
                         "activity logging: reading {} stopped: {e}",
@@ -299,31 +325,35 @@ impl Source {
                 }
             }
             if batch.len() >= BATCH || flushed.elapsed() >= FLUSH_EVERY {
-                self.flush(&mut batch);
+                hand_over(&tx, &mut batch, &mut lost);
                 flushed = Instant::now();
-                // At most once a second, written or not.
-                self.report_lost(lost, &mut reported_lost);
+                self.report(&lost, &mut reported);
             }
         }
-        self.flush(&mut batch);
-        self.report_lost(lost, &mut reported_lost);
+        hand_over(&tx, &mut batch, &mut lost);
+        self.report(&lost, &mut reported);
     }
 
-    fn report_lost(&self, lost: u64, reported: &mut u64) {
-        if lost != *reported {
+    fn report(&self, lost: &Lost, reported: &mut Lost) {
+        if lost.overflows != reported.overflows {
             warn(format!(
                 "activity logging: the kernel dropped {} bursts of {} while the collector was behind",
-                lost - *reported,
+                lost.overflows - reported.overflows,
                 self.name
             ));
-            *reported = lost;
+            reported.overflows = lost.overflows;
+        }
+        if lost.records != reported.records {
+            warn(format!(
+                "activity logging: {} records of {} dropped while writing to the database was behind",
+                lost.records - reported.records,
+                self.name
+            ));
+            reported.records = lost.records;
         }
     }
 
-    fn flush(&self, batch: &mut Vec<logging::Record>) {
-        if batch.is_empty() {
-            return;
-        }
+    fn write(&self, batch: &[logging::Record]) {
         if let Err(e) = self.runtime.block_on(self.writer.write(batch)) {
             warn(format!(
                 "activity logging: writing {} records of {} failed: {e}",
@@ -331,7 +361,21 @@ impl Source {
                 self.name
             ));
         }
-        batch.clear();
+    }
+}
+
+/// Queue `batch` for the writer; when it's full, drop and count.
+fn hand_over(
+    tx: &std::sync::mpsc::SyncSender<Vec<logging::Record>>,
+    batch: &mut Vec<logging::Record>,
+    lost: &mut Lost,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let n = batch.len() as u64;
+    if tx.try_send(std::mem::take(batch)).is_err() {
+        lost.records += n;
     }
 }
 

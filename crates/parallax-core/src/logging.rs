@@ -270,11 +270,19 @@ pub fn protocol_name(protocol: u8) -> String {
 /// configuration now, which may have changed since.
 pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
     let (src, needed) = match event {
-        Event::Opened(f) | Event::Closed(f) => {
+        Event::Opened(f) => {
             if f.mark & crate::generate::firewall::FLOW_MARK == 0 {
                 return None;
             }
             (f.src, LogLevel::Connections)
+        }
+        // A flow's end says only its bytes: below `bytes` there's nothing
+        // to record (and half the writes saved).
+        Event::Closed(f) => {
+            if f.mark & crate::generate::firewall::FLOW_MARK == 0 {
+                return None;
+            }
+            (f.src, LogLevel::Bytes)
         }
         Event::Blocked(b) => (b.src, LogLevel::Denied),
     };
@@ -337,7 +345,7 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
             };
             let mut r = record(kind, f.dst, real, f.protocol, f.port);
             r.flow = Some(f.id);
-            if closed && level >= LogLevel::Bytes {
+            if closed {
                 if let Some((out, back)) = f.bytes {
                     r.bytes_out = Some(out);
                     r.bytes_in = Some(back);
@@ -399,7 +407,7 @@ mod tests {
     #[test]
     fn a_flow_s_end_never_goes_to_the_next_owner_of_its_address() {
         let mut cfg = canonical_config();
-        cfg.server.logs.level = LogLevel::Connections;
+        cfg.server.logs.level = LogLevel::Bytes;
         let mark = crate::generate::firewall::FLOW_MARK;
         let mut open = OpenFlows::default();
         let opened = Event::Opened(flow([10, 8, 2, 1], mark));
@@ -467,9 +475,9 @@ mod tests {
             ("tcp", Some(2283), Some(7))
         );
 
-        // Bytes only at `bytes` and up.
+        // A flow's end only at `bytes` and up.
         let closed = Event::Closed(flow([10, 8, 2, 1], mark));
-        assert_eq!(attribute(&cfg, &closed, 2000).unwrap().bytes_out, None);
+        assert!(attribute(&cfg, &closed, 2000).is_none());
         cfg.server.logs.level = LogLevel::Bytes;
         let r = attribute(&cfg, &closed, 2000).unwrap();
         assert_eq!((r.bytes_out, r.bytes_in), (Some(1200), Some(34_000)));
