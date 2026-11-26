@@ -8,7 +8,7 @@ use parallax_core::model::*;
 use parallax_core::testing::{canonical_config, keypair, today};
 use parallax_core::{Config, Model};
 
-use crate::{Error, Store};
+use crate::{Error, Store, MVCC};
 
 pub(crate) const LATEST: i64 = crate::MIGRATIONS.len() as i64;
 
@@ -283,7 +283,7 @@ async fn the_database_and_its_log_are_owner_only() {
     let dir = TempDir::new();
     let mut store = Store::create(&dir.db()).await.unwrap();
     store.save(&everything_config()).await.unwrap();
-    for file in ["parallax.db", "parallax.db-wal"] {
+    for file in ["parallax.db", "parallax.db-wal", "parallax.db-log"] {
         let mode = std::fs::metadata(dir.0.join(file))
             .unwrap()
             .permissions()
@@ -345,6 +345,26 @@ async fn a_database_written_in_multi_process_mode_opens() {
     let store = Store::open(&path).await.unwrap();
     let rows = store.rows("SELECT x FROM t", Vec::new()).await.unwrap();
     assert_eq!(rows[0].get::<i64>(0).unwrap(), 7);
+    assert_eq!(store.journal_mode(None).await.unwrap(), MVCC);
+}
+
+/// Databases from before 7c are in WAL mode: opening one switches it to
+/// MVCC, once, and keeps what it holds.
+#[tokio::test]
+async fn an_older_database_switches_to_mvcc_and_keeps_its_data() {
+    let dir = TempDir::new();
+    {
+        let mut store = Store::create_plain(&dir.db()).await.unwrap();
+        assert_eq!(store.journal_mode(None).await.unwrap(), "wal");
+        store.save(&everything_config()).await.unwrap();
+    }
+    for _ in 0..2 {
+        let mut store = Store::open(&dir.db()).await.unwrap();
+        assert_eq!(store.journal_mode(None).await.unwrap(), MVCC);
+        assert_eq!(store.load().await.unwrap(), everything_config());
+    }
+    let created = Store::create(&dir.0.join("new.db")).await.unwrap();
+    assert_eq!(created.journal_mode(None).await.unwrap(), MVCC);
 }
 
 #[tokio::test]
