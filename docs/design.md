@@ -41,8 +41,9 @@ crates/parallax-cli/            `parallax` binary (daemon, status, validate, pla
                                 src/daemon.rs and src/protocol.rs: the daemon and
                                 its socket protocol
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)
-packaging/                      the native install: the systemd unit, sysusers.d,
-                                tmpfiles.d, modules-load.d, sysctl.d
+packaging/                      the native install (ADR 0013, docs/native.md): the
+                                systemd unit, sysusers.d, tmpfiles.d, modules-load.d,
+                                sysctl.d, nfpm.yaml (the .deb and Arch package)
 example/parallax.toml           fully commented canonical scenario
 tests/integration/netns.sh      Linux network-namespace integration test (CI), with
                                 the daemon as root or as the native unit

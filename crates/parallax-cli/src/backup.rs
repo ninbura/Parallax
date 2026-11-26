@@ -119,7 +119,7 @@ fn create_command(ctx: &Ctx, if_due: bool) -> anyhow::Result<()> {
         })?,
     };
     for line in lines {
-        println!("{line}");
+        outln!("{line}")?;
     }
     Ok(())
 }
@@ -259,12 +259,12 @@ fn list(ctx: &Ctx, directory: Option<PathBuf>) -> anyhow::Result<()> {
     };
     let backups = backup::list(&directory)?;
     if backups.is_empty() {
-        println!("no backups in {}", directory.display());
+        outln!("no backups in {}", directory.display())?;
     }
     for b in backups {
         let size = std::fs::metadata(&b.path).map_or(0, |m| m.len());
         match backup::inspect(&b.path) {
-            Ok(m) => println!(
+            Ok(m) => outln!(
                 "{}  {}  Parallax {}  schema {}  {}  {}",
                 b.path.display(),
                 m.created,
@@ -276,8 +276,8 @@ fn list(ctx: &Ctx, directory: Option<PathBuf>) -> anyhow::Result<()> {
                     "not encrypted"
                 },
                 human_size(size)
-            ),
-            Err(e) => println!("{}  can't be restored: {e}", b.path.display()),
+            )?,
+            Err(e) => outln!("{}  can't be restored: {e}", b.path.display())?,
         }
     }
     Ok(())
@@ -336,16 +336,16 @@ fn set_passphrase(ctx: &Ctx, generate: bool, replace: bool) -> anyhow::Result<()
     };
     write_atomic(path, &format!("{passphrase}\n"))?;
     if generate {
-        println!("{passphrase}");
+        outln!("{passphrase}")?;
     }
-    eprintln!(
+    eoutln!(
         "wrote {} (mode 0600). Keep the passphrase in your password manager: without it, the backups can't be restored.",
         path.display()
     );
     if !config.server.backup.encrypt {
-        eprintln!("warning: server.backup.encrypt is false, so backups don't use it yet");
+        eoutln!("warning: server.backup.encrypt is false, so backups don't use it yet");
     } else if replace {
-        eprintln!("older backups still need the old passphrase; run `parallax backup create` to make one with the new one");
+        eoutln!("older backups still need the old passphrase; run `parallax backup create` to make one with the new one");
     }
     Ok(())
 }
@@ -374,8 +374,7 @@ fn read_secret(prompt: &str) -> anyhow::Result<String> {
     if !stdin.is_terminal() {
         bail!("asking for a passphrase needs a terminal");
     }
-    eprint!("{prompt}");
-    std::io::stderr().flush()?;
+    eout!("{prompt}");
     let fd = stdin.as_fd();
     let original = tcgetattr(fd).context("reading the terminal settings")?;
     let mut quiet = original.clone();
@@ -384,7 +383,7 @@ fn read_secret(prompt: &str) -> anyhow::Result<String> {
     let mut line = String::new();
     let read = stdin.lock().read_line(&mut line);
     let _ = tcsetattr(fd, OptionalActions::Now, &original);
-    eprintln!();
+    eoutln!();
     if read? == 0 {
         bail!("no passphrase given");
     }
@@ -411,7 +410,7 @@ fn open_backup(
     if let Some(pass) = read_passphrase(server_file)? {
         match backup::open(file, Some(&pass)) {
             Ok(contents) => return Ok((contents, None)),
-            Err(parallax_store::Error::WrongPassphrase(_)) => eprintln!(
+            Err(parallax_store::Error::WrongPassphrase(_)) => eoutln!(
                 "the passphrase in {} doesn't open this backup",
                 server_file.display()
             ),
@@ -429,7 +428,7 @@ fn open_backup(
         match backup::open(file, Some(&pass)) {
             Ok(contents) => return Ok((contents, Some(pass))),
             Err(parallax_store::Error::WrongPassphrase(_)) if attempt < 3 => {
-                eprintln!("wrong passphrase; try again");
+                eoutln!("wrong passphrase; try again");
             }
             Err(e) => return Err(e.into()),
         }
@@ -446,7 +445,7 @@ fn restore(
 ) -> anyhow::Result<()> {
     // Refuses a backup from a newer Parallax before asking for anything.
     let manifest = backup::inspect(file)?;
-    println!(
+    outln!(
         "backup {}: made {} by Parallax {}, {}",
         file.display(),
         manifest.created,
@@ -456,7 +455,7 @@ fn restore(
         } else {
             "not encrypted"
         }
-    );
+    )?;
     let (before, revision) = ctx.current().context(
         "can't read the current database; if it's damaged, move it (parallax.db*) aside and restore as on a fresh install",
     )?;
@@ -488,7 +487,7 @@ fn restore(
             return match ctx.ask(&request).map_err(|e| hidden_from_the_service(e, file))? {
                 Some(Reply::Applied { log, error, .. }) => {
                     for line in log {
-                        println!("{line}");
+                        outln!("{line}")?;
                     }
                     match error {
                         None => Ok(()),
@@ -513,9 +512,9 @@ fn restore(
         )
         .await?;
         for line in lines {
-            println!("{line}");
+            outln!("{line}")?;
         }
-        println!("run `parallax apply` to put it into effect");
+        outln!("run `parallax apply` to put it into effect")?;
         Ok(())
     })
 }
@@ -591,7 +590,9 @@ pub(crate) async fn restore_into(
             None => std::fs::remove_file(key_file).map_err(Into::into),
         };
         if let Err(undo) = undone {
-            eprintln!(
+            // Best effort, not `eoutln!`: the daemon restores through here too.
+            let _ = writeln!(
+                std::io::stderr(),
                 "warning: putting the old server key {} back failed too: {undo:#}",
                 key_file.display()
             );
@@ -639,22 +640,22 @@ fn show_changes(
     let (errors, warnings) = parallax_core::validate::check(restored);
     print_warnings(&warnings);
     for e in &errors {
-        eprintln!("warning: the restored configuration doesn't validate: {e}; fix it with `parallax config edit` before `parallax apply`");
+        eoutln!("warning: the restored configuration doesn't validate: {e}; fix it with `parallax config edit` before `parallax apply`");
     }
     let old = before.map(Config::to_toml).transpose()?.unwrap_or_default();
     let new = restored.to_toml()?;
     if before.is_none() {
-        println!(
+        outln!(
             "the database holds no configuration yet; the backup brings {} networks, {} grants, {} peers",
             restored.networks.len(),
             restored.grants.len(),
             restored.peers.len()
-        );
+        )?;
     } else if old == new {
-        println!("configuration: unchanged");
+        outln!("configuration: unchanged")?;
     } else {
-        println!("configuration:");
-        print!("{}", redact(&parallax_core::plan::unified_diff(&old, &new)));
+        outln!("configuration:")?;
+        out!("{}", redact(&parallax_core::plan::unified_diff(&old, &new)))?;
     }
     let key_file = &restored.server.wireguard.private_key_file;
     let key = match RealFs.read(key_file) {
@@ -666,7 +667,7 @@ fn show_changes(
         Ok(None) => format!("{} is restored", key_file.display()),
         Err(e) => format!("{} can't be read ({e}); it is replaced", key_file.display()),
     };
-    println!("server key: {key}");
+    outln!("server key: {key}")?;
     if errors.is_empty() {
         // Generated with the backup's server key, compared with what's on disk.
         let with_key = MemoryFs::new().with_file(key_file, server_key.expose());
@@ -676,10 +677,10 @@ fn show_changes(
         });
         match plan {
             Ok(plan) => {
-                println!("generated files after `parallax apply`:");
-                print!("{}", plan.render());
+                outln!("generated files after `parallax apply`:")?;
+                out!("{}", plan.render())?;
             }
-            Err(e) => eprintln!("warning: can't preview the generated files: {e:#}"),
+            Err(e) => eoutln!("warning: can't preview the generated files: {e:#}"),
         }
     }
     Ok(())
