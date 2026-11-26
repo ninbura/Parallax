@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use parallax_core::generate::{self, ArtifactKind, Bundle};
 use parallax_core::io::memory::{MemoryFs, RecordingRunner};
 use parallax_core::io::System;
-use parallax_core::model::{FirewallBackend, Grant, Host, Platform, PortSpec, Proto};
+use parallax_core::model::{FirewallBackend, Host, Platform, PortSpec, Proto, Rule};
 use parallax_core::testing::{canonical_config, keypair, today};
 use parallax_core::transport::{self, Transport};
 use parallax_core::{Config, Model};
@@ -99,9 +99,9 @@ fn exports_match_golden_for_every_platform() {
 fn iptables_backend_matches_golden() {
     let mut cfg = canonical_config();
     cfg.server.firewall.backend = FirewallBackend::IptablesNft;
-    cfg.templates[0].grants.push(Grant::Internet);
+    cfg.grants[0].rules.push(Rule::Internet);
     // A guest with internet and a proxied service: not_public and the DNAT.
-    cfg.templates[1].grants.push(Grant::Internet);
+    cfg.grants[1].rules.push(Rule::Internet);
     cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
     let bundle = bundle_for(&cfg);
     for a in bundle
@@ -115,8 +115,8 @@ fn iptables_backend_matches_golden() {
 #[test]
 fn internet_grant_and_masquerade_match_golden() {
     let mut cfg = canonical_config();
-    cfg.templates[0].grants.push(Grant::Internet);
-    cfg.templates[1].grants.push(Grant::Internet);
+    cfg.grants[0].rules.push(Rule::Internet);
+    cfg.grants[1].rules.push(Rule::Internet);
     cfg.networks[0].masquerade = true;
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
@@ -127,7 +127,7 @@ fn internet_grant_and_masquerade_match_golden() {
             .find(|l| l.contains(&format!("\"{tag}: internet")))
             .unwrap()
     };
-    // The owner's all_networks template still reaches private space beyond
+    // The owner's all_networks tier still reaches private space beyond
     // the configured networks; a guest reaches only public addresses.
     assert!(rule("personal").contains("ip daddr != @lan_real"));
     assert!(rule("family").contains("ip daddr != @not_public"));
@@ -140,8 +140,8 @@ fn internet_grant_and_masquerade_match_golden() {
 #[test]
 fn guest_internet_drops_the_home_public_ip() {
     let mut cfg = canonical_config();
-    cfg.templates[0].grants.push(Grant::Internet);
-    cfg.templates[1].grants.push(Grant::Internet);
+    cfg.grants[0].rules.push(Rule::Internet);
+    cfg.grants[1].rules.push(Rule::Internet);
     let home = std::net::Ipv4Addr::new(1, 2, 3, 4);
     let model = Model::resolve(&cfg, today())
         .unwrap()
@@ -150,7 +150,7 @@ fn guest_internet_drops_the_home_public_ip() {
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     check_golden("variants/hairpin.nft", &fw.contents);
     // In the not_public set, which only public-only tiers use: the owner's
-    // all_networks template (lan_real) reaches the router anyway, and a grant
+    // all_networks tier (lan_real) reaches the router anyway, and a grant
     // listed after `internet` that covers the address still works.
     let set: Vec<&str> = fw
         .contents
@@ -195,20 +195,20 @@ fn proxied_service_gets_no_direct_accept() {
         .skip_while(|l| !l.contains("chain prerouting"))
         .collect();
     assert!(pre[2].contains(
-        "iifname \"wg0\" ip saddr 10.8.2.0/24 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
+        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
     ), "{pre:#?}");
     assert!(pre.iter().any(|l| l.contains("netmap home")));
     assert!(!fw.contents.contains("personal/wireguard: https proxy"));
-    assert!(fw
-        .contents
-        .contains("iifname \"wg0\" ip saddr 10.8.2.0/24 ip daddr 10.8.0.1 tcp dport 8443 accept"));
+    assert!(fw.contents.contains(
+        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 10.8.0.1 tcp dport 8443 accept"
+    ));
 }
 
 #[test]
 fn no_proxy_redirect_where_a_grant_reaches_the_host_directly() {
     let mut cfg = canonical_config();
     cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
-    cfg.templates[1].grants.push(Grant::Host {
+    cfg.grants[1].rules.push(Rule::Host {
         host: "192.168.1.5".parse().unwrap(),
         ports: vec![PortSpec::one(parallax_core::model::Proto::Tcp, 443)],
     });
@@ -238,18 +238,18 @@ fn tunnel_peers_are_checked_on_every_packet() {
         assert!(body.iter().any(|l| l.contains("ct direction reply accept")));
         assert!(body.iter().any(|l| l.contains("ct state related accept")));
     }
-    // A packet sees its own template's rules only: one lookup by source
-    // address picks the chain, however many templates come before it.
+    // A packet sees its own tier's rules only: one lookup by source
+    // address picks the chain, however many peers and tiers there are.
     assert!(fw.contents.contains(
-        "iifname \"wg0\" ip saddr vmap { 10.8.1.0/24 : jump tier_personal, 10.8.2.0/24 : jump tier_family }"
+        "iifname \"wg0\" ip saddr vmap { 10.8.1.1 : jump tier_0, 10.8.1.2 : jump tier_0, 10.8.2.1 : jump tier_1 }"
     ));
     assert!(fw
         .contents
-        .contains("iifname \"tailscale0\" ip saddr @ts_family jump tier_family"));
+        .contains("iifname \"tailscale0\" ip saddr @ts_f62eed6a1a23f069 jump tier_1"));
     let family: Vec<&str> = fw
         .contents
         .lines()
-        .skip_while(|l| !l.contains("chain tier_family {"))
+        .skip_while(|l| !l.contains("chain tier_1 {"))
         .take_while(|l| !l.trim().starts_with('}'))
         .collect();
     assert_eq!(
@@ -274,13 +274,12 @@ fn gateway_address_turns_grants_into_input_accepts() {
     assert!(
         input
             .iter()
-            .any(|l| l.contains("ip saddr 10.8.1.0/24 ip daddr 192.168.1.5 accept")),
+            .any(|l| l.contains("ip saddr @wg_20deb125664a4b6d ip daddr 192.168.1.5 accept")),
         "{input:#?}"
     );
     assert!(
-        input
-            .iter()
-            .any(|l| l.contains("ip saddr 10.8.2.0/24 ip daddr 192.168.1.5 tcp dport 443 accept")),
+        input.iter().any(|l| l
+            .contains("ip saddr @wg_f62eed6a1a23f069 ip daddr 192.168.1.5 tcp dport 443 accept")),
         "{input:#?}"
     );
     let drop_idx = input
@@ -307,8 +306,8 @@ fn gateway_address_turns_grants_into_input_accepts() {
 fn guest_allowed_ips_are_granted_hosts_only_in_virtual_space() {
     let cfg = canonical_config();
     let model = Model::resolve(&cfg, today()).unwrap();
-    let family = model.template("family").unwrap();
-    let ips = generate::client::allowed_ips(&model, family, Platform::Mobile);
+    let sister = model.peer("sister-phone").unwrap();
+    let ips = generate::client::allowed_ips(&model, sister, Platform::Mobile);
     assert_eq!(
         ips,
         vec![
@@ -316,8 +315,8 @@ fn guest_allowed_ips_are_granted_hosts_only_in_virtual_space() {
             "10.8.0.1/32".parse().unwrap()
         ]
     );
-    let personal = model.template("personal").unwrap();
-    let ips = generate::client::allowed_ips(&model, personal, Platform::Linux);
+    let laptop = model.peer("laptop").unwrap();
+    let ips = generate::client::allowed_ips(&model, laptop, Platform::Linux);
     assert_eq!(
         ips,
         vec![
@@ -333,11 +332,11 @@ fn named_hosts_get_what_they_resolved_to() {
     // addresses.
     let mut cfg = canonical_config();
     cfg.services[0].host = Host::Name("immich.mydomain.com".into());
-    cfg.templates[1].grants.push(Grant::Host {
+    cfg.grants[1].rules.push(Rule::Host {
         host: Host::Name("game.mydomain.com".into()),
         ports: vec![PortSpec::one(Proto::Udp, 25565)],
     });
-    cfg.templates[1].grants.push(Grant::Host {
+    cfg.grants[1].rules.push(Rule::Host {
         host: Host::Name("nas.mydomain.com".into()),
         ports: Vec::new(),
     });
@@ -364,8 +363,8 @@ fn named_hosts_get_what_they_resolved_to() {
     check_golden("variants/named-hosts.nft", &fw.contents);
     let dns = bundle.of_kind(ArtifactKind::DnsRoutes).next().unwrap();
     check_golden("variants/named-hosts-dns.toml", &dns.contents);
-    let family = model.template("family").unwrap();
-    let ips = generate::client::allowed_ips(&model, family, Platform::Mobile);
+    let sister = model.peer("sister-phone").unwrap();
+    let ips = generate::client::allowed_ips(&model, sister, Platform::Mobile);
     let ips: Vec<String> = ips.iter().map(ToString::to_string).collect();
     assert_eq!(
         ips,
@@ -393,13 +392,13 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     let mut cfg = canonical_config();
     cfg.services[0].host = Host::Name("immich.mydomain.com".into());
     cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
-    let family = &mut cfg.templates[1];
-    family.grants.push(Grant::Host {
+    cfg.grants[1].rules.push(Rule::Host {
         host: Host::Name("game.mydomain.com".into()),
         ports: vec![PortSpec::one(Proto::Udp, 25565)],
     });
-    family.grants.push(Grant::Internet);
-    family.client.allowed_ips = parallax_core::model::AllowedIpsStrategy::FullTunnel;
+    cfg.grants[1].rules.push(Rule::Internet);
+    cfg.peers[2].wireguard.as_mut().unwrap().allowed_ips =
+        parallax_core::model::AllowedIpsStrategy::FullTunnel;
     let home = std::net::Ipv4Addr::new(1, 2, 3, 4);
     let names: parallax_core::names::Resolved = [
         ("immich.mydomain.com".to_string(), vec![home]),
@@ -426,7 +425,7 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     ), "{}", fw.contents);
     // HTTPS by name: redirected to the proxy, which connects to the public IP.
     assert!(fw.contents.contains(
-        "iifname \"wg0\" ip saddr 10.8.2.0/24 ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
+        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
     ), "{}", fw.contents);
     assert!(
         routes.contents.contains("upstream = \"1.2.3.4:443\""),
@@ -439,11 +438,11 @@ fn names_on_the_home_public_ip_are_port_forwards() {
         "{}",
         fw.contents
     );
-    // The owner's template (all_networks + internet) reaches the public IP
+    // The owner's tier (all_networks + internet) reaches the public IP
     // anyway: granting it the service adds no redirect to the proxy.
     let mut owner = cfg.clone();
-    owner.templates[0].grants.push(Grant::Internet);
-    owner.templates[0].grants.push(Grant::Service {
+    owner.grants[0].rules.push(Rule::Internet);
+    owner.grants[0].rules.push(Rule::Service {
         name: "immich".into(),
     });
     let model = Model::resolve(&owner, today())
@@ -454,18 +453,18 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     assert!(
         !fw.contents
-            .contains("ip saddr 10.8.1.0/24 ip daddr 1.2.3.4 tcp dport 443 dnat"),
+            .contains("ip saddr @wg_20deb125664a4b6d ip daddr 1.2.3.4 tcp dport 443 dnat"),
         "{}",
         fw.contents
     );
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     assert!(
-        !routes.contents.contains("10.8.1.0/24"),
+        !routes.contents.contains("10.8.1.1/32"),
         "{}",
         routes.contents
     );
     // Without `internet` the forward still goes out masqueraded.
-    cfg.templates[1].grants.retain(|g| *g != Grant::Internet);
+    cfg.grants[1].rules.retain(|g| *g != Rule::Internet);
     let model = Model::resolve(&cfg, today())
         .unwrap()
         .with_public_ip(Some(home))
@@ -499,11 +498,11 @@ fn port_lists_are_one_rule_per_protocol() {
         .map(|p| p.parse().unwrap())
         .collect();
     cfg.services.push(smb);
-    cfg.templates[1].grants.push(Grant::Service {
+    cfg.grants[1].rules.push(Rule::Service {
         name: "nas-smb".into(),
     });
     // And a game server's port on TCP and UDP, inline.
-    cfg.templates[1].grants.push(Grant::Host {
+    cfg.grants[1].rules.push(Rule::Host {
         host: "192.168.1.20".parse().unwrap(),
         ports: vec!["25565".parse().unwrap()],
     });
@@ -661,18 +660,28 @@ fn apply_preflight_names_missing_tools() {
 fn iptables_apply_refills_chains_in_one_restore() {
     let mut cfg = canonical_config();
     cfg.server.firewall.backend = FirewallBackend::IptablesNft;
-    cfg.templates[1].grants.push(Grant::Internet);
+    cfg.grants[1].rules.push(Rule::Internet);
     let model = Model::resolve(&cfg, today()).unwrap();
     let fs = fs_with_server_key();
     let bundle = generate::generate_all(&model, &fs).unwrap();
     let runner = RecordingRunner::new();
-    // A template was removed since the last apply: its chain is still there.
+    // A tier went away since the last apply: its chain is still there.
     runner.respond_to(
         "iptables",
         &["-t", "filter", "-S"],
         parallax_core::io::Output {
             status: 0,
             stdout: "-P INPUT ACCEPT\n-N PARALLAX_FORWARD\n-N PARALLAX_T0\n-N PARALLAX_T1\n-N PARALLAX_T2\n".into(),
+            stderr: String::new(),
+        },
+    );
+    // A set from before grants, one of a tier that went away, and a live one.
+    runner.respond_to(
+        "ipset",
+        &["list", "-n"],
+        parallax_core::io::Output {
+            status: 0,
+            stdout: "ts_family\nwg_0000000000000000\nwg_f62eed6a1a23f069\nnot_public\n".into(),
             stderr: String::new(),
         },
     );
@@ -683,6 +692,11 @@ fn iptables_apply_refills_chains_in_one_restore() {
     parallax_core::apply::apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
     let lines = runner.command_lines();
     let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
+    // Stale sets go after the restore; live ones stay.
+    let gone = |set: &str| pos(&format!("ipset destroy {set}"));
+    assert!(gone("ts_family").unwrap() > pos("iptables-restore").unwrap());
+    assert!(gone("wg_0000000000000000").is_some());
+    assert!(gone("wg_f62eed6a1a23f069").is_none() && gone("not_public").is_none());
     let restore = pos("iptables-restore --noflush").unwrap();
     // No flush of live chains before the restore: that left a window with
     // empty chains, and empty ones if the restore failed.
@@ -693,7 +707,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
     // Sets are filled aside and swapped in, never flushed while in use.
     assert!(pos("ipset swap parallax-swap not_public").unwrap() < restore);
     assert!(!lines.iter().any(|l| l == "ipset flush not_public"));
-    // Only the stale template chain goes.
+    // Only the stale tier chain goes.
     assert!(lines
         .iter()
         .any(|l| l == "iptables -t filter -X PARALLAX_T2"));
@@ -713,20 +727,25 @@ fn config_export_layout_matches_golden() {
     // on one line becomes a header in every entry of that section.
     let mut busy = canonical_config();
     busy.server.wan_interface = Some("eth1".into());
-    let t = &mut busy.templates[0];
-    t.grants = vec![
-        Grant::Network {
+    busy.grants[0].rules = vec![
+        Rule::Network {
             name: "home".into(),
         },
-        Grant::Host {
+        Rule::Host {
             host: std::net::Ipv4Addr::new(192, 168, 1, 10).into(),
             ports: vec![PortSpec::one(Proto::Udp, 53)],
         },
-        Grant::Internet,
+        Rule::Internet,
     ];
-    t.visible_networks = Some(vec!["home".into()]);
-    t.headscale.tag = Some("tag:personal-devices-with-a-long-name".into());
-    t.headscale.user = Some("someone-with-a-long-user-name-for-the-headscale-identity".into());
+    busy.grants.push(parallax_core::model::Grant {
+        name: "public".into(),
+        everyone: true,
+        rules: vec![Rule::PublicDns],
+    });
+    busy.peers[0].grants.push("family".into());
+    let wg = busy.peers[0].wireguard.as_mut().unwrap();
+    wg.visible_networks = Some(vec!["home".into()]);
+    wg.mtu = Some(1380);
     let text = busy.to_toml().unwrap();
     assert_eq!(Config::from_toml(&text).unwrap(), busy);
     check_golden("config/busy.toml", &text);
@@ -735,6 +754,170 @@ fn config_export_layout_matches_golden() {
     let mut empty = canonical_config();
     empty.peers.clear();
     let text = empty.to_toml().unwrap();
-    assert!(!text.contains("peer"), "{text}");
+    assert!(
+        !text.contains("# Peers") && !text.contains("[[peer]]"),
+        "{text}"
+    );
     assert_eq!(Config::from_toml(&text).unwrap(), empty);
+}
+
+/// A file written before grants replaced templates imports as the same
+/// access: each template a grant, each peer its template's grant and
+/// client settings.
+#[test]
+fn template_configs_import_as_grants() {
+    let old = std::fs::read_to_string(golden_dir().join("config/legacy-templates.toml")).unwrap();
+    assert_eq!(Config::from_toml(&old).unwrap(), canonical_config());
+    let both = old.replacen(
+        "template = \"personal\"",
+        "template = \"personal\"\ngrants = [\"family\"]",
+        1,
+    );
+    let err = Config::from_toml(&both).unwrap_err().to_string();
+    assert!(
+        err.contains("peer 'router' has both template and grants"),
+        "{err}"
+    );
+    // A template that isn't there doesn't bind to a grant of that name.
+    let new = canonical_config().to_toml().unwrap().replacen(
+        "grants = [\"personal\"]",
+        "template = \"personal\"",
+        1,
+    );
+    let err = Config::from_toml(&new).unwrap_err().to_string();
+    assert!(
+        err.contains("peer 'router' has template 'personal', which isn't defined"),
+        "{err}"
+    );
+}
+
+/// Grants decide access at the gateway, not in the device's config: a peer
+/// whose grants change keeps its address, and its exported config only
+/// differs in comments (and in `AllowedIPs` when that follows the grants,
+/// `grants_only`).
+#[test]
+fn changing_grants_keeps_the_address_and_the_exported_config() {
+    let lines = |cfg: &Config, peer: &str| {
+        let model = Model::resolve(cfg, today()).unwrap();
+        let peer = model.peer(peer).unwrap();
+        let export = generate::client::render(&model, peer, Platform::Linux).unwrap();
+        export
+            .contents
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let before = canonical_config();
+    let mut after = before.clone();
+    after.peers[1].grants = vec!["family".into()];
+    after.grants.push(parallax_core::model::Grant {
+        name: "photos".into(),
+        everyone: true,
+        rules: vec![Rule::Network {
+            name: "home".into(),
+        }],
+    });
+    assert_eq!(lines(&before, "laptop"), lines(&after, "laptop"));
+    assert_eq!(after.peers[1].wireguard, before.peers[1].wireguard);
+    // The firewall follows: the laptop is in another tier now.
+    let model = Model::resolve(&after, today()).unwrap();
+    let laptop = model.tier_of(model.peer("laptop").unwrap()).unwrap();
+    assert_eq!(laptop.label(), "family+photos");
+}
+
+/// A peer with two grants reaches what both give and nothing more; a grant
+/// for everyone reaches every peer.
+#[test]
+fn a_peer_reaches_the_union_of_its_grants() {
+    let mut cfg = canonical_config();
+    cfg.services.push(parallax_core::model::Service {
+        name: "nas".into(),
+        host: std::net::Ipv4Addr::new(192, 168, 1, 9).into(),
+        ports: vec![PortSpec::one(Proto::Tcp, 445)],
+        nginx_vhost: false,
+        hostnames: Vec::new(),
+    });
+    cfg.grants.push(parallax_core::model::Grant {
+        name: "files".into(),
+        everyone: false,
+        rules: vec![Rule::Service { name: "nas".into() }],
+    });
+    cfg.grants.push(parallax_core::model::Grant {
+        name: "public".into(),
+        everyone: true,
+        rules: vec![Rule::PublicDns],
+    });
+    cfg.peers[2].grants.push("files".into());
+    let bundle = bundle_for(&cfg);
+    let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // The rules of the tier chain ending in `label`'s default deny.
+    let chain = |label: &str| -> Vec<String> {
+        let deny = format!("drop comment \"{label}: default deny\"");
+        fw.contents
+            .split("chain tier_")
+            .find(|c| c.contains(&deny))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .take_while(|l| *l != "}")
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        chain("family+files+public"),
+        [
+            "oifname \"eth0\" ip daddr 192.168.1.5 tcp dport 443 accept comment \"family+files+public: service immich\"",
+            "oifname \"eth0\" ip daddr 192.168.1.9 tcp dport 445 accept comment \"family+files+public: service nas\"",
+            "drop comment \"family+files+public: default deny\"",
+        ]
+    );
+    // Everyone has `public`: the owner's tier too, and every tier answers
+    // public names.
+    assert_eq!(chain("personal+public").len(), 2);
+    let dns = bundle.of_kind(ArtifactKind::DnsRoutes).next().unwrap();
+    let routes = generate::dns::DnsRoutes::from_toml(&dns.contents).unwrap();
+    assert!(routes.tiers.iter().all(|t| t.public), "{routes:?}");
+}
+
+/// An address that changes hands in one save: the old key is off the
+/// interface before the firewall gives the address its new owner's access.
+#[test]
+fn apply_takes_a_moved_address_off_its_old_key_first() {
+    let cfg = canonical_config();
+    let model = Model::resolve(&cfg, today()).unwrap();
+    let fs = fs_with_server_key();
+    let bundle = generate::generate_all(&model, &fs).unwrap();
+    let wg = |n: usize| cfg.peers[n].wireguard.as_ref().unwrap();
+    let old_key = parallax_core::testing::keypair(77).public.to_base64();
+    let runner = RecordingRunner::new();
+    let wide_key = parallax_core::testing::keypair(78).public.to_base64();
+    // Live: the router with an extra address of nobody's (syncconf's job),
+    // the laptop's address on another key, a key holding a whole range,
+    // and the sister's phone as configured.
+    runner.respond_to(
+        "wg",
+        &["show", "wg0", "allowed-ips"],
+        parallax_core::io::Output {
+            status: 0,
+            stdout: format!(
+                "{}\t10.8.1.1/32 10.8.9.9/32 fd00::2/128\n{old_key}\t10.8.1.2/32\n{wide_key}\t10.8.2.0/24\n{}\t10.8.2.1/32\n",
+                wg(0).public_key.to_base64(),
+                wg(2).public_key.to_base64()
+            ),
+            stderr: String::new(),
+        },
+    );
+    let sys = System {
+        fs: &fs,
+        runner: &runner,
+    };
+    parallax_core::apply::apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+    let lines = runner.command_lines();
+    let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();
+    let removed: Vec<&String> = lines.iter().filter(|l| l.ends_with(" remove")).collect();
+    assert_eq!(removed.len(), 2, "{lines:#?}");
+    assert!(pos(&format!("wg set wg0 peer {old_key} remove")) < pos("nft -f"));
+    assert!(pos(&format!("wg set wg0 peer {wide_key} remove")) < pos("nft -f"));
 }

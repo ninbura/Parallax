@@ -13,6 +13,7 @@ use crate::date::Date;
 use crate::model::*;
 use crate::names::{self, in_zone, Resolved};
 use crate::netmap::Mapping;
+use crate::tier::{self, Tier};
 use crate::{Error, Result, TAILSCALE_CGNAT};
 
 /// A validated configuration plus what generation needs from outside it:
@@ -24,10 +25,11 @@ pub struct Model<'a> {
     today: Date,
     public_ip: Option<Ipv4Addr>,
     names: Resolved,
+    tiers: Vec<Tier<'a>>,
     warnings: Vec<String>,
 }
 
-/// One destination a template's members may reach, with the network it sits on.
+/// One destination a tier's members may reach, with the network it sits on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reach<'a> {
     /// Human label for comments (`service immich`, `network home`).
@@ -120,20 +122,20 @@ fn network_of_host<'a>(config: &'a Config, host: &Host) -> Option<&'a Network> {
     }
 }
 
-/// Would `grant` let a template reach web ports on `host` directly, past the
+/// Would `rule` let a peer reach web ports on `host` directly, past the
 /// proxy? Plain HTTP on tcp/80 and HTTP/3 on udp/443 often serve every site
 /// on the box too. Hosts compare as written: a name and an address for the
 /// same machine don't match.
-fn reaches_web_directly(config: &Config, grant: &Grant, host: &Host) -> bool {
+fn reaches_web_directly(config: &Config, rule: &Rule, host: &Host) -> bool {
     let web = |ports: &[PortSpec]| ranges(ports).into_iter().any(names::covers_web);
-    match grant {
-        Grant::AllNetworks => true,
-        Grant::Network { name } => network_of_host(config, host).is_some_and(|n| &n.name == name),
-        Grant::Host { host: h, ports } => h == host && (ports.is_empty() || web(ports)),
-        Grant::Service { name } => config
+    match rule {
+        Rule::AllNetworks => true,
+        Rule::Network { name } => network_of_host(config, host).is_some_and(|n| &n.name == name),
+        Rule::Host { host: h, ports } => h == host && (ports.is_empty() || web(ports)),
+        Rule::Service { name } => config
             .service(name)
             .is_some_and(|s| !s.is_proxied() && &s.host == host && web(&s.ports)),
-        Grant::Internet => false,
+        Rule::Internet | Rule::PublicDns => false,
     }
 }
 
@@ -146,16 +148,25 @@ fn port_list(ports: &[PortSpec]) -> String {
         .join(", ")
 }
 
-/// A grant as written in the config, for messages.
-fn describe_grant(grant: &Grant) -> String {
-    match grant {
-        Grant::AllNetworks => "all_networks".into(),
-        Grant::Network { name } => format!("network '{name}'"),
-        Grant::Host { host, ports } if ports.is_empty() => format!("host {host}"),
-        Grant::Host { host, ports } => format!("host {host} {}", port_list(ports)),
-        Grant::Service { name } => format!("service '{name}'"),
-        Grant::Internet => "internet".into(),
+/// A rule as written in the config, for messages.
+pub(crate) fn describe_rule(rule: &Rule) -> String {
+    match rule {
+        Rule::AllNetworks => "all_networks".into(),
+        Rule::Network { name } => format!("network '{name}'"),
+        Rule::Host { host, ports } if ports.is_empty() => format!("host {host}"),
+        Rule::Host { host, ports } => format!("host {host} {}", port_list(ports)),
+        Rule::Service { name } => format!("service '{name}'"),
+        Rule::Internet => "internet".into(),
+        Rule::PublicDns => "public_dns".into(),
     }
+}
+
+/// The first grant of `tier` holding `rule`, for messages.
+fn grant_with<'a>(tier: &Tier<'a>, rule: &Rule) -> &'a str {
+    tier.grants
+        .iter()
+        .find(|g| g.rules.contains(rule))
+        .map_or("", |g| g.name.as_str())
 }
 
 /// The label for a reach on `host`: the name with the address it resolved
@@ -169,12 +180,12 @@ fn host_label(host: &Host, ip: Ipv4Addr) -> String {
 }
 
 /// What's wrong with `host` as written, beginning with the host itself. An
-/// address must be on a configured network (grants use real addresses); a
+/// address must be on a configured network (rules use real addresses); a
 /// name must be under one's domains, whose resolvers are asked for it.
 fn host_problem(config: &Config, host: &Host) -> Option<String> {
     match host {
         Host::Ip(ip) => (!config.networks.iter().any(|n| n.subnet.contains(ip))).then(|| {
-            format!("{ip} is not inside any configured network (grants use real addresses)")
+            format!("{ip} is not inside any configured network (rules use real addresses)")
         }),
         Host::Name(name) if !valid_hostname(name) => Some(format!(
             "'{name}' is neither an IPv4 address nor a valid lower-case DNS name"
@@ -210,6 +221,7 @@ impl<'a> Model<'a> {
                 today,
                 public_ip: None,
                 names: Resolved::new(),
+                tiers: tier::tiers(config),
                 warnings,
             })
         } else {
@@ -268,10 +280,10 @@ impl<'a> Model<'a> {
 
     /// The reach for `port` on `ip`, an address `host` stands for: on the
     /// network that holds it, or a port forward on the home's public IP
-    /// when `template` may have that one.
+    /// when `tier` may have that one.
     fn reach_at(
         &self,
-        template: &Template,
+        tier: &Tier<'_>,
         label: String,
         ip: Ipv4Addr,
         ports: Option<Vec<PortRange>>,
@@ -282,7 +294,7 @@ impl<'a> Model<'a> {
         if Some(ip) == self.public_ip {
             // Every port of it is never a reach.
             let ports = ports?;
-            return names::public_ip_refusal(template, Some(&ports), proxied)
+            return names::public_ip_refusal(tier, Some(&ports), proxied)
                 .is_none()
                 .then_some(Reach {
                     label,
@@ -318,11 +330,35 @@ impl<'a> Model<'a> {
         &self.config.server
     }
 
-    pub fn template(&self, name: &str) -> Result<&'a Template> {
-        self.config.template(name).ok_or_else(|| Error::NotFound {
-            kind: "template",
+    pub fn grant(&self, name: &str) -> Result<&'a Grant> {
+        self.config.grant(name).ok_or_else(|| Error::NotFound {
+            kind: "grant",
             name: name.to_string(),
         })
+    }
+
+    /// Every tier in use ([`crate::tier`]).
+    pub fn tiers(&self) -> &[Tier<'a>] {
+        &self.tiers
+    }
+
+    /// The tier `peer` is in; `None` when it has no grants at all.
+    pub fn tier_of(&self, peer: &Peer) -> Option<&Tier<'a>> {
+        self.tiers
+            .iter()
+            .find(|t| t.peers.iter().any(|p| p.name == peer.name))
+    }
+
+    /// Active peers of `tier` on `transport`.
+    pub fn members_on<'t>(
+        &'t self,
+        tier: &'t Tier<'a>,
+        transport: TransportKind,
+    ) -> impl Iterator<Item = &'a Peer> + 't {
+        tier.peers
+            .iter()
+            .copied()
+            .filter(move |p| p.transport == transport && p.is_active(self.today))
     }
 
     pub fn peer(&self, name: &str) -> Result<&'a Peer> {
@@ -337,19 +373,15 @@ impl<'a> Model<'a> {
         self.config.peers.iter().filter(|p| p.is_active(self.today))
     }
 
-    /// Active peers on `transport` belonging to `template` (any template if `None`).
-    pub fn peers_on(
-        &self,
-        transport: TransportKind,
-        template: Option<&'a str>,
-    ) -> impl Iterator<Item = &'a Peer> + '_ {
+    /// Active peers on `transport`.
+    pub fn peers_on(&self, transport: TransportKind) -> impl Iterator<Item = &'a Peer> + '_ {
         self.active_peers()
-            .filter(move |p| p.transport == transport && template.is_none_or(|t| p.template == t))
+            .filter(move |p| p.transport == transport)
     }
 
-    /// Networks whose routes this template's clients receive.
-    pub fn visible_networks(&self, template: &Template) -> Vec<&'a Network> {
-        match &template.visible_networks {
+    /// Networks whose routes this client receives.
+    pub fn visible_networks(&self, client: &WireGuardPeer) -> Vec<&'a Network> {
+        match &client.visible_networks {
             None => self.config.networks.iter().collect(),
             Some(names) => names
                 .iter()
@@ -371,17 +403,17 @@ impl<'a> Model<'a> {
             .or_else(|| network_of_host(self.config, host))
     }
 
-    /// Every destination the template's grants resolve to, in grant order, deduplicated.
-    pub fn reaches(&self, template: &Template) -> Vec<Reach<'a>> {
+    /// Every destination the tier's rules resolve to, in rule order, deduplicated.
+    pub fn reaches(&self, tier: &Tier<'_>) -> Vec<Reach<'a>> {
         let mut out: Vec<Reach<'a>> = Vec::new();
         let mut push = |r: Reach<'a>| {
             if !out.contains(&r) {
                 out.push(r);
             }
         };
-        for grant in &template.grants {
-            match grant {
-                Grant::AllNetworks => {
+        for rule in &tier.rules {
+            match rule {
+                Rule::AllNetworks => {
                     for n in &self.config.networks {
                         push(Reach {
                             label: format!("network {}", n.name),
@@ -394,7 +426,7 @@ impl<'a> Model<'a> {
                         });
                     }
                 }
-                Grant::Network { name } => {
+                Rule::Network { name } => {
                     if let Some(n) = self.config.network(name) {
                         push(Reach {
                             label: format!("network {}", n.name),
@@ -409,58 +441,58 @@ impl<'a> Model<'a> {
                 }
                 // Never every port of the home's public IP: `reach_at`
                 // gives a port forward named ports only.
-                Grant::Host { host, ports } => {
+                Rule::Host { host, ports } => {
                     let ranges = (!ports.is_empty()).then(|| ranges(ports));
                     for ip in self.addresses(host) {
                         let label = host_label(host, ip);
-                        if let Some(r) = self.reach_at(template, label, ip, ranges.clone(), false) {
+                        if let Some(r) = self.reach_at(tier, label, ip, ranges.clone(), false) {
                             push(r);
                         }
                     }
                 }
-                Grant::Service { name } => {
+                Rule::Service { name } => {
                     if let Some(s) = self.config.service(name) {
                         for ip in self.addresses(&s.host) {
                             let label = format!("service {}", s.name);
                             let ports = Some(ranges(&s.ports));
-                            if let Some(r) =
-                                self.reach_at(template, label, ip, ports, s.is_proxied())
-                            {
+                            if let Some(r) = self.reach_at(tier, label, ip, ports, s.is_proxied()) {
                                 push(r);
                             }
                         }
                     }
                 }
-                Grant::Internet => push(Reach {
+                Rule::Internet => push(Reach {
                     label: "internet".to_string(),
                     kind: ReachKind::Internet,
                 }),
+                // DNS only: nothing to reach.
+                Rule::PublicDns => {}
             }
         }
         out
     }
 
-    /// Does `template` reach `service` directly (or through a wider grant)?
+    /// Does `tier` reach `service` directly (or through a wider rule)?
     /// Proxied reaches don't count: the proxy connects from the gateway, and
     /// sibling sites on the same address and port must not inherit them.
-    pub fn reaches_service(&self, template: &Template, service: &Service) -> bool {
+    pub fn reaches_service(&self, tier: &Tier<'_>, service: &Service) -> bool {
         let ranges = ranges(&service.ports);
         self.addresses(&service.host)
             .into_iter()
-            .any(|ip| ranges.iter().any(|r| self.reaches_range(template, ip, *r)))
+            .any(|ip| ranges.iter().any(|r| self.reaches_range(tier, ip, *r)))
     }
 
-    /// Does `template` reach `proto/port` on `host` directly, without the
+    /// Does `tier` reach `proto/port` on `host` directly, without the
     /// proxy? See [`Model::reaches_range`].
     pub fn reaches_directly(
         &self,
-        template: &Template,
+        tier: &Tier<'_>,
         host: Ipv4Addr,
         proto: Proto,
         port: u16,
     ) -> bool {
         self.reaches_range(
-            template,
+            tier,
             host,
             PortRange {
                 proto,
@@ -470,19 +502,16 @@ impl<'a> Model<'a> {
         )
     }
 
-    /// Does `template` reach any of `range` on `host` directly, without the
-    /// proxy? Only LAN grants and port forwards count; `internet` never
+    /// Does `tier` reach any of `range` on `host` directly, without the
+    /// proxy? Only LAN rules and port forwards count; `internet` never
     /// covers a configured network.
-    pub fn reaches_range(&self, template: &Template, host: Ipv4Addr, range: PortRange) -> bool {
+    pub fn reaches_range(&self, tier: &Tier<'_>, host: Ipv4Addr, range: PortRange) -> bool {
         // The owner's `internet` (with `all_networks`) reaches the home's
         // public IP like any public address.
-        if Some(host) == self.public_ip
-            && template.grants.contains(&Grant::AllNetworks)
-            && template.grants.contains(&Grant::Internet)
-        {
+        if Some(host) == self.public_ip && tier.reaches_everything() {
             return true;
         }
-        self.reaches(template).iter().any(|r| match &r.kind {
+        self.reaches(tier).iter().any(|r| match &r.kind {
             ReachKind::Lan { proxied: true, .. } | ReachKind::HomePublic { proxied: true, .. } => {
                 false
             }
@@ -526,12 +555,9 @@ impl<'a> Model<'a> {
             .or_else(|| self.config.networks.first().map(|n| n.interface.as_str()))
     }
 
-    /// Any template grants internet egress.
-    pub fn any_internet_grant(&self) -> bool {
-        self.config
-            .templates
-            .iter()
-            .any(|t| t.grants.contains(&Grant::Internet))
+    /// Some tier has internet egress.
+    pub fn any_internet(&self) -> bool {
+        self.tiers.iter().any(|t| t.has(&Rule::Internet))
     }
 
     /// Every (zone, network) pair, in configuration order.
@@ -543,10 +569,10 @@ impl<'a> Model<'a> {
             .collect()
     }
 
-    /// Routing domains for a template's clients: zones of its visible networks.
-    pub fn routing_domains(&self, template: &Template) -> Vec<&'a str> {
+    /// Routing domains for a client: zones of its visible networks.
+    pub fn routing_domains(&self, client: &WireGuardPeer) -> Vec<&'a str> {
         let mut out = Vec::new();
-        for n in self.visible_networks(template) {
+        for n in self.visible_networks(client) {
             for d in &n.domains {
                 if !out.contains(&d.as_str()) {
                     out.push(d.as_str());
@@ -624,16 +650,6 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
             ));
         }
     }
-    if let Some(listen) = server.dns.listen {
-        for t in &config.templates {
-            if t.wireguard.pool.contains(&listen) {
-                errors.push(format!(
-                    "server.dns.listen {listen} lies inside the pool {} of template '{}'; pick an address outside every pool",
-                    t.wireguard.pool, t.name
-                ));
-            }
-        }
-    }
     let shim = server.dns.listen.unwrap_or_else(|| wg.gateway_address());
     let proxy = server.proxy.listen.unwrap_or_else(|| wg.gateway_address());
     if server.proxy.port == 0 {
@@ -658,13 +674,12 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                 "server.proxy.listen {listen} is not a unicast address the gateway's tunnel peers can be redirected to; leave it unset (the WireGuard gateway address) or use one of the gateway's own addresses"
             ));
         }
-        for t in &config.templates {
-            if t.wireguard.pool.contains(&listen) {
-                errors.push(format!(
-                    "server.proxy.listen {listen} lies inside the pool {} of template '{}'; pick an address outside every pool",
-                    t.wireguard.pool, t.name
-                ));
-            }
+    }
+    if let Some(mtu) = wg.peer_defaults.mtu {
+        if !(1280..=1500).contains(&mtu) {
+            errors.push(format!(
+                "server.wireguard.peer_defaults.mtu {mtu} is outside 1280..=1500"
+            ));
         }
     }
 
@@ -902,149 +917,91 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         }
     }
 
-    // --- templates ------------------------------------------------------
-    let mut seen_templates: BTreeSet<&str> = BTreeSet::new();
+    // --- grants ---------------------------------------------------------
+    let mut seen_grants: BTreeSet<&str> = BTreeSet::new();
     let wan = config
         .server
         .wan_interface
         .as_deref()
         .or_else(|| config.networks.first().map(|n| n.interface.as_str()));
-    for t in &config.templates {
-        let ctx = format!("template '{}'", t.name);
-        if !valid_ident(&t.name) {
+    for g in &config.grants {
+        let ctx = format!("grant '{}'", g.name);
+        if !valid_ident(&g.name) {
             errors.push(format!("{ctx}: name must be a plain identifier"));
         }
-        if !seen_templates.insert(&t.name) {
+        if !seen_grants.insert(&g.name) {
             errors.push(format!("{ctx}: duplicate name"));
         }
-        let pool = t.wireguard.pool;
-        if pool.trunc() != pool {
-            errors.push(format!(
-                "{ctx}: wireguard.pool {pool} has host bits set; write it as {}",
-                pool.trunc()
-            ));
+        if g.rules.is_empty() {
+            warnings.push(format!("{ctx}: has no rules; it gives nothing"));
         }
-        if !wg.supernet.contains(&pool) {
-            errors.push(format!(
-                "{ctx}: wireguard.pool {pool} is not inside the supernet {}",
-                wg.supernet
-            ));
-        }
-        if pool.prefix_len() > 30 {
-            errors.push(format!(
-                "{ctx}: wireguard.pool {pool} is too small for peers; use /30 or larger"
-            ));
-        }
-        if pool.contains(&wg.gateway_address()) {
-            warnings.push(format!(
-                "{ctx}: wireguard.pool {pool} contains the gateway address {}; it will be skipped",
-                wg.gateway_address()
-            ));
-        }
-        if t.headscale.user.is_none() && t.headscale.tag.is_none() {
-            errors.push(format!(
-                "{ctx}: headscale needs a user and/or a tag so Tailscale devices can be placed in this tier"
-            ));
-        }
-        if let Some(tag) = &t.headscale.tag {
-            if !tag.starts_with("tag:") || tag.len() <= 4 {
-                errors.push(format!(
-                    "{ctx}: headscale.tag '{tag}' must look like 'tag:name'"
-                ));
-            }
-        }
-        if let Some(user) = &t.headscale.user {
-            if user.is_empty() {
-                errors.push(format!("{ctx}: headscale.user must not be empty"));
-            }
-        }
-        if let Some(vis) = &t.visible_networks {
-            for v in vis {
-                if config.network(v).is_none() {
-                    errors.push(format!(
-                        "{ctx}: visible_networks mentions unknown network '{v}'"
-                    ));
-                }
-            }
-        }
-        if t.grants.is_empty() {
-            warnings.push(format!("{ctx}: has no grants; its peers can reach nothing"));
-        }
-        for g in &t.grants {
-            match g {
-                Grant::AllNetworks => {}
-                Grant::Network { name } => {
+        for rule in &g.rules {
+            match rule {
+                Rule::AllNetworks | Rule::PublicDns => {}
+                Rule::Network { name } => {
                     if config.network(name).is_none() {
-                        errors.push(format!("{ctx}: grant refers to unknown network '{name}'"));
+                        errors.push(format!("{ctx}: rule refers to unknown network '{name}'"));
                     }
                 }
-                Grant::Host { host, ports } => {
+                Rule::Host { host, ports } => {
                     if let Some(problem) = host_problem(config, host) {
-                        errors.push(format!("{ctx}: grant host {problem}"));
+                        errors.push(format!("{ctx}: rule host {problem}"));
                     }
                     if let Some(problem) = ports_problem(ports) {
-                        errors.push(format!("{ctx}: grant for {host}: {problem}"));
+                        errors.push(format!("{ctx}: rule for {host}: {problem}"));
                     }
                 }
-                Grant::Service { name } => {
+                Rule::Service { name } => {
                     if config.service(name).is_none() {
-                        errors.push(format!("{ctx}: grant refers to unknown service '{name}'"));
+                        errors.push(format!("{ctx}: rule refers to unknown service '{name}'"));
                     }
                 }
-                Grant::Internet => {
+                Rule::Internet => {
                     if wan.is_none() {
                         errors.push(format!(
-                            "{ctx}: internet grant needs server.wan_interface (or at least one network)"
+                            "{ctx}: internet rule needs server.wan_interface (or at least one network)"
                         ));
                     }
                 }
             }
         }
-        for g in &t.grants {
-            let Grant::Service { name } = g else { continue };
+        // Union only: an everyone grant can't be taken away from anyone.
+        let opens: Vec<String> = g
+            .rules
+            .iter()
+            .filter(|r| **r != Rule::PublicDns)
+            .map(describe_rule)
+            .collect();
+        if g.everyone && !opens.is_empty() {
+            warnings.push(format!(
+                "{ctx}: applies to everyone and opens {}: every peer, current and future, reaches that",
+                opens.join(", ")
+            ));
+        }
+    }
+
+    // --- tiers: what combinations of grants reach together ---------------
+    let tiers = tier::tiers(config);
+    for t in &tiers {
+        let ctx = t.context();
+        for rule in &t.rules {
+            let Rule::Service { name } = rule else {
+                continue;
+            };
             let Some(s) = config.service(name).filter(|s| s.is_proxied()) else {
                 continue;
             };
             for o in t
-                .grants
+                .rules
                 .iter()
                 .filter(|o| reaches_web_directly(config, o, &s.host))
             {
                 warnings.push(format!(
-                    "{ctx}: grant {} reaches {} directly, which can bypass the hostname check for service '{}': other sites on that host may answer there",
-                    describe_grant(o),
+                    "{ctx}: rule {} of grant '{}' reaches {} directly, which can bypass the hostname check for service '{}': other sites on that host may answer there",
+                    describe_rule(o),
+                    grant_with(t, o),
                     s.host,
                     s.name
-                ));
-            }
-        }
-        // Allowed: a locked-down device that reaches only what it's granted.
-        if t.client.allowed_ips == AllowedIpsStrategy::FullTunnel
-            && !t.grants.contains(&Grant::Internet)
-        {
-            warnings.push(format!(
-                "{ctx}: client.allowed_ips = full_tunnel routes everything through the gateway but there is no internet grant, so its devices reach only what's granted"
-            ));
-        }
-        if let Some(mtu) = t.client.mtu {
-            if !(1280..=1500).contains(&mtu) {
-                errors.push(format!("{ctx}: client.mtu {mtu} is outside 1280..=1500"));
-            }
-        }
-        if t.dns.wireguard == DnsMode::Split
-            && !config.networks.iter().any(|n| !n.domains.is_empty())
-        {
-            warnings.push(format!(
-                "{ctx}: split DNS is selected but no network declares domains; clients get no routing domains"
-            ));
-        }
-    }
-    for (i, a) in config.templates.iter().enumerate() {
-        for b in config.templates.iter().skip(i + 1) {
-            if overlaps(a.wireguard.pool, b.wireguard.pool) {
-                errors.push(format!(
-                    "templates '{}' and '{}' have overlapping pools ({} and {})",
-                    a.name, b.name, a.wireguard.pool, b.wireguard.pool
                 ));
             }
         }
@@ -1052,6 +1009,7 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
 
     // --- peers ----------------------------------------------------------
     let mut seen_peers: BTreeSet<&str> = BTreeSet::new();
+    let mut split_dns: Vec<&str> = Vec::new();
     let mut addresses: BTreeMap<Ipv4Addr, &str> = BTreeMap::new();
     let mut pubkeys: BTreeMap<String, &str> = BTreeMap::new();
     for p in &config.peers {
@@ -1062,9 +1020,20 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         if !seen_peers.insert(&p.name) {
             errors.push(format!("{ctx}: duplicate name"));
         }
-        let template = config.template(&p.template);
-        if template.is_none() {
-            errors.push(format!("{ctx}: unknown template '{}'", p.template));
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for g in &p.grants {
+            if config.grant(g).is_none() {
+                errors.push(format!("{ctx}: unknown grant '{g}'"));
+            }
+            if !seen.insert(g) {
+                errors.push(format!("{ctx}: lists grant '{g}' twice"));
+            }
+        }
+        let tier = tiers
+            .iter()
+            .find(|t| t.peers.iter().any(|o| o.name == p.name));
+        if tier.is_none() {
+            warnings.push(format!("{ctx}: has no grants; it reaches nothing"));
         }
         match p.transport {
             TransportKind::WireGuard => {
@@ -1078,6 +1047,31 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                         "{ctx}: transport is wireguard but there is no [peer.wireguard] block with a public_key"
                     )),
                     Some(w) => {
+                        if w.dns == DnsMode::Split {
+                            split_dns.push(p.name.as_str());
+                        }
+                        if let Some(vis) = &w.visible_networks {
+                            for v in vis {
+                                if config.network(v).is_none() {
+                                    errors.push(format!(
+                                        "{ctx}: visible_networks mentions unknown network '{v}'"
+                                    ));
+                                }
+                            }
+                        }
+                        // Allowed: a locked-down device that reaches only what it's granted.
+                        if w.allowed_ips == AllowedIpsStrategy::FullTunnel
+                            && !tier.is_some_and(|t| t.has(&Rule::Internet))
+                        {
+                            warnings.push(format!(
+                                "{ctx}: allowed_ips = full_tunnel routes everything through the gateway but none of its grants has an internet rule, so it reaches only what's granted"
+                            ));
+                        }
+                        if let Some(mtu) = w.mtu {
+                            if !(1280..=1500).contains(&mtu) {
+                                errors.push(format!("{ctx}: mtu {mtu} is outside 1280..=1500"));
+                            }
+                        }
                         let key = w.public_key.to_base64();
                         if let Some(other) = pubkeys.insert(key, &p.name) {
                             errors.push(format!("{ctx}: public_key is already used by peer '{other}'"));
@@ -1091,18 +1085,16 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                         }
                         match w.address {
                             None => errors.push(format!(
-                                "{ctx}: has no address yet; `parallax config import` or `config edit` assigns one from the template pool"
+                                "{ctx}: has no address yet; `parallax config import` or `config edit` assigns one from server.wireguard.supernet"
                             )),
                             Some(addr) => {
-                                if let Some(t) = template {
-                                    if !t.wireguard.pool.contains(&addr) {
-                                        errors.push(format!(
-                                            "{ctx}: address {addr} is outside the pool {} of template '{}'",
-                                            t.wireguard.pool, t.name
-                                        ));
-                                    }
+                                if !wg.supernet.contains(&addr) {
+                                    errors.push(format!(
+                                        "{ctx}: address {addr} is outside server.wireguard.supernet {}",
+                                        wg.supernet
+                                    ));
                                 }
-                                if addr == wg.gateway_address() || addr == shim {
+                                if addr == wg.gateway_address() || addr == shim || addr == proxy {
                                     errors.push(format!(
                                         "{ctx}: address {addr} is reserved for the gateway"
                                     ));
@@ -1132,6 +1124,17 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                 }
             }
         }
+    }
+
+    if !split_dns.is_empty() && !config.networks.iter().any(|n| !n.domains.is_empty()) {
+        warnings.push(format!(
+            "split DNS is selected for {} but no network declares domains; those clients get no routing domains",
+            split_dns
+                .iter()
+                .map(|p| format!("peer '{p}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     (errors, warnings)
@@ -1227,14 +1230,10 @@ mod tests {
         assert!(has(&e, "overlaps the WireGuard supernet"), "{e:?}");
         let e = errors_of(|c| c.networks[0].mapped_to = Some("100.100.0.0/24".parse().unwrap()));
         assert!(has(&e, "overlaps the Tailscale range"), "{e:?}");
-        let e = errors_of(|c| c.templates[1].wireguard.pool = "10.8.1.0/24".parse().unwrap());
-        assert!(has(&e, "overlapping pools"), "{e:?}");
-        let e = errors_of(|c| c.templates[1].wireguard.pool = "10.9.1.0/24".parse().unwrap());
-        assert!(has(&e, "not inside the supernet"), "{e:?}");
     }
 
     #[test]
-    fn proxy_must_not_collide_with_the_shim_or_a_pool() {
+    fn proxy_must_not_collide_with_the_shim_or_a_peer() {
         let e = errors_of(|c| c.server.proxy.port = 53);
         assert!(has(&e, "both listen on 10.8.0.1:53"), "{e:?}");
         let e = errors_of(|c| c.server.proxy.port = 0);
@@ -1246,9 +1245,16 @@ mod tests {
                 "{e:?}"
             );
         }
-        let e = errors_of(|c| c.server.proxy.listen = Some("10.8.2.9".parse().unwrap()));
+        // Inside the supernet is fine, unless a peer holds the address.
         assert!(
-            has(&e, "lies inside the pool 10.8.2.0/24 of template 'family'"),
+            errors_of(|c| c.server.proxy.listen = Some("10.8.2.9".parse().unwrap())).is_empty()
+        );
+        let e = errors_of(|c| c.server.proxy.listen = Some("10.8.2.1".parse().unwrap()));
+        assert!(
+            has(
+                &e,
+                "peer 'sister-phone': address 10.8.2.1 is reserved for the gateway"
+            ),
             "{e:?}"
         );
     }
@@ -1256,15 +1262,22 @@ mod tests {
     #[test]
     fn detects_unknown_references() {
         let e = errors_of(|c| {
-            c.templates[1].grants = vec![Grant::Service {
+            c.grants[1].rules = vec![Rule::Service {
                 name: "nope".into(),
             }]
         });
         assert!(has(&e, "unknown service 'nope'"), "{e:?}");
-        let e = errors_of(|c| c.peers[0].template = "ghost".into());
-        assert!(has(&e, "unknown template 'ghost'"), "{e:?}");
+        let e = errors_of(|c| c.peers[0].grants = vec!["ghost".into()]);
+        assert!(has(&e, "peer 'router': unknown grant 'ghost'"), "{e:?}");
+        let e = errors_of(|c| c.peers[0].grants.push("personal".into()));
+        assert!(
+            has(&e, "peer 'router': lists grant 'personal' twice"),
+            "{e:?}"
+        );
+        let e = errors_of(|c| c.grants[1].name = "personal".into());
+        assert!(has(&e, "grant 'personal': duplicate name"), "{e:?}");
         let e = errors_of(|c| {
-            c.templates[0].grants = vec![Grant::Host {
+            c.grants[0].rules = vec![Rule::Host {
                 host: "10.99.0.1".parse().unwrap(),
                 ports: Vec::new(),
             }]
@@ -1273,11 +1286,38 @@ mod tests {
     }
 
     #[test]
-    fn detects_missing_headscale_identity_and_bad_tag() {
-        let e = errors_of(|c| c.templates[0].headscale = HeadscaleIdentity::default());
-        assert!(has(&e, "headscale needs a user and/or a tag"), "{e:?}");
-        let e = errors_of(|c| c.templates[1].headscale.tag = Some("family".into()));
-        assert!(has(&e, "must look like 'tag:name'"), "{e:?}");
+    fn grants_for_everyone_and_peers_without_grants_warn() {
+        let mut cfg = canonical_config();
+        cfg.grants.push(Grant {
+            name: "public".into(),
+            everyone: true,
+            rules: vec![Rule::PublicDns],
+        });
+        let (errors, warnings) = check(&cfg);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!has(&warnings, "applies to everyone"), "{warnings:?}");
+        cfg.grants[2].rules.push(Rule::Network {
+            name: "home".into(),
+        });
+        assert!(
+            has(
+                &check(&cfg).1,
+                "grant 'public': applies to everyone and opens network 'home': every peer, current and future, reaches that"
+            ),
+            "{:?}",
+            check(&cfg).1
+        );
+        let mut cfg = canonical_config();
+        cfg.peers[2].grants.clear();
+        let (errors, warnings) = check(&cfg);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            has(
+                &warnings,
+                "peer 'sister-phone': has no grants; it reaches nothing"
+            ),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -1289,10 +1329,20 @@ mod tests {
             c.peers[1].wireguard.as_mut().unwrap().address = a;
         });
         assert!(has(&e, "already used by peer"), "{e:?}");
-        let e = errors_of(|c| {
+        assert!(errors_of(|c| {
             c.peers[2].wireguard.as_mut().unwrap().address = Some("10.8.1.9".parse().unwrap())
+        })
+        .is_empty());
+        let e = errors_of(|c| {
+            c.peers[2].wireguard.as_mut().unwrap().address = Some("10.9.1.9".parse().unwrap())
         });
-        assert!(has(&e, "outside the pool"), "{e:?}");
+        assert!(
+            has(
+                &e,
+                "address 10.9.1.9 is outside server.wireguard.supernet 10.8.0.0/16"
+            ),
+            "{e:?}"
+        );
         let e = errors_of(|c| {
             let k = c.peers[0].wireguard.as_ref().unwrap().public_key.clone();
             c.peers[1].wireguard.as_mut().unwrap().public_key = k;
@@ -1303,11 +1353,14 @@ mod tests {
     #[test]
     fn full_tunnel_without_internet_is_a_warning() {
         let mut cfg = canonical_config();
-        cfg.templates[0].client.allowed_ips = AllowedIpsStrategy::FullTunnel;
+        cfg.peers[0].wireguard.as_mut().unwrap().allowed_ips = AllowedIpsStrategy::FullTunnel;
         let (errors, warnings) = check(&cfg);
         assert!(errors.is_empty(), "{errors:?}");
-        assert!(has(&warnings, "reach only what's granted"), "{warnings:?}");
-        cfg.templates[0].grants.push(Grant::Internet);
+        assert!(
+            has(&warnings, "peer 'router': allowed_ips = full_tunnel"),
+            "{warnings:?}"
+        );
+        cfg.grants[0].rules.push(Rule::Internet);
         assert!(!has(&check(&cfg).1, "full_tunnel"));
     }
 
@@ -1317,7 +1370,7 @@ mod tests {
         assert!(has(&e, "service 'immich': has no ports"), "{e:?}");
         // An older `port = 0` comes in as a port list with port 0.
         let e = errors_of(|c| {
-            c.templates[1].grants.push(Grant::Host {
+            c.grants[1].rules.push(Rule::Host {
                 host: "192.168.1.9".parse().unwrap(),
                 ports: vec![PortSpec::one(Proto::Tcp, 0)],
             })
@@ -1325,7 +1378,7 @@ mod tests {
         assert!(
             has(
                 &e,
-                "template 'family': grant for 192.168.1.9: '0/tcp' is not a port"
+                "grant 'family': rule for 192.168.1.9: '0/tcp' is not a port"
             ),
             "{e:?}"
         );
@@ -1350,13 +1403,16 @@ mod tests {
         let e = errors_of(|c| c.services[0].host = Host::Name("immich.mydomain.com".into()));
         assert!(e.is_empty(), "{e:?}");
         let e = errors_of(|c| {
-            c.templates[1].grants.push(Grant::Host {
+            c.grants[1].rules.push(Rule::Host {
                 host: Host::Name("game.otherdomain.com".into()),
                 ports: vec![PortSpec::one(Proto::Udp, 25565)],
             })
         });
         assert!(
-            has(&e, "template 'family': grant host game.otherdomain.com is not under any network's domains"),
+            has(
+                &e,
+                "grant 'family': rule host game.otherdomain.com is not under any network's domains"
+            ),
             "{e:?}"
         );
         for bad in ["192.168.1.300", "Nas.mydomain.com", "nas_1.mydomain.com"] {
@@ -1371,12 +1427,12 @@ mod tests {
     #[test]
     fn a_name_reaches_what_it_resolved_to() {
         let mut cfg = canonical_config();
-        cfg.templates[1].grants.push(Grant::Host {
+        cfg.grants[1].rules.push(Rule::Host {
             host: Host::Name("nas.mydomain.com".into()),
             ports: vec![PortSpec::one(Proto::Tcp, 445)],
         });
         let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
-        let family = m.template("family").unwrap();
+        let family = crate::testing::tier(&m, "family");
         // Not looked up yet: nothing beyond the service.
         assert_eq!(m.reaches(family).len(), 1);
         assert!(has(&m.name_problems(), "nas.mydomain.com didn't resolve"));
@@ -1389,6 +1445,7 @@ mod tests {
         )]
         .into();
         let m = m.with_names(found);
+        let family = crate::testing::tier(&m, "family");
         let r = m.reaches(family);
         assert_eq!(
             r.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
@@ -1408,7 +1465,7 @@ mod tests {
             )]
             .into(),
         );
-        assert_eq!(m.reaches(family).len(), 1);
+        assert_eq!(m.reaches(crate::testing::tier(&m, "family")).len(), 1);
         assert!(has(&m.name_problems(), "outside every configured network"));
     }
 
@@ -1425,7 +1482,7 @@ mod tests {
                 )]
                 .into(),
             );
-        let family = m.template("family").unwrap();
+        let family = crate::testing::tier(&m, "family");
         assert_eq!(
             m.reaches(family)[0].client_net(),
             Some("198.18.1.5/32".parse().unwrap())
@@ -1442,11 +1499,11 @@ mod tests {
     fn reaches_resolve_grants_and_dedupe() {
         let cfg = canonical_config();
         let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
-        let family = m.template("family").unwrap();
+        let family = crate::testing::tier(&m, "family");
         let r = m.reaches(family);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].client_net(), Some("198.18.1.5/32".parse().unwrap()));
-        let personal = m.template("personal").unwrap();
+        let personal = crate::testing::tier(&m, "personal");
         let immich = cfg.service("immich").unwrap();
         assert!(m.reaches_service(personal, immich));
         assert!(m.reaches_service(family, immich));
@@ -1474,12 +1531,12 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!has(&warnings, "proxy"), "{warnings:?}");
         let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
-        let family = m.reaches(m.template("family").unwrap());
+        let family = m.reaches(crate::testing::tier(&m, "family"));
         assert!(
             matches!(family[0].kind, ReachKind::Lan { proxied: true, .. }),
             "{family:?}"
         );
-        let personal = m.reaches(m.template("personal").unwrap());
+        let personal = m.reaches(crate::testing::tier(&m, "personal"));
         assert!(
             matches!(personal[0].kind, ReachKind::Lan { proxied: false, .. }),
             "{personal:?}"
@@ -1495,8 +1552,8 @@ mod tests {
         photos.hostnames = Vec::new();
         cfg.services.push(photos);
         let m = Model::resolve(&cfg, Date::new(2026, 9, 6).unwrap()).unwrap();
-        let family = m.template("family").unwrap();
-        let personal = m.template("personal").unwrap();
+        let family = crate::testing::tier(&m, "family");
+        let personal = crate::testing::tier(&m, "personal");
         for s in &cfg.services {
             assert!(!m.reaches_service(family, s), "{}", s.name);
             assert!(m.reaches_service(personal, s), "{}", s.name);
@@ -1565,27 +1622,27 @@ mod tests {
     fn warns_when_another_grant_bypasses_the_proxy() {
         let host: Host = "192.168.1.5".parse().unwrap();
         let bypasses = [
-            Grant::AllNetworks,
-            Grant::Network {
+            Rule::AllNetworks,
+            Rule::Network {
                 name: "home".into(),
             },
-            Grant::Host {
+            Rule::Host {
                 host: host.clone(),
                 ports: Vec::new(),
             },
-            Grant::Host {
+            Rule::Host {
                 host: host.clone(),
                 ports: vec![PortSpec::one(Proto::Tcp, 80)],
             },
-            Grant::Host {
+            Rule::Host {
                 host: host.clone(),
                 ports: vec![PortSpec::one(Proto::Udp, 443)],
             },
-            Grant::Host {
+            Rule::Host {
                 host: host.clone(),
                 ports: vec![PortSpec::one(Proto::Tcp, 443)],
             },
-            Grant::Service {
+            Rule::Service {
                 name: "plain-web".into(),
             },
         ];
@@ -1604,15 +1661,15 @@ mod tests {
         };
         for g in bypasses {
             let mut cfg = with_services();
-            cfg.templates[1].grants.push(g.clone());
+            cfg.grants[1].rules.push(g.clone());
             let (errors, warnings) = check(&cfg);
             assert!(errors.is_empty(), "{errors:?}");
             assert!(
                 has(
                     &warnings,
                     &format!(
-                        "template 'family': grant {} reaches 192.168.1.5 directly",
-                        describe_grant(&g)
+                        "peer 'sister-phone' (grant 'family'): rule {} of grant 'family' reaches 192.168.1.5 directly",
+                        describe_rule(&g)
                     )
                 ),
                 "{g:?}: {warnings:?}"
@@ -1620,11 +1677,11 @@ mod tests {
         }
         // Neither another port nor a second proxied site on the same box bypasses.
         let mut cfg = with_services();
-        cfg.templates[1].grants.push(Grant::Host {
+        cfg.grants[1].rules.push(Rule::Host {
             host,
             ports: vec![PortSpec::one(Proto::Tcp, 22)],
         });
-        cfg.templates[1].grants.push(Grant::Service {
+        cfg.grants[1].rules.push(Rule::Service {
             name: "photos".into(),
         });
         let (errors, warnings) = check(&cfg);

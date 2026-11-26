@@ -84,7 +84,7 @@ a fresh client namespace to the real endpoint, and checks the following:
   routed LAN the host sees the tunnel address; on the masqueraded LAN it sees
   the gateway.
 - **DNS.** The personal peer gets `staging.test` answers rewritten into mapped
-  space, and public names (`dns.public`). The guest, whose only grant is a
+  space, and public names (`public_dns`). The guest, whose only grant is a
   service without hostnames, gets every name refused.
 - **LAN-initiated traffic.** On the routed LAN, a host can start a connection
   to a peer.

@@ -1,6 +1,7 @@
 nft --version
 wg --version
 ip -V
+wg show wg0 allowed-ips
 nft -c -f /var/lib/parallax/nftables/parallax.nft
 nft -f /var/lib/parallax/nftables/parallax.nft
 nft -a list chain ip filter DOCKER-USER

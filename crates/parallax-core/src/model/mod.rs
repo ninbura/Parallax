@@ -1,22 +1,24 @@
 //! The policy model. `parallax-store` keeps it in the database, these serde
 //! types are its TOML import/export form, and they will back the API and GUI
 //! unchanged. Everything here is plain data; behaviour lives in
-//! [`crate::validate`], [`crate::alloc`], [`crate::transport`] and
+//! [`crate::validate`], [`crate::tier`], [`crate::alloc`], [`crate::transport`] and
 //! [`crate::generate`].
 
+mod client;
 mod config;
 mod grant;
 mod host;
 mod layout;
+mod legacy;
 mod network;
 mod peer;
 mod ports;
 mod server;
 mod service;
-mod template;
 
+pub use client::{AllowedIpsStrategy, DnsMode, PeerDefaults};
 pub use config::Config;
-pub use grant::{Grant, Proto};
+pub use grant::{Grant, Proto, Rule};
 pub use host::Host;
 pub use network::Network;
 pub use peer::{Peer, TailscalePeer, TransportKind, WireGuardPeer};
@@ -26,10 +28,6 @@ pub use server::{
     HeadscaleServer, Interval, ProxyServer, PublicIpServer, ServerConfig, WireGuardServer,
 };
 pub use service::Service;
-pub use template::{
-    AllowedIpsStrategy, ClientDefaults, DnsMode, DnsPolicy, HeadscaleIdentity, Template,
-    WireGuardTemplate,
-};
 
 /// Client platform a WireGuard config is exported for. Drives the DNS flavour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

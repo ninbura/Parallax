@@ -33,11 +33,11 @@ The macOS and Windows recipes change system-wide settings that outlive the
 tunnel: while it is down, home names go to an unreachable shim and fail, even
 on the home LAN. Each export says so and gives the command that removes them.
 
-Template `dns.wireguard = "split"` on a mobile export falls back to tunnel-wide
+A peer's `dns = "split"` on a mobile export falls back to tunnel-wide
 with a warning. A tunnel-wide device sends every query to the shim, which
 forwards names outside the home zones to `server.dns.public_resolver` only
-for templates with `dns.public = true`. Without it, the device resolves only
-the template's home names while connected, and the export says so. Split
+for peers with a `public_dns` rule. Without it, the device resolves only
+its granted home names while connected, and the export says so. Split
 clients on other platforms only send the home zones to the shim, so the
 setting doesn't matter to them.
 

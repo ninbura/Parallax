@@ -24,15 +24,14 @@ use std::net::Ipv4Addr;
 
 use crate::generate::firewall::NOT_PUBLIC;
 use crate::io::{Nameserver, Resolver};
-use crate::model::{Config, Grant, ServerConfig};
+use crate::model::{Config, Rule, ServerConfig};
 
-/// Whether some template needs the address for the hairpin drop: one with
+/// Whether some tier needs the address for the hairpin drop: one with
 /// `internet` that reaches public addresses only (no `all_networks`).
 pub fn hairpin(config: &Config) -> bool {
-    config
-        .templates
+    crate::tier::tiers(config)
         .iter()
-        .any(|t| t.grants.contains(&Grant::Internet) && !t.grants.contains(&Grant::AllNetworks))
+        .any(|t| t.has(&Rule::Internet) && !t.has(&Rule::AllNetworks))
 }
 
 /// Whether to look the address up: for the hairpin drop, or to tell a
@@ -184,9 +183,9 @@ mod tests {
     fn only_guests_with_public_only_internet_need_it() {
         let mut cfg = canonical_config();
         assert!(!needed(&cfg));
-        cfg.templates[0].grants.push(Grant::Internet);
+        cfg.grants[0].rules.push(Rule::Internet);
         assert!(!needed(&cfg), "all_networks reaches the router anyway");
-        cfg.templates[1].grants.push(Grant::Internet);
+        cfg.grants[1].rules.push(Rule::Internet);
         assert!(needed(&cfg));
         assert!(hairpin(&cfg));
         // A host named by DNS name may point at it, without any hairpin.

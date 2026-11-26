@@ -20,22 +20,39 @@ impl Proto {
     }
 }
 
-/// What a template's members may reach. Expressed against **real** addresses
+/// A named bundle of rules. Peers (and, in M2, Headscale users) are tied
+/// to any number of grants; what one reaches is the union of their rules,
+/// plus every grant marked `everyone`. Rules only add: there is no deny.
+/// A grant may exist with nothing attached.
+///
+/// TOML form: `[[grant]] name = "family", rules = [{ kind = "service", name = "immich" }]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Grant {
+    pub name: String,
+    /// Applies to every peer, current and future, without being attached.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub everyone: bool,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+}
+
+/// One thing a grant reaches. Expressed against **real** addresses
 /// (or names that resolve to them);
 /// the engine translates to virtual space for clients, Headscale ACLs and
 /// nginx, and to real space for the post-NETMAP FORWARD chain.
 ///
-/// TOML form: `grants = [{ kind = "service", name = "immich" }]`.
+/// TOML form: `rules = [{ kind = "service", name = "immich" }]`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", try_from = "GrantToml")]
-pub enum Grant {
+#[serde(tag = "kind", rename_all = "snake_case", try_from = "RuleToml")]
+pub enum Rule {
     /// Every configured network.
     AllNetworks,
     /// One network by name.
     Network { name: String },
     /// One host: `ports` (`["139/tcp", "445/tcp"]`), or every port when
     /// there are none. `host` is an address or a DNS name. For a host used
-    /// by several templates, a named [`super::Service`] says it once.
+    /// by several grants, a named [`super::Service`] says it once.
     Host {
         host: Host,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -49,13 +66,19 @@ pub enum Grant {
     /// covers everything outside the configured networks. Required for the
     /// `full_tunnel` AllowedIPs strategy to be useful.
     Internet,
+    /// Parallax's DNS server answers public lookups (names outside the
+    /// operator's zones) through `server.dns.public_resolver`. Without it a
+    /// guest's lookups don't leave through the home connection; mobile
+    /// WireGuard apps send every query to the gateway, so they then resolve
+    /// only the home names they're granted. Opens no firewall access.
+    PublicDns,
 }
 
-/// What a grant may look like in TOML, older spellings included: `ip` for
-/// `host`, and `host_port` grants with one `proto` and `port`.
+/// What a rule may look like in TOML, older spellings included: `ip` for
+/// `host`, and `host_port` rules with one `proto` and `port`.
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum GrantToml {
+enum RuleToml {
     AllNetworks,
     Network {
         name: String,
@@ -76,30 +99,31 @@ enum GrantToml {
         name: String,
     },
     Internet,
+    PublicDns,
 }
 
-impl TryFrom<GrantToml> for Grant {
+impl TryFrom<RuleToml> for Rule {
     type Error = String;
-    fn try_from(g: GrantToml) -> Result<Self, String> {
+    fn try_from(g: RuleToml) -> Result<Self, String> {
         Ok(match g {
-            GrantToml::AllNetworks => Grant::AllNetworks,
-            GrantToml::Network { name } => Grant::Network { name },
+            RuleToml::AllNetworks => Rule::AllNetworks,
+            RuleToml::Network { name } => Rule::Network { name },
             // An empty list would mean every port: a list that ended up
             // empty mustn't open everything.
-            GrantToml::Host {
+            RuleToml::Host {
                 host,
                 ports: Some(ports),
             } if ports.is_empty() => {
                 return Err(format!(
-                    "host grant for {host}: ports = [] lists no port; leave ports out to reach every port"
+                    "host rule for {host}: ports = [] lists no port; leave ports out to reach every port"
                 ))
             }
-            GrantToml::Host { host, ports } => Grant::Host {
+            RuleToml::Host { host, ports } => Rule::Host {
                 host,
                 ports: ports.unwrap_or_default(),
             },
             // Port 0 is refused by validation, as before.
-            GrantToml::HostPort { host, proto, port } => Grant::Host {
+            RuleToml::HostPort { host, proto, port } => Rule::Host {
                 host,
                 ports: vec![PortSpec {
                     first: port,
@@ -107,8 +131,9 @@ impl TryFrom<GrantToml> for Grant {
                     proto: Some(proto),
                 }],
             },
-            GrantToml::Service { name } => Grant::Service { name },
-            GrantToml::Internet => Grant::Internet,
+            RuleToml::Service { name } => Rule::Service { name },
+            RuleToml::Internet => Rule::Internet,
+            RuleToml::PublicDns => Rule::PublicDns,
         })
     }
 }
@@ -119,10 +144,10 @@ mod tests {
 
     #[derive(Serialize, Deserialize)]
     struct T {
-        g: Grant,
+        g: Rule,
     }
 
-    fn grant(text: &str) -> Result<Grant, String> {
+    fn rule(text: &str) -> Result<Rule, String> {
         toml::from_str::<T>(&format!("g = {text}"))
             .map(|t| t.g)
             .map_err(|e| e.to_string())
@@ -130,34 +155,34 @@ mod tests {
 
     #[test]
     fn older_spellings_still_read() {
-        let one = Grant::Host {
+        let one = Rule::Host {
             host: "192.168.1.9".parse().unwrap(),
             ports: vec![PortSpec::one(Proto::Udp, 53)],
         };
         assert_eq!(
-            grant(r#"{ kind = "host_port", ip = "192.168.1.9", proto = "udp", port = 53 }"#),
+            rule(r#"{ kind = "host_port", ip = "192.168.1.9", proto = "udp", port = 53 }"#),
             Ok(one.clone())
         );
         assert_eq!(
-            grant(r#"{ kind = "host", host = "192.168.1.9", ports = ["53/udp"] }"#),
+            rule(r#"{ kind = "host", host = "192.168.1.9", ports = ["53/udp"] }"#),
             Ok(one)
         );
-        let e = grant(r#"{ kind = "host", host = "192.168.1.9", port = 53 }"#).unwrap_err();
+        let e = rule(r#"{ kind = "host", host = "192.168.1.9", port = 53 }"#).unwrap_err();
         assert!(e.contains("unknown field `port`"), "{e}");
-        let e = grant(r#"{ kind = "host", host = "192.168.1.9", ports = [] }"#).unwrap_err();
+        let e = rule(r#"{ kind = "host", host = "192.168.1.9", ports = [] }"#).unwrap_err();
         assert!(e.contains("lists no port; leave ports out"), "{e}");
     }
 
     #[test]
     fn written_with_ports_or_without() {
-        let all = Grant::Host {
+        let all = Rule::Host {
             host: Host::Name("nas.mydomain.com".into()),
             ports: Vec::new(),
         };
         let text = toml::to_string(&T { g: all.clone() }).unwrap();
         assert!(!text.contains("ports"), "{text}");
         assert_eq!(
-            grant(r#"{ kind = "host", host = "nas.mydomain.com" }"#),
+            rule(r#"{ kind = "host", host = "nas.mydomain.com" }"#),
             Ok(all)
         );
     }

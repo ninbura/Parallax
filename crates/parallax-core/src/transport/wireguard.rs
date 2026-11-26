@@ -4,10 +4,11 @@ use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
 
-use super::{ProvisionOptions, TierSource, Transport};
+use super::{ProvisionOptions, Transport};
 use crate::generate::{client, wg_server, Artifact, ArtifactKind, Export};
 use crate::io::{FileSystem, KeyGenerator, System};
-use crate::model::{Peer, Platform, ServerConfig, Template, TransportKind, WireGuardPeer};
+use crate::model::{Peer, Platform, ServerConfig, TransportKind, WireGuardPeer};
+use crate::tier::Tier;
 use crate::validate::Model;
 use crate::{Error, Result};
 
@@ -27,18 +28,26 @@ impl Transport for WireGuardTransport {
         server.wireguard.supernet.trunc()
     }
 
-    fn tier_source(&self, _server: &ServerConfig, template: &Template) -> TierSource {
-        TierSource::Cidr(template.wireguard.pool.trunc())
+    fn set_prefix(&self) -> &'static str {
+        "wg"
     }
 
-    fn tier_members(&self, _model: &Model<'_>, template: &Template) -> Vec<Ipv4Net> {
-        vec![template.wireguard.pool.trunc()]
+    fn members_known(&self) -> bool {
+        true
+    }
+
+    fn tier_members(&self, model: &Model<'_>, tier: &Tier<'_>) -> Vec<Ipv4Net> {
+        model
+            .members_on(tier, TransportKind::WireGuard)
+            .filter_map(|p| p.wireguard.as_ref().and_then(|w| w.address))
+            .map(Ipv4Net::from)
+            .collect()
     }
 
     fn provision(
         &self,
         model: &Model<'_>,
-        template: &Template,
+        grants: &[String],
         name: &str,
         keys: &dyn KeyGenerator,
         opts: &ProvisionOptions,
@@ -49,30 +58,32 @@ impl Transport for WireGuardTransport {
                 detail: format!("a peer named '{name}' already exists"),
             });
         }
-        let address = crate::alloc::allocate(model.config(), &template.name)?;
+        for g in grants {
+            model.grant(g)?;
+        }
+        let address = crate::alloc::allocate(model.config())?;
         let kp = keys.keypair();
+        let mut wireguard = WireGuardPeer::new(kp.public, &model.server().wireguard.peer_defaults);
+        wireguard.address = Some(address);
+        // Always present here so the caller can do the one-time export;
+        // the caller strips it before persisting unless
+        // `opts.retain_private_key` is set.
+        wireguard.private_key = Some(kp.private);
+        wireguard.preshared_key = opts.preshared_key.then(|| keys.preshared_key());
         Ok(Peer {
             name: name.to_string(),
-            template: template.name.clone(),
+            grants: grants.to_vec(),
             transport: TransportKind::WireGuard,
             enabled: true,
             expires: opts.expires,
-            wireguard: Some(WireGuardPeer {
-                public_key: kp.public,
-                address: Some(address),
-                // Always present here so the caller can do the one-time export;
-                // the caller strips it before persisting unless
-                // `opts.retain_private_key` is set.
-                private_key: Some(kp.private),
-                preshared_key: opts.preshared_key.then(|| keys.preshared_key()),
-            }),
+            wireguard: Some(wireguard),
             tailscale: None,
         })
     }
 
     fn generate(&self, model: &Model<'_>, fs: &dyn FileSystem) -> Result<Vec<Artifact>> {
         let mut out = vec![wg_server::render(model, fs)?];
-        for peer in model.peers_on(TransportKind::WireGuard, None) {
+        for peer in model.peers_on(TransportKind::WireGuard) {
             if peer
                 .wireguard
                 .as_ref()
@@ -140,7 +151,7 @@ impl Transport for WireGuardTransport {
             .run_checked("ip", &["link", "set", "up", "dev", iface], None)?;
         log.push(format!(
             "wireguard: {iface} at {cidr} synced ({} peers)",
-            model.peers_on(TransportKind::WireGuard, None).count()
+            model.peers_on(TransportKind::WireGuard).count()
         ));
         Ok(log)
     }

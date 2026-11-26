@@ -18,12 +18,9 @@ pub enum Error {
     #[error("{kind} '{name}' not found")]
     NotFound { kind: &'static str, name: String },
 
-    /// An address pool has no free host left.
-    #[error("address pool {pool} of template '{template}' is exhausted")]
-    PoolExhausted {
-        template: String,
-        pool: ipnet::Ipv4Net,
-    },
+    /// The WireGuard supernet has no free host left.
+    #[error("server.wireguard.supernet {pool} has no free address left; widen it")]
+    PoolExhausted { pool: ipnet::Ipv4Net },
 
     /// A key, address or other literal is malformed.
     #[error("malformed {what}: {detail}")]

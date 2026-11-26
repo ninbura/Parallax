@@ -3,7 +3,7 @@
 //! One address serves every tier, and every answer depends on who asks: a
 //! query from a tunnel address gets an answer only for names that tier may
 //! reach (its granted networks' zones, its granted services' hostnames, and
-//! public names where the template has `dns.public`). Everything else is
+//! public names where the tier has `public_dns`). Everything else is
 //! refused. Home zones are forwarded to the home resolvers and their answers
 //! rewritten into mapped space; public names go to the public resolver, and
 //! answers pointing inward are dropped.

@@ -27,8 +27,8 @@ Golden files: after an intended generator change, run
   run against in-memory fakes.
 - `parallax-cli` is a thin harness over core. Keep logic in core.
 - Errors: `thiserror` in core (`error.rs`), `anyhow` in the CLI. Messages
-  name the offending thing and say what's wrong ("address pool 10.8.2.0/24
-  of template 'family' is exhausted"), never just "invalid config".
+  name the offending thing and say what's wrong ("peer 'sister-phone':
+  unknown grant 'familly'"), never just "invalid config".
 - Config types are `serde` with `deny_unknown_fields`. Typos must fail loudly.
 - Generated output is deterministic: same input, byte-identical output.
 - Secrets (private and preshared keys, API keys) use the types in

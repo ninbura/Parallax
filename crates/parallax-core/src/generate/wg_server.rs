@@ -50,11 +50,14 @@ pub fn render(model: &Model<'_>, fs: &dyn FileSystem) -> Result<Artifact> {
     s.push_str("[Interface]\n");
     let _ = writeln!(s, "PrivateKey = {}", key.expose_base64());
     let _ = writeln!(s, "ListenPort = {}", wg.listen_port);
-    for peer in model.peers_on(TransportKind::WireGuard, None) {
+    for peer in model.peers_on(TransportKind::WireGuard) {
         let Some(w) = &peer.wireguard else { continue };
         let Some(addr) = w.address else { continue };
         s.push('\n');
-        let _ = writeln!(s, "# {} (template {})", peer.name, peer.template);
+        let _ = match model.tier_of(peer) {
+            Some(tier) => writeln!(s, "# {} (grants {})", peer.name, tier.label()),
+            None => writeln!(s, "# {} (no grants)", peer.name),
+        };
         s.push_str("[Peer]\n");
         let _ = writeln!(s, "PublicKey = {}", w.public_key);
         if let Some(psk) = &w.preshared_key {

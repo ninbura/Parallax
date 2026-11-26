@@ -11,12 +11,14 @@ Cargo.toml                      workspace (resolver 2), shared dependency versio
 crates/parallax-core/           pure library, no I/O of its own
   src/lib.rs                    module tree, TAILSCALE_CGNAT
   src/model/                    serde types: Config, ServerConfig, Network, Service,
-                                Template, Grant, Peer (+ Platform)
+                                Grant, Rule, Peer (+ Platform); legacy.rs reads
+                                template-era TOML
+  src/tier.rs                   peers with the same grants form a tier
   src/secret.rs                 PublicKey / PrivateKey / PresharedKey / Secret (Debug-redacted)
   src/date.rs                   dependency-free civil date for peer expiry
   src/netmap.rs                 Mapping: 1:1 prefix translation (+ property test)
   src/validate.rs               check() + Model (validated view every generator uses)
-  src/alloc.rs                  WireGuard pool allocation
+  src/alloc.rs                  WireGuard address allocation (from the supernet)
   src/io.rs                     FileSystem / ProcessRunner / KeyGenerator traits,
                                 memory + real implementations
   src/transport/{mod,wireguard,tailscale}.rs
@@ -49,14 +51,15 @@ pub struct Config {
     pub server: ServerConfig,
     pub networks: Vec<Network>,     // [[network]]
     pub services: Vec<Service>,     // [[service]]
-    pub templates: Vec<Template>,   // [[template]]
+    pub grants: Vec<Grant>,         // [[grant]]
     pub peers: Vec<Peer>,           // [[peer]]
 }
 
 pub struct ServerConfig {
     pub wireguard: WireGuardServer,   // interface, listen_port, supernet, endpoint,
-                                      // public_key, private_key_file
-    pub headscale: HeadscaleServer,   // interface, server_url, api_key_file, derp, subnet_router_node
+                                      // public_key, private_key_file, peer_defaults
+    pub headscale: HeadscaleServer,   // interface, server_url, api_key_file, derp,
+                                      // subnet_router_node, dns (tailnet-wide)
     pub dns: DnsServer,               // listen (default: WG gateway addr), port, public_resolver
     pub firewall: FirewallServer,     // backend (nftables | iptables-nft), docker_coexistence
     pub wan_interface: Option<String>,
@@ -78,62 +81,72 @@ pub struct Service { name, host: Host, ports: Vec<PortSpec>, nginx_vhost: bool,
 pub struct PortSpec { first: u16, last: u16, proto: Option<Proto> }   // "445/tcp", "137-138/udp", "25565" (both)
 pub enum Host { Ip(Ipv4Addr), Name(String) }   // TOML: a string either way
 
-pub struct Template {
+pub struct Grant {
     pub name: String,
-    pub wireguard: WireGuardTemplate,   // pool: Ipv4Net  (the range IS the tier)
-    pub headscale: HeadscaleIdentity,   // user and/or tag
-    pub grants: Vec<Grant>,
-    pub visible_networks: Option<Vec<String>>,
-    pub dns: DnsPolicy,                 // { wireguard: DnsMode, tailscale: DnsMode }
-    pub client: ClientDefaults,         // allowed_ips strategy, mtu, persistent_keepalive
+    pub everyone: bool,                 // every peer has it, unattached
+    pub rules: Vec<Rule>,
 }
 
 #[serde(tag = "kind")]
-pub enum Grant { AllNetworks, Network{name}, Host{host, ports}, Service{name}, Internet }
+pub enum Rule { AllNetworks, Network{name}, Host{host, ports}, Service{name}, Internet, PublicDns }
 pub enum DnsMode { Split, TunnelWide, None }
 pub enum AllowedIpsStrategy { MappedSubnets, GrantsOnly, FullTunnel }
 
 pub struct Peer {
     pub name: String,
-    pub template: String,
+    pub grants: Vec<String>,             // besides every `everyone` grant
     pub transport: TransportKind,        // WireGuard | Tailscale (a device fact)
     pub enabled: bool,
     pub expires: Option<Date>,
-    pub wireguard: Option<WireGuardPeer>, // public_key, address, private_key?, preshared_key?
+    pub wireguard: Option<WireGuardPeer>, // public_key, address, private_key?, preshared_key?,
+                                          // dns, allowed_ips, mtu?, persistent_keepalive?,
+                                          // visible_networks?
     pub tailscale: Option<TailscalePeer>, // node_id?, address?  (M2)
 }
 ```
 
+Access is named grants (ADR 0010). A peer has any number of them and
+reaches the union of their rules plus every `everyone` grant; rules only
+add. Peers with the same effective grants form a **tier** (`tier.rs`), and
+every generator works per tier: one firewall chain, one DNS and one proxy
+entry each, built from the union. A WireGuard peer's address is the lowest
+free one of the supernet and says nothing about access, so changing its
+grants changes neither the address nor its client config (except
+`AllowedIPs` under `grants_only`). How the client is set up (DNS mode,
+`allowed_ips`, MTU, keepalive, visible networks) is per peer, copied from
+`server.wireguard.peer_defaults` when it's added. Files written with
+`[[template]]` still import (`model/legacy.rs`), each template becoming a
+grant of its name.
+
 Ports are lists, written the way ufw writes them: `445/tcp`, `137-138/udp`,
 or a bare `25565` for TCP and UDP. A service is a named host and its ports
-(SMB is one service with four ports), granted to any number of templates; a
-grant itself has no name, since it's only the link between a template and
-what it reaches. A `host` grant is the inline form for one-offs: with
-`ports` it opens those, without them every port. The firewall matches one
-set of ports per protocol per rule (`tcp dport { 139, 445 }`). Older
-configurations still import: a service's single `port`/`proto`, and
-`host_port` grants (now a `host` grant with one port).
+(SMB is one service with four ports), used by any number of grants. A
+`host` rule is the inline form for one-offs: with `ports` it opens those,
+without them every port. The firewall matches one set of ports per protocol
+per rule (`tcp dport { 139, 445 }`). Older configurations still import: a
+service's single `port`/`proto`, and `host_port` rules (now a `host` rule
+with one port).
 
 Two additions relative to the handoff, both small and flagged:
 
-- `Grant::Internet` and `server.wan_interface`. Without an egress grant a
+- `Rule::Internet` and `server.wan_interface`. Without an egress rule a
   `full_tunnel` device reaches only what it's granted (the trailing deny drops
   the rest); validation warns, since that's usually a mistake but can be a
   locked-down device on purpose.
-- `Template.dns` is per transport (`wireguard` / `tailscale`) because the
-  canonical scenario wants tunnel-wide DNS on plain WireGuard for the family
-  tier but split DNS through the Tailscale client. `dns.public` (off by
-  default) lets the template's members look up public names through the
-  gateway; see "DNS server".
+- The DNS mode differs per transport: a WireGuard peer has its own
+  (`peer.wireguard.dns`; the canonical guest phone is tunnel-wide), while
+  Tailscale nodes share `server.headscale.dns`, since the Tailscale client
+  does split DNS natively. A `public_dns` rule lets a tier look up public
+  names through the gateway; see "DNS server".
 
-Grants are written against real addresses, or DNS names that resolve to
+Rules are written against real addresses, or DNS names that resolve to
 them (ADR 0009): a name is looked up through the resolvers of the network
 whose zone holds it, and grants what it resolved to when every address is
 inside a configured network or is the home's public IP. The public IP is
-port forwards: a template that doesn't reach everything gets one port at
+port forwards: a tier that doesn't reach everything gets one port at
 a time there, and web ports only through the HTTPS proxy
 (`ReachKind::HomePublic`). Those addresses are an input to generation
-(`Model::with_names`), like the date. `Model::reaches(template)` resolves
+(`Model::with_names`), like the date. `Model::reaches(tier)` resolves
 them to `Reach { label, kind: Lan { network, real, port, proxied } | HomePublic { address, port, proxied } | Internet }` and
 `Reach::client_net()` translates to virtual space for clients, nginx and (M2)
 Headscale ACLs. The nftables FORWARD chain matches real addresses because it
@@ -146,9 +159,10 @@ pub trait Transport {
     fn kind(&self) -> TransportKind;
     fn ingress_interface(&self, server: &ServerConfig) -> String;      // wg0 / tailscale0
     fn source_range(&self, server: &ServerConfig) -> Ipv4Net;          // WG supernet / 100.64.0.0/10
-    fn tier_source(&self, server: &ServerConfig, t: &Template) -> TierSource; // Cidr(pool) / Set("ts_<t>")
-    fn tier_members(&self, model: &Model, t: &Template) -> Vec<Ipv4Net>;     // pool / one /32 per node
-    fn provision(&self, model: &Model, t: &Template, name: &str,
+    fn set_name(&self, tier: &Tier) -> String;                          // wg_<key> / ts_<key>
+    fn members_known(&self) -> bool;                                    // WG: yes; TS: synced (M2)
+    fn tier_members(&self, model: &Model, tier: &Tier) -> Vec<Ipv4Net>; // one /32 per active member
+    fn provision(&self, model: &Model, grants: &[String], name: &str,
                  keys: &dyn KeyGenerator, opts: &ProvisionOptions) -> Result<Peer>;
     fn generate(&self, model: &Model, fs: &dyn FileSystem) -> Result<Vec<Artifact>>;
     fn export(&self, model: &Model, peer: &Peer, platform: Platform) -> Result<Export>;
@@ -158,12 +172,14 @@ pub fn all() -> Vec<Box<dyn Transport>>   // always [WireGuard, Tailscale]
 ```
 
 The shared generators (`firewall`, `dns`, `proxy`, `nginx`) iterate `transport::all()`
-and only use the first five methods. That is why the M1 nftables table already
-has its final shape: NETMAP matches `{ "wg0", "tailscale0" }`, every template
-gets a WireGuard rule block keyed on its pool and a Tailscale block keyed on
-the `ts_<template>` set (empty until M2 syncs it), and both transports end
-with a catch-all deny. `TailscaleTransport` implements those five methods
-today and returns `NotImplemented` for provision/export.
+and only use the methods above `provision`. That is why the M1 nftables table
+already has its final shape: NETMAP matches `{ "wg0", "tailscale0" }`, every
+tier has a member set per transport (`wg_<key>`, and `ts_<key>`, empty
+until M2 syncs it; the key is a hash of the tier's grants, so a set name
+never changes meaning between applies), and both transports end with a
+catch-all deny.
+`TailscaleTransport` implements those today and returns `NotImplemented` for
+provision/export.
 
 The INPUT chain is locked down too: from a tunnel interface only DNS
 (UDP/TCP 53 to the DNS server's address), ICMP echo, grants that cover a network's
@@ -182,22 +198,25 @@ connections on their next packet, with no conntrack flush on apply (which
 would drop everyone's sessions, or need a diff of what changed).
 
 Checking every packet is only cheap if a packet doesn't walk past every
-other template's rules first (with 200 rules ahead of it, small-packet UDP
+other tier's rules first (with 200 rules ahead of it, small-packet UDP
 through WireGuard ran at a quarter of the speed; `dev/bench/firewall.sh`
-measures this). So each template's FORWARD rules live in their own chain
-(`tier_<template>`, ending in its default deny), and FORWARD picks the
-chain with one verdict-map lookup on the source address:
-`iifname "wg0" ip saddr vmap { 10.8.1.0/24 : jump tier_personal, ... }`.
-Tailscale tiers are sets of node addresses, so they get one `jump` rule per
-template for now. The `iptables-nft` backend has no verdict maps: it jumps
-to numbered chains (`PARALLAX_T<n>`) with one rule per template.
+measures this). So each tier's FORWARD rules live in their own chain
+(`tier_<n>`, ending in its default deny; numbered, since a tier may be
+several grants, which the rules' comments name), and FORWARD picks the
+chain with one verdict-map lookup on the peer's source address:
+`iifname "wg0" ip saddr vmap { 10.8.1.1 : jump tier_0, 10.8.2.1 : jump tier_1, ... }`.
+Tailscale tiers are sets of node addresses that M2 keeps in sync without a
+new ruleset, so they get one `jump` rule per tier. INPUT and the proxy
+redirect match a tier's member set, one rule per tier. The `iptables-nft`
+backend has no verdict maps: it jumps to numbered chains (`PARALLAX_T<n>`)
+with one rule per peer address.
 
 `internet` reaches public addresses only: FORWARD to the WAN interface
 excludes private, shared (CGNAT), loopback, link-local, multicast, reserved,
 documentation and benchmarking ranges as well as the configured networks
 (the `not_public` set). Otherwise a guest with full tunnel could reach
 subnets the router knows but Parallax doesn't, such as other VLANs. A
-template that also has `all_networks` is the owner's own and keeps
+tier that also has `all_networks` is the owner's own and keeps
 "everything outside the configured networks" (`lan_real`).
 
 Tunnel peers are IPv4-only: WireGuard's AllowedIPs already refuses IPv6, and
@@ -208,17 +227,17 @@ it that way for transports that might carry it (Tailscale). The
 ## Proxied HTTPS services
 
 One address and port often serves many sites (an nginx with several
-virtual hosts), so a firewall rule on `host:443` lets a template reach all
-of them. A service with `hostnames` closes that gap: `service` grants reach
+virtual hosts), so a firewall rule on `host:443` lets a peer reach all
+of them. A service with `hostnames` closes that gap: `service` rules reach
 it only through Parallax's own HTTPS proxy, which terminates TLS, checks
 SNI, `Host` and HTTP/2 `:authority` on every request, and forwards only the
-listed names to the service. The firewall gives such grants no direct
+listed names to the service. The firewall gives such rules no direct
 accept (`ReachKind::Lan { proxied: true }`). Instead, for each tier with a
-`service` grant on a proxied service, PREROUTING sends its `tcp/443` to that
+`service` rule on a proxied service, PREROUTING sends its `tcp/443` to that
 service's address, as clients see it (virtual where mapped), to the proxy
 (`server.proxy`, `10.8.0.1:8443` by default). The rule comes before NETMAP,
 since NAT takes the first match. A tier that already reaches that host's 443
-directly (`all_networks`, its network, a `host` grant covering tcp/443) gets
+directly (`all_networks`, its network, a `host` rule covering tcp/443) gets
 no redirect: the proxy would add nothing. Only tiers with a redirect may
 reach the proxy port in INPUT. The firewall works per tier and the proxy per
 hostname: when a tier loses one of several proxied hostnames, its other
@@ -229,9 +248,10 @@ its routes after every apply.
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
 clients couldn't resolve them through the DNS server), and only on `tcp/443`. A
-template with another grant that reaches the same host's web ports directly
+tier with another rule that reaches the same host's web ports directly
 (`all_networks`, its network, `host`, tcp/80, or 443 on either protocol)
-gets a warning naming that grant, since it can bypass the hostname check.
+gets a warning naming that rule and its grant, since it can bypass the
+hostname check.
 Proxied reaches also don't count toward nginx `allow` snippets: the proxy
 connects from the gateway, and sibling sites on the same address mustn't
 inherit the tier.
@@ -245,8 +265,8 @@ uses whichever certificate covers each hostname.
 `apply` writes `proxy/routes.toml`: the listen address, the certificate
 folder, the upstream CA bundle, and one site per hostname with its upstream
 (the service's real `host:port`) and the tier members allowed to use it.
-A site exists only when some template has a `service` grant on it, and
-only that template's members are allowed: every proxied tier lands on the
+A site exists only when some tier has a `service` rule on it, and
+only that tier's members are allowed: every proxied tier lands on the
 same proxy, so the source address is what keeps one tier off another
 tier's hostnames. The proxy reads nothing else from the configuration.
 
@@ -294,15 +314,14 @@ WireGuard gateway address), and the answer depends on who asks. The DNS
 server (crate `parallax-dns`, built on hickory, a task in the daemon) reads
 `dns/routes.toml`, which `apply` writes, and re-reads it after each apply:
 
-- **Who asks.** The source address picks the tier: the template's WireGuard
-  pool, or (M2) its Tailscale nodes. WireGuard ties the source address to the
-  peer's key. A source outside every tier is refused.
-- **What it may ask.** A network grant (or `all_networks`) gives the
-  network's `domains`; a `service` grant gives the service's `hostnames`.
-  A `host` grant on a name gives that name (one granted by
-  address gives none), and so does a granted service whose host is a name.
-  Names outside every zone go
-  to `server.dns.public_resolver`, only for templates with `dns.public`.
+- **Who asks.** The source address picks the tier: its peers' WireGuard
+  addresses, or (M2) its Tailscale nodes. WireGuard ties the source address
+  to the peer's key. A source outside every tier is refused.
+- **What it may ask.** A network rule (or `all_networks`) gives the
+  network's `domains`; a `service` rule gives the service's `hostnames`.
+  A `host` rule on a name gives that name (one by address gives none), and
+  so does a granted service whose host is a name. Names outside every zone
+  go to `server.dns.public_resolver`, only for tiers with `public_dns`.
   Everything else is `REFUSED`. A name inside a zone is never sent to the
   public resolver, even for a public tier: it would leak the operator's
   names, and the public answer is the home's public address.
@@ -344,7 +363,7 @@ a single transaction. `parallax-core` never sees the database. Decisions and
 alternatives: ADR 0005.
 
 - One table per part of the model, child tables with a `position` for lists
-  (`network_domains`, `template_grants`, ...). Values are TEXT in their TOML
+  (`network_domains`, `grant_rules`, `peer_grants`, ...). Values are TEXT in their TOML
   spelling.
 - Every row has a hidden integer id beside its unique name; references between
   tables use the id. `save` matches rows by name, so a kept name keeps its id.
@@ -374,7 +393,7 @@ wireguard/wg0.conf                 wg(8) format for `wg syncconf`   (0600)
 nftables/parallax.nft              table inet parallax, atomic replace
 nftables/docker-user.nft           DOCKER-USER accepts (docker_coexistence)
 dns/routes.toml                    zones, mappings and tiers for the DNS server
-nginx/snippets/parallax-<t>.conf   allow lines per tier
+nginx/snippets/parallax-<g>.conf   allow lines for every peer with grant <g>
 nginx/snippets/parallax-service-<s>.conf   allow lines + deny all per vhost
 proxy/routes.toml                  sites for the HTTPS proxy
 clients/<peer>/<platform>.conf     only for peers that retain their private key (0600)
@@ -406,7 +425,7 @@ carry the revision they were based on; an older one is refused and the CLI
 retries against the latest. With no daemon answering, the CLI opens the
 database itself. SIGTERM deletes the table and the interface.
 
-When a guest template has `internet`, the daemon also keeps the home's
+When a guest tier has `internet`, the daemon also keeps the home's
 public IP (ADR 0008): it looks it up at startup, every 5 minutes and when a
 saved change alters what the lookup depends on, re-applies when it changes,
 and keeps the last one found in the `daemon_state` table. The address is an

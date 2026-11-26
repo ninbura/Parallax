@@ -1,7 +1,7 @@
 # Parallax
 
 A Dockerized WireGuard + Headscale gateway with a Rust engine that uses subnet
-remapping, DNS rewriting and template-based access policies to make split
+remapping, DNS rewriting and grant-based access policies to make split
 tunnels and scoped guest access just work, from any client.
 
 **Status: Milestone 1** (shared engine + WireGuard transport + CLI harness).
@@ -15,10 +15,11 @@ design, not a "WireGuard-only" mode.
   home. Parallax NETMAPs each LAN to a collision-free virtual prefix
   (`192.168.1.5` ⇄ `198.18.1.5`) and rewrites DNS answers to match, from
   the same single mapping.
-- Access is a **template** (policy class) with grants; every WireGuard peer of
-  a template draws from a dedicated pool, so the address *is* the tier and the
-  gateway's nftables FORWARD chain enforces the policy regardless of what the
-  client puts in `AllowedIPs`.
+- Access is **named grants** (bundles of rules: networks, hosts and their
+  ports, services, internet); a device has one or many and reaches their
+  union. The gateway's nftables FORWARD chain enforces it per source address,
+  regardless of what the client puts in `AllowedIPs`, so changing a device's
+  grants needs no new client config.
 - nginx `allow/deny` snippets extend the same identity to virtual hosts.
 
 ## Try it
@@ -32,7 +33,7 @@ $parallax config import /tmp/parallax.toml
 $parallax keygen --write-config
 $parallax validate
 $parallax generate -o /tmp/parallax-out
-$parallax peer add tablet --template family --platform mobile
+$parallax peer add tablet --grant family --platform mobile
 $parallax peer show
 $parallax config export
 ```

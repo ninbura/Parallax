@@ -17,15 +17,15 @@ real = "192.168.1.0/24"
 virtual = "198.18.1.0/24"
 
 [[tier]]
-template = "personal"
-members = ["10.8.1.0/24"]
+tier = "personal"
+members = ["10.8.1.1/32", "10.8.1.2/32"]
 zones = ["mydomain.com"]
 names = []
 public = true
 
 [[tier]]
-template = "family"
-members = ["10.8.2.0/24"]
+tier = "family"
+members = ["10.8.2.1/32"]
 zones = []
 names = ["immich.mydomain.com", "game.mydomain.com", "nas.mydomain.com"]
 public = false

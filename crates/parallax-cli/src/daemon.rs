@@ -7,7 +7,7 @@
 //! proxy run as tasks and re-read their routes after each apply. The CLI
 //! talks to it over a Unix socket ([`crate::protocol`]).
 //!
-//! When guest templates have `internet`, it looks up the home's public IP
+//! When guests have `internet`, it looks up the home's public IP
 //! (for their hairpin drop) at startup, every 5 minutes, and when a saved
 //! change alters what the lookup depends on; it re-applies when the address
 //! changes, and keeps the last one found across restarts. Hosts named by

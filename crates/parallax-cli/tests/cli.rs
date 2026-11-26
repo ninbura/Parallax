@@ -104,7 +104,7 @@ fn validate_accepts_the_example() {
     let (ok, out, err) = s.run(&["validate"]);
     assert!(ok, "{err}");
     assert!(
-        out.contains("valid (1 networks, 2 templates, 3 peers, 3 active)"),
+        out.contains("valid (1 networks, 2 grants, 3 peers, 3 active)"),
         "{out}"
     );
 }
@@ -160,14 +160,17 @@ fn peer_lifecycle_stores_no_private_key() {
         "peer",
         "add",
         "tablet",
-        "--template",
+        "--grant",
         "family",
+        "--allowed-ips",
+        "grants_only",
         "--platform",
         "mobile",
         "--preshared-key",
     ]);
     assert!(ok, "{err}");
-    assert!(out.contains("Address = 10.8.2.2/32"), "{out}");
+    // The lowest free address of the supernet.
+    assert!(out.contains("Address = 10.8.0.2/32"), "{out}");
     assert!(
         out.contains("AllowedIPs = 198.18.1.5/32, 10.8.0.1/32"),
         "{out}"
@@ -200,7 +203,7 @@ fn peer_lifecycle_stores_no_private_key() {
         "{out}"
     );
 
-    let (ok, _, err) = s.run(&["peer", "add", "tablet", "--template", "family"]);
+    let (ok, _, err) = s.run(&["peer", "add", "tablet", "--grant", "family"]);
     assert!(!ok);
     assert!(err.contains("already exists"), "{err}");
 
@@ -217,14 +220,15 @@ fn peer_lifecycle_stores_no_private_key() {
 fn allocate_fills_missing_addresses() {
     let s = Scratch::new("alloc");
     let mut text = std::fs::read_to_string(s.config()).unwrap();
-    text.push_str("\n[[peer]]\nname = \"nas\"\ntemplate = \"personal\"\ntransport = \"wireguard\"\nwireguard = { public_key = \"DSuieBHAaq5V19ySBwUTiLBh9Pnduq1K9gcWaxXqMVc=\" }\n");
+    text.push_str("\n[[peer]]\nname = \"nas\"\ngrants = [\"personal\"]\ntransport = \"wireguard\"\nwireguard = { public_key = \"DSuieBHAaq5V19ySBwUTiLBh9Pnduq1K9gcWaxXqMVc=\" }\n");
     std::fs::write(s.config(), text).unwrap();
     let (ok, _, err) = s.run(&["config", "import", &s.config().to_string_lossy()]);
     assert!(ok, "{err}");
-    assert!(err.contains("allocated 10.8.1.3 to peer 'nas'"), "{err}");
+    // The lowest free address of the supernet: access isn't in addresses.
+    assert!(err.contains("allocated 10.8.0.2 to peer 'nas'"), "{err}");
     let (ok, out, err) = s.run(&["peer", "show", "nas"]);
     assert!(ok, "{err}");
-    assert!(out.contains("address=10.8.1.3"), "{out}");
+    assert!(out.contains("address=10.8.0.2"), "{out}");
 }
 
 #[test]
@@ -359,7 +363,7 @@ fn config_edit_saves_what_the_editor_changed() {
     assert!(text.contains("\"eth9\""), "{text}");
 
     // An edit that breaks the configuration is refused.
-    let bad = [("EDITOR", "sed -i s/10.8.1.0/10.9.1.0/")];
+    let bad = [("EDITOR", "sed -i s/10.8.1.1/10.9.1.1/")];
     let (ok, _, err) = s.run_with_env(&["config", "edit", "-o", &out, "--yes"], &bad);
     assert!(!ok);
     assert!(err.contains("invalid"), "{err}");
@@ -543,7 +547,7 @@ fn every_database_file_is_owner_only() {
     use std::os::unix::fs::PermissionsExt;
     let s = Scratch::new("modes");
     s.import();
-    s.run(&["peer", "add", "tablet", "--template", "family"]);
+    s.run(&["peer", "add", "tablet", "--grant", "family"]);
     let mut seen = 0;
     for entry in std::fs::read_dir(&s.dir).unwrap() {
         let path = entry.unwrap().path();
@@ -567,7 +571,7 @@ fn a_backup_restores_what_changed_since() {
     let file = s.backups().pop().unwrap();
     let (ok, out, _) = s.run(&["backup", "list"]);
     assert!(
-        ok && out.contains("encrypted") && out.contains("schema 5"),
+        ok && out.contains("encrypted") && out.contains("schema 6"),
         "{out}"
     );
 

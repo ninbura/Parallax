@@ -196,13 +196,13 @@ real = "192.168.1.0/24"
 virtual = "198.18.1.0/24"
 
 [[tier]]
-template = "personal"
+tier = "personal"
 members = ["{PERSONAL}/32"]
 zones = ["mydomain.com", "xn--bcher-kva.ch"]
 public = true
 
 [[tier]]
-template = "family"
+tier = "family"
 members = ["{FAMILY}/32"]
 names = ["immich.mydomain.com", "photos.mydomain.com"]
 public = {family_public}

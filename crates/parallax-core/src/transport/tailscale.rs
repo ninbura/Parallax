@@ -5,22 +5,16 @@
 
 use ipnet::Ipv4Net;
 
-use super::{ProvisionOptions, TierSource, Transport};
+use super::{ProvisionOptions, Transport};
 use crate::generate::{Artifact, Export};
 use crate::io::{FileSystem, KeyGenerator, System};
-use crate::model::{Peer, Platform, ServerConfig, Template, TransportKind};
+use crate::model::{Peer, Platform, ServerConfig, TransportKind};
+use crate::tier::Tier;
 use crate::validate::Model;
 use crate::{Error, Result, TAILSCALE_CGNAT};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TailscaleTransport;
-
-impl TailscaleTransport {
-    /// nftables set holding the Tailscale addresses of a template's nodes.
-    pub fn set_name(template: &Template) -> String {
-        format!("ts_{}", template.name.replace('-', "_"))
-    }
-}
 
 impl Transport for TailscaleTransport {
     fn kind(&self) -> TransportKind {
@@ -35,13 +29,17 @@ impl Transport for TailscaleTransport {
         TAILSCALE_CGNAT
     }
 
-    fn tier_source(&self, _server: &ServerConfig, template: &Template) -> TierSource {
-        TierSource::Set(Self::set_name(template))
+    fn set_prefix(&self) -> &'static str {
+        "ts"
     }
 
-    fn tier_members(&self, model: &Model<'_>, template: &Template) -> Vec<Ipv4Net> {
+    fn members_known(&self) -> bool {
+        false
+    }
+
+    fn tier_members(&self, model: &Model<'_>, tier: &Tier<'_>) -> Vec<Ipv4Net> {
         model
-            .peers_on(TransportKind::Tailscale, Some(&template.name))
+            .members_on(tier, TransportKind::Tailscale)
             .filter_map(|p| p.tailscale.as_ref().and_then(|t| t.address))
             .map(Ipv4Net::from)
             .collect()
@@ -50,7 +48,7 @@ impl Transport for TailscaleTransport {
     fn provision(
         &self,
         _model: &Model<'_>,
-        _template: &Template,
+        _grants: &[String],
         _name: &str,
         _keys: &dyn KeyGenerator,
         _opts: &ProvisionOptions,

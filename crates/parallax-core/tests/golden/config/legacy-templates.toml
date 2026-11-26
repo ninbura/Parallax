@@ -1,0 +1,110 @@
+# Server
+
+[server.wireguard]
+interface = "wg0"
+listen_port = 51820
+supernet = "10.8.0.0/16"
+endpoint = "vpn.mydomain.com:51820"
+public_key = "DSuieBHAaq5V19ySBwUTiLBh9Pnduq1K9gcWaxXqMVc="
+private_key_file = "/etc/parallax/wg-server.key"
+
+[server.headscale]
+interface = "tailscale0"
+server_url = "https://headscale.mydomain.com"
+api_key_file = "/etc/parallax/headscale-api.key"
+derp = "embedded"
+subnet_router_node = "parallax-gateway"
+
+[server.dns]
+port = 53
+public_resolver = "1.1.1.1"
+
+[server.firewall]
+backend = "nftables"
+docker_coexistence = true
+
+[server.proxy]
+port = 8443
+certificates = "/etc/parallax/certs"
+upstream_ca = "/etc/ssl/certs/ca-certificates.crt"
+
+[server.backup]
+directory = "/var/lib/parallax/backups"
+automatic = true
+interval = "1d"
+keep = 14
+encrypt = true
+passphrase_file = "/etc/parallax/backup.passphrase"
+
+[server.public_ip]
+encrypted_dns = []
+
+# Networks
+
+[[network]]
+name = "home"
+interface = "eth0"
+subnet = "192.168.1.0/24"
+mapped_to = "198.18.1.0/24"
+upstream_dns = ["192.168.1.1"]
+domains = ["mydomain.com"]
+masquerade = false
+
+# Services
+
+[[service]]
+name = "immich"
+host = "192.168.1.5"
+ports = ["443/tcp"]
+nginx_vhost = true
+
+# Templates
+
+[[template]]
+name = "personal"
+grants = [{ kind = "all_networks" }]
+wireguard = { pool = "10.8.1.0/24" }
+headscale = { user = "gabriel" }
+dns = { wireguard = "split", tailscale = "split", public = true }
+client = { allowed_ips = "mapped_subnets", persistent_keepalive = 25 }
+
+[[template]]
+name = "family"
+grants = [{ kind = "service", name = "immich" }]
+wireguard = { pool = "10.8.2.0/24" }
+headscale = { tag = "tag:family" }
+dns = { wireguard = "tunnel_wide", tailscale = "split", public = false }
+client = { allowed_ips = "grants_only", persistent_keepalive = 25 }
+
+# Peers
+
+[[peer]]
+name = "router"
+template = "personal"
+transport = "wireguard"
+enabled = true
+[peer.wireguard]
+public_key = "pOCSkrZRwni5dyxWn1+puxPZBrRqtoyd+dwrRAn4ogk="
+address = "10.8.1.1"
+
+[[peer]]
+name = "laptop"
+template = "personal"
+transport = "wireguard"
+enabled = true
+[peer.wireguard]
+public_key = "zo060cy2M+x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk="
+address = "10.8.1.2"
+private_key = "AAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAkI="
+
+[[peer]]
+name = "sister-phone"
+template = "family"
+transport = "wireguard"
+enabled = true
+expires = "2027-12-31"
+[peer.wireguard]
+public_key = "Xf7dO2vUf2+ijuFdlp1bsOpTd01Ii9r53xxuASSz7yI="
+address = "10.8.2.1"
+private_key = "AAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA0M="
+preshared_key = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk="

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
-    /// Unique name, referenced by grants and templates.
+    /// Unique name, referenced by rules and peers.
     pub name: String,
     /// Gateway interface attached to this network (e.g. `eth0`).
     pub interface: String,
