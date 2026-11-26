@@ -112,14 +112,14 @@ fn iptables_backend_matches_golden() {
     }
 }
 
-/// Logged peers get their flows marked and their blocked attempts handed
-/// to the collector; peers at `off` appear nowhere. (With nobody logged,
+/// Logged peers get their blocked attempts handed to the collector, and at
+/// `connections` or more their flows marked; peers at `off` appear nowhere. (With nobody logged,
 /// the canonical goldens above have none of it.)
 #[test]
 fn logging_rules_match_golden() {
     let mut cfg = canonical_config();
     let family = cfg.grants.iter().position(|g| g.name == "family").unwrap();
-    cfg.grants[family].log = Some(LogLevel::Denied);
+    cfg.grants[family].log = Some(LogLevel::Blocked);
     cfg.peers[0].log = Some(LogLevel::Connections);
     for backend in [FirewallBackend::Nftables, FirewallBackend::IptablesNft] {
         cfg.server.firewall.backend = backend;
@@ -134,7 +134,7 @@ fn logging_rules_match_golden() {
     cfg.server.firewall.backend = FirewallBackend::Nftables;
     let model = Model::resolve(&cfg, today()).unwrap();
     let flows = parallax_core::logging::addresses(&model, LogLevel::Connections);
-    let denied = parallax_core::logging::addresses(&model, LogLevel::Denied);
+    let denied = parallax_core::logging::addresses(&model, LogLevel::Blocked);
     let address = |i: usize| {
         cfg.peers[i]
             .wireguard
@@ -142,8 +142,12 @@ fn logging_rules_match_golden() {
             .and_then(|w| w.address)
             .unwrap()
     };
+    // Levels include the ones below: the peer at `connections` is in both
+    // sets; sister-phone, at `blocked` through family, only in the second.
     assert!(flows.iter().any(|n| n.addr() == address(0)));
-    assert!(!denied.iter().any(|n| n.addr() == address(0)));
+    assert!(denied.iter().any(|n| n.addr() == address(0)));
+    assert!(!flows.iter().any(|n| n.addr() == address(2)));
+    assert!(denied.iter().any(|n| n.addr() == address(2)));
     // Everyone not logged stays out of both sets.
     for (i, p) in cfg.peers.iter().enumerate() {
         let logged = p.log.is_some() || p.grants.iter().any(|g| g == "family");

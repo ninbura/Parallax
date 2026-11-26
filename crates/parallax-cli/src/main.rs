@@ -316,9 +316,12 @@ enum LogCommand {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum LevelArg {
     Off,
+    /// Attempts the firewall stopped.
+    Blocked,
+    /// Also every connection.
     Connections,
-    Bytes,
-    Denied,
+    /// Also the bytes of each connection.
+    Detailed,
     /// Clear a peer's or grant's own level.
     Inherit,
 }
@@ -327,9 +330,9 @@ impl LevelArg {
     fn level(self) -> Option<LogLevel> {
         match self {
             LevelArg::Off => Some(LogLevel::Off),
+            LevelArg::Blocked => Some(LogLevel::Blocked),
             LevelArg::Connections => Some(LogLevel::Connections),
-            LevelArg::Bytes => Some(LogLevel::Bytes),
-            LevelArg::Denied => Some(LogLevel::Denied),
+            LevelArg::Detailed => Some(LogLevel::Detailed),
             LevelArg::Inherit => None,
         }
     }

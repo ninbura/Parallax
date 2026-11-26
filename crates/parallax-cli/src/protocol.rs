@@ -201,7 +201,7 @@ mod tests {
         // Every kind of log level: the socket reads peers through the same
         // form as TOML.
         config.server.logs.level = parallax_core::model::LogLevel::Connections;
-        config.grants[1].log = Some(parallax_core::model::LogLevel::Denied);
+        config.grants[1].log = Some(parallax_core::model::LogLevel::Blocked);
         config.peers[0].log = Some(parallax_core::model::LogLevel::Off);
         let Request::Save {
             configuration,

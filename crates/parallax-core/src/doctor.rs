@@ -104,11 +104,11 @@ pub fn diagnose(config: Result<&Config, String>, sys: System<'_>) -> Vec<Check> 
             outcome: check_backup(&config.server.backup, sys),
         });
         // Also before the first peer, when the global level asks for bytes.
-        let bytes = config.server.logs.level >= LogLevel::Bytes
+        let bytes = config.server.logs.level >= LogLevel::Detailed
             || config
                 .peers
                 .iter()
-                .any(|p| p.enabled && crate::logging::level(config, p) >= LogLevel::Bytes);
+                .any(|p| p.enabled && crate::logging::level(config, p) >= LogLevel::Detailed);
         if bytes {
             checks.push(Check {
                 name: "byte counts".into(),
@@ -712,7 +712,7 @@ mod tests {
         };
         let mut config = canonical_config();
         assert!(names(&config, &healthy_fs()).is_empty());
-        config.peers[0].log = Some(LogLevel::Bytes);
+        config.peers[0].log = Some(LogLevel::Detailed);
         let [(_, Outcome::Warn(w))] = &names(&config, &healthy_fs())[..] else {
             panic!("expected one warning");
         };

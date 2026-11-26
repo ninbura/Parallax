@@ -285,20 +285,23 @@ fn log_levels_are_set_for_everyone_a_grant_or_a_peer() {
         assert!(!ok, "{args:?} should fail");
         err
     };
-    let out = ok(&["log", "level", "denied", "--grant", "family"]);
+    let out = ok(&["log", "level", "blocked", "--grant", "family"]);
     assert!(
-        out.contains("grant 'family' logs denied for its peers now"),
+        out.contains("grant 'family' logs blocked for its peers now"),
         "{out}"
     );
-    let out = ok(&["log", "level", "bytes", "--peer", "sister-phone"]);
-    assert!(out.contains("peer 'sister-phone' logs bytes now"), "{out}");
+    let out = ok(&["log", "level", "detailed", "--peer", "sister-phone"]);
+    assert!(
+        out.contains("peer 'sister-phone' logs detailed now"),
+        "{out}"
+    );
     assert!(
         !out.contains("in effect"),
         "its own level is what's in effect: {out}"
     );
     // Back to its grant's level.
     let out = ok(&["log", "level", "inherit", "--peer", "sister-phone"]);
-    assert!(out.contains("in effect: denied"), "{out}");
+    assert!(out.contains("in effect: blocked"), "{out}");
     let out = ok(&["log", "level", "connections"]);
     assert!(
         out.contains("everyone logs connections by default now"),
@@ -306,11 +309,11 @@ fn log_levels_are_set_for_everyone_a_grant_or_a_peer() {
     );
     let text = ok(&["config", "export"]);
     assert!(text.contains("level = \"connections\""), "{text}");
-    assert!(text.contains("log = \"denied\""), "{text}");
+    assert!(text.contains("log = \"blocked\""), "{text}");
 
     let err = refused(&["log", "level", "inherit"]);
     assert!(err.contains("nothing to inherit"), "{err}");
-    let err = refused(&["log", "level", "bytes", "--peer", "nobody"]);
+    let err = refused(&["log", "level", "detailed", "--peer", "nobody"]);
     assert!(err.contains("peer 'nobody' not found"), "{err}");
     let err = refused(&["log", "level", "verbose"]);
     assert!(err.contains("verbose"), "{err}");

@@ -91,11 +91,12 @@ passphrase_file = "/etc/parallax/backup.passphrase"
 encrypted_dns = []
 
 [server.logs]
-# Per-peer activity logging (docs/logging.md): "off", "connections" (one
-# record per new connection), "bytes" (also bytes each way when it ends) or
-# "denied" (also attempts the firewall blocked). This is the default for
-# everyone; `log = "..."` on a grant or a peer overrides it. A peer's own
-# level wins, then the most detailed of its grants'.
+# Per-peer activity logging (docs/logging.md), like log verbosity: "off",
+# "blocked" (attempts the firewall stopped), "connections" (also one record
+# per new connection) or "detailed" (also the bytes each way when it ends).
+# This is the default for everyone; `log = "..."` on a grant or a peer
+# overrides it. A peer's own level wins, then the most detailed of its
+# grants'.
 level = "off"
 # Kept apart from the configuration, so it can live on another disk.
 path = "/var/lib/parallax/logs.db"
