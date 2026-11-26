@@ -92,11 +92,10 @@ pub fn addresses(model: &Model<'_>, at_least: LogLevel) -> Vec<Ipv4Net> {
     out
 }
 
-/// Whether some peer's level is at least `at_least`.
+/// Whether some peer the firewall can mark is logged at `at_least` or
+/// more (the same peers as [`addresses`]).
 pub fn any(model: &Model<'_>, at_least: LogLevel) -> bool {
-    model
-        .active_peers()
-        .any(|p| level(model.config(), p) >= at_least)
+    !addresses(model, at_least).is_empty()
 }
 
 /// A connection as the kernel's connection tracking reports it, as the
@@ -418,6 +417,18 @@ mod tests {
         assert_eq!(r.destination, Ipv4Addr::new(198, 18, 1, 9));
         assert_eq!(r.real_destination, Some(Ipv4Addr::new(192, 168, 1, 9)));
         assert_eq!(r.protocol, "udp");
+    }
+
+    /// Levels survive TOML (import, export, `config edit`). The daemon's
+    /// socket reads through the same form (its test is in the CLI).
+    #[test]
+    fn levels_survive_toml() {
+        let mut cfg = canonical_config();
+        cfg.server.logs.level = LogLevel::Connections;
+        cfg.grants[1].log = Some(LogLevel::Denied);
+        cfg.peers[0].log = Some(LogLevel::Off);
+        let toml = cfg.to_toml().unwrap();
+        assert_eq!(Config::from_toml(&toml).unwrap(), cfg);
     }
 
     #[test]

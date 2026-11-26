@@ -87,7 +87,7 @@ pub enum Host { Ip(Ipv4Addr), Name(String) }   // TOML: a string either way
 pub struct Grant {
     pub name: String,
     pub everyone: bool,                 // every peer has it, unattached
-    pub log: Option<LogLevel>,          // raises its peers' log level (docs/logging.md)
+    pub log: Option<LogLevel>,          // sets its peers' log level (docs/logging.md)
     pub rules: Vec<Rule>,
 }
 
@@ -130,7 +130,7 @@ a peer's own `log` wins, then the most detailed `log` among its grants, then
 `0x20000000`) and hands the blocked attempts of the second to nflog group
 20568, rate-limited, before each drop they can reach (a tier's default deny,
 the unknown-source drop, the gateway host's). With nobody logged none of it
-is generated, so the goldens of the canonical scenario are unchanged.
+is generated: the canonical goldens have no logging rule or set.
 
 Ports are lists, written the way ufw writes them: `445/tcp`, `137-138/udp`,
 or a bare `25565` for TCP and UDP. A service is a named host and its ports

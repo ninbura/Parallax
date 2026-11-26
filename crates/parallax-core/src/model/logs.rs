@@ -102,7 +102,8 @@ fn default_logs_max_size() -> ByteSize {
     ByteSize::from_bytes(ByteSize::GIB)
 }
 
-/// A size in bytes, written in binary units: `512MiB`, `1GiB`.
+/// A size in bytes, written in binary units: `512MiB`, `1GiB` (or `B` for
+/// a size that isn't a whole KiB).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ByteSize(u64);
@@ -112,14 +113,15 @@ impl ByteSize {
     const MIB: u64 = 1024 * ByteSize::KIB;
     const GIB: u64 = 1024 * ByteSize::MIB;
     const TIB: u64 = 1024 * ByteSize::GIB;
-    const UNITS: [(&'static str, u64); 4] = [
+    // Largest first; `B` last, since every other suffix ends in it.
+    const UNITS: [(&'static str, u64); 5] = [
         ("TiB", ByteSize::TIB),
         ("GiB", ByteSize::GIB),
         ("MiB", ByteSize::MIB),
         ("KiB", ByteSize::KIB),
+        ("B", 1),
     ];
 
-    /// `bytes` should be a whole number of KiB, or it prints rounded down.
     pub const fn from_bytes(bytes: u64) -> Self {
         ByteSize(bytes)
     }
@@ -166,7 +168,7 @@ impl std::fmt::Display for ByteSize {
         let (suffix, unit) = ByteSize::UNITS
             .into_iter()
             .find(|&(_, unit)| self.0.is_multiple_of(unit))
-            .unwrap_or(("KiB", ByteSize::KIB));
+            .unwrap_or(("B", 1));
         write!(f, "{}{suffix}", self.0 / unit)
     }
 }
@@ -194,12 +196,16 @@ mod tests {
             ("1GiB", ByteSize::GIB, "1GiB"),
             ("64KiB", 64 * ByteSize::KIB, "64KiB"),
             ("2TiB", 2 * ByteSize::TIB, "2TiB"),
+            ("1500B", 1500, "1500B"),
+            ("2048B", 2048, "2KiB"),
         ] {
             let b: ByteSize = text.parse().unwrap();
             assert_eq!(b.as_bytes(), bytes, "{text}");
             assert_eq!(b.to_string(), shown, "{text}");
         }
-        for bad in ["", "0GiB", "1", "GiB", "1GB", "1gib", "-1MiB", "1.5GiB"] {
+        for bad in [
+            "", "0GiB", "0B", "1", "GiB", "B", "1GB", "1gib", "-1MiB", "1.5GiB",
+        ] {
             assert!(bad.parse::<ByteSize>().is_err(), "{bad}");
         }
     }
