@@ -5,18 +5,22 @@ set -e
 
 systemd-sysusers parallax.conf
 systemd-tmpfiles --create parallax.conf
-# Forwarding and the module now, not only from the next boot. Both fail in a
-# container, which is fine: the host decides there.
-/usr/lib/systemd/systemd-sysctl 90-parallax.conf || echo "parallax: could not set net.ipv4.ip_forward now; it is set at boot" >&2
-modprobe wireguard 2>/dev/null || true
 
-if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload
-    # An upgrade ($2 is the old version): a running service gets the new binary.
+# Only on a running system, not in a chroot or an image build.
+[ -d /run/systemd/system ] || exit 0
+systemctl daemon-reload
+# ip_forward and the module now, not only from the next boot. Through the
+# boot-time services, so every sysctl.d file applies in order and a local
+# override still wins.
+systemctl restart systemd-sysctl.service systemd-modules-load.service ||
+    echo "parallax: warning: could not apply sysctl.d or modules-load.d now; they apply at boot" >&2
+
+if [ -n "$2" ]; then
+    # An upgrade ($2 is the old version): a running service gets the new
+    # binary. deb-systemd-invoke honours a local policy-rc.d.
+    deb-systemd-invoke try-restart parallax.service ||
+        echo "parallax: warning: restarting the service failed; see journalctl -u parallax" >&2
+else
     # A first install leaves it stopped and disabled; it needs a configuration.
-    if [ -n "$2" ]; then
-        systemctl try-restart parallax.service
-    else
-        echo "parallax: put your configuration in /etc/parallax/parallax.toml, then: sudo systemctl enable --now parallax (docs/native.md)"
-    fi
+    echo "parallax: put your configuration in /etc/parallax/parallax.toml, then: sudo systemctl enable --now parallax (docs/native.md)"
 fi

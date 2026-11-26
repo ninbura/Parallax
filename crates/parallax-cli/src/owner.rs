@@ -58,10 +58,12 @@ pub(crate) fn database_belongs_to_another_user(db: &Path) -> Option<(String, Str
 
 /// After root wrote `path` (a key or a passphrase) into a directory another
 /// user owns: give it to that user, or the service couldn't read it.
+/// `lchown`: that user can replace the file with a symlink in the meantime,
+/// and root must not hand them whatever it points to.
 pub(crate) fn hand_to_directory_owner(path: &Path) -> anyhow::Result<()> {
     use anyhow::Context;
     if let Some((uid, gid)) = foreign_owner(dir_of(path)) {
-        std::os::unix::fs::chown(path, Some(uid), Some(gid))
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
             .with_context(|| format!("giving {} to uid {uid}", path.display()))?;
     }
     Ok(())

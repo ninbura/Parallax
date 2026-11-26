@@ -64,9 +64,8 @@ sudo install -m 0644 packaging/modules-load.d/parallax.conf /usr/lib/modules-loa
 sudo install -m 0644 packaging/sysctl.d/90-parallax.conf /usr/lib/sysctl.d/
 sudo systemd-sysusers parallax.conf
 sudo systemd-tmpfiles --create parallax.conf
-sudo /usr/lib/systemd/systemd-sysctl 90-parallax.conf
-sudo modprobe wireguard
 sudo systemctl daemon-reload
+sudo systemctl restart systemd-sysctl systemd-modules-load   # ip_forward and wireguard now
 ```
 
 ## First start
@@ -90,16 +89,16 @@ Before it starts the daemon, the service:
 
 Then `parallax daemon` applies the configuration, brings up `wg0` and starts
 the DNS server and the HTTPS proxy. `systemctl start` returns once that has
-worked, or fails if it hasn't. See what went wrong with:
+worked, or fails if it hasn't. The journal shows what went wrong, including
+`doctor`'s report from before the daemon started:
 
 ```sh
 sudo journalctl -u parallax
-sudo parallax doctor
 ```
 
 After the first import the database is the configuration. Unlike in Docker,
-`parallax.toml` isn't renamed (the service can't write to it). It's ignored
-from then on, so delete it once the service runs. Change the configuration
+`parallax.toml` isn't renamed: the unit only imports it. It's ignored from
+then on, so delete it once the service runs. Change the configuration
 with `sudo parallax config edit` (see setup.md, "Editing the configuration").
 
 Then set the backup passphrase and keep it in your password manager:
@@ -114,10 +113,12 @@ Docker. Every saved change applies anyway.
 
 ## Running `parallax` commands
 
-Run the CLI as root: `sudo parallax <command>`. While the service runs, every
-command goes through its socket (`/run/parallax/parallax.sock`, which only
-`parallax` and root can open), so the daemon holds the database and applies
-each change as it's saved. There's no `parallax` group. Opening the CLI to
+Run the CLI as root: `sudo parallax <command>`. While the service runs,
+whatever reads or changes the configuration goes through its socket
+(`/run/parallax/parallax.sock`, which only `parallax` and root can open), so
+the daemon holds the database and applies each change as it's saved.
+`sudo parallax doctor` checks the host as root, with the configuration from
+the daemon. There's no `parallax` group. Opening the CLI to
 another user would hand them the gateway.
 
 When the service isn't running, root refuses commands that would open the
@@ -135,12 +136,15 @@ nothing of the service's exists yet, so root may restore a backup then
 
 ## Certificates for proxied services
 
-The service reads certificates from `server.proxy.certificates`
-(`/etc/parallax/certs` by default) as the `parallax` user. certbot keeps
-`/etc/letsencrypt/live` and `archive` readable by root only, so point
-Parallax at a copy. A certbot deploy hook keeps the copy current. It runs
-after every renewal, as root. Copy only the certificates Parallax should
-hold:
+The service reads certificates from `server.proxy.certificates` as the
+`parallax` user. certbot keeps `/etc/letsencrypt/live` and `archive`
+readable by root only, so point Parallax at a copy that root owns and the
+service may only read, and set
+`server.proxy.certificates = "/etc/parallax-certs"`. Not under
+`/etc/parallax`: the service owns that directory, and a hook running as root
+mustn't write anywhere the service could redirect it. A certbot deploy hook
+keeps the copy current. It runs after every renewal, as root. Copy only the
+certificates Parallax should hold:
 
 ```sh
 #!/bin/sh
@@ -151,9 +155,9 @@ case "$name" in
     immich.mydomain.com) ;;   # the hostnames Parallax proxies
     *) exit 0 ;;
 esac
-dest=/etc/parallax/certs/$name
-install -d -m 0700 -o parallax -g parallax /etc/parallax/certs "$dest"
-install -m 0600 -o parallax -g parallax \
+dest=/etc/parallax-certs/$name
+install -d -m 0750 -o root -g parallax /etc/parallax-certs "$dest"
+install -m 0640 -o root -g parallax \
     "$RENEWED_LINEAGE/fullchain.pem" "$RENEWED_LINEAGE/privkey.pem" "$dest/"
 ```
 
@@ -171,6 +175,7 @@ The service can't see `/home`, `/root`, `/tmp` or `/var/tmp`. To restore
 while it runs, put the backup in the backup directory first:
 
 ```sh
+sudo install -d -m 0700 -o parallax -g parallax /var/lib/parallax/backups
 sudo install -m 0600 -o parallax -g parallax parallax-backup-20261124T153000Z.tar /var/lib/parallax/backups/
 sudo parallax backup restore /var/lib/parallax/backups/parallax-backup-20261124T153000Z.tar
 ```
@@ -183,7 +188,9 @@ sudo parallax backup restore ~/parallax-backup-20261124T153000Z.tar
 sudo systemctl enable --now parallax
 ```
 
-That restores the database, the server key and the passphrase. On its first
+That restores the database and the server key. When the backup is
+encrypted, it also saves the passphrase you give it for the next backups,
+unless one is already set. On its first
 start the service takes ownership of `/var/lib/parallax` and applies the
 restored configuration. You don't need the `parallax apply` the restore
 suggests.

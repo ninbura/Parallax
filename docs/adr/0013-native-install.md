@@ -56,6 +56,8 @@ profile. The only file it lets `wg` open is under `/etc/wireguard`, so
   service's directories. Root would otherwise leave root-owned `-wal`,
   `.db-log` or generated files that the service can't open. Keys and
   passphrases root writes into `/etc/parallax` go to the directory's owner.
+  Root writes them as new files and hands them over with `lchown`, so a
+  link the service left there can't redirect root's write or `chown`.
 - **Packages:** one nfpm config builds the `.deb` and the Arch package from
   the static musl binary. Arch's systemd pacman hooks create the user and
   the directory, set the sysctl and load the module. The `.deb` does the
@@ -80,8 +82,9 @@ profile. The only file it lets `wg` open is under `/etc/wireguard`, so
   does.
 - The service can't see `/home`, `/root` or `/tmp`, so files the daemon
   reads itself (a backup to restore) must be somewhere it can.
-- certbot's `/etc/letsencrypt` is root-only. Natively, certificates are
-  copied by a deploy hook into a directory the service can read.
+- certbot's `/etc/letsencrypt` is root-only. Natively, a deploy hook copies
+  certificates into a root-owned directory the service can only read, not
+  into `/etc/parallax`, where the service could redirect root's writes.
 - `CAP_NET_ADMIN` covers all of the host's networking, not just Parallax's
   table and interface; the kernel can't narrow it. The service's exposure
   is what it does on the network: the DNS server and the proxy, and later

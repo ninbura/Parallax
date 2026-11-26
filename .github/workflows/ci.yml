@@ -93,11 +93,13 @@ jobs:
           go-version: stable
           cache: false
       - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@$NFPM_VERSION
-      - run: |
+      - shell: bash # with pipefail
+        run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/parallax dist/parallax
-          export ARCH=${{ matrix.arch }} BINARY=dist/parallax
-          export VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "parallax-cli") | .version')
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "parallax-cli") | .version')
+          test -n "$VERSION"
+          export VERSION ARCH=${{ matrix.arch }} BINARY=dist/parallax
           nfpm package -f packaging/nfpm.yaml -p deb -t dist/
           nfpm package -f packaging/nfpm.yaml -p archlinux -t dist/
           ls -l dist
@@ -133,11 +135,20 @@ jobs:
       - run: sudo parallax peer show
       - run: test "$(ps -o user= -p "$(systemctl show -P MainPID parallax)")" = parallax
       - run: systemd-analyze security --threshold=20 parallax.service
+      # An upgrade (here a reinstall) restarts a running service.
+      - run: |
+          before=$(systemctl show -P MainPID parallax)
+          sudo apt-get install -y --reinstall ./dist/parallax_*_amd64.deb
+          test "$(systemctl show -P MainPID parallax)" != "$before"
+          sudo parallax status
       - if: failure()
         run: sudo journalctl -u parallax --no-pager
       # Removing it takes the gateway down and leaves the keys and database.
       - run: sudo apt-get remove -y parallax
-      - run: "! ip link show wg0 && ! sudo nft list table inet parallax"
+      - shell: bash
+        run: |
+          ip -o link show > links && sudo nft list tables > tables
+          ! grep -q ': wg0:' links && ! grep -qx 'table inet parallax' tables
       - run: sudo test -f /etc/parallax/wg-server.key && sudo test -f /var/lib/parallax/parallax.db
 
   install-arch:
