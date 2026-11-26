@@ -1,5 +1,10 @@
 # Setting up a Parallax gateway (M1: WireGuard path)
 
+This guide runs Parallax in rootful Docker. To run it on the host as an
+unprivileged systemd service instead (a `.deb`, an Arch package or a static
+binary), see [native.md](native.md). The host, router, endpoint, grants and
+certificates sections here apply to both.
+
 ## What you need on the host
 
 - Linux with a current nftables and kernel that support prefix NAT (NETMAP;
