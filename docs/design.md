@@ -41,8 +41,11 @@ crates/parallax-cli/            `parallax` binary (daemon, status, validate, pla
                                 src/daemon.rs and src/protocol.rs: the daemon and
                                 its socket protocol
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)
+packaging/                      the native install: the systemd unit, sysusers.d,
+                                tmpfiles.d, modules-load.d, sysctl.d
 example/parallax.toml           fully commented canonical scenario
-tests/integration/netns.sh      Linux network-namespace integration test (CI)
+tests/integration/netns.sh      Linux network-namespace integration test (CI), with
+                                the daemon as root or as the native unit
 docs/adr/                       decisions
 ```
 
@@ -375,7 +378,9 @@ alternatives: ADR 0005.
   otherwise each CLI command while it needs it. Every change is one write
   transaction (`Store::update`). With the daemon, changes queue in its one
   writer (ADR 0007).
-- The database and its log are 0600.
+- MVCC mode (`BEGIN CONCURRENT`, ADR 0011): opening a database switches it once,
+  before migrating. `sqlite3` can't open the live file; a backup's copy it can.
+- The database and its logs (`-wal`, MVCC's `-log`) are 0600.
 
 The CLI validates before every save, so the database only ever holds a valid
 configuration. `config import` and `config edit` also give WireGuard peers
@@ -383,7 +388,8 @@ without an address the next free one.
 
 Backups (`parallax_store::backup`, ADR 0006): `parallax-backup-<time>.tar`
 holds a plaintext `manifest.toml` and `payload.tar.age`, which is `age`
-passphrase-encrypted and holds a `VACUUM INTO` copy of the database and the
+passphrase-encrypted and holds a copy of the database, rebuilt from its rows
+in WAL mode (the live one runs in MVCC mode, ADR 0011), and the
 server key. Restore stages the backup's database next to the live one,
 migrates and checks it, then replaces every row of the live database with
 its rows in one write transaction. Operator guide: `docs/backup.md`.

@@ -138,6 +138,19 @@ async fn an_encrypted_backup_needs_its_passphrase() {
     assert!(!text.contains("SQLite format"));
 }
 
+/// The live database runs in MVCC mode, which `sqlite3` can't open; a
+/// backup's copy is a plain file it can (docs/backup.md).
+#[tokio::test]
+async fn a_backup_holds_a_database_sqlite3_can_open() {
+    let dir = TempDir::new();
+    let file = backup(&dir, None).await;
+    let contents = open(&file, None).unwrap();
+    let header = &contents.database[..20];
+    assert!(header.starts_with(b"SQLite format 3\0"));
+    // Bytes 18 and 19: the file format versions; Turso marks MVCC with 255.
+    assert!(header[18] <= 2 && header[19] <= 2, "{header:?}");
+}
+
 #[tokio::test]
 async fn unchanged_contents_give_the_same_checksum() {
     let dir = TempDir::new();
@@ -147,6 +160,14 @@ async fn unchanged_contents_give_the_same_checksum() {
     store.save(&canonical_config()).await.unwrap();
     let again = store.snapshot(&key).await.unwrap();
     assert_eq!(first.contents_sha256(), again.contents_sha256());
+    // What the daemon learns on this machine isn't backed up (a restore
+    // keeps the current one), so a new public IP isn't new contents.
+    store
+        .set_public_ip(std::net::Ipv4Addr::new(203, 0, 113, 7))
+        .await
+        .unwrap();
+    let new_ip = store.snapshot(&key).await.unwrap();
+    assert_eq!(first.contents_sha256(), new_ip.contents_sha256());
 
     let mut changed = canonical_config();
     changed.peers.pop();

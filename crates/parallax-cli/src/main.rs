@@ -86,6 +86,7 @@ fn emit(args: std::fmt::Arguments) -> anyhow::Result<()> {
 }
 
 mod backup;
+mod owner;
 mod protocol;
 
 #[derive(Parser)]
@@ -437,12 +438,29 @@ impl Ctx {
 
     /// Open the database, which must exist.
     pub(crate) async fn open_store(&self) -> anyhow::Result<Store> {
+        self.not_root_on_the_services_database()?;
         Store::open(&self.db).await.map_err(|e| self.locked(e))
     }
 
     /// Open the database, creating an empty one if there is none.
     pub(crate) async fn create_store(&self) -> anyhow::Result<Store> {
+        self.not_root_on_the_services_database()?;
         Store::create(&self.db).await.map_err(|e| self.locked(e))
+    }
+
+    /// On a native install the database belongs to the service's user.
+    fn not_root_on_the_services_database(&self) -> anyhow::Result<()> {
+        if let Some((who, sudo_u)) = owner::database_belongs_to_another_user(&self.db) {
+            bail!(
+                "{} belongs to {who}, and no daemon answers on {}. Opening the database as \
+                 root would leave files that user can't open. Start the service (`sudo \
+                 systemctl start parallax`) so this goes through its socket, or run it as that \
+                 user (`sudo -u {sudo_u} parallax ...`)",
+                self.db.display(),
+                self.socket.display(),
+            );
+        }
+        Ok(())
     }
 
     /// Another process holds the database, yet no daemon answered.
@@ -782,6 +800,15 @@ fn run() -> anyhow::Result<()> {
             out!("{}", plan.render())?;
         }
         Command::Generate(out) => {
+            if let Some((who, sudo_u)) = owner::belongs_to_another_user(&out.out) {
+                bail!(
+                    "{} belongs to {who}: files generated there as root would be ones the \
+                     service can't replace. See the changes with `parallax plan`, generate \
+                     elsewhere (`-o <dir>`), or run it as that user (`sudo -u {sudo_u} parallax \
+                     generate`)",
+                    out.out.display()
+                );
+            }
             let (config, learned) = ctx.load_for_generation()?;
             let model = model_for(&config, today(), &learned)?;
             let bundle = generate::generate_all(&model, &fs)?;
@@ -966,6 +993,7 @@ fn keygen(ctx: &Ctx, write_config: bool, if_missing: bool) -> anyhow::Result<()>
     }
     let kp = OsKeyGenerator.keypair();
     fs.write(&path, &format!("{}\n", kp.private.expose_base64()), true)?;
+    owner::hand_to_directory_owner(&path)?;
     // Record the key before printing anything, so a reader that goes away
     // can't leave a new key file with the old public key in the database.
     let saved = if write_config {

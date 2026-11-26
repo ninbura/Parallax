@@ -1,7 +1,8 @@
 # ADR 0005: The database is the source of truth
 
 Status: accepted (step 6a, before M2). Supersedes ADR 0002. Its
-multi-process and MVCC paragraphs are superseded by ADR 0007 (the daemon).
+multi-process and MVCC paragraphs are superseded by ADR 0007 (the daemon)
+and ADR 0011 (MVCC).
 
 ## Decision
 
@@ -42,7 +43,7 @@ a file next to it.
   `config edit` saves only if nobody changed the configuration while the
   editor was open, and keeps the edited file if someone did.
 - **Parallel writers (MVCC, `BEGIN CONCURRENT`) wait for the daemon.**
-  *(Decided in ADR 0007: not now.)* Turso's
+  *(Decided in ADR 0007: not now; ADR 0011 turns it on, step 7c.)* Turso's
   MVCC refuses multi-process access (its bookkeeping lives in one process's
   memory), and while it's on `sqlite3` can't open the file. Once the daemon
   (step 7) is the only process holding the database and the CLI talks to it,

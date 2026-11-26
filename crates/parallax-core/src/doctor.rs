@@ -11,8 +11,12 @@ use crate::model::{BackupServer, Config, FirewallBackend};
 
 /// The kernel's identity mapping: the initial user namespace maps every uid to itself.
 const INIT_USERNS_UID_MAP: (u64, u64, u64) = (0, 0, 4_294_967_295);
-/// Bit of `CAP_NET_ADMIN` in `/proc/self/status` capability masks.
+/// Bits in `/proc/self/status` capability masks.
+const CAP_NET_BIND_SERVICE_BIT: u32 = 10;
 const CAP_NET_ADMIN_BIT: u32 = 12;
+/// Where the kernel's default puts it when the sysctl can't be read.
+const DEFAULT_UNPRIVILEGED_PORT_START: u32 = 1024;
+const UNIT_DOC: &str = "packaging/systemd/parallax.service";
 /// Short enough for the 15-byte interface name limit, unlikely to clash.
 const PROBE_INTERFACE: &str = "parallax-probe";
 /// A ruleset using prefix NAT (NETMAP), checked with `nft -c` and never loaded.
@@ -66,6 +70,11 @@ pub fn diagnose(config: Result<&Config, String>, sys: System<'_>) -> Vec<Check> 
     ];
 
     let config = config.ok();
+    if let Some(config) = config {
+        if let Some(result) = check_net_bind_service(config, sys) {
+            checks.push(Check::new("CAP_NET_BIND_SERVICE", result));
+        }
+    }
     let backend = config.map_or(FirewallBackend::Nftables, |c| c.server.firewall.backend);
     let missing = crate::apply::preflight(backend, sys);
     checks.push(Check::new(
@@ -278,29 +287,121 @@ fn check_user_namespace(sys: System<'_>) -> Result<String, String> {
     };
     Err(format!(
         "running in a user namespace ({root}). Rootless Docker is not supported: Parallax \
-         needs root over the host's own network. Run it on a rootful Docker daemon (with \
+         needs CAP_NET_ADMIN over the host's own network. Run it on a rootful Docker daemon (with \
          userns-remap, set `userns_mode: host` for this service) or install it natively; \
          see {SETUP_DOC}"
     ))
 }
 
-fn check_net_admin(sys: System<'_>) -> Result<String, String> {
+/// What `/proc/self/status` says about this process's privileges.
+struct Privileges {
+    effective_uid: u32,
+    effective: u64,
+    ambient: u64,
+}
+
+fn privileges(sys: System<'_>) -> Result<Privileges, String> {
     let path = Path::new("/proc/self/status");
     let text = read(sys, path)?;
-    let effective = text
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:"))
-        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-        .ok_or_else(|| format!("no readable CapEff line in {}", path.display()))?;
-    if effective & (1 << CAP_NET_ADMIN_BIT) != 0 {
-        Ok("held".into())
-    } else {
-        Err(
+    let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name));
+    let mask = |name: &str| {
+        field(name)
+            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+            .ok_or_else(|| format!("no readable {name} line in {}", path.display()))
+    };
+    let effective_uid = field("Uid:")
+        .and_then(|ids| ids.split_whitespace().nth(1))
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(|| format!("no readable Uid: line in {}", path.display()))?;
+    Ok(Privileges {
+        effective_uid,
+        effective: mask("CapEff:")?,
+        ambient: mask("CapAmb:").unwrap_or(0),
+    })
+}
+
+fn check_net_admin(sys: System<'_>) -> Result<String, String> {
+    let p = privileges(sys)?;
+    if p.effective & (1 << CAP_NET_ADMIN_BIT) == 0 {
+        return Err(
             "missing; run as root, give the container `cap_add: [NET_ADMIN]`, \
              or grant the native service CAP_NET_ADMIN"
                 .into(),
-        )
+        );
     }
+    if p.effective_uid == 0 {
+        return Ok("held".into());
+    }
+    // Not root: `nft`, `ip` and `wg` keep only ambient capabilities across exec.
+    if p.ambient & (1 << CAP_NET_ADMIN_BIT) == 0 {
+        return Err(format!(
+            "held, but not ambient: running as uid {}, so `nft`, `ip` and `wg` start \
+             without it. Set `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE` \
+             (see {UNIT_DOC})",
+            p.effective_uid
+        ));
+    }
+    Ok(format!(
+        "held, and ambient for `nft`, `ip` and `wg` (uid {})",
+        p.effective_uid
+    ))
+}
+
+/// Only when a port the gateway listens on is below the unprivileged range.
+/// The daemon binds the DNS server and the HTTPS proxy itself; the kernel
+/// binds WireGuard's UDP port for `wg`, a subprocess, so for a non-root
+/// service that one needs the capability ambient too.
+fn check_net_bind_service(config: &Config, sys: System<'_>) -> Option<Result<String, String>> {
+    // u32: the sysctl goes up to 65536 (no unprivileged port at all).
+    let start = read(
+        sys,
+        Path::new("/proc/sys/net/ipv4/ip_unprivileged_port_start"),
+    )
+    .ok()
+    .and_then(|s| s.trim().parse::<u32>().ok())
+    .unwrap_or(DEFAULT_UNPRIVILEGED_PORT_START);
+    let server = &config.server;
+    let low: Vec<(String, bool)> = [
+        ("DNS", server.dns.port, false),
+        ("proxy", server.proxy.port, false),
+        ("WireGuard", server.wireguard.listen_port, true),
+    ]
+    .into_iter()
+    .filter(|(_, port, _)| u32::from(*port) < start)
+    .map(|(what, port, by_wg)| (format!("{what} port {port}"), by_wg))
+    .collect();
+    if low.is_empty() {
+        return None;
+    }
+    let p = match privileges(sys) {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e)),
+    };
+    let bit = 1 << CAP_NET_BIND_SERVICE_BIT;
+    let names = |filter: &dyn Fn(bool) -> bool| {
+        low.iter()
+            .filter(|(_, by_wg)| filter(*by_wg))
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let all = names(&|_| true);
+    if p.effective & bit == 0 {
+        return Some(Err(format!(
+            "missing, and needed below net.ipv4.ip_unprivileged_port_start ({start}): \
+             {all}. Run as root, or give the native service CAP_NET_BIND_SERVICE (see {UNIT_DOC})"
+        )));
+    }
+    let by_wg = names(&|by_wg| by_wg);
+    if p.effective_uid != 0 && !by_wg.is_empty() && p.ambient & bit == 0 {
+        return Some(Err(format!(
+            "held, but not ambient: running as uid {}, so `wg` can't bind {by_wg} \
+             (below {start}). Set `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE` \
+             (see {UNIT_DOC})",
+            p.effective_uid
+        )));
+    }
+    Some(Ok(format!("held, for {all}")))
 }
 
 /// The gateway shares the host's network namespace, so it can't set this
@@ -467,7 +568,11 @@ mod tests {
     use crate::model::Rule;
     use crate::testing::canonical_config;
 
-    const ROOT_STATUS: &str = "Name:\tparallax\nCapEff:\t000001ffffffffff\n";
+    const ROOT_STATUS: &str =
+        "Name:\tparallax\nUid:\t0\t0\t0\t0\nCapEff:\t000001ffffffffff\nCapAmb:\t0000000000000000\n";
+    /// The native service: uid 999 with exactly its two capabilities, both ambient.
+    const SERVICE_STATUS: &str =
+        "Name:\tparallax\nUid:\t999\t999\t999\t999\nCapEff:\t0000000000001400\nCapAmb:\t0000000000001400\n";
 
     fn healthy_fs() -> MemoryFs {
         MemoryFs::new()
@@ -530,6 +635,7 @@ mod tests {
                 "user namespace",
                 "CAP_NET_ADMIN",
                 "ip_forward",
+                "CAP_NET_BIND_SERVICE",
                 "tools",
                 "interface eth0",
                 "wireguard",
@@ -630,11 +736,123 @@ mod tests {
     #[test]
     fn missing_net_admin_and_forwarding_are_reported_together() {
         let fs = healthy_fs()
-            .with_file("/proc/self/status", "CapEff:\t0000000000000000\n")
+            .with_file(
+                "/proc/self/status",
+                "Uid:\t0\t0\t0\t0\nCapEff:\t0000000000000000\n",
+            )
             .with_file("/proc/sys/net/ipv4/ip_forward", "0\n");
         let checks = run(&fs, &RecordingRunner::new());
         let names: Vec<&str> = problems(&checks).iter().map(|p| p.0).collect();
-        assert_eq!(names, ["CAP_NET_ADMIN", "ip_forward"]);
+        // No capabilities at all: the DNS port can't be bound either.
+        assert_eq!(
+            names,
+            ["CAP_NET_ADMIN", "ip_forward", "CAP_NET_BIND_SERVICE"]
+        );
+    }
+
+    #[test]
+    fn the_native_service_with_its_two_ambient_capabilities_passes() {
+        let fs = healthy_fs().with_file("/proc/self/status", SERVICE_STATUS);
+        let checks = run(&fs, &RecordingRunner::new());
+        assert_eq!(problems(&checks), vec![]);
+        let found = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.outcome.clone())
+        };
+        assert_eq!(
+            found("CAP_NET_ADMIN"),
+            Some(Outcome::Ok(
+                "held, and ambient for `nft`, `ip` and `wg` (uid 999)".into()
+            ))
+        );
+        assert_eq!(
+            found("CAP_NET_BIND_SERVICE"),
+            Some(Outcome::Ok("held, for DNS port 53".into()))
+        );
+    }
+
+    #[test]
+    fn a_non_root_service_needs_net_admin_ambient() {
+        // Effective but not ambient: what `CapabilityBoundingSet=` alone, or
+        // file capabilities on the binary, would give.
+        let status =
+            SERVICE_STATUS.replace("CapAmb:\t0000000000001400", "CapAmb:\t0000000000000000");
+        let fs = healthy_fs().with_file("/proc/self/status", &status);
+        let checks = run(&fs, &RecordingRunner::new());
+        let p = problems(&checks);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].0, "CAP_NET_ADMIN");
+        assert!(
+            p[0].1.contains("not ambient: running as uid 999"),
+            "{}",
+            p[0].1
+        );
+        assert!(p[0].1.contains("AmbientCapabilities="), "{}", p[0].1);
+    }
+
+    #[test]
+    fn a_low_dns_port_needs_net_bind_service() {
+        // CAP_NET_ADMIN only (bit 12).
+        let status = SERVICE_STATUS.replace("0000000000001400", "0000000000001000");
+        let fs = healthy_fs().with_file("/proc/self/status", &status);
+        let checks = run(&fs, &RecordingRunner::new());
+        let p = problems(&checks);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].0, "CAP_NET_BIND_SERVICE");
+        assert!(
+            p[0].1.starts_with(
+                "missing, and needed below net.ipv4.ip_unprivileged_port_start (1024): DNS port 53."
+            ),
+            "{}",
+            p[0].1
+        );
+
+        // Unprivileged from port 0 on: nothing to check.
+        let fs = fs.with_file("/proc/sys/net/ipv4/ip_unprivileged_port_start", "0\n");
+        let checks = run(&fs, &RecordingRunner::new());
+        assert_eq!(problems(&checks), vec![]);
+        assert!(!checks.iter().any(|c| c.name == "CAP_NET_BIND_SERVICE"));
+    }
+
+    #[test]
+    fn a_low_wireguard_port_needs_net_bind_service_ambient() {
+        let mut config = canonical_config();
+        config.server.wireguard.listen_port = 443;
+        // Effective, not ambient: the daemon could bind, `wg` couldn't.
+        let status =
+            SERVICE_STATUS.replace("CapAmb:\t0000000000001400", "CapAmb:\t0000000000001000");
+        let fs = healthy_fs().with_file("/proc/self/status", &status);
+        let checks = run_with(Ok(&config), &fs, &RecordingRunner::new());
+        let p = problems(&checks);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].0, "CAP_NET_BIND_SERVICE");
+        assert!(
+            p[0].1
+                .contains("`wg` can't bind WireGuard port 443 (below 1024)"),
+            "{}",
+            p[0].1
+        );
+    }
+
+    #[test]
+    fn no_unprivileged_ports_at_all_is_understood() {
+        // 65536 doesn't fit a port: every port, the proxy's 8443 too, needs the capability.
+        let status = SERVICE_STATUS.replace("0000000000001400", "0000000000001000");
+        let fs = healthy_fs()
+            .with_file("/proc/self/status", &status)
+            .with_file("/proc/sys/net/ipv4/ip_unprivileged_port_start", "65536\n");
+        let checks = run(&fs, &RecordingRunner::new());
+        let p = problems(&checks);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].1.starts_with(
+                "missing, and needed below net.ipv4.ip_unprivileged_port_start (65536): DNS port 53, proxy port 8443, WireGuard port 51820."
+            ),
+            "{}",
+            p[0].1
+        );
     }
 
     #[test]

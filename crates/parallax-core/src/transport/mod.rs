@@ -77,7 +77,8 @@ pub trait Transport {
     /// Credentials a device needs, rendered for a platform.
     fn export(&self, model: &Model<'_>, peer: &Peer, platform: Platform) -> Result<Export>;
 
-    /// Reconcile the live system with `artifacts`. Returns a log of what was done.
+    /// Reconcile the live system with `artifacts` (the whole bundle, contents
+    /// included). Returns a log of what was done.
     fn apply(
         &self,
         model: &Model<'_>,

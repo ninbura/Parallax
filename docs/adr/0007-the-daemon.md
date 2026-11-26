@@ -1,6 +1,7 @@
 # ADR 0007: The daemon
 
-Status: accepted (step 7). Changes the concurrency part of ADR 0005.
+Status: accepted (step 7). Changes the concurrency part of ADR 0005. Its
+rejection of MVCC is reversed by ADR 0011.
 
 ## Decision
 
@@ -94,6 +95,8 @@ socket.
   together break a rule that spans rows (write skew). It's experimental and
   stops `sqlite3` opening the file. Revisit for the activity logs (step 7b),
   which get their own database with many small writes, with a benchmark.
+  (Revisited in step 7c: ADR 0011 turns it on. It wasn't experimental by
+  then, and the writer task stays for the write-skew reason above.)
 - **DNS and the proxy as separate processes.** Three processes to supervise
   from a shell script, and SIGHUP to deliver to each after every apply.
 - **HTTP over the socket.** More dependencies and framing for six requests
