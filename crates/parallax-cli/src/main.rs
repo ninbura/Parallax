@@ -422,13 +422,14 @@ fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
                 (logging::Target::Global, None) => String::new(),
             };
             if *changed {
-                println!("{what} now");
+                outln!("{what} now")?;
             } else {
-                println!("{what} already");
+                outln!("{what} already")?;
             }
             if let Some(l) = effective {
-                println!("in effect: {l}");
+                outln!("in effect: {l}")?;
             }
+            Ok(())
         },
     )
 }
