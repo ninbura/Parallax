@@ -283,6 +283,26 @@ fn list(ctx: &Ctx, directory: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A native service doesn't see the host's /tmp, /var/tmp or /home
+/// (`PrivateTmp`, `ProtectHome`), so it can't reopen a backup the CLI read
+/// from there.
+fn hidden_from_the_service(e: anyhow::Error, file: &Path) -> anyhow::Error {
+    let file = std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf());
+    let hidden = ["/tmp", "/var/tmp", "/home", "/root"]
+        .iter()
+        .any(|dir| file.starts_with(dir));
+    if hidden {
+        e.context(format!(
+            "the daemon couldn't restore {}: a native install's service can't see /tmp, \
+             /var/tmp, /home or /root. Move the backup into the backup directory \
+             (server.backup.directory) and restore it from there",
+            file.display()
+        ))
+    } else {
+        e
+    }
+}
+
 fn human_size(bytes: u64) -> String {
     match bytes {
         b if b >= 1 << 20 => format!("{:.1} MiB", b as f64 / f64::from(1 << 20)),
@@ -465,7 +485,7 @@ fn restore(
                 revision,
                 contents_sha256: contents.manifest.contents_sha256.clone(),
             };
-            return match ctx.ask(&request)? {
+            return match ctx.ask(&request).map_err(|e| hidden_from_the_service(e, file))? {
                 Some(Reply::Applied { log, error, .. }) => {
                     for line in log {
                         println!("{line}");
@@ -713,5 +733,5 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
     f.write_all(contents.as_bytes()).with_context(ctx)?;
     f.sync_all().with_context(ctx)?;
     std::fs::rename(&tmp, path).with_context(ctx)?;
-    Ok(())
+    crate::owner::hand_to_directory_owner(path)
 }
