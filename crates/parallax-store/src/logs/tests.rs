@@ -84,7 +84,7 @@ async fn records_come_back_as_written_oldest_first() {
 }
 
 #[tokio::test]
-async fn queries_filter_and_follow() {
+async fn queries_filter_and_give_the_newest() {
     let dir = TempDir::new();
     let logs = logs(&dir).await;
     let w = logs.writer().unwrap();
@@ -134,22 +134,6 @@ async fn queries_filter_and_follow() {
     );
     // The newest few, still oldest first.
     assert_eq!(q(Query { limit: 3, ..all() }).await, [8, 9, 10]);
-    // Following: what came after an id.
-    let ids: Vec<i64> = logs
-        .query(&all())
-        .await
-        .unwrap()
-        .iter()
-        .map(|(id, _)| *id)
-        .collect();
-    assert_eq!(
-        q(Query {
-            after: Some(ids[6]),
-            ..all()
-        })
-        .await,
-        [8, 9, 10]
-    );
 }
 
 /// Each source writes on its own connection, at the same time.

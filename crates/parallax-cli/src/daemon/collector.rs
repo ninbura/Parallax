@@ -32,23 +32,118 @@ const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// counted and reported.
 const RECEIVE_BUFFER: usize = 8 << 20;
 const PURGE_EVERY: Duration = Duration::from_secs(10 * 60);
+/// How often the supervisor checks its feeds are alive.
+const CHECK_EVERY: Duration = Duration::from_secs(5);
+/// Waits before trying a failed feed again, doubling up to the most.
+const RETRY_FIRST: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// The open activity database, for answering `parallax log` too.
 pub type Slot = Arc<RwLock<Option<Arc<Logs>>>>;
 
-/// What runs now.
-struct Running {
-    path: std::path::PathBuf,
-    flows: bool,
-    denied: bool,
-    stop: Arc<AtomicBool>,
-    threads: Vec<std::thread::JoinHandle<()>>,
+/// One feed and its thread, when it runs.
+struct Feed {
+    name: &'static str,
+    /// The level a peer needs for this feed to run.
+    level: LogLevel,
+    open: Open,
+    parse: Parse,
+    wanted: bool,
+    running: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+    /// After a failure: when to try again, and how long the wait was.
+    retry: Option<(Instant, Duration)>,
 }
 
-/// Keep the sources in line with the configuration, and purge.
+impl Feed {
+    fn new(name: &'static str, level: LogLevel, open: Open, parse: Parse) -> Self {
+        Feed {
+            name,
+            level,
+            open,
+            parse,
+            wanted: false,
+            running: None,
+            retry: None,
+        }
+    }
+
+    fn alive(&self) -> bool {
+        self.running.as_ref().is_some_and(|(_, t)| !t.is_finished())
+    }
+
+    /// Start it: on failure, say so and wait longer before the next try.
+    fn start(&mut self, logs: &Logs, views: &Views) {
+        match self.spawn(logs, views) {
+            Ok(running) => {
+                self.running = Some(running);
+                self.retry = None;
+                log(format!("activity logging: reading {}", self.name));
+            }
+            Err(e) => {
+                let wait = self
+                    .retry
+                    .map_or(RETRY_FIRST, |(_, w)| (w * 2).min(RETRY_MAX));
+                warn(format!(
+                    "activity logging: can't read {}: {e}; trying again in {}s",
+                    self.name,
+                    wait.as_secs()
+                ));
+                self.retry = Some((Instant::now() + wait, wait));
+            }
+        }
+    }
+
+    fn spawn(
+        &self,
+        logs: &Logs,
+        views: &Views,
+    ) -> anyhow::Result<(Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
+        let socket = (self.open)()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let source = Source {
+            name: self.name,
+            socket,
+            parse: self.parse,
+            views: views.clone(),
+            writer: logs.writer()?,
+            stop: Arc::clone(&stop),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        let thread = std::thread::Builder::new()
+            .name(format!("parallax {}", self.name))
+            .spawn(move || source.run())?;
+        Ok((stop, thread))
+    }
+
+    /// Stop it and wait while it writes what it holds (within a read timeout).
+    async fn stop(&mut self) {
+        if let Some((stop, thread)) = self.running.take() {
+            stop.store(true, Ordering::Relaxed);
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
+    }
+}
+
+/// Keep the feeds in line with the configuration, restart any that fail,
+/// and purge.
 pub async fn supervise(mut views: Views, slot: Slot) {
-    let mut running: Option<Running> = None;
+    let mut feeds = [
+        Feed::new(
+            "connections",
+            LogLevel::Connections,
+            open_conntrack,
+            netlink::conntrack_events,
+        ),
+        Feed::new(
+            "blocked attempts",
+            LogLevel::Denied,
+            open_nflog,
+            netlink::nflog_packets,
+        ),
+    ];
+    let mut path: Option<std::path::PathBuf> = None;
     let mut purge = tokio::time::interval(PURGE_EVERY);
+    let mut check = tokio::time::interval(CHECK_EVERY);
     loop {
         tokio::select! {
             changed = views.changed() => if changed.is_err() { break },
@@ -56,54 +151,65 @@ pub async fn supervise(mut views: Views, slot: Slot) {
                 purge_now(&views, &slot).await;
                 continue;
             }
+            _ = check.tick() => {}
         }
         let Some(config) = views.borrow().as_ref().map(|v| Arc::clone(&v.config)) else {
             continue;
         };
-        let flows = logging::configured(&config, LogLevel::Connections);
-        let denied = logging::configured(&config, LogLevel::Denied);
-        let path = config.server.logs.path.clone();
-        let same = running
-            .as_ref()
-            .is_some_and(|r| r.flows == flows && r.denied == denied && r.path == path);
-        if same {
-            continue;
+        for feed in &mut feeds {
+            feed.wanted = logging::configured(&config, feed.level);
         }
-        if let Some(old) = running.take() {
-            stop(old).await;
+        let wanted = feeds.iter().any(|f| f.wanted);
+        // A new place for the records: the old database is let go first, so
+        // nothing reads or purges it under the new settings.
+        if path.as_ref() != Some(&config.server.logs.path) {
+            for feed in &mut feeds {
+                feed.stop().await;
+            }
+            set(&slot, None);
+            path = Some(config.server.logs.path.clone());
         }
-        // Keep the database open while it holds records, so they can be
-        // read with logging off.
-        let logs = match open(&path, flows || denied, &slot).await {
-            Ok(logs) => logs,
-            Err(e) => {
-                warn(format!("activity logging: {e:#}"));
+        let current = slot.read().ok().and_then(|s| s.clone());
+        let logs = match current {
+            Some(logs) => Some(logs),
+            None => match open(&config.server.logs.path, wanted, &slot).await {
+                Ok(logs) => logs,
+                Err(e) => {
+                    warn(format!("activity logging: {e:#}"));
+                    None
+                }
+            },
+        };
+        for feed in &mut feeds {
+            if !feed.wanted {
+                feed.stop().await;
+                feed.retry = None;
                 continue;
             }
-        };
-        let Some(logs) = logs else {
-            continue;
-        };
-        running = Some(start(&logs, &views, path, flows, denied));
+            if feed.alive() {
+                continue;
+            }
+            // Stopped on its own (it said why): clear it, then start again.
+            feed.stop().await;
+            let due = feed.retry.is_none_or(|(at, _)| Instant::now() >= at);
+            if let (Some(logs), true) = (&logs, due) {
+                feed.start(logs, &views);
+            }
+        }
     }
-    if let Some(old) = running.take() {
-        stop(old).await;
+    for feed in &mut feeds {
+        feed.stop().await;
     }
 }
 
-/// The database at `path`: opened if logging needs it or it already
-/// exists, and shared through `slot`.
+/// The database at `path`, shared through `slot`: opened if logging needs
+/// it or it already exists, so records can be read with logging off.
 async fn open(
     path: &std::path::Path,
     needed: bool,
     slot: &Slot,
 ) -> anyhow::Result<Option<Arc<Logs>>> {
-    let current = slot.read().ok().and_then(|s| s.clone());
-    if let Some(logs) = current.filter(|l| l.path() == path) {
-        return Ok(Some(logs));
-    }
     if !needed && !path.exists() {
-        set(slot, None);
         return Ok(None);
     }
     let logs = Arc::new(
@@ -120,86 +226,6 @@ fn set(slot: &Slot, logs: Option<Arc<Logs>>) {
     if let Ok(mut s) = slot.write() {
         *s = logs;
     }
-}
-
-fn start(
-    logs: &Arc<Logs>,
-    views: &Views,
-    path: std::path::PathBuf,
-    flows: bool,
-    denied: bool,
-) -> Running {
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::new();
-    let sources: [(bool, &'static str, Open, Parse); 2] = [
-        (
-            flows,
-            "connections",
-            open_conntrack,
-            netlink::conntrack_events,
-        ),
-        (
-            denied,
-            "blocked attempts",
-            open_nflog,
-            netlink::nflog_packets,
-        ),
-    ];
-    for (wanted, name, open, parse) in sources {
-        if !wanted {
-            continue;
-        }
-        let socket = match open() {
-            Ok(s) => s,
-            Err(e) => {
-                warn(format!("activity logging: can't read {name}: {e}"));
-                continue;
-            }
-        };
-        let writer = match logs.writer() {
-            Ok(w) => w,
-            Err(e) => {
-                warn(format!("activity logging: {e}"));
-                continue;
-            }
-        };
-        let source = Source {
-            name,
-            socket,
-            parse,
-            views: views.clone(),
-            writer,
-            stop: Arc::clone(&stop),
-            runtime: tokio::runtime::Handle::current(),
-        };
-        match std::thread::Builder::new()
-            .name(format!("parallax {name}"))
-            .spawn(move || source.run())
-        {
-            Ok(t) => threads.push(t),
-            Err(e) => warn(format!("activity logging: starting {name}: {e}")),
-        }
-        log(format!("activity logging: reading {name}"));
-    }
-    Running {
-        path,
-        flows,
-        denied,
-        stop,
-        threads,
-    }
-}
-
-async fn stop(old: Running) {
-    old.stop.store(true, Ordering::Relaxed);
-    let threads = old.threads;
-    // Each notices within a read timeout and writes what it holds.
-    let _ = tokio::task::spawn_blocking(move || {
-        for t in threads {
-            let _ = t.join();
-        }
-    })
-    .await;
 }
 
 async fn purge_now(views: &Views, slot: &Slot) {
@@ -246,6 +272,7 @@ impl Source {
         let mut flushed = Instant::now();
         let mut lost: u64 = 0;
         let mut reported_lost = 0;
+        let mut open = logging::OpenFlows::default();
         while !self.stop.load(Ordering::Relaxed) {
             match rustix::net::recv(&self.socket, &mut buf[..], RecvFlags::empty()) {
                 Ok((n, _)) => {
@@ -254,11 +281,9 @@ impl Source {
                         let config = self.views.borrow().as_ref().map(|v| Arc::clone(&v.config));
                         if let Some(config) = config {
                             let time = now_ms();
-                            batch.extend(
-                                events
-                                    .iter()
-                                    .filter_map(|e| logging::attribute(&config, e, time)),
-                            );
+                            batch.extend(events.iter().filter_map(|e| {
+                                open.settle(e, logging::attribute(&config, e, time))
+                            }));
                         }
                     }
                 }
@@ -273,20 +298,26 @@ impl Source {
                     break;
                 }
             }
-            if batch.len() >= BATCH || (!batch.is_empty() && flushed.elapsed() >= FLUSH_EVERY) {
+            if batch.len() >= BATCH || flushed.elapsed() >= FLUSH_EVERY {
                 self.flush(&mut batch);
                 flushed = Instant::now();
-                if lost != reported_lost {
-                    warn(format!(
-                        "activity logging: the kernel dropped {} bursts of {} while the collector was behind",
-                        lost - reported_lost,
-                        self.name
-                    ));
-                    reported_lost = lost;
-                }
+                // At most once a second, written or not.
+                self.report_lost(lost, &mut reported_lost);
             }
         }
         self.flush(&mut batch);
+        self.report_lost(lost, &mut reported_lost);
+    }
+
+    fn report_lost(&self, lost: u64, reported: &mut u64) {
+        if lost != *reported {
+            warn(format!(
+                "activity logging: the kernel dropped {} bursts of {} while the collector was behind",
+                lost - *reported,
+                self.name
+            ));
+            *reported = lost;
+        }
     }
 
     fn flush(&self, batch: &mut Vec<logging::Record>) {
@@ -326,25 +357,55 @@ fn open_conntrack() -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// The firewall's nflog group for blocked attempts.
+/// The firewall's nflog group for blocked attempts, with each packet's
+/// connection-tracking entry (where the peer sent it); kernels that can't
+/// add it get the packet alone.
 fn open_nflog() -> io::Result<OwnedFd> {
+    const EBUSY: i32 = 16;
+    let busy = || {
+        io::Error::other(format!(
+            "nflog group {LOG_GROUP} is taken by another program (EBUSY)"
+        ))
+    };
+    match bind_nflog(true) {
+        Ok(fd) => Ok(fd),
+        Err(e) if e.raw_os_error() == Some(EBUSY) => Err(busy()),
+        Err(_) => bind_nflog(false).map_err(|e| {
+            if e.raw_os_error() == Some(EBUSY) {
+                busy()
+            } else {
+                e
+            }
+        }),
+    }
+}
+
+fn bind_nflog(conntrack: bool) -> io::Result<OwnedFd> {
     let fd = netlink_socket()?;
     rustix::net::bind(&fd, &SocketAddrNetlink::new(0, 0))?;
     rustix::net::sendto(
         &fd,
-        &netlink::nflog_bind(LOG_GROUP),
+        &netlink::nflog_bind(LOG_GROUP, conntrack),
         SendFlags::empty(),
         &SocketAddrNetlink::new(0, 0),
     )?;
+    // The answer, within a few read timeouts.
     let mut buf = [0u8; 4096];
-    let (n, _) = rustix::net::recv(&fd, &mut buf[..], RecvFlags::empty())?;
-    match netlink::acknowledged(&buf[..n]) {
-        Ok(()) => Ok(fd),
-        Err(16) => Err(io::Error::other(format!(
-            "nflog group {LOG_GROUP} is taken by another program (EBUSY)"
-        ))),
-        Err(code) => Err(io::Error::from_raw_os_error(code)),
+    for _ in 0..3 {
+        let n = match rustix::net::recv(&fd, &mut buf[..], RecvFlags::empty()) {
+            Ok((n, _)) => n,
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        match netlink::acknowledgement(&buf[..n]) {
+            Some(Ok(())) => return Ok(fd),
+            Some(Err(code)) => return Err(io::Error::from_raw_os_error(code)),
+            None => {}
+        }
     }
+    Err(io::Error::other(format!(
+        "the kernel didn't answer binding nflog group {LOG_GROUP}"
+    )))
 }
 
 fn now_ms() -> u64 {

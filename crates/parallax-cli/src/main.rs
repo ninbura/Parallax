@@ -338,30 +338,44 @@ fn parse_record_kind(s: &str) -> Result<RecordKind, String> {
     s.parse().map_err(|e: parallax_core::Error| e.to_string())
 }
 
-/// Print records as they match; with `follow`, keep polling for new ones.
-fn show_records(ctx: &Ctx, mut query: Query, follow: bool) -> anyhow::Result<()> {
-    let mut shown_any = false;
+/// How far back `--follow` reads again each second. Feeds commit
+/// concurrently, so ids don't arrive in order: a cursor on the last id
+/// could skip a batch that commits after a later one. Re-reading a window
+/// and skipping what was shown can't.
+const FOLLOW_WINDOW_MS: u64 = 10_000;
+
+/// Print records as they match; with `follow`, keep showing new ones.
+fn show_records(ctx: &Ctx, query: Query, follow: bool) -> anyhow::Result<()> {
+    let records = read_records(ctx, &query)?;
+    for (_, r) in &records {
+        println!("{}", record_line(r));
+    }
+    if !follow {
+        if records.is_empty() {
+            eprintln!("no records (see `parallax log level` and docs/logging.md)");
+        }
+        return Ok(());
+    }
+    // Shown, by id and time (ids start over in a new database).
+    let mut shown: std::collections::HashSet<(i64, u64)> =
+        records.iter().map(|(id, r)| (*id, r.time)).collect();
     loop {
-        let records = read_records(ctx, &query)?;
-        for (id, r) in &records {
-            println!("{}", record_line(r));
-            query.after = Some(*id);
-            shown_any = true;
-        }
-        if !follow {
-            break;
-        }
-        // Following: everything after the last one, as it comes.
-        if query.after.is_none() {
-            query.after = Some(0);
-        }
-        query.limit = 1000;
         std::thread::sleep(Duration::from_secs(1));
+        let since = now_ms().saturating_sub(FOLLOW_WINDOW_MS);
+        let window = Query {
+            since: Some(since.max(query.since.unwrap_or(0))),
+            limit: 10_000,
+            ..query.clone()
+        };
+        let mut fresh = read_records(ctx, &window)?;
+        fresh.sort_by_key(|(id, r)| (r.time, *id));
+        for (id, r) in &fresh {
+            if shown.insert((*id, r.time)) {
+                println!("{}", record_line(r));
+            }
+        }
+        shown.retain(|(_, time)| *time + 2 * FOLLOW_WINDOW_MS >= since);
     }
-    if !shown_any && !follow {
-        eprintln!("no records (see `parallax log level` and docs/logging.md)");
-    }
-    Ok(())
 }
 
 /// Through the daemon, which holds logs.db; without one, from the file.
@@ -472,7 +486,6 @@ fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
                 peer,
                 kinds: kind,
                 since: since.map(|s| now.saturating_sub(s.as_secs().saturating_mul(1000))),
-                after: None,
                 limit,
             };
             return show_records(ctx, query, follow);

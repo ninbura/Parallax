@@ -138,6 +138,9 @@ pub struct Blocked {
     pub port: Option<u16>,
     /// Bound for the gateway host itself, not forwarded.
     pub to_gateway: bool,
+    /// Where the peer sent it, from its connection-tracking entry: `dst` is
+    /// after NETMAP. `None` when the kernel didn't say.
+    pub addressed: Option<Ipv4Addr>,
 }
 
 /// What the collector hears from the kernel.
@@ -216,6 +219,40 @@ impl std::str::FromStr for RecordKind {
     }
 }
 
+/// The peer each open flow was recorded for, so a flow's end is never put
+/// down to another peer that has since taken its address (a removed peer's
+/// connections can outlive it by days, and the next peer added gets its
+/// address).
+#[derive(Debug, Default)]
+pub struct OpenFlows(std::collections::HashMap<u32, String>);
+
+impl OpenFlows {
+    /// Past this many open flows (closes lost while the collector was
+    /// behind), start over rather than grow without bound.
+    const MAX: usize = 1 << 18;
+
+    /// `record` is what [`attribute`] made of `event`: kept, or dropped
+    /// when it ends a flow that began as another peer's.
+    pub fn settle(&mut self, event: &Event, record: Option<Record>) -> Option<Record> {
+        match event {
+            Event::Opened(f) => {
+                if let Some(r) = &record {
+                    if self.0.len() >= Self::MAX {
+                        self.0.clear();
+                    }
+                    self.0.insert(f.id, r.peer.clone());
+                }
+                record
+            }
+            Event::Closed(f) => match (self.0.remove(&f.id), record) {
+                (Some(began), Some(r)) if began != r.peer => None,
+                (_, record) => record,
+            },
+            Event::Blocked(_) => record,
+        }
+    }
+}
+
 /// `6` → `tcp`; others by number.
 pub fn protocol_name(protocol: u8) -> String {
     match protocol {
@@ -291,21 +328,16 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
             }
             r
         }
-        // The firewall sees a blocked packet after NETMAP, so its
-        // destination is already the real one: map it back to what the peer
-        // addressed.
+        // The firewall sees a blocked packet after NETMAP. What the peer
+        // addressed comes from the packet's conntrack entry; without it,
+        // only what was seen.
         Event::Blocked(b) => {
             let kind = if b.to_gateway {
                 RecordKind::DeniedGateway
             } else {
                 RecordKind::Denied
             };
-            let addressed = config
-                .networks
-                .iter()
-                .find(|n| n.subnet.contains(&b.dst))
-                .map(|n| n.to_client_addr(b.dst))
-                .unwrap_or(b.dst);
+            let addressed = b.addressed.unwrap_or(b.dst);
             let real = (addressed != b.dst).then_some(b.dst);
             record(kind, addressed, real, b.protocol, b.port)
         }
@@ -345,6 +377,24 @@ mod tests {
 
         peer.log = Some(LogLevel::Bytes);
         assert_eq!(level(&cfg, &peer), LogLevel::Bytes, "its own");
+    }
+
+    #[test]
+    fn a_flow_s_end_never_goes_to_the_next_owner_of_its_address() {
+        let mut cfg = canonical_config();
+        cfg.server.logs.level = LogLevel::Connections;
+        let mark = crate::generate::firewall::FLOW_MARK;
+        let mut open = OpenFlows::default();
+        let opened = Event::Opened(flow([10, 8, 2, 1], mark));
+        let closed = Event::Closed(flow([10, 8, 2, 1], mark));
+        let r = open.settle(&opened, attribute(&cfg, &opened, 1));
+        assert_eq!(r.unwrap().peer, "sister-phone");
+        // sister-phone is gone; another peer has its address now.
+        cfg.peers[2].name = "new-tablet".into();
+        assert!(open.settle(&closed, attribute(&cfg, &closed, 2)).is_none());
+        // A close the collector saw no start of is kept.
+        let r = open.settle(&closed, attribute(&cfg, &closed, 3));
+        assert_eq!(r.unwrap().peer, "new-tablet");
     }
 
     #[test]
@@ -415,15 +465,17 @@ mod tests {
     }
 
     #[test]
-    fn blocked_packets_are_mapped_back_and_need_the_denied_level() {
+    fn blocked_packets_give_where_they_were_sent_and_need_the_denied_level() {
         let mut cfg = canonical_config();
-        let blocked = Event::Blocked(Blocked {
+        let mut b = Blocked {
             protocol: 17,
             src: Ipv4Addr::new(10, 8, 2, 1),
             dst: Ipv4Addr::new(192, 168, 1, 9),
             port: Some(53),
             to_gateway: false,
-        });
+            addressed: Some(Ipv4Addr::new(198, 18, 1, 9)),
+        };
+        let blocked = Event::Blocked(b.clone());
         cfg.server.logs.level = LogLevel::Bytes;
         assert!(attribute(&cfg, &blocked, 1).is_none());
         cfg.server.logs.level = LogLevel::Denied;
@@ -432,6 +484,11 @@ mod tests {
         assert_eq!(r.destination, Ipv4Addr::new(198, 18, 1, 9));
         assert_eq!(r.real_destination, Some(Ipv4Addr::new(192, 168, 1, 9)));
         assert_eq!(r.protocol, "udp");
+        // Without the conntrack entry, only what was seen: never a guess.
+        b.addressed = None;
+        let r = attribute(&cfg, &Event::Blocked(b), 1).unwrap();
+        assert_eq!(r.destination, Ipv4Addr::new(192, 168, 1, 9));
+        assert_eq!(r.real_destination, None);
     }
 
     /// Levels survive TOML (import, export, `config edit`). The daemon's

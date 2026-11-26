@@ -22,6 +22,9 @@ const RETRIES: u32 = 5;
 /// Rows deleted per statement while purging, so a big purge never holds
 /// a long transaction.
 const PURGE_CHUNK: i64 = 5000;
+/// Rounds of measuring and deleting while over the size.
+const SIZE_ROUNDS: usize = 3;
+const CHECKPOINT_TRIES: u32 = 10;
 
 /// The open activity database.
 #[derive(Debug)]
@@ -41,8 +44,7 @@ impl std::fmt::Debug for Writer {
     }
 }
 
-/// Which records to read. Without `after`, the newest `limit` up to now;
-/// with it, the oldest `limit` after that id (for following new ones).
+/// Which records to read: the newest `limit` that match.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
@@ -51,7 +53,6 @@ pub struct Query {
     pub kinds: Vec<RecordKind>,
     /// Unix milliseconds.
     pub since: Option<u64>,
-    pub after: Option<i64>,
     pub limit: u32,
 }
 
@@ -105,32 +106,24 @@ impl Logs {
             params.push(int(since).into());
             conditions.push(format!("time >= ?{}", params.len()));
         }
-        if let Some(after) = query.after {
-            params.push(after.into());
-            conditions.push(format!("id > ?{}", params.len()));
-        }
         let filter = if conditions.is_empty() {
             String::new()
         } else {
             format!("WHERE {}", conditions.join(" AND "))
         };
-        // Following reads forward from `after`; otherwise the newest, so
-        // read backward and turn them around.
-        let order = if query.after.is_some() { "ASC" } else { "DESC" };
+        // The newest: read backward, then turn them around.
         params.push(i64::from(query.limit).into());
         let sql = format!(
             "SELECT id, time, kind, peer, grants, source, destination, real_destination,
                     network, protocol, port, flow, bytes_out, bytes_in
-             FROM records {filter} ORDER BY id {order} LIMIT ?{}",
+             FROM records {filter} ORDER BY id DESC LIMIT ?{}",
             params.len()
         );
         let mut out = Vec::new();
         for row in self.store.rows(&sql, params).await? {
             out.push(record(&self.store.path, &row)?);
         }
-        if query.after.is_none() {
-            out.reverse();
-        }
+        out.reverse();
         Ok(out)
     }
 
@@ -170,8 +163,12 @@ impl Logs {
                 break;
             }
         }
-        let used = self.used_bytes().await?;
-        if used > max_bytes {
+        // Rows differ in size, so measure again after each round.
+        for _ in 0..SIZE_ROUNDS {
+            let used = self.used_bytes().await?;
+            if used <= max_bytes {
+                break;
+            }
             let count = self.count().await?;
             let target = max_bytes / 10 * 9;
             // Rows are about the same size, so drop the same share of them.
@@ -211,9 +208,28 @@ impl Logs {
     /// Bytes the records take up: pages in use, after moving MVCC's log
     /// into the file so the count is current.
     pub async fn used_bytes(&self) -> Result<u64> {
-        self.store
-            .rows("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
-            .await?;
+        // A writer's open transaction can hold the checkpoint off briefly.
+        for attempt in 1..=CHECKPOINT_TRIES {
+            let busy = match self
+                .store
+                .rows("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
+                .await
+            {
+                // SQLite's answer: busy, then log and checkpointed pages.
+                Ok(rows) => rows
+                    .first()
+                    .is_some_and(|r| r.get::<i64>(0).ok() == Some(1)),
+                Err(Error::Db(turso::Error::Busy(_))) => true,
+                Err(e) => return Err(e),
+            };
+            if !busy {
+                break;
+            }
+            if attempt == CHECKPOINT_TRIES {
+                return Err(Error::Locked(self.store.path.clone()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         let pragma = |name: &'static str| async move {
             let rows = self
                 .store

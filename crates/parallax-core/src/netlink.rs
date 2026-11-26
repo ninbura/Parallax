@@ -50,8 +50,12 @@ const CTA_COUNTERS_BYTES: u16 = 2;
 /// nflog's attributes.
 const NFULA_PAYLOAD: u16 = 9;
 const NFULA_PREFIX: u16 = 10;
+/// The packet's connection-tracking entry, when asked for.
+const NFULA_CT: u16 = 18;
 const NFULA_CFG_CMD: u16 = 1;
 const NFULA_CFG_MODE: u16 = 2;
+const NFULA_CFG_FLAGS: u16 = 6;
+const NFULNL_CFG_F_CONNTRACK: u16 = 0x0004;
 const NFULNL_CFG_CMD_BIND: u8 = 1;
 const NFULNL_COPY_PACKET: u8 = 2;
 
@@ -66,14 +70,22 @@ pub const CONNTRACK_GROUPS: u32 =
 const COPY_RANGE: u32 = 64;
 
 /// The message that binds this socket to nflog `group`, copying the first
-/// bytes of each packet. The kernel answers with an acknowledgement
-/// ([`acknowledged`]).
-pub fn nflog_bind(group: u16) -> Vec<u8> {
+/// bytes of each packet, and with `conntrack` each packet's connection
+/// tracking entry too (its original destination, from before NETMAP). The
+/// kernel answers with an acknowledgement ([`acknowledgement`]).
+pub fn nflog_bind(group: u16, conntrack: bool) -> Vec<u8> {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, NFULA_CFG_CMD, &[NFULNL_CFG_CMD_BIND]);
     let mut mode = COPY_RANGE.to_be_bytes().to_vec();
     mode.extend([NFULNL_COPY_PACKET, 0]);
     push_attr(&mut attrs, NFULA_CFG_MODE, &mode);
+    if conntrack {
+        push_attr(
+            &mut attrs,
+            NFULA_CFG_FLAGS,
+            &NFULNL_CFG_F_CONNTRACK.to_be_bytes(),
+        );
+    }
 
     let length = HEADER + NFGEN + attrs.len();
     let mut out = Vec::with_capacity(length);
@@ -88,19 +100,17 @@ pub fn nflog_bind(group: u16) -> Vec<u8> {
     out
 }
 
-/// The kernel's answer to a request: `Ok` for an acknowledgement, the
-/// error number for a refusal (`EBUSY`: another program holds the group).
-pub fn acknowledged(bytes: &[u8]) -> Result<(), i32> {
-    for (kind, body) in messages(bytes) {
-        if kind == NLMSG_ERROR {
-            let code = body
-                .get(..4)
-                .and_then(|b| b.try_into().ok())
-                .map_or(0, i32::from_ne_bytes);
-            return if code == 0 { Ok(()) } else { Err(-code) };
+/// The kernel's answer to a request, if this buffer holds a complete one:
+/// `Ok` for an acknowledgement, the error number for a refusal (`EBUSY`:
+/// another program holds the group). `None`: keep reading.
+pub fn acknowledgement(bytes: &[u8]) -> Option<Result<(), i32>> {
+    messages(bytes).into_iter().find_map(|(kind, body)| {
+        if kind != NLMSG_ERROR {
+            return None;
         }
-    }
-    Ok(())
+        let code = i32::from_ne_bytes(body.get(..4)?.try_into().ok()?);
+        Some(if code == 0 { Ok(()) } else { Err(-code) })
+    })
 }
 
 /// The events in a buffer read from the conntrack socket. Anything else
@@ -133,11 +143,13 @@ pub fn nflog_packets(bytes: &[u8]) -> Vec<Event> {
         }
         let mut payload = None;
         let mut prefix = None;
+        let mut conntrack = None;
         for (t, v) in attrs(body.get(NFGEN..).unwrap_or_default()) {
             match t {
                 NFULA_PAYLOAD => payload = Some(v),
                 // Null-terminated.
                 NFULA_PREFIX => prefix = Some(v.split(|&b| b == 0).next().unwrap_or_default()),
+                NFULA_CT => conntrack = Some(v),
                 _ => {}
             }
         }
@@ -145,8 +157,13 @@ pub fn nflog_packets(bytes: &[u8]) -> Vec<Event> {
             continue;
         };
         let to_gateway = prefix == Some(crate::generate::firewall::DENIED_GATEWAY.as_bytes());
+        // The original destination, before NETMAP changed it.
+        let addressed = conntrack
+            .and_then(|ct| find(&attrs(ct), CTA_TUPLE_ORIG).and_then(tuple))
+            .map(|t| t.dst);
         out.push(Event::Blocked(Blocked {
             to_gateway,
+            addressed,
             ..packet
         }));
     }
@@ -276,6 +293,7 @@ fn ipv4(p: &[u8]) -> Option<Blocked> {
         dst: addr(p.get(16..20)?)?,
         port,
         to_gateway: false,
+        addressed: None,
     })
 }
 
@@ -404,14 +422,25 @@ mod tests {
     }
 
     fn nflog_message(prefix: &str, packet: &[u8]) -> Vec<u8> {
+        nflog_message_ct(prefix, packet, None)
+    }
+
+    /// With `addressed`, the packet's conntrack entry: the peer sent it there.
+    fn nflog_message_ct(prefix: &str, packet: &[u8], addressed: Option<[u8; 4]>) -> Vec<u8> {
         let mut text = prefix.as_bytes().to_vec();
         text.push(0);
-        let a = [
+        let mut a = [
             attr(1, &[0x08, 0x00, 2, 0]),
             attr(NFULA_PREFIX, &text),
             attr(NFULA_PAYLOAD, packet),
         ]
         .concat();
+        if let Some(dst) = addressed {
+            a.extend(nested(
+                NFULA_CT,
+                &tuple_attr(CTA_TUPLE_ORIG, [10, 8, 2, 1], dst, 6, 22),
+            ));
+        }
         message(SUBSYS_ULOG << 8 | ULOG_PACKET, AF_INET, &a)
     }
 
@@ -441,6 +470,7 @@ mod tests {
                 dst: Ipv4Addr::from(dst),
                 port,
                 to_gateway,
+                addressed: None,
             })
         };
         assert_eq!(
@@ -454,8 +484,26 @@ mod tests {
     }
 
     #[test]
+    fn a_packet_s_conntrack_entry_gives_where_the_peer_sent_it() {
+        let packet = ip_packet(6, [10, 8, 2, 1], [192, 168, 1, 9], 22);
+        let events = nflog_packets(&nflog_message_ct(
+            crate::generate::firewall::DENIED_FORWARD,
+            &packet,
+            Some([198, 18, 1, 9]),
+        ));
+        let [Event::Blocked(b)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(b.dst, Ipv4Addr::new(192, 168, 1, 9));
+        assert_eq!(b.addressed, Some(Ipv4Addr::new(198, 18, 1, 9)));
+    }
+
+    #[test]
     fn the_bind_request_and_its_answer() {
-        let m = nflog_bind(20568);
+        let with_ct = nflog_bind(20568, true);
+        let flags = attrs(&with_ct[HEADER + NFGEN..]);
+        assert_eq!(find(&flags, NFULA_CFG_FLAGS), Some(&[0, 4][..]));
+        let m = nflog_bind(20568, false);
         assert_eq!(
             u32::from_ne_bytes(m[..4].try_into().unwrap()) as usize,
             m.len()
@@ -480,7 +528,13 @@ mod tests {
             out.extend([0; 16]);
             out
         };
-        assert_eq!(acknowledged(&answer(0)), Ok(()));
-        assert_eq!(acknowledged(&answer(-16)), Err(16));
+        assert_eq!(acknowledgement(&answer(0)), Some(Ok(())));
+        assert_eq!(acknowledgement(&answer(-16)), Some(Err(16)));
+        // No answer yet, or a truncated one: keep reading.
+        assert_eq!(acknowledgement(&ct_message(CT_NEW, AF_INET, false)), None);
+        let mut short = answer(0);
+        short.truncate(18);
+        short[..4].copy_from_slice(&18u32.to_ne_bytes());
+        assert_eq!(acknowledgement(&short), None);
     }
 }
