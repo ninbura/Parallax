@@ -183,25 +183,25 @@ pub enum RecordKind {
     Opened,
     Closed,
     /// Blocked on its way through the gateway.
-    Denied,
+    Blocked,
     /// Blocked on its way to the gateway host itself.
-    DeniedGateway,
+    BlockedGateway,
 }
 
 impl RecordKind {
     pub const ALL: [RecordKind; 4] = [
         RecordKind::Opened,
         RecordKind::Closed,
-        RecordKind::Denied,
-        RecordKind::DeniedGateway,
+        RecordKind::Blocked,
+        RecordKind::BlockedGateway,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             RecordKind::Opened => "opened",
             RecordKind::Closed => "closed",
-            RecordKind::Denied => "denied",
-            RecordKind::DeniedGateway => "denied_gateway",
+            RecordKind::Blocked => "blocked",
+            RecordKind::BlockedGateway => "blocked_gateway",
         }
     }
 }
@@ -214,7 +214,7 @@ impl std::str::FromStr for RecordKind {
             .find(|k| k.as_str() == s)
             .ok_or_else(|| Error::Malformed {
                 what: "record kind",
-                detail: format!("'{s}' is not one of opened, closed, denied, denied_gateway"),
+                detail: format!("'{s}' is not one of opened, closed, blocked, blocked_gateway"),
             })
     }
 }
@@ -276,15 +276,15 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
             }
             (f.src, LogLevel::Connections)
         }
-        // A flow's end says only its bytes: below `bytes` there's nothing
+        // A flow's end says only its bytes: below `detailed` there's nothing
         // to record (and half the writes saved).
         Event::Closed(f) => {
             if f.mark & crate::generate::firewall::FLOW_MARK == 0 {
                 return None;
             }
-            (f.src, LogLevel::Bytes)
+            (f.src, LogLevel::Detailed)
         }
-        Event::Blocked(b) => (b.src, LogLevel::Denied),
+        Event::Blocked(b) => (b.src, LogLevel::Blocked),
     };
     let peer = config.peers.iter().find(|p| {
         p.transport == TransportKind::WireGuard
@@ -358,9 +358,9 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
         // only what was seen.
         Event::Blocked(b) => {
             let kind = if b.to_gateway {
-                RecordKind::DeniedGateway
+                RecordKind::BlockedGateway
             } else {
-                RecordKind::Denied
+                RecordKind::Blocked
             };
             let addressed = b.addressed.unwrap_or(b.dst);
             let real = (addressed != b.dst).then_some(b.dst);
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn a_flow_s_end_never_goes_to_the_next_owner_of_its_address() {
         let mut cfg = canonical_config();
-        cfg.server.logs.level = LogLevel::Bytes;
+        cfg.server.logs.level = LogLevel::Detailed;
         let mark = crate::generate::firewall::FLOW_MARK;
         let mut open = OpenFlows::default();
         let opened = Event::Opened(flow([10, 8, 2, 1], mark));
@@ -478,10 +478,10 @@ mod tests {
             ("tcp", Some(2283), Some(7))
         );
 
-        // A flow's end only at `bytes` and up.
+        // A flow's end only at `detailed`.
         let closed = Event::Closed(flow([10, 8, 2, 1], mark));
         assert!(attribute(&cfg, &closed, 2000).is_none());
-        cfg.server.logs.level = LogLevel::Bytes;
+        cfg.server.logs.level = LogLevel::Detailed;
         let r = attribute(&cfg, &closed, 2000).unwrap();
         assert_eq!((r.bytes_out, r.bytes_in), (Some(1200), Some(34_000)));
 
@@ -518,11 +518,11 @@ mod tests {
             addressed: Some(Ipv4Addr::new(198, 18, 1, 9)),
         };
         let blocked = Event::Blocked(b.clone());
-        cfg.server.logs.level = LogLevel::Bytes;
+        cfg.server.logs.level = LogLevel::Off;
         assert!(attribute(&cfg, &blocked, 1).is_none());
-        cfg.server.logs.level = LogLevel::Denied;
+        cfg.server.logs.level = LogLevel::Blocked;
         let r = attribute(&cfg, &blocked, 1).unwrap();
-        assert_eq!(r.kind, RecordKind::Denied);
+        assert_eq!(r.kind, RecordKind::Blocked);
         assert_eq!(r.destination, Ipv4Addr::new(198, 18, 1, 9));
         assert_eq!(r.real_destination, Some(Ipv4Addr::new(192, 168, 1, 9)));
         assert_eq!(r.protocol, "udp");

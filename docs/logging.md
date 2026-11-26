@@ -61,7 +61,7 @@ rules = [...]
 ```sh
 parallax log show                          # the newest 50, oldest first
 parallax log show --peer sister-phone --since 1d
-parallax log show --kind denied,denied_gateway --limit 200
+parallax log show --kind blocked,blocked_gateway --limit 200
 parallax log show --follow                 # and keep showing new ones
 ```
 
@@ -70,13 +70,14 @@ Each line is one record:
 ```
 2026-11-26T10:50:05Z  sister-phone  opened  tcp 198.18.1.5:2283 (192.168.1.5, home)  grants family
 2026-11-26T10:50:19Z  sister-phone  closed  tcp 198.18.1.5:2283 (192.168.1.5, home)  1.2 KiB out, 33.2 KiB in  grants family
-2026-11-26T10:50:06Z  sister-phone  denied  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family
+2026-11-26T10:50:06Z  sister-phone  blocked  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family
 ```
 
 The destination is the address the peer used, then in brackets the real one
-and its network. `denied_gateway` is a blocked attempt at the gateway host
-itself. Names are kept as they were, so records survive renaming or removing
-a peer or grant. A connection's `closed` record comes some seconds after it
+and its network. `blocked_gateway` is a blocked attempt at the gateway host
+itself. `opened` records come from `connections` up, `closed` ones (with the
+bytes) only at `detailed`. Names are kept as they were, so records survive
+renaming or removing a peer or grant. A connection's `closed` record comes some seconds after it
 closes: the kernel reports a connection's end when it next sweeps its
 connection table.
 

@@ -319,7 +319,7 @@ enum LogCommand {
         /// Only this peer's.
         #[arg(long)]
         peer: Option<String>,
-        /// Only these kinds: opened, closed, denied, denied_gateway (repeat,
+        /// Only these kinds: opened, closed, blocked, blocked_gateway (repeat,
         /// or separate with commas).
         #[arg(long, value_delimiter = ',', value_parser = parse_record_kind)]
         kind: Vec<RecordKind>,

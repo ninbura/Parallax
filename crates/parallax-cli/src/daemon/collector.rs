@@ -139,7 +139,7 @@ pub async fn supervise(mut views: Views, slot: Slot) {
         ),
         Feed::new(
             "blocked attempts",
-            LogLevel::Denied,
+            LogLevel::Blocked,
             open_nflog,
             netlink::nflog_packets,
         ),

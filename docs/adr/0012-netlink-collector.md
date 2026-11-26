@@ -33,7 +33,7 @@ package in the image and on native installs; nflog has no tool besides
   as it is now. Blocked packets come only from logged peers' rules.
 - **A feed runs only while someone needs it.** The collector subscribes to
   connection tracking while some peer logs `connections` or more, and binds
-  the nflog group while some peer logs `denied`. With nobody logged it opens
+  the nflog group while some peer logs `blocked` or more. With nobody logged it opens
   no socket, so the kernel sends nothing.
 - **Losses are counted, not hidden.** The receive buffer is 8 MiB; when the
   kernel still drops events (`ENOBUFS`), the daemon says so in its log.

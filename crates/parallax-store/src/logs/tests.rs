@@ -48,7 +48,7 @@ async fn records_come_back_as_written_oldest_first() {
             port: None,
             flow: None,
             protocol: "icmp".into(),
-            ..record(3000, "laptop", RecordKind::DeniedGateway)
+            ..record(3000, "laptop", RecordKind::BlockedGateway)
         },
     ];
     logs.writer().unwrap().write(&written).await.unwrap();
@@ -91,7 +91,7 @@ async fn queries_filter_and_give_the_newest() {
     for t in 1..=10 {
         let peer = if t % 2 == 0 { "laptop" } else { "sister-phone" };
         let kind = if t % 3 == 0 {
-            RecordKind::Denied
+            RecordKind::Blocked
         } else {
             RecordKind::Opened
         };
@@ -118,7 +118,7 @@ async fn queries_filter_and_give_the_newest() {
     );
     assert_eq!(
         q(Query {
-            kinds: vec![RecordKind::Denied],
+            kinds: vec![RecordKind::Blocked],
             ..all()
         })
         .await,

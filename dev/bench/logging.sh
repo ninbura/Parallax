@@ -2,8 +2,8 @@
 # Activity logging cost benchmark on network namespaces (docs/logging.md).
 #
 # A. Per packet: a WireGuard peer uploads with iperf3 through the gateway to
-#    a host on the mapped home LAN, with the peer at `off`, `connections` and
-#    `denied`. Throughput and CPU show what the logging rules cost each packet.
+#    a host on the mapped home LAN, with the peer at `off`, `blocked` and
+#    `connections`. Throughput and CPU show what the logging rules cost each packet.
 # B. Per connection: with the daemon running, a flood of short TCP
 #    connections, (1) nobody logged, (2) from the logged peer itself (every
 #    event kept and written), (3) from the gateway host with nobody logged
@@ -153,7 +153,7 @@ echo "A. per packet: iperf3 through the tunnel, $SECONDS_PER_RUN s per run, $(np
 printf '%-6s %-12s %4s %8s %7s %11s\n' mode level run Gbit/s cores cores/Gbit
 for mode in ${MODES:-tcp udp}; do
     args=(); [ "$mode" = udp ] && args=(-u -b 0 -l 1200)
-    for lvl in off connections denied; do
+    for lvl in off blocked connections; do
         level "$lvl"
         for run in $(seq 1 "$RUNS"); do
             before=$(cpu_busy)
