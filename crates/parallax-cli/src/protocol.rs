@@ -3,7 +3,8 @@
 //! that speaks another version is refused, naming both.
 //!
 //! Secrets cross the socket (private keys in the configuration, a backup
-//! passphrase). It is root-only (0600 in a 0700 directory), the types keep
+//! passphrase). It is owner-only (0600 in a 0700 directory: the daemon's user,
+//! root in Docker or `parallax` natively; root reaches it either way), the types keep
 //! their redacted `Debug`, and nothing logs a message.
 
 use std::io::BufRead;
