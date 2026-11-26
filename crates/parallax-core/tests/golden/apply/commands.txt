@@ -10,5 +10,5 @@ nft -f /var/lib/parallax/nftables/docker-user.nft
 ip link show dev wg0
 ip link add wg0 type wireguard
 ip address replace 10.8.0.1/16 dev wg0
-wg syncconf wg0 /var/lib/parallax/wireguard/wg0.conf
+wg syncconf wg0 /dev/stdin
 ip link set up dev wg0

@@ -650,6 +650,19 @@ fn apply_runs_expected_commands_and_is_idempotent() {
     let report = parallax_core::apply::apply(&model, &bundle, out, sys).unwrap();
     let lines = runner.command_lines();
     check_golden("apply/commands.txt", &(lines.join("\n") + "\n"));
+    // `wg` reads the config from the pipe, not a path (AppArmor on Ubuntu).
+    let fed = runner
+        .calls
+        .borrow()
+        .iter()
+        .find(|(p, a, _)| p == "wg" && a.first().is_some_and(|a| a == "syncconf"))
+        .and_then(|(_, _, stdin)| stdin.clone());
+    assert_eq!(
+        fed.as_deref(),
+        parallax_core::io::FileSystem::read(&fs, &out.join("wireguard/wg0.conf"))
+            .unwrap()
+            .as_deref()
+    );
     assert!(
         report
             .log
