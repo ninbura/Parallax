@@ -39,8 +39,9 @@
 # (n) the daemon tears down on SIGTERM, re-applies on SIGHUP and repairs a deleted
 # table, and keeps the home's public IP across the restart, (r) a peer with two grants
 # reaches both and nothing more, a grant for everyone reaches every peer, and changing
-# grants keeps addresses and client configs. Every change goes through the
-# daemon and takes effect without SIGHUP.
+# grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
+# change access when they return, and a refused one changes nothing. Every change
+# goes through the daemon and takes effect without SIGHUP.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -775,5 +776,38 @@ apply "$WORK/forward-base.toml"
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(r) the grant for everyone outlived its removal"
 [ "$(https_as $FRIEND immich.mydomain.com 198.18.1.5)" = BLOCKED ] || fail "(r) friend kept family after it was detached"
 pass "(r) two grants reach their union and nothing more; a grant for everyone reaches every peer; addresses and client configs stay"
+
+# (s) the same from the command line: each `grant` and `peer grants` command is live
+# when it returns, and one that's refused (a rule that isn't there, a grant someone
+# still has) leaves access as it was. Laptop's own grants never change: the control.
+GUEST_CONF=$($P export guest --platform mobile 2>/dev/null | grep -v '^#')
+g() { $P "$@" >/dev/null 2>"$WORK/grant.err" || { cat "$WORK/grant.err"; fail "(s) parallax $*"; }; sleep 0.3; }
+refused() { if $P "$@" >/dev/null 2>&1; then fail "(s) parallax $* should be refused"; fi; }
+web() { curl_as "$1" http://198.18.1.5:8080/; }
+[ "$(web $GUEST)" = BLOCKED ] || fail "(s) guest reached 8080 before any grant gave it"
+g grant create web host:192.168.1.5:8080/tcp
+[ "$(web $GUEST)" = BLOCKED ] || fail "(s) a grant attached to no one gave access"
+g grant attach web --to guest
+[ "$(web $GUEST)" = home-other ] || fail "(s) guest -> its attached grant"
+[ "$(web $FRIEND)" = BLOCKED ] || fail "(s) friend got guest's grant"
+g peer grants guest remove web
+[ "$(web $GUEST)" = BLOCKED ] || fail "(s) guest kept a grant detached from its side"
+g grant everyone web on
+for src in $GUEST $FRIEND; do [ "$(web $src)" = home-other ] || fail "(s) $src missed the grant for everyone"; done
+refused grant rule remove web host:192.168.1.5:8080/udp
+refused grant detach web --from friend
+refused grant remove web
+[ "$(web $FRIEND)" = home-other ] || fail "(s) a refused change took access away"
+g grant rename web lan-web
+[ "$(web $GUEST)" = home-other ] || fail "(s) a rename changed access"
+g grant remove lan-web --force
+for src in $GUEST $FRIEND; do [ "$(web $src)" = BLOCKED ] || fail "(s) $src kept a removed grant"; done
+[ "$(web $LAPTOP)" = home-other ] || fail "(s) laptop's access changed with others' grants"
+[ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(s) guest lost family"
+$P peer show guest | grep -q '^guest  grants=family  .*address=10.8.0.3 ' \
+    || { $P peer show guest; fail "(s) guest's grants or address"; }
+[ "$($P export guest --platform mobile 2>/dev/null | grep -v '^#')" = "$GUEST_CONF" ] \
+    || fail "(s) guest's client config changed with its grants"
+pass "(s) grant and peer grants commands change access on return; refused ones change nothing"
 
 echo "ALL PASS"

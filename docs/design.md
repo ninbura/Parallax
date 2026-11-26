@@ -14,6 +14,7 @@ crates/parallax-core/           pure library, no I/O of its own
                                 Grant, Rule, Peer (+ Platform); legacy.rs reads
                                 template-era TOML
   src/tier.rs                   peers with the same grants form a tier
+  src/grants.rs                 changing grants and who has them (CLI, later GUI)
   src/secret.rs                 PublicKey / PrivateKey / PresharedKey / Secret (Debug-redacted)
   src/date.rs                   dependency-free civil date for peer expiry
   src/netmap.rs                 Mapping: 1:1 prefix translation (+ property test)
@@ -35,7 +36,8 @@ crates/parallax-proxy/          the HTTPS proxy (a task in the daemon)
 crates/parallax-dns/            the DNS server (a task in the daemon)
 crates/parallax-cli/            `parallax` binary (daemon, status, validate, plan,
                                 generate, apply, keygen, config import/export/edit,
-                                backup, peer add/remove/show, export, doctor);
+                                backup, grant, peer add/remove/show/grants,
+                                export, doctor);
                                 src/daemon.rs and src/protocol.rs: the daemon and
                                 its socket protocol
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)

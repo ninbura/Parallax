@@ -18,6 +18,11 @@ pub enum Error {
     #[error("{kind} '{name}' not found")]
     NotFound { kind: &'static str, name: String },
 
+    /// A change that would do something other than what was asked, refused
+    /// before anything changed.
+    #[error("{0}")]
+    Refused(String),
+
     /// The WireGuard supernet has no free host left.
     #[error("server.wireguard.supernet {pool} has no free address left; widen it")]
     PoolExhausted { pool: ipnet::Ipv4Net },
