@@ -121,6 +121,9 @@ jobs:
         with:
           name: parallax-amd64
           path: dist
+      # Undo what the runner already has (Docker turns forwarding on), so the
+      # checks below see what the package did.
+      - run: sudo sysctl -w net.ipv4.ip_forward=0 && (sudo modprobe -r wireguard || true)
       - run: sudo apt-get update && sudo apt-get install -y ./dist/parallax_*_amd64.deb
       - run: getent passwd parallax && test "$(sudo stat -c %U:%a /etc/parallax)" = parallax:700
       - run: test "$(sysctl -n net.ipv4.ip_forward)" = 1 && test -d /sys/module/wireguard

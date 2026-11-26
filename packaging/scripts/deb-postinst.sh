@@ -6,8 +6,9 @@ set -e
 systemd-sysusers parallax.conf
 systemd-tmpfiles --create parallax.conf
 
-# Only on a running system, not in a chroot or an image build.
-[ -d /run/systemd/system ] || exit 0
+# Only on a running system, not in a chroot or an image build (one with the
+# host's /run bound in would otherwise reach the host's systemd).
+[ -d /run/systemd/system ] && ! systemd-detect-virt -q --chroot || exit 0
 systemctl daemon-reload
 # ip_forward and the module now, not only from the next boot. Through the
 # boot-time services, so every sysctl.d file applies in order and a local
