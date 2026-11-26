@@ -323,7 +323,35 @@ if [ "$MODE" = unit ]; then
         || fail "could not read the sandbox from $UNIT_FILE"
     AS_UNIT=(systemd-run --quiet --collect -p User=nobody -p "NetworkNamespacePath=/run/netns/${PREFIX}gw"
         -p "ReadWritePaths=$WORK" "${SANDBOX[@]}")
+    # A first start from nothing: the unit's own ExecStartPre lines, in order,
+    # pointed at a fresh directory.
+    for d in first bad none; do mkdir "$WORK/$d"; done
+    sed "s|^private_key_file = .*|private_key_file = \"$WORK/first/wg-server.key\"|" "$WORK/parallax.toml" \
+        > "$WORK/first/parallax.toml"
+    printf '[server\n' > "$WORK/bad/parallax.toml"
     chown -R nobody "$WORK"
+    starts=0
+    first_start() { # directory
+        local line
+        while IFS= read -r line; do
+            line=${line#ExecStartPre=}
+            line=${line//\/usr\/bin\/parallax/"$WORK/parallax --db $1/parallax.db --socket $1/parallax.sock"}
+            line=${line//\/etc\/parallax\/parallax.toml/"$1/parallax.toml"}
+            starts=$((starts + 1))
+            "${AS_UNIT[@]}" --unit="${PREFIX}first-$starts" --wait --pipe /bin/sh -c "$line" || return 1
+        done < <(grep '^ExecStartPre=' "$UNIT_FILE")
+    }
+    first_start "$WORK/first" > "$WORK/first.out" 2>&1 \
+        || { cat "$WORK/first.out"; fail "the unit's first start (import, doctor, keygen) fails as the service"; }
+    grep -q "^imported" "$WORK/first.out" || { cat "$WORK/first.out"; fail "the first start did not import the TOML"; }
+    [ "$(stat -c '%U %a' "$WORK/first/wg-server.key")" = "nobody 600" ] \
+        || fail "the first start's server key is not the service's own, 0600"
+    if first_start "$WORK/bad" > "$WORK/bad.out" 2>&1; then fail "a broken TOML did not stop the first start"; fi
+    grep -q "^imported" "$WORK/bad.out" && fail "a broken TOML was imported"
+    if first_start "$WORK/none" > "$WORK/none.out" 2>&1; then fail "a start with no TOML and no database passed"; fi
+    grep -q "^FAIL  configuration" "$WORK/none.out" \
+        || { cat "$WORK/none.out"; fail "with no TOML, doctor did not say there's no configuration"; }
+    pass "the unit's first start: imports, checks and makes the key as the service; a broken TOML stops it"
     "${AS_UNIT[@]}" --unit="${PREFIX}doctor" --wait --pipe \
         "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" doctor > "$WORK/doctor-unit" 2>&1 \
         || { cat "$WORK/doctor-unit"; fail "doctor fails as the native service"; }
@@ -351,7 +379,13 @@ start_daemon() { # reconcile interval in seconds
     for _ in $(seq 100); do
         if $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep -q . \
             && inns gw ss -Hltn 'sport = :8443' | grep -q .; then
-            [ "$MODE" = unit ] && systemctl show -p MainPID --value "$unit" > "$WORK/daemon.pid"
+            if [ "$MODE" = unit ]; then
+                # 0 would mean it already exited, and `kill 0` hits this whole test.
+                local pid
+                pid=$(systemctl show -p MainPID --value "$unit")
+                [ "${pid:-0}" -gt 0 ] || fail "the daemon's unit $unit has no main process"
+                echo "$pid" > "$WORK/daemon.pid"
+            fi
             return 0
         fi
         sleep 0.1
@@ -749,6 +783,12 @@ if [ "$MODE" = unit ]; then
     if $P validate > "$WORK/root.err" 2>&1; then fail "(n) root opened the service's database directly"; fi
     grep -q "belongs to user 'nobody', and no daemon answers" "$WORK/root.err" \
         || { cat "$WORK/root.err"; fail "(n) root's refusal doesn't say whose database it is"; }
+    if inns gw timeout 20 $P daemon -o "$WORK/out" > "$WORK/root-daemon.err" 2>&1; then
+        fail "(n) root ran a daemon on the service's database"
+    fi
+    grep -q "a daemon run as root would leave files that user can't open" "$WORK/root-daemon.err" \
+        || { cat "$WORK/root-daemon.err"; fail "(n) root's daemon didn't say why it refused"; }
+    inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) root's refused daemon applied anyway"
     runuser -u nobody -- "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" validate >/dev/null \
         || fail "(n) without a daemon the service's user opens the database itself"
 else

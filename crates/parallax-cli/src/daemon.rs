@@ -663,6 +663,14 @@ impl Engine {
             .enable_time()
             .build()
             .context("starting the engine's runtime")?;
+        if let Some((who, sudo_u)) = crate::owner::services_database(db) {
+            bail!(
+                "{} belongs to {who}: a daemon run as root would leave files that user can't \
+                 open. Start the service instead (`sudo systemctl start parallax`), or run it as \
+                 that user (`sudo -u {sudo_u} parallax daemon ...`)",
+                db.display()
+            );
+        }
         let mut store = rt.block_on(Store::open(db)).map_err(|e| match e {
             parallax_store::Error::InUse(_) => anyhow!(
                 "the database {} is open in another process; is another daemon running?",

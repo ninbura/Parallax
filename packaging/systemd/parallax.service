@@ -14,9 +14,9 @@ Type=simple
 User=parallax
 Group=parallax
 # The first start fills an empty database from the TOML; after that the
-# database is the configuration and the file is ignored. "-": no file is fine,
-# doctor then says there's no configuration.
-ExecStartPre=-/usr/bin/parallax config import --if-empty /etc/parallax/parallax.toml
+# database is the configuration and the file is ignored. No file is fine
+# (doctor then says there's no configuration); a bad one stops the start.
+ExecStartPre=/bin/sh -c 'test ! -e /etc/parallax/parallax.toml || exec /usr/bin/parallax config import --if-empty /etc/parallax/parallax.toml'
 ExecStartPre=/usr/bin/parallax doctor
 ExecStartPre=/usr/bin/parallax keygen --if-missing --write-config
 ExecStart=/usr/bin/parallax daemon -o /var/lib/parallax
