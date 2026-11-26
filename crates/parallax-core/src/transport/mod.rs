@@ -39,9 +39,10 @@ pub trait Transport {
     fn source_range(&self, server: &ServerConfig) -> Ipv4Net;
 
     /// The named address set holding `tier`'s members on this transport,
-    /// which the firewall matches them by.
+    /// which the firewall matches them by. Named by the tier's grants
+    /// ([`Tier::key`]), at most 19 characters (ipset's limit is 31).
     fn set_name(&self, tier: &Tier<'_>) -> String {
-        format!("{}_tier_{}", self.set_prefix(), tier.index)
+        format!("{}_{}", self.set_prefix(), tier.key())
     }
 
     /// `wg`, `ts`: starts this transport's set names.

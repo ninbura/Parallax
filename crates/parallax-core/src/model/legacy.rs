@@ -154,16 +154,21 @@ impl TryFrom<ConfigToml> for Config {
                 }
                 (None, grants) => grants.unwrap_or_default(),
                 (Some(name), None) => {
-                    let template = c.template.iter().find(|t| t.name == name);
-                    if let (Some(t), Some(w)) = (template, wireguard.as_mut()) {
+                    // Not a grant of that name: it would bind silently,
+                    // with none of the template's client settings.
+                    let t = c.template.iter().find(|t| t.name == name).ok_or_else(|| {
+                        format!(
+                            "peer '{}' has template '{name}', which isn't defined; give it grants = [...] instead",
+                            p.name
+                        )
+                    })?;
+                    if let Some(w) = wireguard.as_mut() {
                         w.dns = t.dns.wireguard;
                         w.allowed_ips = t.client.allowed_ips;
                         w.mtu = t.client.mtu;
                         w.persistent_keepalive = t.client.persistent_keepalive;
                         w.visible_networks = t.visible_networks.clone();
                     }
-                    // An unknown template stays an unknown grant, which
-                    // validation reports.
                     vec![name]
                 }
             };

@@ -49,8 +49,18 @@ configuration always numbers them alike.
   `iifname "wg0" ip saddr vmap { 10.8.1.1 : jump tier_0, ... }`. Chains are
   numbered (`tier_<n>`, `PARALLAX_T<n>`); a tier's name can be several
   grants long, and the rules' comments say which (`family+photos: ...`).
-  INPUT and the proxy redirect match the tier's member set (`wg_tier_<n>`,
-  `ts_tier_<n>`), so they stay one rule per tier however many peers.
+  INPUT and the proxy redirect match the tier's member set (`wg_<key>`,
+  `ts_<key>`, the key a hash of its grants' names), so they stay one rule
+  per tier however many peers. Sets are named by content, not position:
+  `iptables-nft` refills sets before it restores the rules, and a set
+  whose name moved to other access would briefly give old rules' access to
+  new members.
+- **Addresses change hands.** Since an address no longer implies access, a
+  save can give a removed peer's address to someone with other grants.
+  Apply first takes any live WireGuard peer off the interface that holds an
+  address the new configuration gives another key, then replaces the
+  firewall, then re-syncs WireGuard. The old key never holds the address under the new
+  owner's rules, even if a later step fails.
 - **DNS and proxy** routes list each tier's member addresses.
 - **Validation** runs per tier on the union: the hostname-bypass warning,
   `full_tunnel` without `internet`, the home's public IP rules (ADR 0008,

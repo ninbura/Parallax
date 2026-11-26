@@ -248,7 +248,7 @@ pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolve
             {
                 out.push(format!(
                     "{}: rule {what}: {name} is the home's public IP {home}, and {why}; it gives nothing there",
-                    t.context()
+                    t.grant_context()
                 ));
             }
         }
@@ -505,13 +505,11 @@ mod tests {
         let found = problems(&cfg, Some(HOME), &at_home);
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(
-            found[0].starts_with("peer 'sister-phone' (grant 'family'): rule host nas.mydomain.com: nas.mydomain.com is the home's public IP 1.2.3.4, and every port there is a port forward"),
+            found[0].starts_with("grant 'family': rule host nas.mydomain.com: nas.mydomain.com is the home's public IP 1.2.3.4, and every port there is a port forward"),
             "{found:?}"
         );
         assert!(
-            found[1].starts_with(
-                "peer 'sister-phone' (grant 'family'): rule host nas.mydomain.com 443/udp:"
-            ),
+            found[1].starts_with("grant 'family': rule host nas.mydomain.com 443/udp:"),
             "{found:?}"
         );
         assert!(found[1].contains("service with hostnames"), "{found:?}");
@@ -568,6 +566,22 @@ mod tests {
         let mut new = old.clone();
         new.services[0].host = Host::Name(NAS.into());
         new.services[0].hostnames = vec![NAS.into()];
+        assert!(check_save(Some(&old), &new, Some(HOME), &FakeResolver::new(), &known).is_ok());
+    }
+
+    #[test]
+    fn an_old_problem_doesnt_block_removing_a_peer() {
+        // Every port of the public IP: a problem already, for a tier of two.
+        let mut old = named();
+        old.grants[1].rules.push(Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: Vec::new(),
+        });
+        old.peers[1].grants = vec!["family".into()];
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert_eq!(problems(&old, Some(HOME), &known).len(), 1);
+        let mut new = old.clone();
+        new.peers.remove(1);
         assert!(check_save(Some(&old), &new, Some(HOME), &FakeResolver::new(), &known).is_ok());
     }
 

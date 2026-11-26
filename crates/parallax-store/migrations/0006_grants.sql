@@ -36,9 +36,9 @@ CREATE TABLE grant_rules (
 );
 INSERT INTO grant_rules (grant_id, position, kind, network_id, service_id, host)
     SELECT template_id, position, kind, network_id, service_id, host FROM template_grants;
--- dns.public: a rule after the template's own (their positions run from 0).
+-- dns.public: a rule after the template's own.
 INSERT INTO grant_rules (grant_id, position, kind)
-    SELECT t.id, COUNT(g.position), 'public_dns'
+    SELECT t.id, COALESCE(MAX(g.position) + 1, 0), 'public_dns'
     FROM templates t LEFT JOIN template_grants g ON g.template_id = t.id
     WHERE t.dns_public
     GROUP BY t.id;

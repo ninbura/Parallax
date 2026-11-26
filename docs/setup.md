@@ -348,7 +348,11 @@ Include the generated snippets in vhosts. `nginx/snippets/parallax-<grant>.conf`
 holds `allow` lines for every peer with that grant; `nginx/snippets/parallax-service-<name>.conf`
 (for services marked `nginx_vhost = true`) holds every peer that reaches the
 service, the local LAN, and `deny all`. Parallax does not reload nginx; copy
-the snippets (or bind-mount the output directory) and reload yourself.
+the snippets (or bind-mount the output directory) and reload yourself. The
+lists name peers by address, and an address keeps its peer when grants
+change: until nginx reloads, a peer that lost a grant may still pass a
+vhost's allow list, for instance when it keeps another vhost on the same
+address and port. Reload nginx after changing grants.
 
 ## Proxied HTTPS services and certificates
 

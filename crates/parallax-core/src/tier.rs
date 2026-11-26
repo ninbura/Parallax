@@ -36,6 +36,21 @@ impl Tier<'_> {
             .join("+")
     }
 
+    /// 16 hex digits naming the tier by its grants, not its position: a
+    /// set named after it always means the same access. On iptables, sets
+    /// change before the rules that use them, so a set whose name moved to
+    /// other access would briefly give the old rules' access to its new
+    /// members (FNV-1a of the label: fixed across builds, no dependency).
+    pub fn key(&self) -> String {
+        let hash = self
+            .label()
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+        format!("{hash:016x}")
+    }
+
     pub fn has(&self, rule: &Rule) -> bool {
         self.rules.contains(&rule)
     }
@@ -51,29 +66,39 @@ impl Tier<'_> {
     /// Who a message is about: `peer 'sister-phone' (grant 'family')`,
     /// `peers 'laptop', 'router' (grants 'lan', 'photos')`.
     pub fn context(&self) -> String {
-        let quoted = |names: Vec<&str>| {
-            names
-                .iter()
-                .map(|n| format!("'{n}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let peers = quoted(self.peers.iter().map(|p| p.name.as_str()).collect());
-        let grants = quoted(self.grants.iter().map(|g| g.name.as_str()).collect());
+        let peers = quoted(self.peers.iter().map(|p| p.name.as_str()));
         format!(
-            "{} {peers} ({} {grants})",
+            "{} {peers} ({})",
             if self.peers.len() == 1 {
                 "peer"
             } else {
                 "peers"
             },
+            self.grant_context()
+        )
+    }
+
+    /// The grants alone: `grant 'family'`, `grants 'lan', 'photos'`. For
+    /// messages that are compared before and after a change, which adding
+    /// or removing a peer mustn't alter.
+    pub fn grant_context(&self) -> String {
+        format!(
+            "{} {}",
             if self.grants.len() == 1 {
                 "grant"
             } else {
                 "grants"
             },
+            quoted(self.grants.iter().map(|g| g.name.as_str()))
         )
     }
+}
+
+fn quoted<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    names
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Positions in `config.grants` of what `peer` has: its own grants and

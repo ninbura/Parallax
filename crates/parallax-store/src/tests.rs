@@ -545,7 +545,8 @@ async fn update_saves_the_change_or_nothing() {
 
 /// The canonical configuration as Parallax stored it before grants replaced
 /// templates (schema 5), with a third, unattached template that has a port
-/// list and `dns.public`, and every template on tunnel-wide Tailscale DNS.
+/// list, a gap in its rule positions and `dns.public`, and every template on
+/// tunnel-wide Tailscale DNS.
 async fn schema_5_database(path: &Path) {
     let db = turso::Builder::new_local(path.to_str().unwrap())
         .build()
@@ -594,7 +595,7 @@ async fn schema_5_database(path: &Path) {
             headscale_tag, visible_networks_limited, dns_wireguard, dns_tailscale,
             dns_public, client_allowed_ips, client_mtu, client_persistent_keepalive)
          VALUES
-            (1, 'personal', 0, '10.8.1.0/24', 'someone', NULL, 0, 'split',
+            (1, 'personal', 0, '10.8.1.0/24', 'someone', NULL, 1, 'split',
                 'tunnel_wide', 1, 'mapped_subnets', NULL, 25),
             (2, 'family', 1, '10.8.2.0/24', NULL, 'tag:family', 1, 'tunnel_wide',
                 'tunnel_wide', 0, 'grants_only', NULL, 25),
@@ -604,9 +605,14 @@ async fn schema_5_database(path: &Path) {
          VALUES (1, 0, 'all_networks', NULL, NULL, NULL),
             (2, 0, 'service', NULL, 1, NULL),
             (3, 0, 'host', NULL, NULL, '192.168.1.9'),
-            (3, 1, 'network', 1, NULL, NULL);
+            (3, 2, 'network', 1, NULL, NULL);
          INSERT INTO template_grant_ports (template_id, grant_position, position, ports)
-         VALUES (3, 0, 0, '25565/udp'), (3, 0, 1, '25565/tcp');",
+         VALUES (3, 0, 0, '25565/udp'), (3, 0, 1, '25565/tcp');
+         INSERT INTO template_visible_networks (template_id, position, network_id)
+         VALUES (1, 0, 1);
+         INSERT INTO peers (id, name, position, template_id, transport, enabled,
+            tailscale, tailscale_node_id, tailscale_address)
+         VALUES (3, 'tv', 3, 1, 'tailscale', 1, 1, 5, '100.64.0.5');",
     )
     .await
     .unwrap();
@@ -648,12 +654,28 @@ async fn templates_become_grants_with_the_same_access() {
     let loaded = store.load().await.unwrap();
 
     let mut expected = canonical_config();
-    // `family` showed no network: its peer keeps that.
+    // `personal` showed only `home` and `family` no network: their
+    // WireGuard peers keep that; the Tailscale one has no such setting.
+    for p in &mut expected.peers[..2] {
+        p.wireguard.as_mut().unwrap().visible_networks = Some(vec!["home".into()]);
+    }
     expected.peers[2]
         .wireguard
         .as_mut()
         .unwrap()
         .visible_networks = Some(Vec::new());
+    expected.peers.push(Peer {
+        name: "tv".into(),
+        grants: vec!["personal".into()],
+        transport: TransportKind::Tailscale,
+        enabled: true,
+        expires: None,
+        wireguard: None,
+        tailscale: Some(TailscalePeer {
+            node_id: Some(5),
+            address: Some(Ipv4Addr::new(100, 64, 0, 5)),
+        }),
+    });
     expected.server.headscale.dns = DnsMode::TunnelWide;
     expected.grants.push(Grant {
         name: "spare".into(),

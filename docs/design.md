@@ -159,7 +159,7 @@ pub trait Transport {
     fn kind(&self) -> TransportKind;
     fn ingress_interface(&self, server: &ServerConfig) -> String;      // wg0 / tailscale0
     fn source_range(&self, server: &ServerConfig) -> Ipv4Net;          // WG supernet / 100.64.0.0/10
-    fn set_name(&self, tier: &Tier) -> String;                          // wg_tier_<n> / ts_tier_<n>
+    fn set_name(&self, tier: &Tier) -> String;                          // wg_<key> / ts_<key>
     fn members_known(&self) -> bool;                                    // WG: yes; TS: synced (M2)
     fn tier_members(&self, model: &Model, tier: &Tier) -> Vec<Ipv4Net>; // one /32 per active member
     fn provision(&self, model: &Model, grants: &[String], name: &str,
@@ -174,8 +174,10 @@ pub fn all() -> Vec<Box<dyn Transport>>   // always [WireGuard, Tailscale]
 The shared generators (`firewall`, `dns`, `proxy`, `nginx`) iterate `transport::all()`
 and only use the methods above `provision`. That is why the M1 nftables table
 already has its final shape: NETMAP matches `{ "wg0", "tailscale0" }`, every
-tier has a member set per transport (`wg_tier_<n>`, and `ts_tier_<n>`, empty
-until M2 syncs it), and both transports end with a catch-all deny.
+tier has a member set per transport (`wg_<key>`, and `ts_<key>`, empty
+until M2 syncs it; the key is a hash of the tier's grants, so a set name
+never changes meaning between applies), and both transports end with a
+catch-all deny.
 `TailscaleTransport` implements those today and returns `NotImplemented` for
 provision/export.
 

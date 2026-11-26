@@ -195,13 +195,13 @@ fn proxied_service_gets_no_direct_accept() {
         .skip_while(|l| !l.contains("chain prerouting"))
         .collect();
     assert!(pre[2].contains(
-        "iifname \"wg0\" ip saddr @wg_tier_1 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
+        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
     ), "{pre:#?}");
     assert!(pre.iter().any(|l| l.contains("netmap home")));
     assert!(!fw.contents.contains("personal/wireguard: https proxy"));
-    assert!(fw
-        .contents
-        .contains("iifname \"wg0\" ip saddr @wg_tier_1 ip daddr 10.8.0.1 tcp dport 8443 accept"));
+    assert!(fw.contents.contains(
+        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 10.8.0.1 tcp dport 8443 accept"
+    ));
 }
 
 #[test]
@@ -245,7 +245,7 @@ fn tunnel_peers_are_checked_on_every_packet() {
     ));
     assert!(fw
         .contents
-        .contains("iifname \"tailscale0\" ip saddr @ts_tier_1 jump tier_1"));
+        .contains("iifname \"tailscale0\" ip saddr @ts_f62eed6a1a23f069 jump tier_1"));
     let family: Vec<&str> = fw
         .contents
         .lines()
@@ -274,13 +274,12 @@ fn gateway_address_turns_grants_into_input_accepts() {
     assert!(
         input
             .iter()
-            .any(|l| l.contains("ip saddr @wg_tier_0 ip daddr 192.168.1.5 accept")),
+            .any(|l| l.contains("ip saddr @wg_20deb125664a4b6d ip daddr 192.168.1.5 accept")),
         "{input:#?}"
     );
     assert!(
-        input
-            .iter()
-            .any(|l| l.contains("ip saddr @wg_tier_1 ip daddr 192.168.1.5 tcp dport 443 accept")),
+        input.iter().any(|l| l
+            .contains("ip saddr @wg_f62eed6a1a23f069 ip daddr 192.168.1.5 tcp dport 443 accept")),
         "{input:#?}"
     );
     let drop_idx = input
@@ -426,7 +425,7 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     ), "{}", fw.contents);
     // HTTPS by name: redirected to the proxy, which connects to the public IP.
     assert!(fw.contents.contains(
-        "iifname \"wg0\" ip saddr @wg_tier_1 ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
+        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
     ), "{}", fw.contents);
     assert!(
         routes.contents.contains("upstream = \"1.2.3.4:443\""),
@@ -454,7 +453,7 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     assert!(
         !fw.contents
-            .contains("ip saddr @wg_tier_0 ip daddr 1.2.3.4 tcp dport 443 dnat"),
+            .contains("ip saddr @wg_20deb125664a4b6d ip daddr 1.2.3.4 tcp dport 443 dnat"),
         "{}",
         fw.contents
     );
@@ -676,6 +675,16 @@ fn iptables_apply_refills_chains_in_one_restore() {
             stderr: String::new(),
         },
     );
+    // A set from before grants, one of a tier that went away, and a live one.
+    runner.respond_to(
+        "ipset",
+        &["list", "-n"],
+        parallax_core::io::Output {
+            status: 0,
+            stdout: "ts_family\nwg_0000000000000000\nwg_f62eed6a1a23f069\nnot_public\n".into(),
+            stderr: String::new(),
+        },
+    );
     let sys = System {
         fs: &fs,
         runner: &runner,
@@ -683,6 +692,11 @@ fn iptables_apply_refills_chains_in_one_restore() {
     parallax_core::apply::apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
     let lines = runner.command_lines();
     let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
+    // Stale sets go after the restore; live ones stay.
+    let gone = |set: &str| pos(&format!("ipset destroy {set}"));
+    assert!(gone("ts_family").unwrap() > pos("iptables-restore").unwrap());
+    assert!(gone("wg_0000000000000000").is_some());
+    assert!(gone("wg_f62eed6a1a23f069").is_none() && gone("not_public").is_none());
     let restore = pos("iptables-restore --noflush").unwrap();
     // No flush of live chains before the restore: that left a window with
     // empty chains, and empty ones if the restore failed.
@@ -762,6 +776,17 @@ fn template_configs_import_as_grants() {
     let err = Config::from_toml(&both).unwrap_err().to_string();
     assert!(
         err.contains("peer 'router' has both template and grants"),
+        "{err}"
+    );
+    // A template that isn't there doesn't bind to a grant of that name.
+    let new = canonical_config().to_toml().unwrap().replacen(
+        "grants = [\"personal\"]",
+        "template = \"personal\"",
+        1,
+    );
+    let err = Config::from_toml(&new).unwrap_err().to_string();
+    assert!(
+        err.contains("peer 'router' has template 'personal', which isn't defined"),
         "{err}"
     );
 }
@@ -854,4 +879,45 @@ fn a_peer_reaches_the_union_of_its_grants() {
     let dns = bundle.of_kind(ArtifactKind::DnsRoutes).next().unwrap();
     let routes = generate::dns::DnsRoutes::from_toml(&dns.contents).unwrap();
     assert!(routes.tiers.iter().all(|t| t.public), "{routes:?}");
+}
+
+/// An address that changes hands in one save: the old key is off the
+/// interface before the firewall gives the address its new owner's access.
+#[test]
+fn apply_takes_a_moved_address_off_its_old_key_first() {
+    let cfg = canonical_config();
+    let model = Model::resolve(&cfg, today()).unwrap();
+    let fs = fs_with_server_key();
+    let bundle = generate::generate_all(&model, &fs).unwrap();
+    let wg = |n: usize| cfg.peers[n].wireguard.as_ref().unwrap();
+    let old_key = parallax_core::testing::keypair(77).public.to_base64();
+    let runner = RecordingRunner::new();
+    let wide_key = parallax_core::testing::keypair(78).public.to_base64();
+    // Live: the router with an extra address of nobody's (syncconf's job),
+    // the laptop's address on another key, a key holding a whole range,
+    // and the sister's phone as configured.
+    runner.respond_to(
+        "wg",
+        &["show", "wg0", "allowed-ips"],
+        parallax_core::io::Output {
+            status: 0,
+            stdout: format!(
+                "{}\t10.8.1.1/32 10.8.9.9/32 fd00::2/128\n{old_key}\t10.8.1.2/32\n{wide_key}\t10.8.2.0/24\n{}\t10.8.2.1/32\n",
+                wg(0).public_key.to_base64(),
+                wg(2).public_key.to_base64()
+            ),
+            stderr: String::new(),
+        },
+    );
+    let sys = System {
+        fs: &fs,
+        runner: &runner,
+    };
+    parallax_core::apply::apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+    let lines = runner.command_lines();
+    let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();
+    let removed: Vec<&String> = lines.iter().filter(|l| l.ends_with(" remove")).collect();
+    assert_eq!(removed.len(), 2, "{lines:#?}");
+    assert!(pos(&format!("wg set wg0 peer {old_key} remove")) < pos("nft -f"));
+    assert!(pos(&format!("wg set wg0 peer {wide_key} remove")) < pos("nft -f"));
 }
