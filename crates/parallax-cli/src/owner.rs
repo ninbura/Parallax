@@ -40,7 +40,8 @@ fn user_name(uid: u32) -> Option<String> {
 /// When root is about to open or write `path` itself (the database, the
 /// output directory) and it belongs to another user, the service's: who that
 /// is, as "user 'name'" (or "uid N") and as a `sudo -u` argument. Root would
-/// leave files there (`-wal`, `-tshm`, generated files) that user can't open.
+/// leave files there (the database's `-wal` and `.db-log`, generated files)
+/// that user can't open.
 pub(crate) fn belongs_to_another_user(path: &Path) -> Option<(String, String)> {
     let (uid, _) = foreign_owner(path)?;
     Some(match user_name(uid) {
@@ -50,7 +51,7 @@ pub(crate) fn belongs_to_another_user(path: &Path) -> Option<(String, String)> {
 }
 
 /// The same for a database: the file, or the directory its `-wal` and
-/// `-tshm` files go in.
+/// `.db-log` files go in.
 pub(crate) fn database_belongs_to_another_user(db: &Path) -> Option<(String, String)> {
     belongs_to_another_user(db).or_else(|| belongs_to_another_user(dir_of(db)))
 }
