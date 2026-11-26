@@ -33,6 +33,10 @@ use parallax_store::{Store, TempDir};
 
 use crate::protocol::{Reply, Request};
 
+// Declared before the print macros below, so they aren't in scope there: the
+// daemon must outlive whoever reads its log.
+mod daemon;
+
 // `print!`, `println!`, `eprint!` and `eprintln!` for the commands, which panic
 // when the reader has gone (`parallax peer show | head -1`, a pager that quits).
 // stdout carries what a command produces: a lost write there is an error
@@ -82,7 +86,6 @@ fn emit(args: std::fmt::Arguments) -> anyhow::Result<()> {
 }
 
 mod backup;
-mod daemon;
 mod protocol;
 
 #[derive(Parser)]
@@ -1192,7 +1195,6 @@ fn confirm(question: &str, default: bool) -> anyhow::Result<bool> {
         bail!("{question} needs a terminal to answer; pass --yes to go ahead without asking");
     }
     eout!("{question} [{}] ", if default { "Y/n" } else { "y/N" });
-    std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;
     Ok(match answer.trim().to_ascii_lowercase().as_str() {

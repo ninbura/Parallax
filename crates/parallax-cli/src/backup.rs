@@ -355,7 +355,6 @@ fn read_secret(prompt: &str) -> anyhow::Result<String> {
         bail!("asking for a passphrase needs a terminal");
     }
     eout!("{prompt}");
-    std::io::stderr().flush()?;
     let fd = stdin.as_fd();
     let original = tcgetattr(fd).context("reading the terminal settings")?;
     let mut quiet = original.clone();

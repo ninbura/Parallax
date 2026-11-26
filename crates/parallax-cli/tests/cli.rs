@@ -875,6 +875,7 @@ fn a_backup_dated_in_the_future_does_not_stay_newest() {
 /// A reader that goes away (`parallax peer show | head -1`, a pager that quits)
 /// stops the command quietly with SIGPIPE's status, not a panic. The pipe's
 /// read end is closed before the command starts, so every write fails.
+#[cfg(unix)]
 #[test]
 fn a_closed_stdout_stops_the_command_without_a_panic() {
     use std::os::unix::process::ExitStatusExt;
