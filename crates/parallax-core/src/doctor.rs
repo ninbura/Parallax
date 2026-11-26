@@ -94,10 +94,12 @@ pub fn diagnose(config: Result<&Config, String>, sys: System<'_>) -> Vec<Check> 
             name: "backups".into(),
             outcome: check_backup(&config.server.backup, sys),
         });
-        let bytes = config
-            .peers
-            .iter()
-            .any(|p| p.enabled && crate::logging::level(config, p) >= LogLevel::Bytes);
+        // Also before the first peer, when the global level asks for bytes.
+        let bytes = config.server.logs.level >= LogLevel::Bytes
+            || config
+                .peers
+                .iter()
+                .any(|p| p.enabled && crate::logging::level(config, p) >= LogLevel::Bytes);
         if bytes {
             checks.push(Check {
                 name: "byte counts".into(),

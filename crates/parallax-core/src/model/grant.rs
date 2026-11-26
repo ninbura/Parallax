@@ -33,8 +33,9 @@ pub struct Grant {
     /// Applies to every peer, current and future, without being attached.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub everyone: bool,
-    /// How much to log for the peers that have it (docs/logging.md). Unset:
-    /// the grant doesn't raise its peers' level.
+    /// How much to log for the peers that have it, unless a peer sets its own
+    /// (docs/logging.md); `off` turns the global level down for them. Unset:
+    /// the grant sets no level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<super::LogLevel>,
     #[serde(default)]

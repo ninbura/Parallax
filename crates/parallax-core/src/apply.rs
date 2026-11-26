@@ -194,12 +194,17 @@ fn apply_firewall(
                 sys.runner
                     .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
             }
-            // Sets of tiers that no longer exist: no rule uses them since the
-            // restore. Prefixed as the transports name them (and as builds
+            // Sets of tiers that no longer exist, and the logging sets once
+            // nobody is logged: no rule uses them since the restore. Tier
+            // sets are prefixed as the transports name them (and as builds
             // before grants did: `ts_<template>`).
             let live = sys.runner.run("ipset", &["list", "-n"], None)?;
+            let logging = [
+                crate::generate::firewall::LOG_FLOWS_SET,
+                crate::generate::firewall::LOG_DENIED_SET,
+            ];
             for name in live.stdout.lines().map(str::trim).filter(|n| {
-                (n.starts_with("wg_") || n.starts_with("ts_"))
+                (n.starts_with("wg_") || n.starts_with("ts_") || logging.contains(n))
                     && !rs.sets.iter().any(|s| s.name == *n)
             }) {
                 sys.runner.run("ipset", &["destroy", name], None)?;

@@ -508,10 +508,6 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         .push(Rule::new(Chain::Input, Action::Accept, "replies").ct(Ct::Reply));
     rs.rules
         .push(Rule::new(Chain::Input, Action::Accept, "related (ICMP errors)").ct(Ct::Related));
-    rs.rules.push(
-        Rule::new(Chain::Input, Action::Accept, "wireguard listen port")
-            .l4(Some((Proto::Udp, server.wireguard.listen_port))),
-    );
     for proto in [Proto::Udp, Proto::Tcp] {
         rs.rules.push(
             Rule::new(Chain::Input, Action::Accept, "dns shim")
@@ -521,9 +517,14 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         );
     }
     // After the shim: DNS queries are logged only by their own opt-in.
+    // Before everything else a tunnel peer can reach on the host.
     if !log_flows.is_empty() {
         rs.rules.push(mark_flows(Chain::Input));
     }
+    rs.rules.push(
+        Rule::new(Chain::Input, Action::Accept, "wireguard listen port")
+            .l4(Some((Proto::Udp, server.wireguard.listen_port))),
+    );
     let mut ping = Rule::new(Chain::Input, Action::Accept, "ping the gateway").iifs(&ingress);
     ping.icmp_echo = true;
     rs.rules.push(ping);

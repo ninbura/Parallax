@@ -52,9 +52,9 @@ table inet parallax {
 		ct state invalid iifname { "wg0", "tailscale0" } drop comment "invalid state"
 		ct direction reply accept comment "replies"
 		ct state related accept comment "related (ICMP errors)"
-		udp dport 51820 accept comment "wireguard listen port"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 udp dport 53 accept comment "dns shim"
 		iifname { "wg0", "tailscale0" } ip daddr 10.8.0.1 tcp dport 53 accept comment "dns shim"
+		udp dport 51820 accept comment "wireguard listen port"
 		iifname { "wg0", "tailscale0" } icmp type echo-request accept comment "ping the gateway"
 		iifname { "wg0", "tailscale0" } drop comment "tunnel peers may not reach anything else on the gateway host"
 	}

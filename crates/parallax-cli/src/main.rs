@@ -346,8 +346,9 @@ fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
         ctx,
         |c| {
             let changed = logging::set_level(c, &target, level)?;
-            let effective = match &target {
-                logging::Target::Peer(p) => c.peer(p).map(|peer| logging::level(c, peer)),
+            // What a peer that went back to inheriting ends up with.
+            let effective = match (&target, level) {
+                (logging::Target::Peer(p), None) => c.peer(p).map(|peer| logging::level(c, peer)),
                 _ => None,
             };
             Ok((changed, effective))

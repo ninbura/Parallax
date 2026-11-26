@@ -18,7 +18,7 @@ Each level includes the ones before it.
 | `off` | nothing (the default) |
 | `connections` | one record per new connection: peer, destination (as the peer saw it and as it really is), protocol, port |
 | `bytes` | also the bytes each way when a connection ends |
-| `denied` | also attempts the firewall blocked, at most 20 a second |
+| `denied` | also attempts the firewall blocked, rate-limited |
 
 DNS queries are not part of any level. They will be a separate opt-in,
 since they say more about a person than their connections do.
@@ -56,8 +56,8 @@ rules = [...]
 
 ## Where records go
 
-Records go in their own database, `logs.db`, next to the configuration by
-default. `path` moves it: on a Raspberry Pi, put it on a USB SSD rather than
+Records go in their own database, by default `/var/lib/parallax/logs.db`,
+beside the configuration's. `path` moves it: on a Raspberry Pi, put it on a USB SSD rather than
 the SD card, which constant small writes wear out; or on `tmpfs` if records
 should end at reboot. With Docker, mount a second volume there.
 
@@ -82,7 +82,10 @@ Without it, connections are still logged, without their bytes.
 The firewall marks the new connections of logged peers (bit `0x20000000` of
 the connection mark, leaving the other bits alone), so the collector keeps
 only theirs. Just before each drop a logged peer can hit, a rate-limited rule
-hands the blocked packet to the collector (nflog group 20568). Peers at `off`
-are in neither set, and with nobody logged neither the sets nor the rules
-exist. Nothing is logged per packet: connections are recorded once when they
-start and once when they end.
+hands the blocked packet to the collector (nflog group 20568), at most 20 a
+second per rule with bursts of 40, so a peer scanning ports can't flood it.
+Peers at `off` are in neither set, and with nobody logged neither the sets
+nor the rules exist. Connections are recorded once when they start and once
+when they end, not per packet; blocked attempts are per packet, within that
+limit. Packets dropped for being out of a connection's state (stale or
+malformed) aren't blocked attempts and aren't logged.

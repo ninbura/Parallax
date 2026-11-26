@@ -291,7 +291,11 @@ fn log_levels_are_set_for_everyone_a_grant_or_a_peer() {
         "{out}"
     );
     let out = ok(&["log", "level", "bytes", "--peer", "sister-phone"]);
-    assert!(out.contains("in effect: bytes"), "{out}");
+    assert!(out.contains("peer 'sister-phone' logs bytes now"), "{out}");
+    assert!(
+        !out.contains("in effect"),
+        "its own level is what's in effect: {out}"
+    );
     // Back to its grant's level.
     let out = ok(&["log", "level", "inherit", "--peer", "sister-phone"]);
     assert!(out.contains("in effect: denied"), "{out}");
@@ -562,11 +566,11 @@ fn fake_daemon(
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let reply = match request["request"].as_str().unwrap() {
                 "load" => serde_json::json!({
-                    "protocol": 4, "reply": "configuration", "public_ip": null, "names": {},
+                    "protocol": 5, "reply": "configuration", "public_ip": null, "names": {},
                     "configuration": config, "revision": 3,
                 }),
                 "save" => serde_json::json!({
-                    "protocol": 4, "reply": "applied", "revision": 4,
+                    "protocol": 5, "reply": "applied", "revision": 4,
                     "log": ["applied by the fake daemon"], "error": null,
                 }),
                 other => panic!("unexpected request {other}"),
@@ -609,7 +613,7 @@ fn commands_go_through_a_running_daemon() {
     assert_eq!(seen[2]["revision"], 3, "saved against the loaded revision");
     let peers = seen[2]["configuration"]["peer"].as_array().unwrap();
     assert!(peers.iter().all(|p| p["name"] != "router"), "{peers:?}");
-    assert!(seen.iter().all(|r| r["protocol"] == 4));
+    assert!(seen.iter().all(|r| r["protocol"] == 5));
 }
 
 /// A stale socket file (its daemon is gone) means no daemon.
