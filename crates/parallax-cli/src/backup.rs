@@ -119,7 +119,7 @@ fn create_command(ctx: &Ctx, if_due: bool) -> anyhow::Result<()> {
         })?,
     };
     for line in lines {
-        outln!("{line}");
+        outln!("{line}")?;
     }
     Ok(())
 }
@@ -259,7 +259,7 @@ fn list(ctx: &Ctx, directory: Option<PathBuf>) -> anyhow::Result<()> {
     };
     let backups = backup::list(&directory)?;
     if backups.is_empty() {
-        outln!("no backups in {}", directory.display());
+        outln!("no backups in {}", directory.display())?;
     }
     for b in backups {
         let size = std::fs::metadata(&b.path).map_or(0, |m| m.len());
@@ -276,8 +276,8 @@ fn list(ctx: &Ctx, directory: Option<PathBuf>) -> anyhow::Result<()> {
                     "not encrypted"
                 },
                 human_size(size)
-            ),
-            Err(e) => outln!("{}  can't be restored: {e}", b.path.display()),
+            )?,
+            Err(e) => outln!("{}  can't be restored: {e}", b.path.display())?,
         }
     }
     Ok(())
@@ -316,7 +316,7 @@ fn set_passphrase(ctx: &Ctx, generate: bool, replace: bool) -> anyhow::Result<()
     };
     write_atomic(path, &format!("{passphrase}\n"))?;
     if generate {
-        outln!("{passphrase}");
+        outln!("{passphrase}")?;
     }
     eoutln!(
         "wrote {} (mode 0600). Keep the passphrase in your password manager: without it, the backups can't be restored.",
@@ -436,7 +436,7 @@ fn restore(
         } else {
             "not encrypted"
         }
-    );
+    )?;
     let (before, revision) = ctx.current().context(
         "can't read the current database; if it's damaged, move it (parallax.db*) aside and restore as on a fresh install",
     )?;
@@ -468,7 +468,7 @@ fn restore(
             return match ctx.ask(&request)? {
                 Some(Reply::Applied { log, error, .. }) => {
                     for line in log {
-                        outln!("{line}");
+                        outln!("{line}")?;
                     }
                     match error {
                         None => Ok(()),
@@ -493,9 +493,9 @@ fn restore(
         )
         .await?;
         for line in lines {
-            outln!("{line}");
+            outln!("{line}")?;
         }
-        outln!("run `parallax apply` to put it into effect");
+        outln!("run `parallax apply` to put it into effect")?;
         Ok(())
     })
 }
@@ -631,12 +631,12 @@ fn show_changes(
             restored.networks.len(),
             restored.grants.len(),
             restored.peers.len()
-        );
+        )?;
     } else if old == new {
-        outln!("configuration: unchanged");
+        outln!("configuration: unchanged")?;
     } else {
-        outln!("configuration:");
-        out!("{}", redact(&parallax_core::plan::unified_diff(&old, &new)));
+        outln!("configuration:")?;
+        out!("{}", redact(&parallax_core::plan::unified_diff(&old, &new)))?;
     }
     let key_file = &restored.server.wireguard.private_key_file;
     let key = match RealFs.read(key_file) {
@@ -648,7 +648,7 @@ fn show_changes(
         Ok(None) => format!("{} is restored", key_file.display()),
         Err(e) => format!("{} can't be read ({e}); it is replaced", key_file.display()),
     };
-    outln!("server key: {key}");
+    outln!("server key: {key}")?;
     if errors.is_empty() {
         // Generated with the backup's server key, compared with what's on disk.
         let with_key = MemoryFs::new().with_file(key_file, server_key.expose());
@@ -658,8 +658,8 @@ fn show_changes(
         });
         match plan {
             Ok(plan) => {
-                outln!("generated files after `parallax apply`:");
-                out!("{}", plan.render());
+                outln!("generated files after `parallax apply`:")?;
+                out!("{}", plan.render())?;
             }
             Err(e) => eoutln!("warning: can't preview the generated files: {e:#}"),
         }

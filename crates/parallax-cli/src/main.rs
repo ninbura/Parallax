@@ -33,44 +33,51 @@ use parallax_store::{Store, TempDir};
 
 use crate::protocol::{Reply, Request};
 
-// `print!`, `println!`, `eprint!` and `eprintln!` for the commands. They panic
-// when the reader has gone (`parallax peer show | head -1`, a pager that quits);
-// these stop the command there instead, with SIGPIPE's status, as a C tool
-// would. Nothing after the lost line runs. Not for the daemon: it must outlive
-// whoever reads its log.
+// `print!`, `println!`, `eprint!` and `eprintln!` for the commands, which panic
+// when the reader has gone (`parallax peer show | head -1`, a pager that quits).
+// stdout carries what a command produces: a lost write there is an error
+// (`StdoutClosed`), so the command stops at that line and its cleanup runs
+// (temp dirs hold private copies), and `main` exits with SIGPIPE's status.
+// stderr only carries messages about the work: losing one never stops it, so
+// `peer add` still prints its one-time config.
 macro_rules! out {
-    ($($arg:tt)*) => { $crate::emit(false, format_args!($($arg)*)) };
+    ($($arg:tt)*) => { $crate::emit(format_args!($($arg)*)) };
 }
 macro_rules! outln {
     () => { out!("\n") };
     ($($arg:tt)*) => { out!("{}\n", format_args!($($arg)*)) };
 }
 macro_rules! eout {
-    ($($arg:tt)*) => { $crate::emit(true, format_args!($($arg)*)) };
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_fmt(format_args!($($arg)*)).and_then(|()| err.flush());
+    }};
 }
 macro_rules! eoutln {
     () => { eout!("\n") };
     ($($arg:tt)*) => { eout!("{}\n", format_args!($($arg)*)) };
 }
 
-/// What `out!` and friends call: write and flush, or end the process.
-fn emit(to_stderr: bool, args: std::fmt::Arguments) {
-    let written = if to_stderr {
-        let mut err = std::io::stderr().lock();
-        err.write_fmt(args).and_then(|()| err.flush())
-    } else {
-        let mut out = std::io::stdout().lock();
-        out.write_fmt(args).and_then(|()| out.flush())
-    };
-    match written {
-        Ok(()) => {}
-        // 128 + SIGPIPE: what a shell reports for a tool the signal ended.
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(141),
-        Err(e) => {
-            let stream = if to_stderr { "stderr" } else { "stdout" };
-            let _ = writeln!(std::io::stderr(), "error: writing to {stream}: {e}");
-            std::process::exit(1);
-        }
+/// stdout's reader went away before the command finished writing.
+#[derive(Debug)]
+struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout was closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// What `out!` and `outln!` call.
+fn emit(args: std::fmt::Arguments) -> anyhow::Result<()> {
+    let mut out = std::io::stdout().lock();
+    match out.write_fmt(args).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(StdoutClosed.into()),
+        Err(e) => Err(anyhow::Error::new(e).context("writing to stdout")),
     }
 }
 
@@ -343,6 +350,10 @@ fn main() {
     // writes itself get explicit modes (`RealFs`).
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     if let Err(e) = run() {
+        if e.downcast_ref::<StdoutClosed>().is_some() {
+            // 128 + SIGPIPE: what a shell reports for a tool the signal ended.
+            std::process::exit(141);
+        }
         eoutln!("error: {e:#}");
         std::process::exit(1);
     }
@@ -640,9 +651,9 @@ pub(crate) fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn print_export(export: &Export) {
+fn print_export(export: &Export) -> anyhow::Result<()> {
     print_warnings(&export.warnings);
-    out!("{}", export.contents);
+    out!("{}", export.contents)
 }
 
 /// Every hostname the proxy will serve needs a usable certificate, and the
@@ -752,7 +763,7 @@ fn run() -> anyhow::Result<()> {
                 config.grants.len(),
                 config.peers.len(),
                 model.active_peers().count()
-            );
+            )?;
         }
         Command::Doctor => doctor(&ctx)?,
         Command::Plan(out) => {
@@ -762,10 +773,10 @@ fn run() -> anyhow::Result<()> {
             print_warnings(&model.name_problems());
             print_warnings(&check_certificates(&model)?);
             for line in name_lines(model.names()) {
-                outln!("name {line}");
+                outln!("name {line}")?;
             }
             let plan = parallax_core::plan::plan(&bundle, &out.out, &fs)?;
-            out!("{}", plan.render());
+            out!("{}", plan.render())?;
         }
         Command::Generate(out) => {
             let (config, learned) = ctx.load_for_generation()?;
@@ -775,13 +786,13 @@ fn run() -> anyhow::Result<()> {
             print_warnings(&model.name_problems());
             parallax_core::plan::write_bundle(&bundle, &out.out, &fs)?;
             for a in &bundle.artifacts {
-                outln!("wrote {}", out.out.join(&a.path).display());
+                outln!("wrote {}", out.out.join(&a.path).display())?;
             }
         }
         Command::Apply(out) => match ctx.ask(&Request::Apply)? {
             Some(Reply::Applied { log, error, .. }) => {
                 for line in log {
-                    outln!("{line}");
+                    outln!("{line}")?;
                 }
                 if let Some(e) = error {
                     bail!("apply failed: {e}");
@@ -820,7 +831,7 @@ fn run() -> anyhow::Result<()> {
                 })?;
                 print_warnings(&warnings);
                 for line in log {
-                    outln!("{line}");
+                    outln!("{line}")?;
                 }
             }
         },
@@ -843,15 +854,15 @@ fn run() -> anyhow::Result<()> {
                 outln!(
                     "daemon at {}: configuration revision {revision}",
                     ctx.socket.display()
-                );
+                )?;
                 if let Some(ip) = public_ip {
-                    outln!("home public IP: {ip}");
+                    outln!("home public IP: {ip}")?;
                 }
                 for line in name_lines(&names) {
-                    outln!("name {line}");
+                    outln!("name {line}")?;
                 }
                 match apply_error {
-                    None => outln!("last apply: ok"),
+                    None => outln!("last apply: ok")?,
                     Some(e) => bail!("last apply failed: {e}"),
                 }
             }
@@ -874,7 +885,7 @@ fn run() -> anyhow::Result<()> {
             let model = model_for(&config, today(), &learned)?;
             let p = model.peer(&peer)?;
             let export = transport::by_kind(p.transport).export(&model, p, platform)?;
-            print_export(&export);
+            print_export(&export)?;
         }
     }
     Ok(())
@@ -899,18 +910,18 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
     let mut failed = 0;
     for check in &checks {
         match &check.outcome {
-            Outcome::Ok(detail) => outln!("ok    {}: {detail}", check.name),
-            Outcome::Warn(problem) => outln!("warn  {}: {problem}", check.name),
+            Outcome::Ok(detail) => outln!("ok    {}: {detail}", check.name)?,
+            Outcome::Warn(problem) => outln!("warn  {}: {problem}", check.name)?,
             Outcome::Fail(problem) => {
                 failed += 1;
-                outln!("FAIL  {}: {problem}", check.name);
+                outln!("FAIL  {}: {problem}", check.name)?;
             }
         }
     }
     if failed > 0 {
         bail!("{failed} of {} checks failed", checks.len());
     }
-    outln!("all {} checks passed", checks.len());
+    outln!("all {} checks passed", checks.len())?;
     Ok(())
 }
 
@@ -939,7 +950,7 @@ fn keygen(ctx: &Ctx, write_config: bool, if_missing: bool) -> anyhow::Result<()>
                         "recorded the public key of {} ({shown}) in {}",
                         path.display(),
                         db.display()
-                    );
+                    )?;
                     report(saved, "")?;
                 }
             }
@@ -952,20 +963,27 @@ fn keygen(ctx: &Ctx, write_config: bool, if_missing: bool) -> anyhow::Result<()>
     }
     let kp = OsKeyGenerator.keypair();
     fs.write(&path, &format!("{}\n", kp.private.expose_base64()), true)?;
-    outln!("wrote {} (mode 0600)", path.display());
-    outln!("public key: {}", kp.public);
-    if write_config {
+    // Record the key before printing anything, so a reader that goes away
+    // can't leave a new key file with the old public key in the database.
+    let saved = if write_config {
         let ((), saved) = ctx.update(|c| {
             c.server.wireguard.public_key = kp.public.clone();
             Ok(())
         })?;
-        outln!("recorded server.wireguard.public_key in {}", db.display());
+        Some(saved)
+    } else {
+        None
+    };
+    outln!("wrote {} (mode 0600)", path.display())?;
+    outln!("public key: {}", kp.public)?;
+    if let Some(saved) = saved {
+        outln!("recorded server.wireguard.public_key in {}", db.display())?;
         report(saved, "")?;
     } else {
         outln!(
             "set server.wireguard.public_key = \"{}\" with `parallax config edit`",
             kp.public
-        );
+        )?;
     }
     Ok(())
 }
@@ -1018,7 +1036,7 @@ fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
                     current.clone_from(&config);
                     Ok(())
                 })?;
-                outln!("{summary}");
+                outln!("{summary}")?;
                 return report(saved, "run `parallax apply` to put it into effect");
             }
             let saved = block_on(async {
@@ -1036,7 +1054,7 @@ fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
                 not_imported();
                 return Ok(());
             }
-            outln!("{summary}; run `parallax apply` to put it into effect");
+            outln!("{summary}; run `parallax apply` to put it into effect")?;
         }
         ConfigCommand::Export { output } => {
             let text = ctx.load()?.to_toml()?;
@@ -1045,7 +1063,7 @@ fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
                     RealFs.write(&path, &text, true)?;
                     eoutln!("wrote {} (mode 0600)", path.display());
                 }
-                None => out!("{text}"),
+                None => out!("{text}")?,
             }
         }
         ConfigCommand::Edit { out, yes } => config_edit(ctx, &out.out, yes)?,
@@ -1069,7 +1087,7 @@ fn config_edit(ctx: &Ctx, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("reading {}", file.display()))?;
         if text == original {
-            outln!("no changes");
+            outln!("no changes")?;
             return Ok(());
         }
         match prepare(&text) {
@@ -1085,21 +1103,21 @@ fn config_edit(ctx: &Ctx, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
 
     let new_text = edited.to_toml()?;
     if new_text == original {
-        outln!("no changes");
+        outln!("no changes")?;
         return Ok(());
     }
-    outln!("configuration:");
+    outln!("configuration:")?;
     out!(
         "{}",
         redact(&parallax_core::plan::unified_diff(&original, &new_text))
-    );
+    )?;
     let model = model_for(&edited, today(), &learned)?;
     match generate::generate_all(&model, &RealFs)
         .and_then(|bundle| parallax_core::plan::plan(&bundle, out_dir, &RealFs))
     {
         Ok(plan) => {
-            outln!("generated files:");
-            out!("{}", plan.render());
+            outln!("generated files:")?;
+            out!("{}", plan.render())?;
         }
         Err(e) => eoutln!("warning: can't preview the generated files: {e}"),
     }
@@ -1138,7 +1156,7 @@ fn config_edit(ctx: &Ctx, out_dir: &Path, yes: bool) -> anyhow::Result<()> {
     };
     match outcome {
         Ok(Some(saved)) => {
-            outln!("saved");
+            outln!("saved")?;
             report(saved, "run `parallax apply` to put it into effect")
         }
         Ok(None) => Err(keep(
@@ -1219,10 +1237,10 @@ fn new_warnings<T>(
 fn grant_change<T>(
     ctx: &Ctx,
     mut change: impl FnMut(&mut Config) -> anyhow::Result<T>,
-    done: impl FnOnce(&T),
+    done: impl FnOnce(&T) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let ((out, warnings), saved) = ctx.update(|config| new_warnings(config, &mut change))?;
-    done(&out);
+    done(&out)?;
     // Through the daemon, its apply log already carries every warning.
     if matches!(saved, Saved::Direct) {
         print_warnings(&warnings);
@@ -1247,13 +1265,14 @@ fn print_added(
     added: &grants::Added,
     done: impl Fn(&str) -> String,
     already: impl Fn(&str) -> String,
-) {
+) -> anyhow::Result<()> {
     for item in &added.added {
-        outln!("{}", done(item));
+        outln!("{}", done(item))?;
     }
     for item in &added.already {
-        outln!("{}", already(item));
+        outln!("{}", already(item))?;
     }
+    Ok(())
 }
 
 fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
@@ -1273,7 +1292,8 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                     } else {
                         "; attach it with `parallax grant attach`"
                     }
-                );
+                )?;
+                Ok(())
             },
         ),
         GrantCommand::Remove { name, force } => grant_change(
@@ -1290,23 +1310,25 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                 Ok(grants::remove(c, &name)?)
             },
             |had| {
-                outln!("removed grant '{name}'");
+                outln!("removed grant '{name}'")?;
                 eoutln!(
                     "note: snippets/parallax-{name}.conf stays on disk with its last allow lines; remove any nginx include of it, delete it, and reload nginx"
                 );
                 if !had.is_empty() {
-                    outln!("taken from {}", quoted(had));
+                    outln!("taken from {}", quoted(had))?;
                 }
+                Ok(())
             },
         ),
         GrantCommand::Rename { from, to } => grant_change(
             ctx,
             |c| Ok(grants::rename(c, &from, &to)?),
             |peers| {
-                outln!("renamed grant '{from}' to '{to}' (peers {})", quoted(peers));
+                outln!("renamed grant '{from}' to '{to}' (peers {})", quoted(peers))?;
                 eoutln!(
                     "note: its nginx snippet is now snippets/parallax-{to}.conf; parallax-{from}.conf stays on disk with its last allow lines, so point any include at the new one, delete the old, and reload nginx"
                 );
+                Ok(())
             },
         ),
         GrantCommand::Show { name } => {
@@ -1336,15 +1358,15 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                     outln!(
                         "{}  everyone=true  peers={peers}  attached={attached}",
                         g.name
-                    );
+                    )?;
                 } else {
-                    outln!("{}  everyone=false  peers={attached}", g.name);
+                    outln!("{}  everyone=false  peers={attached}", g.name)?;
                 }
                 if g.rules.is_empty() {
-                    outln!("    no rules: it gives nothing");
+                    outln!("    no rules: it gives nothing")?;
                 }
                 for rule in &g.rules {
-                    outln!("    rule {rule}");
+                    outln!("    rule {rule}")?;
                 }
             }
             Ok(())
@@ -1358,7 +1380,8 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                         added,
                         |r| format!("added rule {r}"),
                         |r| format!("grant '{grant}' already has rule {r}"),
-                    );
+                    )?;
+                    Ok(())
                 },
             ),
             GrantRule::Remove { grant, rules } => grant_change(
@@ -1366,8 +1389,9 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                 |c| Ok(grants::remove_rules(c, &grant, &rules)?),
                 |()| {
                     for rule in &rules {
-                        outln!("removed rule {rule}");
+                        outln!("removed rule {rule}")?;
                     }
+                    Ok(())
                 },
             ),
         },
@@ -1379,7 +1403,8 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                     added,
                     |p| format!("attached '{grant}' to '{p}'"),
                     |p| format!("'{p}' already has '{grant}'"),
-                );
+                )?;
+                Ok(())
             },
         ),
         GrantCommand::Detach { grant, from } => grant_change(
@@ -1390,13 +1415,14 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
             },
             |everyone| {
                 for peer in &from {
-                    outln!("detached '{grant}' from '{peer}'");
+                    outln!("detached '{grant}' from '{peer}'")?;
                 }
                 if *everyone {
                     eoutln!(
                         "note: '{grant}' applies to everyone, so they still have it until that's switched off"
                     );
                 }
+                Ok(())
             },
         ),
         GrantCommand::Everyone { grant, switch } => {
@@ -1418,13 +1444,14 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                         "applies only to the peers it's attached to"
                     };
                     if *changed {
-                        outln!("grant '{grant}' now {state}");
+                        outln!("grant '{grant}' now {state}")?;
                     } else {
-                        outln!("grant '{grant}' already {state}");
+                        outln!("grant '{grant}' already {state}")?;
                     }
                     if !on {
-                        outln!("attached to {}", quoted(kept));
+                        outln!("attached to {}", quoted(kept))?;
                     }
+                    Ok(())
                 },
             )
         }
@@ -1463,8 +1490,9 @@ fn peer_grants(ctx: &Ctx, peer: &str, change: PeerGrants) -> anyhow::Result<()> 
                     added,
                     |g| format!("attached '{g}' to '{peer}'"),
                     |g| format!("'{peer}' already has '{g}'"),
-                );
-                outln!("{line}");
+                )?;
+                outln!("{line}")?;
+                Ok(())
             },
         ),
         PeerGrants::Remove { grants: list } => grant_change(
@@ -1542,7 +1570,7 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                 eoutln!("the private key below is shown once and not stored; save the config now");
             }
             // Printed before any apply error: the key isn't stored anywhere else.
-            print_export(&export);
+            print_export(&export)?;
             report(saved, "run `parallax apply` to let the gateway accept it")?;
         }
         PeerCommand::Remove { name } => {
@@ -1554,7 +1582,7 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                 }
                 Ok(())
             })?;
-            outln!("removed peer '{name}'");
+            outln!("removed peer '{name}'")?;
             report(saved, "run `parallax apply` to revoke it on the gateway")?;
         }
         PeerCommand::Grants { peer, change } => peer_grants(ctx, &peer, change)?,
@@ -1582,7 +1610,7 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                     p.expires
                         .map(|e| format!("  expires={e}"))
                         .unwrap_or_default()
-                );
+                )?;
                 for r in tier.map(|t| model.reaches(t)).unwrap_or_default() {
                     let via = r
                         .client_net()
@@ -1607,7 +1635,7 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                         ),
                         _ => String::new(),
                     };
-                    outln!("    reaches {}{ports}{via}{proxied}", r.label);
+                    outln!("    reaches {}{ports}{via}{proxied}", r.label)?;
                 }
                 let public = tier.is_some_and(|t| t.has(&parallax_core::Rule::PublicDns));
                 match &p.wireguard {
@@ -1615,11 +1643,11 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                         "    dns: {} public={public}; allowed_ips={}",
                         w.dns.as_str(),
                         w.allowed_ips.as_str()
-                    ),
+                    )?,
                     None => outln!(
                         "    dns: {} public={public}",
                         model.server().headscale.dns.as_str()
-                    ),
+                    )?,
                 }
             }
         }

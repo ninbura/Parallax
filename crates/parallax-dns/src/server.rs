@@ -45,8 +45,11 @@ const MAX_UDP_PAYLOAD: u16 = 1232;
 /// Responses queued per TCP connection (hickory's default).
 const TCP_QUEUE: usize = 32;
 
+// Best effort: a log line nobody can read is dropped. `eprintln!` would panic
+// the task, and the daemon stops the gateway when this server's task ends.
 fn log(msg: impl std::fmt::Display) {
-    eprintln!("parallax dns: {msg}");
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "parallax dns: {msg}");
 }
 
 /// Everything a query needs, swapped whole on reload.
