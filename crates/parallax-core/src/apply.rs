@@ -260,13 +260,25 @@ fn apply_firewall(
 /// it someone else's grants; the old key must not hold it meanwhile, nor if
 /// a later step fails. Every other difference is left to `wg syncconf`, so
 /// unchanged peers keep their sessions. No interface yet: nothing to do.
+/// An interface whose peers can't be read stops the apply here, before the
+/// firewall changes: carrying on would skip the hand-over.
 fn drop_moved_peers(model: &Model<'_>, sys: System<'_>, log: &mut Vec<String>) -> Result<()> {
     let iface = model.server().wireguard.interface.as_str();
-    let live = sys
-        .runner
-        .run("wg", &["show", iface, "allowed-ips"], None)?;
+    let args = ["show", iface, "allowed-ips"];
+    let live = sys.runner.run("wg", &args, None)?;
     if !live.ok() {
-        return Ok(());
+        let exists = sys
+            .runner
+            .run("ip", &["link", "show", "dev", iface], None)?
+            .ok();
+        if !exists {
+            return Ok(());
+        }
+        return Err(Error::Command {
+            command: format!("wg {}", args.join(" ")),
+            status: live.status,
+            stderr: live.stderr.trim().to_string(),
+        });
     }
     let owners: BTreeMap<Ipv4Addr, String> = model
         .peers_on(crate::model::TransportKind::WireGuard)
@@ -320,4 +332,78 @@ pub fn apply(
         log.extend(transport.apply(model, &bundle.artifacts, sys)?);
     }
     Ok(ApplyReport { log })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test")]
+
+    use super::*;
+    use crate::io::memory::{MemoryFs, RecordingRunner};
+    use crate::io::Output;
+
+    fn failed(stderr: &str) -> Output {
+        Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// Who holds which address can't be read, but the interface is there:
+    /// stop before the firewall changes instead of skipping the hand-over.
+    #[test]
+    fn an_unreadable_interface_stops_the_hand_over() {
+        let cfg = crate::testing::canonical_config();
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "wg",
+            &["show", "wg0", "allowed-ips"],
+            failed("Unable to access interface: Operation not permitted"),
+        );
+        let fs = MemoryFs::new();
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        let err = drop_moved_peers(&model, sys, &mut Vec::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("wg show wg0 allowed-ips")
+                && err.to_string().contains("Operation not permitted"),
+            "{err}"
+        );
+    }
+
+    /// No interface yet (first apply): nothing holds an address.
+    #[test]
+    fn a_missing_interface_needs_no_hand_over() {
+        let cfg = crate::testing::canonical_config();
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "wg",
+            &["show", "wg0", "allowed-ips"],
+            failed("Unable to access interface: No such device"),
+        );
+        runner.respond_to(
+            "ip",
+            &["link", "show", "dev", "wg0"],
+            failed("Device \"wg0\" does not exist."),
+        );
+        let fs = MemoryFs::new();
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        drop_moved_peers(&model, sys, &mut Vec::new()).unwrap();
+        assert!(
+            !runner
+                .command_lines()
+                .iter()
+                .any(|l| l.ends_with(" remove")),
+            "{:?}",
+            runner.command_lines()
+        );
+    }
 }
