@@ -272,6 +272,91 @@ fn peer_show_marks_proxied_services() {
 }
 
 #[test]
+fn grants_are_managed_from_either_side() {
+    let s = Scratch::new("grants");
+    s.import();
+    let ok = |args: &[&str]| {
+        let (ok, out, err) = s.run(args);
+        assert!(ok, "{args:?}: {err}");
+        out
+    };
+    let refused = |args: &[&str]| {
+        let (ok, _, err) = s.run(args);
+        assert!(!ok, "{args:?} should fail");
+        err
+    };
+    let address = || ok(&["peer", "show", "laptop"]).contains("address=10.8.1.2 ");
+
+    ok(&["grant", "create", "photos", "service:immich"]);
+    let out = ok(&["grant", "attach", "photos", "--to", "laptop,sister-phone"]);
+    assert!(out.contains("attached 'photos' to 'laptop'"), "{out}");
+    assert!(out.contains("attached 'photos' to 'sister-phone'"), "{out}");
+    let out = ok(&["grant", "show", "photos"]);
+    assert!(
+        out.starts_with(
+            "photos  everyone=false  peers=laptop,sister-phone\n    rule service:immich\n"
+        ),
+        "{out}"
+    );
+    assert!(address());
+
+    // A rule that isn't there, or a peer that doesn't exist, changes nothing.
+    let err = refused(&[
+        "grant",
+        "rule",
+        "remove",
+        "photos",
+        "service:immich",
+        "host:192.168.1.9:445/tcp",
+    ]);
+    assert!(
+        err.contains("has no rule host:192.168.1.9:445/tcp; nothing removed"),
+        "{err}"
+    );
+    let err = refused(&["grant", "attach", "photos", "--to", "router,mom"]);
+    assert!(err.contains("peer 'mom' not found"), "{err}");
+    assert!(!ok(&["grant", "show", "photos"]).contains("router"));
+    let err = refused(&["grant", "rule", "add", "photos", "services:immich"]);
+    assert!(err.contains("'services' is not one of"), "{err}");
+
+    // From the peer's side.
+    let out = ok(&["peer", "grants", "laptop", "remove", "personal"]);
+    assert!(out.contains("'laptop' now has 'photos'"), "{out}");
+    let err = refused(&["peer", "grants", "laptop", "add", "familly"]);
+    assert!(err.contains("grant 'familly' not found"), "{err}");
+    ok(&["peer", "grants", "laptop", "set", "personal,family"]);
+    assert!(ok(&["peer", "show", "laptop"]).contains("grants=personal,family "));
+
+    // For everyone: says what it opens, and can't be detached from one peer.
+    ok(&["grant", "create", "public", "public_dns"]);
+    ok(&["grant", "everyone", "public", "on"]);
+    let (_, _, err) = s.run(&["grant", "rule", "add", "public", "network:home"]);
+    assert!(
+        err.contains("applies to everyone and opens network 'home'"),
+        "{err}"
+    );
+    assert!(
+        ok(&["grant", "show", "public"]).contains("peers=everyone (router,laptop,sister-phone)")
+    );
+    let err = refused(&["grant", "detach", "public", "--from", "router"]);
+    assert!(err.contains("because it applies to everyone"), "{err}");
+
+    // Removing a grant someone has takes --force; renaming follows it.
+    ok(&["grant", "rename", "photos", "pics"]);
+    assert!(ok(&["peer", "show", "sister-phone"]).contains("grants=family,pics,public "));
+    let err = refused(&["grant", "remove", "pics"]);
+    assert!(
+        err.contains("held by 'sister-phone'; removing it takes it from them"),
+        "{err}"
+    );
+    let out = ok(&["grant", "remove", "pics", "--force"]);
+    assert!(out.contains("taken from 'sister-phone'"), "{out}");
+    assert!(address());
+    let (ok_, _, err) = s.run(&["validate"]);
+    assert!(ok_, "{err}");
+}
+
+#[test]
 fn plan_needs_a_certificate_for_every_proxied_hostname() {
     let s = Scratch::new("certs");
     let certs = s.dir.join("certs");

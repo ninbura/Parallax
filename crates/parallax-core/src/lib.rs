@@ -18,6 +18,7 @@ pub mod date;
 pub mod doctor;
 pub mod error;
 pub mod generate;
+pub mod grants;
 pub mod io;
 pub mod model;
 pub mod names;

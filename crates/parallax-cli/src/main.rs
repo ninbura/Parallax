@@ -17,10 +17,11 @@ use clap::{Args, Parser, Subcommand};
 use parallax_core::date::Date;
 use parallax_core::doctor::Outcome;
 use parallax_core::generate::{self, Export};
+use parallax_core::grants;
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
 use parallax_core::model::{
-    AllowedIpsStrategy, DnsMode, Peer, Platform, ServerConfig, TransportKind,
+    AllowedIpsStrategy, DnsMode, Peer, Platform, Rule, ServerConfig, TransportKind,
 };
 use parallax_core::names::{self, Resolved};
 use parallax_core::public_ip;
@@ -106,6 +107,11 @@ enum Command {
         #[command(subcommand)]
         command: backup::BackupCommand,
     },
+    /// Manage grants: named bundles of rules that peers are given.
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommand,
+    },
     /// Manage peers.
     Peer {
         #[command(subcommand)]
@@ -188,6 +194,105 @@ enum PeerCommand {
     Remove { name: String },
     /// Show peers, their addresses and what they can reach.
     Show { name: Option<String> },
+    /// Change which grants a peer has. Its address and client config stay.
+    Grants {
+        peer: String,
+        #[command(subcommand)]
+        change: PeerGrants,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeerGrants {
+    /// Give it exactly these grants (none: it keeps only grants for everyone).
+    Set {
+        #[arg(value_delimiter = ',')]
+        grants: Vec<String>,
+    },
+    /// Attach grants to it.
+    Add {
+        #[arg(required = true, value_delimiter = ',')]
+        grants: Vec<String>,
+    },
+    /// Detach grants from it. It must have each one attached.
+    Remove {
+        #[arg(required = true, value_delimiter = ',')]
+        grants: Vec<String>,
+    },
+}
+
+/// A rule on the command line: `all_networks`, `internet`, `public_dns`,
+/// `network:<name>`, `service:<name>`, `host:<address or name>[:<ports>]`
+/// with ufw-style ports (`host:nas.mydomain.com:139/tcp,445/tcp`).
+const RULE_HELP: &str = "Rules: all_networks, internet, public_dns, network:<name>, service:<name>, host:<address or name>[:<ports>] (ports like ufw: 445/tcp,137-138/udp,25565)";
+
+#[derive(Subcommand)]
+enum GrantCommand {
+    /// Create a grant with these rules. It applies to no one until attached.
+    #[command(after_help = RULE_HELP)]
+    Create {
+        name: String,
+        rules: Vec<Rule>,
+        /// Apply it to every peer, current and future.
+        #[arg(long)]
+        everyone: bool,
+    },
+    /// Remove a grant and take it from everyone who has it.
+    Remove {
+        name: String,
+        /// Remove it even though peers have it.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Rename a grant; peers keep it under the new name.
+    Rename { from: String, to: String },
+    /// Show grants, their rules and who has them.
+    Show { name: Option<String> },
+    /// Change a grant's rules.
+    Rule {
+        #[command(subcommand)]
+        change: GrantRule,
+    },
+    /// Attach a grant to peers.
+    Attach {
+        grant: String,
+        /// The peers (repeat, or separate with commas).
+        #[arg(long, required = true, value_delimiter = ',')]
+        to: Vec<String>,
+    },
+    /// Detach a grant from peers. Each must have it attached.
+    Detach {
+        grant: String,
+        /// The peers (repeat, or separate with commas).
+        #[arg(long, required = true, value_delimiter = ',')]
+        from: Vec<String>,
+    },
+    /// Whether a grant applies to every peer, current and future.
+    Everyone { grant: String, switch: Switch },
+}
+
+#[derive(Subcommand)]
+enum GrantRule {
+    /// Add rules to a grant.
+    #[command(after_help = RULE_HELP)]
+    Add {
+        grant: String,
+        #[arg(required = true)]
+        rules: Vec<Rule>,
+    },
+    /// Remove rules from a grant, written as `grant show` lists them.
+    #[command(after_help = RULE_HELP)]
+    Remove {
+        grant: String,
+        #[arg(required = true)]
+        rules: Vec<Rule>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
 }
 
 fn main() {
@@ -720,6 +825,7 @@ fn run() -> anyhow::Result<()> {
         } => keygen(&ctx, write_config, if_missing)?,
         Command::Config { command } => config_command(&ctx, command)?,
         Command::Backup { command } => backup::run(&ctx, command)?,
+        Command::Grant { command } => grant_command(&ctx, command)?,
         Command::Peer { command } => peer_command(&ctx, command)?,
         Command::Export { peer, platform } => {
             let (config, learned) = ctx.load_for_generation()?;
@@ -1050,6 +1156,250 @@ fn redact(diff: &str) -> String {
         .collect()
 }
 
+/// Make a change and return, with its result, the validation warnings it
+/// adds: a grant change should say what it brought about (a grant for
+/// everyone that opens a network), not repeat what was already there.
+fn new_warnings<T>(
+    config: &mut Config,
+    change: impl FnOnce(&mut Config) -> anyhow::Result<T>,
+) -> anyhow::Result<(T, Vec<String>)> {
+    let (_, before) = parallax_core::validate::check(config);
+    let out = change(config)?;
+    let (_, after) = parallax_core::validate::check(config);
+    Ok((
+        out,
+        after.into_iter().filter(|w| !before.contains(w)).collect(),
+    ))
+}
+
+/// Save a grant change, print what it did, its new warnings, and what
+/// became of it.
+fn grant_change<T>(
+    ctx: &Ctx,
+    mut change: impl FnMut(&mut Config) -> anyhow::Result<T>,
+    done: impl FnOnce(&T),
+) -> anyhow::Result<()> {
+    let ((out, warnings), saved) = ctx.update(|config| new_warnings(config, &mut change))?;
+    done(&out);
+    print_warnings(&warnings);
+    report(saved, "run `parallax apply` to put it into effect")
+}
+
+/// `'a', 'b'`, or `none`.
+fn quoted(names: &[String]) -> String {
+    if names.is_empty() {
+        return "none".into();
+    }
+    names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One line per item an addition added, and per item already there.
+fn print_added(
+    added: &grants::Added,
+    done: impl Fn(&str) -> String,
+    already: impl Fn(&str) -> String,
+) {
+    for item in &added.added {
+        println!("{}", done(item));
+    }
+    for item in &added.already {
+        println!("{}", already(item));
+    }
+}
+
+fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
+    match command {
+        GrantCommand::Create {
+            name,
+            rules,
+            everyone,
+        } => grant_change(
+            ctx,
+            |c| Ok(grants::create(c, &name, everyone, rules.clone())?),
+            |()| {
+                println!(
+                    "created grant '{name}'{}",
+                    if everyone {
+                        " for everyone"
+                    } else {
+                        "; attach it with `parallax grant attach`"
+                    }
+                );
+            },
+        ),
+        GrantCommand::Remove { name, force } => grant_change(
+            ctx,
+            |c| {
+                let holders = grants::holders(c, &name)?;
+                if !force && !holders.is_empty() {
+                    let names: Vec<String> = holders.iter().map(|p| p.name.clone()).collect();
+                    bail!(
+                        "grant '{name}' is held by {}; removing it takes it from them. Pass --force to remove it anyway",
+                        quoted(&names)
+                    );
+                }
+                Ok(grants::remove(c, &name)?)
+            },
+            |had| {
+                println!("removed grant '{name}'");
+                if !had.is_empty() {
+                    println!("taken from {}", quoted(had));
+                }
+            },
+        ),
+        GrantCommand::Rename { from, to } => grant_change(
+            ctx,
+            |c| Ok(grants::rename(c, &from, &to)?),
+            |peers| {
+                println!("renamed grant '{from}' to '{to}' (peers {})", quoted(peers));
+                eprintln!(
+                    "note: its nginx snippet is now snippets/parallax-{to}.conf; update any include of parallax-{from}.conf"
+                );
+            },
+        ),
+        GrantCommand::Show { name } => {
+            let config = ctx.load()?;
+            let shown: Vec<&parallax_core::Grant> = match &name {
+                Some(n) => vec![config
+                    .grant(n)
+                    .ok_or_else(|| anyhow!("grant '{n}' not found"))?],
+                None => config.grants.iter().collect(),
+            };
+            for g in shown {
+                let holders: Vec<&str> = grants::holders(&config, &g.name)?
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect();
+                let peers = match (g.everyone, holders.is_empty()) {
+                    (_, true) if !g.everyone => "-".to_string(),
+                    (true, _) => format!("everyone ({})", holders.join(",")),
+                    _ => holders.join(","),
+                };
+                println!("{}  everyone={}  peers={peers}", g.name, g.everyone);
+                if g.rules.is_empty() {
+                    println!("    no rules: it gives nothing");
+                }
+                for rule in &g.rules {
+                    println!("    rule {rule}");
+                }
+            }
+            Ok(())
+        }
+        GrantCommand::Rule { change } => match change {
+            GrantRule::Add { grant, rules } => grant_change(
+                ctx,
+                |c| Ok(grants::add_rules(c, &grant, &rules)?),
+                |added| {
+                    print_added(
+                        added,
+                        |r| format!("added rule {r}"),
+                        |r| format!("grant '{grant}' already has rule {r}"),
+                    );
+                },
+            ),
+            GrantRule::Remove { grant, rules } => grant_change(
+                ctx,
+                |c| Ok(grants::remove_rules(c, &grant, &rules)?),
+                |()| {
+                    for rule in &rules {
+                        println!("removed rule {rule}");
+                    }
+                },
+            ),
+        },
+        GrantCommand::Attach { grant, to } => grant_change(
+            ctx,
+            |c| Ok(grants::attach(c, &grant, &to)?),
+            |added| {
+                print_added(
+                    added,
+                    |p| format!("attached '{grant}' to '{p}'"),
+                    |p| format!("'{p}' already has '{grant}'"),
+                );
+            },
+        ),
+        GrantCommand::Detach { grant, from } => grant_change(
+            ctx,
+            |c| Ok(grants::detach(c, &grant, &from)?),
+            |()| {
+                for peer in &from {
+                    println!("detached '{grant}' from '{peer}'");
+                }
+            },
+        ),
+        GrantCommand::Everyone { grant, switch } => {
+            let on = matches!(switch, Switch::On);
+            grant_change(
+                ctx,
+                |c| Ok(grants::set_everyone(c, &grant, on)?),
+                |changed| {
+                    let state = if on {
+                        "applies to everyone"
+                    } else {
+                        "applies only to the peers it's attached to"
+                    };
+                    if *changed {
+                        println!("grant '{grant}' now {state}");
+                    } else {
+                        println!("grant '{grant}' already {state}");
+                    }
+                },
+            )
+        }
+    }
+}
+
+fn peer_grants(ctx: &Ctx, peer: &str, change: PeerGrants) -> anyhow::Result<()> {
+    let show = |config: &Config| -> String {
+        let own = config
+            .peer(peer)
+            .map(|p| p.grants.as_slice())
+            .unwrap_or_default();
+        if own.is_empty() {
+            format!("'{peer}' now has no grants of its own")
+        } else {
+            format!("'{peer}' now has {}", quoted(own))
+        }
+    };
+    match change {
+        PeerGrants::Set { grants: list } => grant_change(
+            ctx,
+            |c| {
+                grants::set_peer(c, peer, &list)?;
+                Ok(show(c))
+            },
+            |line| println!("{line}"),
+        ),
+        PeerGrants::Add { grants: list } => grant_change(
+            ctx,
+            |c| {
+                let added = grants::peer_add(c, peer, &list)?;
+                Ok((added, show(c)))
+            },
+            |(added, line)| {
+                print_added(
+                    added,
+                    |g| format!("attached '{g}' to '{peer}'"),
+                    |g| format!("'{peer}' already has '{g}'"),
+                );
+                println!("{line}");
+            },
+        ),
+        PeerGrants::Remove { grants: list } => grant_change(
+            ctx,
+            |c| {
+                grants::peer_remove(c, peer, &list)?;
+                Ok(show(c))
+            },
+            |line| println!("{line}"),
+        ),
+    }
+}
+
 fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
     match command {
         PeerCommand::Add {
@@ -1131,6 +1481,7 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
             println!("removed peer '{name}'");
             report(saved, "run `parallax apply` to revoke it on the gateway")?;
         }
+        PeerCommand::Grants { peer, change } => peer_grants(ctx, &peer, change)?,
         PeerCommand::Show { name } => {
             let (config, learned) = ctx.load_for_generation()?;
             let model = model_for(&config, today(), &learned)?;

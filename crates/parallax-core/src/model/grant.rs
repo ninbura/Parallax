@@ -74,6 +74,87 @@ pub enum Rule {
     PublicDns,
 }
 
+/// The command-line form: `all_networks`, `internet`, `public_dns`,
+/// `network:home`, `service:immich`, `host:192.168.1.5`,
+/// `host:nas.mydomain.com:139/tcp,445/tcp`. Kinds are the TOML `kind`s;
+/// hosts and port lists hold no `:`, so it splits unambiguously.
+impl std::fmt::Display for Rule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Rule::AllNetworks => f.write_str("all_networks"),
+            Rule::Network { name } => write!(f, "network:{name}"),
+            Rule::Host { host, ports } => {
+                write!(f, "host:{host}")?;
+                for (i, port) in ports.iter().enumerate() {
+                    write!(f, "{}{port}", if i == 0 { ':' } else { ',' })?;
+                }
+                Ok(())
+            }
+            Rule::Service { name } => write!(f, "service:{name}"),
+            Rule::Internet => f.write_str("internet"),
+            Rule::PublicDns => f.write_str("public_dns"),
+        }
+    }
+}
+
+impl std::str::FromStr for Rule {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> crate::Result<Self> {
+        let malformed = |detail: String| crate::Error::Malformed {
+            what: "rule",
+            detail,
+        };
+        let mut parts = s.splitn(3, ':');
+        let kind = parts.next().unwrap_or_default();
+        let value = parts.next();
+        let ports = parts.next();
+        let named = |what: &str| match value {
+            Some(v) if !v.is_empty() && ports.is_none() => Ok(v.to_string()),
+            _ => Err(malformed(format!("'{s}': write it {kind}:<{what}>"))),
+        };
+        let bare = |rule: Rule| match value {
+            None => Ok(rule),
+            Some(_) => Err(malformed(format!("'{s}': {kind} takes nothing after it"))),
+        };
+        match kind {
+            "all_networks" => bare(Rule::AllNetworks),
+            "internet" => bare(Rule::Internet),
+            "public_dns" => bare(Rule::PublicDns),
+            "network" => Ok(Rule::Network {
+                name: named("network")?,
+            }),
+            "service" => Ok(Rule::Service {
+                name: named("service")?,
+            }),
+            "host" => {
+                let host = match value {
+                    Some(h) if !h.is_empty() => h,
+                    _ => {
+                        return Err(malformed(format!(
+                            "'{s}': write it host:<address or name>[:<ports>]"
+                        )))
+                    }
+                };
+                let ports = match ports {
+                    None => Vec::new(),
+                    Some(list) => list
+                        .split(',')
+                        .map(str::parse)
+                        .collect::<Result<_, _>>()
+                        .map_err(|e: String| malformed(format!("'{s}': {e}")))?,
+                };
+                Ok(Rule::Host {
+                    host: host.parse().unwrap_or_else(|never| match never {}),
+                    ports,
+                })
+            }
+            _ => Err(malformed(format!(
+                "'{s}': '{kind}' is not one of all_networks, network, host, service, internet, public_dns"
+            ))),
+        }
+    }
+}
+
 /// What a rule may look like in TOML, older spellings included: `ip` for
 /// `host`, and `host_port` rules with one `proto` and `port`.
 #[derive(Deserialize)]
@@ -171,6 +252,42 @@ mod tests {
         assert!(e.contains("unknown field `port`"), "{e}");
         let e = rule(r#"{ kind = "host", host = "192.168.1.9", ports = [] }"#).unwrap_err();
         assert!(e.contains("lists no port; leave ports out"), "{e}");
+    }
+
+    #[test]
+    fn the_command_line_form_reads_back() {
+        for text in [
+            "all_networks",
+            "internet",
+            "public_dns",
+            "network:home",
+            "service:immich",
+            "host:192.168.1.5",
+            "host:nas.mydomain.com:139/tcp,445/tcp,25565",
+        ] {
+            let rule: Rule = text.parse().unwrap();
+            assert_eq!(rule.to_string(), text);
+        }
+        assert_eq!(
+            "host:192.168.1.9:53/udp".parse::<Rule>().unwrap(),
+            Rule::Host {
+                host: "192.168.1.9".parse().unwrap(),
+                ports: vec![PortSpec::one(Proto::Udp, 53)],
+            }
+        );
+        for (bad, why) in [
+            ("services:immich", "'services' is not one of"),
+            ("service", "write it service:<service>"),
+            ("service:", "write it service:<service>"),
+            ("network:home:80", "write it network:<network>"),
+            ("internet:yes", "internet takes nothing after it"),
+            ("host:", "write it host:<address or name>"),
+            ("host:192.168.1.9:", "is not a port"),
+            ("host:192.168.1.9:53/sctp", "neither tcp nor udp"),
+        ] {
+            let e = bad.parse::<Rule>().unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     #[test]

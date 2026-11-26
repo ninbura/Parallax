@@ -210,7 +210,30 @@ rules = [{ kind = "public_dns" }]
 ```
 
 A peer's address never encodes its access, so changing its grants needs no
-new client config. Configurations written with `[[template]]` (before
+new client config.
+
+Manage them from the command line, from either side (in the container,
+prefix each with `sudo docker compose exec parallax`):
+
+```sh
+parallax grant create photos service:immich public_dns
+parallax grant attach photos --to sister-phone,mom-tablet
+parallax grant rule add photos host:nas.mydomain.com:139/tcp,445/tcp
+parallax peer grants laptop add photos      # or: set a,b / remove photos
+parallax grant everyone public on
+parallax grant show                          # every grant, its rules, who has it
+```
+
+Rules are written `all_networks`, `internet`, `public_dns`, `network:<name>`,
+`service:<name>` or `host:<address or name>[:<ports>]`, ports as ufw writes
+them. Each change applies when the command returns. Adding what's already
+there does nothing and says so; removing a rule or detaching a grant that
+isn't there is refused, since a typo would otherwise leave the access in
+place. `grant remove` asks for `--force` while anyone has the grant. Renaming
+a grant renames its nginx snippet (`snippets/parallax-<grant>.conf`), so
+update any `include` of it.
+
+Configurations written with `[[template]]` (before
 grants) still import: each template becomes a grant of the same name, and
 each peer keeps its template's access and client settings.
 

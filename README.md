@@ -34,6 +34,7 @@ $parallax keygen --write-config
 $parallax validate
 $parallax generate -o /tmp/parallax-out
 $parallax peer add tablet --grant family --platform mobile
+$parallax grant attach personal --to tablet
 $parallax peer show
 $parallax config export
 ```
@@ -59,7 +60,9 @@ or read `docs/setup.md`. Backups (automatic, encrypted, one-command restore):
 - `crates/parallax-dns`: the DNS server (a task in `parallax daemon`):
   per-tier answers, home zones rewritten into mapped space.
 - `crates/parallax-cli`: `daemon`, `status`, `validate`, `plan`, `generate`,
-  `apply`, `keygen`, `config import|export|edit`, `peer add|remove|show`,
+  `apply`, `keygen`, `config import|export|edit`,
+  `grant create|remove|rename|show|rule|attach|detach|everyone`,
+  `peer add|remove|show|grants`,
   `export`, `doctor`, `backup create|list|restore|passphrase`. While the
   daemon runs, every command goes through its socket.
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
