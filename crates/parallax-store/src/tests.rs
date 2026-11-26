@@ -290,6 +290,16 @@ async fn the_database_and_its_log_are_owner_only() {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "{file}");
     }
+
+    // Turso names MVCC's log by replacing the extension.
+    let other = dir.0.join("state.sqlite");
+    let mut store = Store::create(&other).await.unwrap();
+    store.save(&everything_config()).await.unwrap();
+    let mode = std::fs::metadata(dir.0.join("state.db-log"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "state.db-log");
 }
 
 #[tokio::test]
@@ -365,6 +375,38 @@ async fn an_older_database_switches_to_mvcc_and_keeps_its_data() {
     }
     let created = Store::create(&dir.0.join("new.db")).await.unwrap();
     assert_eq!(created.journal_mode(None).await.unwrap(), MVCC);
+}
+
+/// A database from a newer Parallax is refused before anything changes it,
+/// so the newer build can still open it as it was.
+#[tokio::test]
+async fn a_newer_database_is_refused_without_switching_it() {
+    let dir = TempDir::new();
+    let store = Store::create_plain(&dir.db()).await.unwrap();
+    store
+        .exec(
+            "INSERT INTO schema_version (version) VALUES (99)",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let err = Store::open(&dir.db()).await.unwrap_err();
+    assert!(matches!(err, Error::TooNew { found: 99, .. }), "{err}");
+    let db = turso::Builder::new_local(dir.db().to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("PRAGMA journal_mode", ()).await.unwrap();
+    let mode = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    assert_eq!(mode, "wal");
 }
 
 #[tokio::test]
