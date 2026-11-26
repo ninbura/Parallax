@@ -51,6 +51,30 @@ fn check_golden(name: &str, actual: &str) {
     }
 }
 
+/// Tier set names (`wg_<16 hex>`) as `wg_*`: they hash each tier's access,
+/// so they differ between scenarios.
+fn anon(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(['w', 't']) {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        let is_set = (tail.starts_with("wg_") || tail.starts_with("ts_"))
+            && tail.len() >= 19
+            && tail.as_bytes()[3..19].iter().all(u8::is_ascii_hexdigit);
+        if is_set {
+            out.push_str(&tail[..3]);
+            out.push('*');
+            rest = &tail[19..];
+        } else {
+            out.push_str(&tail[..1]);
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn bundle_for(config: &Config) -> Bundle {
     let model = Model::resolve(config, today()).expect("valid");
     generate::generate_all(&model, &fs_with_server_key()).expect("generate")
@@ -174,15 +198,17 @@ fn proxied_service_gets_no_direct_accept() {
     cfg.networks[0].gateway_address = Some("192.168.1.5".parse().unwrap());
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // Set names follow each scenario's access (issue #35).
+    let fw_text = anon(&fw.contents);
     check_golden("variants/proxied-service.nft", &fw.contents);
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     check_golden("variants/proxied-service-routes.toml", &routes.contents);
     assert!(
-        !fw.contents
+        !fw_text
             .lines()
             .any(|l| l.contains("service immich") && l.contains(" accept ")),
         "family must not reach immich directly, not even on the gateway host:\n{}",
-        fw.contents
+        fw_text
     );
     assert!(fw
         .contents
@@ -195,13 +221,13 @@ fn proxied_service_gets_no_direct_accept() {
         .skip_while(|l| !l.contains("chain prerouting"))
         .collect();
     assert!(pre[2].contains(
-        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
+        "iifname \"wg0\" ip saddr @wg_* ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
     ), "{pre:#?}");
     assert!(pre.iter().any(|l| l.contains("netmap home")));
-    assert!(!fw.contents.contains("personal/wireguard: https proxy"));
-    assert!(fw.contents.contains(
-        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 10.8.0.1 tcp dport 8443 accept"
-    ));
+    assert!(!fw_text.contains("personal/wireguard: https proxy"));
+    assert!(
+        fw_text.contains("iifname \"wg0\" ip saddr @wg_* ip daddr 10.8.0.1 tcp dport 8443 accept")
+    );
 }
 
 #[test]
@@ -222,8 +248,10 @@ fn no_proxy_redirect_where_a_grant_reaches_the_host_directly() {
 fn tunnel_peers_are_checked_on_every_packet() {
     let bundle = bundle_for(&canonical_config());
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // Set names follow each scenario's access (issue #35).
+    let fw_text = anon(&fw.contents);
     // No blanket "established" accept: a removed grant cuts open flows.
-    assert!(!fw.contents.contains("established"), "{}", fw.contents);
+    assert!(!fw_text.contains("established"), "{}", fw_text);
     for chain in ["chain input", "chain forward"] {
         let body: Vec<&str> = fw
             .contents
@@ -240,12 +268,12 @@ fn tunnel_peers_are_checked_on_every_packet() {
     }
     // A packet sees its own tier's rules only: one lookup by source
     // address picks the chain, however many peers and tiers there are.
-    assert!(fw.contents.contains(
+    assert!(fw_text.contains(
         "iifname \"wg0\" ip saddr vmap { 10.8.1.1 : jump tier_0, 10.8.1.2 : jump tier_0, 10.8.2.1 : jump tier_1 }"
     ));
     assert!(fw
         .contents
-        .contains("iifname \"tailscale0\" ip saddr @ts_f62eed6a1a23f069 jump tier_1"));
+        .contains("iifname \"tailscale0\" ip saddr @ts_* jump tier_1"));
     let family: Vec<&str> = fw
         .contents
         .lines()
@@ -264,6 +292,8 @@ fn gateway_address_turns_grants_into_input_accepts() {
     cfg.networks[0].gateway_address = Some("192.168.1.5".parse().unwrap());
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // Set names follow each scenario's access (issue #35).
+    let fw_text = anon(&fw.contents);
     check_golden("variants/gateway-address.nft", &fw.contents);
     let input: Vec<&str> = fw
         .contents
@@ -274,12 +304,13 @@ fn gateway_address_turns_grants_into_input_accepts() {
     assert!(
         input
             .iter()
-            .any(|l| l.contains("ip saddr @wg_20deb125664a4b6d ip daddr 192.168.1.5 accept")),
+            .any(|l| l.contains("ip saddr @wg_* ip daddr 192.168.1.5 accept")),
         "{input:#?}"
     );
     assert!(
-        input.iter().any(|l| l
-            .contains("ip saddr @wg_f62eed6a1a23f069 ip daddr 192.168.1.5 tcp dport 443 accept")),
+        input
+            .iter()
+            .any(|l| l.contains("ip saddr @wg_* ip daddr 192.168.1.5 tcp dport 443 accept")),
         "{input:#?}"
     );
     let drop_idx = input
@@ -416,28 +447,26 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     );
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // Set names follow each scenario's access (issue #35).
+    let fw_text = anon(&fw.contents);
     check_golden("variants/home-public-names.nft", &fw.contents);
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     check_golden("variants/home-public-names-routes.toml", &routes.contents);
     // The game port: accepted out the WAN, masqueraded; still in not_public.
-    assert!(fw.contents.contains(
+    assert!(fw_text.contains(
         "oifname \"eth0\" ip daddr 1.2.3.4 udp dport 25565 accept comment \"family: host game.mydomain.com (1.2.3.4) (a port forward on the home's public IP)\""
-    ), "{}", fw.contents);
+    ), "{}", fw_text);
     // HTTPS by name: redirected to the proxy, which connects to the public IP.
-    assert!(fw.contents.contains(
-        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
-    ), "{}", fw.contents);
+    assert!(fw_text.contains(
+        "iifname \"wg0\" ip saddr @wg_* ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
+    ), "{}", fw_text);
     assert!(
         routes.contents.contains("upstream = \"1.2.3.4:443\""),
         "{}",
         routes.contents
     );
     // Nothing else on the public IP: no all-ports accept.
-    assert!(
-        !fw.contents.contains("ip daddr 1.2.3.4 accept"),
-        "{}",
-        fw.contents
-    );
+    assert!(!fw_text.contains("ip daddr 1.2.3.4 accept"), "{}", fw_text);
     // The owner's tier (all_networks + internet) reaches the public IP
     // anyway: granting it the service adds no redirect to the proxy.
     let mut owner = cfg.clone();
@@ -451,11 +480,11 @@ fn names_on_the_home_public_ip_are_port_forwards() {
         .with_names(names.clone());
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    let fw_text = anon(&fw.contents);
     assert!(
-        !fw.contents
-            .contains("ip saddr @wg_20deb125664a4b6d ip daddr 1.2.3.4 tcp dport 443 dnat"),
+        !fw_text.contains("ip saddr @wg_* ip daddr 1.2.3.4 tcp dport 443 dnat"),
         "{}",
-        fw.contents
+        fw_text
     );
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     assert!(
@@ -471,17 +500,16 @@ fn names_on_the_home_public_ip_are_port_forwards() {
         .with_names(names);
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    let fw_text = anon(&fw.contents);
     assert!(
-        fw.contents
-            .contains("ip daddr 1.2.3.4 udp dport 25565 accept"),
+        fw_text.contains("ip daddr 1.2.3.4 udp dport 25565 accept"),
         "{}",
-        fw.contents
+        fw_text
     );
     assert!(
-        fw.contents
-            .contains("masquerade comment \"internet egress\""),
+        fw_text.contains("masquerade comment \"internet egress\""),
         "{}",
-        fw.contents
+        fw_text
     );
 }
 
@@ -677,6 +705,14 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let model = Model::resolve(&cfg, today()).unwrap();
     let fs = fs_with_server_key();
     let bundle = generate::generate_all(&model, &fs).unwrap();
+    // A live tier set's name, as the ruleset gives it.
+    let live = parallax_core::generate::firewall::build(&model)
+        .unwrap()
+        .sets
+        .into_iter()
+        .find(|s| s.name.starts_with("wg_"))
+        .unwrap()
+        .name;
     let runner = RecordingRunner::new();
     // A tier went away since the last apply: its chain is still there.
     runner.respond_to(
@@ -694,7 +730,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
         &["list", "-n"],
         parallax_core::io::Output {
             status: 0,
-            stdout: "ts_family\nwg_0000000000000000\nwg_f62eed6a1a23f069\nnot_public\n".into(),
+            stdout: format!("ts_family\nwg_0000000000000000\n{live}\nnot_public\n"),
             stderr: String::new(),
         },
     );
@@ -709,7 +745,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let gone = |set: &str| pos(&format!("ipset destroy {set}"));
     assert!(gone("ts_family").unwrap() > pos("iptables-restore").unwrap());
     assert!(gone("wg_0000000000000000").is_some());
-    assert!(gone("wg_f62eed6a1a23f069").is_none() && gone("not_public").is_none());
+    assert!(gone(&live).is_none() && gone("not_public").is_none());
     let restore = pos("iptables-restore --noflush").unwrap();
     // No flush of live chains before the restore: that left a window with
     // empty chains, and empty ones if the restore failed.

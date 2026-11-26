@@ -36,19 +36,11 @@ impl Tier<'_> {
             .join("+")
     }
 
-    /// 16 hex digits naming the tier by its grants, not its position: a
-    /// set named after it always means the same access. On iptables, sets
-    /// change before the rules that use them, so a set whose name moved to
-    /// other access would briefly give the old rules' access to its new
-    /// members (FNV-1a of the label: fixed across builds, no dependency).
+    /// 16 hex digits naming the tier by its grants, not its position. The
+    /// firewall then renames each tier set after its whole access
+    /// (`generate::firewall`, issue #35).
     pub fn key(&self) -> String {
-        let hash = self
-            .label()
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-            });
-        format!("{hash:016x}")
+        fnv64(&self.label())
     }
 
     pub fn has(&self, rule: &Rule) -> bool {
@@ -92,6 +84,14 @@ impl Tier<'_> {
             quoted(self.grants.iter().map(|g| g.name.as_str()))
         )
     }
+}
+
+/// 16 hex digits of FNV-1a: fixed across builds, no dependency.
+pub(crate) fn fnv64(text: &str) -> String {
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{hash:016x}")
 }
 
 fn quoted<'a>(names: impl Iterator<Item = &'a str>) -> String {
