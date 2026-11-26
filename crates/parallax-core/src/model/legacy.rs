@@ -131,6 +131,7 @@ impl TryFrom<ConfigToml> for Config {
             grants.push(Grant {
                 name: t.name.clone(),
                 everyone: false,
+                log: None,
                 rules,
             });
         }
@@ -175,6 +176,7 @@ impl TryFrom<ConfigToml> for Config {
             peers.push(Peer {
                 name: p.name,
                 grants,
+                log: None,
                 transport: p.transport,
                 enabled: p.enabled,
                 expires: p.expires,

@@ -48,7 +48,7 @@ EDITOR=nvim $parallax config edit -o /tmp/parallax-out
 
 `apply` needs Linux with `nft`, `wg` and `ip`; use the container (`docker/`)
 or read `docs/setup.md`. Backups (automatic, encrypted, one-command restore):
-`docs/backup.md`.
+`docs/backup.md`. Per-peer activity logging: `docs/logging.md`.
 
 ## Layout
 

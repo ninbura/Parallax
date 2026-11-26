@@ -157,7 +157,8 @@ impl Store {
                     backup_encrypt, backup_passphrase_file,
                     public_ip_address, public_ip_encrypted_dns,
                     wireguard_peer_dns, wireguard_peer_allowed_ips, wireguard_peer_mtu,
-                    wireguard_peer_persistent_keepalive, headscale_dns
+                    wireguard_peer_persistent_keepalive, headscale_dns,
+                    logs_level, logs_path, logs_keep, logs_max_size
                  FROM server WHERE id = 1",
                 Vec::new(),
             )
@@ -229,6 +230,12 @@ impl Store {
                     .filter(|p| !p.is_empty())
                     .map(|p| parse(at, "public ip encrypted dns", p))
                     .collect::<Result<_>>()?,
+            },
+            logs: LogsServer {
+                level: variant(at, "logs level", &r.get::<String>(34)?)?,
+                path: PathBuf::from(r.get::<String>(35)?),
+                keep: parse(at, "logs keep", &r.get::<String>(36)?)?,
+                max_size: parse(at, "logs max_size", &r.get::<String>(37)?)?,
             },
             wan_interface: r.get(20)?,
         }))
@@ -316,6 +323,10 @@ impl Store {
                         .join(",")
                         .into(),
                 ),
+                ("logs_level", variant_text(&s.logs.level)?),
+                ("logs_path", path("server.logs.path", &s.logs.path)?),
+                ("logs_keep", text(s.logs.keep)),
+                ("logs_max_size", text(s.logs.max_size)),
             ],
         )
         .await?;
@@ -477,7 +488,7 @@ impl Store {
         let mut out = Vec::new();
         let rows = self
             .rows(
-                "SELECT id, name, everyone FROM grants ORDER BY position",
+                "SELECT id, name, everyone, log FROM grants ORDER BY position",
                 Vec::new(),
             )
             .await?;
@@ -488,6 +499,7 @@ impl Store {
             out.push(Grant {
                 rules: self.load_rules(id, &at).await?,
                 everyone: r.get(2)?,
+                log: variant_opt(&at, "log", r.get(3)?)?,
                 name,
             });
         }
@@ -559,6 +571,7 @@ impl Store {
                         ("name", text(&g.name)),
                         ("position", position.into()),
                         ("everyone", g.everyone.into()),
+                        ("log", log_level(g.log)?),
                     ],
                 )
                 .await?;
@@ -622,7 +635,8 @@ impl Store {
                     wireguard_public_key, wireguard_address, wireguard_private_key,
                     wireguard_preshared_key, tailscale, tailscale_node_id, tailscale_address,
                     wireguard_dns, wireguard_allowed_ips, wireguard_mtu,
-                    wireguard_persistent_keepalive, wireguard_visible_networks_limited
+                    wireguard_persistent_keepalive, wireguard_visible_networks_limited,
+                    log
                  FROM peers ORDER BY position",
                 Vec::new(),
             )
@@ -701,6 +715,7 @@ impl Store {
                         id,
                     )
                     .await?,
+                log: variant_opt(&at, "log", r.get(17)?)?,
                 transport: variant(&at, "transport", &r.get::<String>(2)?)?,
                 enabled: r.get(3)?,
                 expires: parse_opt(&at, "expires", r.get(4)?)?,
@@ -740,6 +755,7 @@ impl Store {
                         ("name", text(&p.name)),
                         ("position", position.into()),
                         ("transport", variant_text(&p.transport)?),
+                        ("log", log_level(p.log)?),
                         ("enabled", p.enabled.into()),
                         ("expires", p.expires.map(|d| d.to_string()).into()),
                         (
@@ -927,6 +943,18 @@ fn variant<T: DeserializeOwned>(at: &str, what: &str, s: &str) -> Result<T> {
     use serde::de::value::{Error as DeError, StrDeserializer};
     T::deserialize(StrDeserializer::<DeError>::new(s))
         .map_err(|e| Error::Stored(format!("{at}: {what} '{s}': {e}")))
+}
+
+fn variant_opt<T: DeserializeOwned>(at: &str, what: &str, s: Option<String>) -> Result<Option<T>> {
+    s.map(|s| variant(at, what, &s)).transpose()
+}
+
+/// A grant's or peer's own log level; NULL when it sets none.
+fn log_level(level: Option<LogLevel>) -> Result<Value> {
+    Ok(match level {
+        Some(l) => variant_text(&l)?,
+        None => Value::Null,
+    })
 }
 
 fn parse<T>(at: &str, what: &str, s: &str) -> Result<T>

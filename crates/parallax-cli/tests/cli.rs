@@ -272,6 +272,47 @@ fn peer_show_marks_proxied_services() {
 }
 
 #[test]
+fn log_levels_are_set_for_everyone_a_grant_or_a_peer() {
+    let s = Scratch::new("log-level");
+    s.import();
+    let ok = |args: &[&str]| {
+        let (ok, out, err) = s.run(args);
+        assert!(ok, "{args:?}: {err}");
+        out
+    };
+    let refused = |args: &[&str]| {
+        let (ok, _, err) = s.run(args);
+        assert!(!ok, "{args:?} should fail");
+        err
+    };
+    let out = ok(&["log", "level", "denied", "--grant", "family"]);
+    assert!(
+        out.contains("grant 'family' logs denied for its peers now"),
+        "{out}"
+    );
+    let out = ok(&["log", "level", "bytes", "--peer", "sister-phone"]);
+    assert!(out.contains("in effect: bytes"), "{out}");
+    // Back to its grant's level.
+    let out = ok(&["log", "level", "inherit", "--peer", "sister-phone"]);
+    assert!(out.contains("in effect: denied"), "{out}");
+    let out = ok(&["log", "level", "connections"]);
+    assert!(
+        out.contains("everyone logs connections by default now"),
+        "{out}"
+    );
+    let text = ok(&["config", "export"]);
+    assert!(text.contains("level = \"connections\""), "{text}");
+    assert!(text.contains("log = \"denied\""), "{text}");
+
+    let err = refused(&["log", "level", "inherit"]);
+    assert!(err.contains("nothing to inherit"), "{err}");
+    let err = refused(&["log", "level", "bytes", "--peer", "nobody"]);
+    assert!(err.contains("peer 'nobody' not found"), "{err}");
+    let err = refused(&["log", "level", "verbose"]);
+    assert!(err.contains("verbose"), "{err}");
+}
+
+#[test]
 fn grants_are_managed_from_either_side() {
     let s = Scratch::new("grants");
     s.import();
@@ -656,7 +697,7 @@ fn a_backup_restores_what_changed_since() {
     let file = s.backups().pop().unwrap();
     let (ok, out, _) = s.run(&["backup", "list"]);
     assert!(
-        ok && out.contains("encrypted") && out.contains("schema 6"),
+        ok && out.contains("encrypted") && out.contains("schema 7"),
         "{out}"
     );
 

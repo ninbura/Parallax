@@ -39,6 +39,7 @@ pub fn create(config: &mut Config, name: &str, everyone: bool, rules: &[Rule]) -
     let mut grant = Grant {
         name: name.to_string(),
         everyone,
+        log: None,
         rules: Vec::new(),
     };
     for rule in rules {

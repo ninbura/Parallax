@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use crate::io::System;
-use crate::model::{BackupServer, Config, FirewallBackend};
+use crate::model::{BackupServer, Config, FirewallBackend, LogLevel};
 
 /// The kernel's identity mapping: the initial user namespace maps every uid to itself.
 const INIT_USERNS_UID_MAP: (u64, u64, u64) = (0, 0, 4_294_967_295);
@@ -94,8 +94,35 @@ pub fn diagnose(config: Result<&Config, String>, sys: System<'_>) -> Vec<Check> 
             name: "backups".into(),
             outcome: check_backup(&config.server.backup, sys),
         });
+        let bytes = config
+            .peers
+            .iter()
+            .any(|p| p.enabled && crate::logging::level(config, p) >= LogLevel::Bytes);
+        if bytes {
+            checks.push(Check {
+                name: "byte counts".into(),
+                outcome: check_conntrack_acct(sys),
+            });
+        }
     }
     checks
+}
+
+/// Logging `bytes` needs the kernel to count each connection's bytes, a
+/// host setting like `ip_forward`. Only a warning: connections are still
+/// logged, just without their bytes.
+fn check_conntrack_acct(sys: System<'_>) -> Outcome {
+    let fix =
+        "set `net.netfilter.nf_conntrack_acct = 1` in /etc/sysctl.d/ and run `sysctl --system`";
+    match read(sys, Path::new("/proc/sys/net/netfilter/nf_conntrack_acct")) {
+        Ok(v) if v.trim() == "1" => Outcome::Ok("on".into()),
+        Ok(_) => Outcome::Warn(format!(
+            "net.netfilter.nf_conntrack_acct is 0 on the host, so connections are logged without their bytes; {fix}"
+        )),
+        Err(_) => Outcome::Warn(format!(
+            "connection tracking isn't loaded yet (it is once the firewall is applied), so this can't be checked; logging bytes needs it to count them: {fix}"
+        )),
+    }
 }
 
 /// Backups are optional, so problems with them only warn. Also the startup
@@ -563,6 +590,29 @@ mod tests {
                 .filter(|p| p.to_string_lossy().contains(".parallax-doctor"))
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn byte_counts_are_checked_only_when_some_peer_logs_bytes() {
+        let names = |config: &Config, fs: &MemoryFs| -> Vec<(String, Outcome)> {
+            run_with(Ok(config), fs, &RecordingRunner::new())
+                .into_iter()
+                .filter(|c| c.name == "byte counts")
+                .map(|c| (c.name, c.outcome))
+                .collect()
+        };
+        let mut config = canonical_config();
+        assert!(names(&config, &healthy_fs()).is_empty());
+        config.peers[0].log = Some(LogLevel::Bytes);
+        let [(_, Outcome::Warn(w))] = &names(&config, &healthy_fs())[..] else {
+            panic!("expected one warning");
+        };
+        assert!(w.contains("nf_conntrack_acct = 1"), "{w}");
+        let on = healthy_fs().with_file("/proc/sys/net/netfilter/nf_conntrack_acct", "1\n");
+        assert_eq!(
+            names(&config, &on),
+            [("byte counts".to_string(), Outcome::Ok("on".into()))]
         );
     }
 
