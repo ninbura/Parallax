@@ -26,3 +26,11 @@ peers.
   later without touching generators or the CLI.
 - Tests use `RecordingRunner` and assert the exact command sequence
   (`tests/golden/apply/commands.txt`).
+
+## Update (step 8.1)
+
+The config reaches `wg syncconf` on stdin (`/dev/stdin`), not as a path.
+Ubuntu 25.10 and later confine `wg` with AppArmor, which lets it open files
+only under `/etc/wireguard`; a pipe from the caller isn't a file `wg` opens.
+`wg-quick` feeds `wg` the same way. The file under the output directory stays
+for `parallax plan`.
