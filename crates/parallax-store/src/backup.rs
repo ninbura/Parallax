@@ -5,7 +5,8 @@
 //!   it's encrypted, and checksums. Plaintext, so backups can be listed and
 //!   checked without the passphrase.
 //! - `payload.tar.age` (`payload.tar` when unencrypted): `parallax.db`, a
-//!   consistent copy of the database, and `wg-server.key`, the server's
+//!   consistent copy of the database rebuilt from its rows in WAL mode (so
+//!   `sqlite3` opens it; the live one runs in MVCC mode), and `wg-server.key`, the server's
 //!   private key. Encrypted with `age` in passphrase mode, so
 //!   `age -d payload.tar.age | tar x` opens one by hand.
 //!
@@ -139,6 +140,19 @@ impl Store {
         })?;
 
         let scratch = TempDir::new_in(parent(&self.path), ".parallax-backup")?;
+        // The copy is rebuilt from the rows, not copied from the file: the
+        // live database is in MVCC mode, which `sqlite3` can't open and
+        // which numbers re-inserted rows anew on every save, so a file copy
+        // of the same configuration would differ each time. Rebuilt in the
+        // default mode, the same rows always give the same bytes.
+        let rebuilt_path = scratch.path().join("rebuilt.db");
+        let mut rebuilt = Store::create_plain(&rebuilt_path).await?;
+        let reader = self.reader().await?;
+        rebuilt
+            .replace_with(&reader, None)
+            .await
+            .map_err(|e| self.busy(e))?;
+        drop(reader);
         let copy = scratch.path().join(DATABASE);
         let target = copy.to_str().filter(|p| !p.contains('\'')).ok_or_else(|| {
             Error::Invalid(format!(
@@ -146,12 +160,12 @@ impl Store {
                 copy.display()
             ))
         })?;
-        // One statement, one read transaction: a consistent copy even while
-        // another connection writes.
-        self.conn
+        // Compacted into one file, without the rebuild's log.
+        rebuilt
+            .conn
             .execute(&format!("VACUUM INTO '{target}'"), ())
-            .await
-            .map_err(|e| self.busy(e.into()))?;
+            .await?;
+        drop(rebuilt);
         let database = std::fs::read(&copy)
             .map_err(|e| Error::io(format!("reading {}", copy.display()), e))?;
         let payload = pack(&[(DATABASE, &database), (SERVER_KEY, &key)], 0)?;
@@ -228,18 +242,26 @@ impl Store {
                     .await?;
             }
             for table in tables {
+                // A busy source is named as itself, not as this database.
                 let columns: Vec<String> = source
                     .rows(&format!("PRAGMA table_info({table})"), Vec::new())
-                    .await?
+                    .await
+                    .map_err(|e| source.busy(e))?
                     .iter()
                     .map(|r| r.get::<String>(1))
                     .collect::<std::result::Result<_, _>>()?;
                 let list = columns.join(", ");
                 let slots: Vec<String> = (1..=columns.len()).map(|i| format!("?{i}")).collect();
                 let insert = format!("INSERT INTO {table} ({list}) VALUES ({})", slots.join(", "));
+                // In stored order, so the copy gets its rows in the same
+                // order every time (a backup's bytes depend only on them).
                 for row in source
-                    .rows(&format!("SELECT {list} FROM {table}"), Vec::new())
-                    .await?
+                    .rows(
+                        &format!("SELECT {list} FROM {table} ORDER BY rowid"),
+                        Vec::new(),
+                    )
+                    .await
+                    .map_err(|e| source.busy(e))?
                 {
                     let values = (0..columns.len())
                         .map(|i| row.get_value(i))
@@ -299,7 +321,11 @@ impl Store {
             .collect::<std::result::Result<_, _>>()?;
         let mut tables = Vec::new();
         for name in names {
-            if name == "schema_version" || name.starts_with("sqlite_") {
+            // Turso's MVCC bookkeeping, not ours.
+            if name == "schema_version"
+                || name.starts_with("sqlite_")
+                || name.starts_with("__turso_internal")
+            {
                 continue;
             }
             // Names go into SQL unquoted; ours are all plain identifiers.

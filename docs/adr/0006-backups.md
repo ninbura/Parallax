@@ -1,6 +1,7 @@
 # ADR 0006: Backups
 
-Status: accepted (step 6b).
+Status: accepted (step 6b). How the database is copied changed in step
+7c.1 (ADR 0011).
 
 ## Decision
 
@@ -9,9 +10,12 @@ holding everything Parallax keeps: the database and the server's private
 key. `parallax backup restore <file>` puts both back. How to use them:
 `docs/backup.md`.
 
-- **The database is copied with `VACUUM INTO`**: one statement, one read
-  transaction, so the copy is consistent while other processes write, and
-  it's compact. It holds everything, including what the GUI will store.
+- **The database is rebuilt from its rows** (since 7c.1, ADR 0011; before,
+  `VACUUM INTO` of the live file): table by table inside one read
+  transaction, so the copy is consistent while others write, into a new
+  file in WAL mode, then compacted. It holds all configuration, including
+  what the GUI will store, but not runtime state a restore never reads
+  (`daemon_state`).
   TOML isn't in backups; it stays a way to move the configuration only.
 - **The layout:** a plaintext `manifest.toml` (format, Parallax version,
   schema version, time, whether encrypted, checksums) and `payload.tar.age`,
