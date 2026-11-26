@@ -395,7 +395,7 @@ impl Ctx {
 
     /// On a native install the database belongs to the service's user.
     fn not_root_on_the_services_database(&self) -> anyhow::Result<()> {
-        if let Some((who, sudo_u)) = owner::services_database(&self.db) {
+        if let Some((who, sudo_u)) = owner::database_belongs_to_another_user(&self.db) {
             bail!(
                 "{} belongs to {who}, and no daemon answers on {}. Opening the database as \
                  root would leave files that user can't open. Start the service (`sudo \
@@ -745,6 +745,15 @@ fn run() -> anyhow::Result<()> {
             print!("{}", plan.render());
         }
         Command::Generate(out) => {
+            if let Some((who, sudo_u)) = owner::belongs_to_another_user(&out.out) {
+                bail!(
+                    "{} belongs to {who}: files generated there as root would be ones the \
+                     service can't replace. See the changes with `parallax plan`, generate \
+                     elsewhere (`-o <dir>`), or run it as that user (`sudo -u {sudo_u} parallax \
+                     generate`)",
+                    out.out.display()
+                );
+            }
             let (config, learned) = ctx.load_for_generation()?;
             let model = model_for(&config, today(), &learned)?;
             let bundle = generate::generate_all(&model, &fs)?;

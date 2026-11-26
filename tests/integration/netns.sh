@@ -66,8 +66,8 @@ done
 MODE="${NETNS_DAEMON:-root}"
 case $MODE in
     root) ;;
-    unit) command -v systemd-run >/dev/null && [ -d /run/systemd/system ] \
-              || { echo "NETNS_DAEMON=unit needs systemd"; exit 2; } ;;
+    unit) command -v systemd-run >/dev/null && command -v runuser >/dev/null && [ -d /run/systemd/system ] \
+              || { echo "NETNS_DAEMON=unit needs systemd and runuser"; exit 2; } ;;
     *) echo "NETNS_DAEMON is root or unit"; exit 2 ;;
 esac
 UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.service"
@@ -315,7 +315,7 @@ if [ "$MODE" = unit ]; then
     SANDBOX=()
     while IFS= read -r line; do
         case ${line%%=*} in
-            Type | User | Group | Exec* | Restart* | StateDirectory* | RuntimeDirectory* | ReadWritePaths) ;;
+            User | Group | Exec* | Restart* | StateDirectory* | RuntimeDirectory* | ReadWritePaths) ;;
             *) SANDBOX+=(-p "$line") ;;
         esac
     done < <(sed -n '/^\[Service\]/,/^\[/p' "$UNIT_FILE" | grep -E '^[A-Za-z]+=')
@@ -338,7 +338,7 @@ if [ "$MODE" = unit ]; then
             line=${line//\/usr\/bin\/parallax/"$WORK/parallax --db $1/parallax.db --socket $1/parallax.sock"}
             line=${line//\/etc\/parallax\/parallax.toml/"$1/parallax.toml"}
             starts=$((starts + 1))
-            "${AS_UNIT[@]}" --unit="${PREFIX}first-$starts" --wait --pipe /bin/sh -c "$line" || return 1
+            "${AS_UNIT[@]}" --unit="${PREFIX}first-$starts" -p Type=exec --wait --pipe /bin/sh -c "$line" || return 1
         done < <(grep '^ExecStartPre=' "$UNIT_FILE")
     }
     first_start "$WORK/first" > "$WORK/first.out" 2>&1 \
@@ -352,7 +352,7 @@ if [ "$MODE" = unit ]; then
     grep -q "^FAIL  configuration" "$WORK/none.out" \
         || { cat "$WORK/none.out"; fail "with no TOML, doctor did not say there's no configuration"; }
     pass "the unit's first start: imports, checks and makes the key as the service; a broken TOML stops it"
-    "${AS_UNIT[@]}" --unit="${PREFIX}doctor" --wait --pipe \
+    "${AS_UNIT[@]}" --unit="${PREFIX}doctor" -p Type=exec --wait --pipe \
         "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" doctor > "$WORK/doctor-unit" 2>&1 \
         || { cat "$WORK/doctor-unit"; fail "doctor fails as the native service"; }
     grep -q "^ok    CAP_NET_ADMIN: held, and ambient" "$WORK/doctor-unit" \

@@ -10,7 +10,9 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
+# Ready once it has applied and answers on its socket, so `systemctl start`
+# returns only then.
+Type=notify
 User=parallax
 Group=parallax
 # The first start fills an empty database from the TOML; after that the

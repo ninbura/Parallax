@@ -5,17 +5,18 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-/// This process's effective uid, from `/proc/self/status` (`Uid:` holds the
-/// real, effective, saved and filesystem uids).
-fn effective_uid() -> Option<u32> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("Uid:"))?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+/// Owner (uid, gid) of `path`, or of its nearest existing ancestor when it
+/// doesn't exist yet, when this process is root and that owner isn't.
+/// Symlinks are followed: what counts is the file that would be opened.
+fn foreign_owner(path: &Path) -> Option<(u32, u32)> {
+    if !rustix::process::geteuid().is_root() {
+        return None;
+    }
+    let meta = path
+        .ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .find_map(|p| std::fs::metadata(p).ok())?;
+    (meta.uid() != 0).then(|| (meta.uid(), meta.gid()))
 }
 
 /// The directory `path` is in.
@@ -24,15 +25,6 @@ fn dir_of(path: &Path) -> &Path {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     }
-}
-
-/// Owner (uid, gid) of `dir` when this process is root and someone else owns it.
-fn foreign_owner(dir: &Path) -> Option<(u32, u32)> {
-    if effective_uid()? != 0 {
-        return None;
-    }
-    let meta = std::fs::metadata(dir).ok()?;
-    (meta.uid() != 0).then(|| (meta.uid(), meta.gid()))
 }
 
 /// The name `/etc/passwd` gives `uid`, for messages only.
@@ -45,16 +37,22 @@ fn user_name(uid: u32) -> Option<String> {
     })
 }
 
-/// When root is about to open `db` itself, and the database's directory
-/// belongs to another user (the service's): who that is, as "user 'name'" (or
-/// "uid N") and as a `sudo -u` argument. Root opening it would leave files
-/// (`-wal`, `-tshm`) that user can't open.
-pub(crate) fn services_database(db: &Path) -> Option<(String, String)> {
-    let (uid, _) = foreign_owner(dir_of(db))?;
+/// When root is about to open or write `path` itself (the database, the
+/// output directory) and it belongs to another user, the service's: who that
+/// is, as "user 'name'" (or "uid N") and as a `sudo -u` argument. Root would
+/// leave files there (`-wal`, `-tshm`, generated files) that user can't open.
+pub(crate) fn belongs_to_another_user(path: &Path) -> Option<(String, String)> {
+    let (uid, _) = foreign_owner(path)?;
     Some(match user_name(uid) {
         Some(name) => (format!("user '{name}'"), name),
         None => (format!("uid {uid}"), format!("#{uid}")),
     })
+}
+
+/// The same for a database: the file, or the directory its `-wal` and
+/// `-tshm` files go in.
+pub(crate) fn database_belongs_to_another_user(db: &Path) -> Option<(String, String)> {
+    belongs_to_another_user(db).or_else(|| belongs_to_another_user(dir_of(db)))
 }
 
 /// After root wrote `path` (a key or a passphrase) into a directory another
