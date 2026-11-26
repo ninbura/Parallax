@@ -865,3 +865,44 @@ fn a_backup_dated_in_the_future_does_not_stay_newest() {
     assert!(ok && out.is_empty(), "{out}{err}");
     assert_eq!(s.backups().len(), 2);
 }
+
+/// A reader that goes away (`parallax peer show | head -1`, a pager that quits)
+/// stops the command quietly with SIGPIPE's status, not a panic. The pipe's
+/// read end is closed before the command starts, so every write fails.
+#[test]
+fn a_closed_stdout_or_stderr_stops_the_command_without_a_panic() {
+    use std::os::unix::process::ExitStatusExt;
+    let s = Scratch::new("closed-pipe");
+    s.import();
+    for args in [&["config", "export"][..], &["peer", "show"], &["validate"]] {
+        for stream in ["stdout", "stderr"] {
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_parallax"));
+            cmd.arg("--db")
+                .arg(s.db())
+                .arg("--socket")
+                .arg(s.socket())
+                .args(args)
+                .stdin(std::process::Stdio::null());
+            let out = if stream == "stdout" {
+                cmd.stdout(writer).stderr(std::process::Stdio::piped())
+            } else {
+                // `validate` reports on stdout; send both there to reach stderr's writes too.
+                cmd.stdout(writer.try_clone().unwrap()).stderr(writer)
+            }
+            .output()
+            .unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                (out.status.code(), out.status.signal()),
+                (Some(141), None),
+                "{args:?} with a closed {stream}: {err}"
+            );
+            assert!(
+                !err.contains("panicked"),
+                "{args:?} with a closed {stream}: {err}"
+            );
+        }
+    }
+}

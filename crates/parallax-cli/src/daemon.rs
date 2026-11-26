@@ -25,6 +25,7 @@
 //! the database copy; its encryption and writing run on a backup thread of
 //! their own, so they never delay a save.
 
+use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,12 +71,14 @@ const NAMES_EVERY: Duration = Duration::from_secs(300);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+// A log line nobody can read is dropped: `println!` would panic, possibly in a
+// task, leaving the rest of the daemon running without it.
 fn log(msg: impl std::fmt::Display) {
-    println!("parallax: {msg}");
+    let _ = writeln!(std::io::stdout(), "parallax: {msg}");
 }
 
 fn warn(msg: impl std::fmt::Display) {
-    eprintln!("parallax: {msg}");
+    let _ = writeln!(std::io::stderr(), "parallax: {msg}");
 }
 
 fn sys() -> System<'static> {
