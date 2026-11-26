@@ -4,6 +4,9 @@
 # binary (PARALLAX=...). KEEP_LOG=<file> keeps a copy of the daemon's log.
 # NETNS_PREFIX=<prefix> names the namespaces (default: one per run, so several
 # runs can share a machine). Interfaces live inside them and keep their names.
+# NETNS_DAEMON=unit runs the daemon (and a doctor) as an unprivileged user under
+# packaging/systemd/parallax.service's sandbox and capabilities, as a native
+# install does; needs systemd. The default, root, is how the Docker image runs it.
 #
 # Topology (every namespace is fresh; names below are without the prefix):
 #   home    192.168.1.5   "nginx" (TLS, picks the site by Host: immich and a sibling
@@ -60,11 +63,23 @@ for ns in $NAMESPACES; do
     ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
 done
 
-WORK=$(mktemp -d /tmp/parallax-it.XXXXXX)
+MODE="${NETNS_DAEMON:-root}"
+case $MODE in
+    root) ;;
+    unit) command -v systemd-run >/dev/null && [ -d /run/systemd/system ] \
+              || { echo "NETNS_DAEMON=unit needs systemd"; exit 2; } ;;
+    *) echo "NETNS_DAEMON is root or unit"; exit 2 ;;
+esac
+UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.service"
+
+# The unit's private /tmp would hide one under /tmp.
+WORK=$(mktemp -d "$([ "$MODE" = unit ] && echo /run || echo /tmp)/parallax-it.XXXXXX")
 PIDS=()
+UNITS=()
 CREATED=() # only these are cleaned up: a run that lost a race for a name leaves the winner's alone
 cleanup() {
     set +e
+    for u in "${UNITS[@]:-}"; do [ -n "$u" ] && systemctl stop "$u" 2>/dev/null; done
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
     # $! above is the backgrounded `inns` subshell, not the server it starts: kill
     # whatever still runs in each namespace, or they outlive the test and keep the
@@ -292,16 +307,53 @@ fi
 grep -q "^FAIL  user namespace" "$WORK/doctor-userns" || fail "doctor did not name the user namespace"
 pass "doctor passes on the gateway and refuses a user namespace"
 
+# As a native install runs it: `nobody` (the test's stand-in for the `parallax`
+# user) in the gateway namespace, with the unit's sandbox and capabilities. Only
+# what names the unit's own install (its user, paths, commands) is left out; the
+# test brings its own.
+if [ "$MODE" = unit ]; then
+    SANDBOX=()
+    while IFS= read -r line; do
+        case ${line%%=*} in
+            Type | User | Group | Exec* | Restart* | StateDirectory* | RuntimeDirectory* | ReadWritePaths) ;;
+            *) SANDBOX+=(-p "$line") ;;
+        esac
+    done < <(sed -n '/^\[Service\]/,/^\[/p' "$UNIT_FILE" | grep -E '^[A-Za-z]+=')
+    printf '%s\n' "${SANDBOX[@]}" | grep -q '^AmbientCapabilities=CAP_NET_ADMIN' \
+        || fail "could not read the sandbox from $UNIT_FILE"
+    AS_UNIT=(systemd-run --quiet --collect -p User=nobody -p "NetworkNamespacePath=/run/netns/${PREFIX}gw"
+        -p "ReadWritePaths=$WORK" "${SANDBOX[@]}")
+    chown -R nobody "$WORK"
+    "${AS_UNIT[@]}" --unit="${PREFIX}doctor" --wait --pipe \
+        "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" doctor > "$WORK/doctor-unit" 2>&1 \
+        || { cat "$WORK/doctor-unit"; fail "doctor fails as the native service"; }
+    grep -q "^ok    CAP_NET_ADMIN: held, and ambient" "$WORK/doctor-unit" \
+        || { cat "$WORK/doctor-unit"; fail "doctor did not see CAP_NET_ADMIN as ambient"; }
+    pass "doctor passes as the native service: unprivileged, sandboxed, two ambient capabilities"
+fi
+
 # The daemon applies, then serves DNS and the proxy on the tunnel address. Drift
 # checks are hourly here, so the tests below can change live rules on purpose;
 # (n) restarts it with a short interval.
 start_daemon() { # reconcile interval in seconds
-    inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/daemon.pid" \
-        $P daemon -o "$WORK/out" --reconcile-every "$1" >> "$WORK/daemon.log" 2>&1 &
-    PIDS+=($!)
+    local unit="${PREFIX}daemon-${#UNITS[@]}"
+    if [ "$MODE" = unit ]; then
+        UNITS+=("$unit")
+        "${AS_UNIT[@]}" --unit="$unit" -p "StandardOutput=append:$WORK/daemon.log" \
+            -p "StandardError=append:$WORK/daemon.log" \
+            "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" \
+            daemon -o "$WORK/out" --reconcile-every "$1"
+    else
+        inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/daemon.pid" \
+            $P daemon -o "$WORK/out" --reconcile-every "$1" >> "$WORK/daemon.log" 2>&1 &
+        PIDS+=($!)
+    fi
     for _ in $(seq 100); do
-        $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep -q . \
-            && inns gw ss -Hltn 'sport = :8443' | grep -q . && return 0
+        if $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep -q . \
+            && inns gw ss -Hltn 'sport = :8443' | grep -q .; then
+            [ "$MODE" = unit ] && systemctl show -p MainPID --value "$unit" > "$WORK/daemon.pid"
+            return 0
+        fi
         sleep 0.1
     done
     fail "parallax daemon did not start"
@@ -692,7 +744,16 @@ kill -0 "$DAEMON" 2>/dev/null && fail "(n) the daemon did not stop on SIGTERM"
 inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) the table outlived the daemon"
 inns gw ip link show wg0 >/dev/null 2>&1 && fail "(n) wg0 outlived the daemon"
 [ -e "$SOCK" ] && fail "(n) the socket outlived the daemon"
-$P validate >/dev/null || fail "(n) without a daemon the CLI opens the database itself"
+if [ "$MODE" = unit ]; then
+    # Root opening the service's database would leave files the service can't open.
+    if $P validate > "$WORK/root.err" 2>&1; then fail "(n) root opened the service's database directly"; fi
+    grep -q "belongs to user 'nobody', and no daemon answers" "$WORK/root.err" \
+        || { cat "$WORK/root.err"; fail "(n) root's refusal doesn't say whose database it is"; }
+    runuser -u nobody -- "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" validate >/dev/null \
+        || fail "(n) without a daemon the service's user opens the database itself"
+else
+    $P validate >/dev/null || fail "(n) without a daemon the CLI opens the database itself"
+fi
 start_daemon 1
 # wg0 is new: the clients' sessions are gone until they handshake again (up to ~15 s).
 for _ in $(seq 10); do [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] && break; done

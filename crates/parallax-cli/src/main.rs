@@ -382,12 +382,44 @@ impl Ctx {
 
     /// Open the database, which must exist.
     pub(crate) async fn open_store(&self) -> anyhow::Result<Store> {
+        self.not_root_on_the_services_database()?;
         Store::open(&self.db).await.map_err(|e| self.locked(e))
     }
 
     /// Open the database, creating an empty one if there is none.
     pub(crate) async fn create_store(&self) -> anyhow::Result<Store> {
+        self.not_root_on_the_services_database()?;
         Store::create(&self.db).await.map_err(|e| self.locked(e))
+    }
+
+    /// On a native install the database belongs to the service's user. Root
+    /// opening it directly (no daemon running) would leave root-owned files
+    /// next to it (`-wal`, `-tshm`) that the service then can't open.
+    fn not_root_on_the_services_database(&self) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = match self.db.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        let (Ok(me), Ok(owner)) = (std::fs::metadata("/proc/self"), std::fs::metadata(dir)) else {
+            return Ok(());
+        };
+        if me.uid() != 0 || owner.uid() == 0 {
+            return Ok(());
+        }
+        let uid = owner.uid();
+        let (who, sudo_u) = match user_name(uid) {
+            Some(name) => (format!("user '{name}'"), name),
+            None => (format!("uid {uid}"), format!("#{uid}")),
+        };
+        bail!(
+            "{} belongs to {who}, and no daemon answers on {}. Opening the database as root \
+             would leave files that user can't open. Start the service (`sudo systemctl start \
+             parallax`) so this goes through its socket, or run it as that user (`sudo -u \
+             {sudo_u} parallax ...`)",
+            dir.display(),
+            self.socket.display(),
+        )
     }
 
     /// Another process holds the database, yet no daemon answered.
@@ -516,6 +548,16 @@ impl Ctx {
             None => bail!("the daemon stopped answering; nothing saved"),
         }
     }
+}
+
+/// The name `/etc/passwd` gives `uid`, for messages only.
+fn user_name(uid: u32) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        (fields.nth(1)? == uid.to_string()).then(|| name.to_string())
+    })
 }
 
 /// A reply that doesn't answer the request.
