@@ -395,13 +395,13 @@ mod tests {
         cfg.grants.push(Grant {
             name: "watched".into(),
             everyone: true,
-            log: Some(LogLevel::Denied),
+            log: Some(LogLevel::Blocked),
             rules: Vec::new(),
         });
-        assert_eq!(level(&cfg, &peer), LogLevel::Denied, "grant for everyone");
+        assert_eq!(level(&cfg, &peer), LogLevel::Blocked, "grant for everyone");
 
-        peer.log = Some(LogLevel::Bytes);
-        assert_eq!(level(&cfg, &peer), LogLevel::Bytes, "its own");
+        peer.log = Some(LogLevel::Detailed);
+        assert_eq!(level(&cfg, &peer), LogLevel::Detailed, "its own");
     }
 
     #[test]
@@ -426,15 +426,18 @@ mod tests {
     fn levels_are_set_and_cleared_by_name() {
         let mut cfg = canonical_config();
         let peer = Target::Peer("sister-phone".into());
-        assert!(set_level(&mut cfg, &peer, Some(LogLevel::Bytes)).unwrap());
-        assert!(!set_level(&mut cfg, &peer, Some(LogLevel::Bytes)).unwrap());
-        assert_eq!(cfg.peer("sister-phone").unwrap().log, Some(LogLevel::Bytes));
+        assert!(set_level(&mut cfg, &peer, Some(LogLevel::Detailed)).unwrap());
+        assert!(!set_level(&mut cfg, &peer, Some(LogLevel::Detailed)).unwrap());
+        assert_eq!(
+            cfg.peer("sister-phone").unwrap().log,
+            Some(LogLevel::Detailed)
+        );
         assert!(set_level(&mut cfg, &peer, None).unwrap());
         assert_eq!(cfg.peer("sister-phone").unwrap().log, None);
 
         let grant = Target::Grant("family".into());
-        assert!(set_level(&mut cfg, &grant, Some(LogLevel::Denied)).unwrap());
-        assert_eq!(cfg.grant("family").unwrap().log, Some(LogLevel::Denied));
+        assert!(set_level(&mut cfg, &grant, Some(LogLevel::Blocked)).unwrap());
+        assert_eq!(cfg.grant("family").unwrap().log, Some(LogLevel::Blocked));
         assert!(set_level(&mut cfg, &Target::Global, Some(LogLevel::Connections)).unwrap());
         assert_eq!(cfg.server.logs.level, LogLevel::Connections);
 
@@ -536,7 +539,7 @@ mod tests {
     fn levels_survive_toml() {
         let mut cfg = canonical_config();
         cfg.server.logs.level = LogLevel::Connections;
-        cfg.grants[1].log = Some(LogLevel::Denied);
+        cfg.grants[1].log = Some(LogLevel::Blocked);
         cfg.peers[0].log = Some(LogLevel::Off);
         let toml = cfg.to_toml().unwrap();
         assert_eq!(Config::from_toml(&toml).unwrap(), cfg);

@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use super::Interval;
 
-/// How much the gateway records about a peer's traffic. Each level
-/// includes the ones before it.
+/// How much the gateway records about a peer's traffic, like log
+/// verbosity: each level includes the ones before it, and the first is the
+/// one that matters most (what the firewall stopped).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
@@ -16,28 +17,28 @@ pub enum LogLevel {
     /// Nothing. Costs nothing: no firewall rules, no events read.
     #[default]
     Off,
-    /// One record per new connection: peer, destination, port.
+    /// Attempts the firewall stopped (rate-limited): like warnings.
+    Blocked,
+    /// Also one record per new connection: peer, destination, port.
     Connections,
     /// Also the bytes each way when a connection ends.
-    Bytes,
-    /// Also attempts the firewall blocked (rate-limited).
-    Denied,
+    Detailed,
 }
 
 impl LogLevel {
     pub const ALL: [LogLevel; 4] = [
         LogLevel::Off,
+        LogLevel::Blocked,
         LogLevel::Connections,
-        LogLevel::Bytes,
-        LogLevel::Denied,
+        LogLevel::Detailed,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             LogLevel::Off => "off",
+            LogLevel::Blocked => "blocked",
             LogLevel::Connections => "connections",
-            LogLevel::Bytes => "bytes",
-            LogLevel::Denied => "denied",
+            LogLevel::Detailed => "detailed",
         }
     }
 }
@@ -56,7 +57,7 @@ impl std::str::FromStr for LogLevel {
             .find(|l| l.as_str() == s)
             .ok_or_else(|| crate::Error::Malformed {
                 what: "log level",
-                detail: format!("'{s}' is not one of off, connections, bytes, denied"),
+                detail: format!("'{s}' is not one of off, blocked, connections, detailed"),
             })
     }
 }
@@ -178,10 +179,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn levels_order_from_off_to_denied() {
-        assert!(LogLevel::Off < LogLevel::Connections);
-        assert!(LogLevel::Connections < LogLevel::Bytes);
-        assert!(LogLevel::Bytes < LogLevel::Denied);
+    fn levels_order_from_off_to_detailed() {
+        assert!(LogLevel::Off < LogLevel::Blocked);
+        assert!(LogLevel::Blocked < LogLevel::Connections);
+        assert!(LogLevel::Connections < LogLevel::Detailed);
         for level in LogLevel::ALL {
             assert_eq!(level.as_str().parse::<LogLevel>().unwrap(), level);
         }

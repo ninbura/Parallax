@@ -5,8 +5,8 @@
 #   ipset create -exist ts_20deb125664a4b6d hash:net comment ; elements: 
 #   ipset create -exist wg_f62eed6a1a23f069 hash:net comment ; elements: 10.8.2.1/32
 #   ipset create -exist ts_f62eed6a1a23f069 hash:net comment ; elements: 
-#   ipset create -exist log_flows hash:net comment ; elements: 10.8.1.1/32, 10.8.2.1/32
-#   ipset create -exist log_denied hash:net comment ; elements: 10.8.2.1/32
+#   ipset create -exist log_flows hash:net comment ; elements: 10.8.1.1/32
+#   ipset create -exist log_denied hash:net comment ; elements: 10.8.1.1/32, 10.8.2.1/32
 *filter
 :PARALLAX_INPUT - [0:0]
 :PARALLAX_FORWARD - [0:0]

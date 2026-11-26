@@ -462,7 +462,7 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
 
     // Activity logging: only when some peer is logged.
     let log_flows = crate::logging::addresses(model, LogLevel::Connections);
-    let log_denied = crate::logging::addresses(model, LogLevel::Denied);
+    let log_denied = crate::logging::addresses(model, LogLevel::Blocked);
     let mark_flows = |chain: Chain| {
         Rule::new(chain, Action::MarkFlow, "logged peers: mark new flows")
             .iifs(&ingress)

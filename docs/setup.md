@@ -110,7 +110,7 @@ It checks the following. `backups` only warns: the gateway runs without them.
 | wireguard | a WireGuard interface can't be created | `/etc/modules-load.d/` (above) |
 | NETMAP | the kernel or `nft` rejects prefix NAT (`nftables` backend only) | a newer kernel or nftables |
 | backups (warns) | automatic backups are off, the directory isn't writable, no passphrase is set, or unencrypted backups go to a network filesystem | [docs/backup.md](backup.md) |
-| byte counts (warns; only when a peer logs `bytes` or more) | `net.netfilter.nf_conntrack_acct` is 0 | [docs/logging.md](logging.md) |
+| byte counts (warns; only when a peer logs at `detailed`) | `net.netfilter.nf_conntrack_acct` is 0 | [docs/logging.md](logging.md) |
 
 ## Choosing the endpoint
 

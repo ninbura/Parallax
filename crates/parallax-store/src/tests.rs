@@ -120,7 +120,7 @@ pub(crate) fn everything_config() -> Config {
     c.grants.push(Grant {
         name: "public".into(),
         everyone: true,
-        log: Some(LogLevel::Denied),
+        log: Some(LogLevel::Blocked),
         rules: Vec::new(),
     });
     let wg = c.peers[0].wireguard.as_mut().unwrap();

@@ -36,14 +36,14 @@ table inet parallax {
 		type ipv4_addr
 		flags interval
 		comment "peers whose connections are logged"
-		elements = { 10.8.1.1, 10.8.2.1 }
+		elements = { 10.8.1.1 }
 	}
 
 	set log_denied {
 		type ipv4_addr
 		flags interval
 		comment "peers whose blocked attempts are logged"
-		elements = { 10.8.2.1 }
+		elements = { 10.8.1.1, 10.8.2.1 }
 	}
 
 	chain input {
