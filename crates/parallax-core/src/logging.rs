@@ -92,6 +92,19 @@ pub fn addresses(model: &Model<'_>, at_least: LogLevel) -> Vec<Ipv4Net> {
     out
 }
 
+/// Whether some enabled WireGuard peer with an address is logged at
+/// `at_least` or more: what the collector reads for. From the
+/// configuration alone; expired peers count, which only means reading
+/// events nobody's marked.
+pub fn configured(config: &Config, at_least: LogLevel) -> bool {
+    config.peers.iter().any(|p| {
+        p.enabled
+            && p.transport == TransportKind::WireGuard
+            && p.wireguard.as_ref().and_then(|w| w.address).is_some()
+            && level(config, p) >= at_least
+    })
+}
+
 /// Whether some peer the firewall can mark is logged at `at_least` or
 /// more (the same peers as [`addresses`]).
 pub fn any(model: &Model<'_>, at_least: LogLevel) -> bool {
@@ -137,7 +150,8 @@ pub enum Event {
 
 /// One stored activity record. Names are kept as they were, so the
 /// history survives renames and removals.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Record {
     /// Unix milliseconds.
     pub time: u64,
@@ -160,7 +174,8 @@ pub struct Record {
     pub bytes_in: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecordKind {
     Opened,
     Closed,

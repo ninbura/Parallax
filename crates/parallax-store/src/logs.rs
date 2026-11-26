@@ -43,7 +43,8 @@ impl std::fmt::Debug for Writer {
 
 /// Which records to read. Without `after`, the newest `limit` up to now;
 /// with it, the oldest `limit` after that id (for following new ones).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Query {
     pub peer: Option<String>,
     /// Any of these kinds; empty: every kind.

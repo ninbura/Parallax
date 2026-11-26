@@ -1,6 +1,7 @@
 # ADR 0001: Control WireGuard through `wg`/`ip` subprocesses, not netlink
 
-Status: accepted (M1)
+Status: accepted (M1). ADR 0012 makes a scoped exception: the activity
+collector reads its event streams from netlink directly.
 
 ## Context
 

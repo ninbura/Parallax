@@ -5,10 +5,6 @@ where, how much it sent and received, and what the firewall blocked. It's
 off for everyone until you turn it on, and off costs nothing: no firewall
 rules, no events read.
 
-> This version sets the levels up and prepares the firewall. The collector
-> that records them, and `parallax log` to read the records, come in the
-> next release.
-
 ## Levels
 
 Each level includes the ones before it.
@@ -54,6 +50,33 @@ log = "denied"
 rules = [...]
 ```
 
+## Reading records
+
+```sh
+parallax log show                          # the newest 50, oldest first
+parallax log show --peer sister-phone --since 1d
+parallax log show --kind denied,denied_gateway --limit 200
+parallax log show --follow                 # and keep showing new ones
+```
+
+Each line is one record:
+
+```
+2026-11-26T10:50:05Z  sister-phone  opened  tcp 198.18.1.5:2283 (192.168.1.5, home)  grants family
+2026-11-26T10:50:19Z  sister-phone  closed  tcp 198.18.1.5:2283 (192.168.1.5, home)  1.2 KiB out, 33.2 KiB in  grants family
+2026-11-26T10:50:06Z  sister-phone  denied  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family
+```
+
+The destination is the address the peer used, then in brackets the real one
+and its network. `denied_gateway` is a blocked attempt at the gateway host
+itself. Names are kept as they were, so records survive renaming or removing
+a peer or grant. A connection's `closed` record comes some seconds after it
+closes: the kernel reports a connection's end when it next sweeps its
+connection table.
+
+With a daemon running, `log show` asks it; without one, it reads `logs.db`
+itself.
+
 ## Where records go
 
 Records go in their own database, by default `/var/lib/parallax/logs.db`,
@@ -62,7 +85,10 @@ the SD card, which constant small writes wear out; or on `tmpfs` if records
 should end at reboot. With Docker, mount a second volume there.
 
 Records are deleted once they're older than `keep` or once they take up more
-than `max_size`, whichever comes first. Backups leave them out by default.
+than `max_size`, whichever comes first, checked every 10 minutes. Past
+`max_size`, the oldest go until the records take up 90% of it. Deleted
+records leave space that new ones reuse, so the file levels off at about
+`max_size` rather than shrinking. Backups don't include records yet.
 
 ## Byte counts need a host setting
 
@@ -85,7 +111,7 @@ only theirs. Just before each drop a logged peer can hit, a rate-limited rule
 hands the blocked packet to the collector (nflog group 20568), at most 20 a
 second per rule with bursts of 40, so a peer scanning ports can't flood it.
 Peers at `off` are in neither set, and with nobody logged neither the sets
-nor the rules exist. Connections are recorded once when they start and once
+nor the rules exist, and the daemon doesn't read either feed (ADR 0012). Connections are recorded once when they start and once
 when they end, not per packet; blocked attempts are per packet, within that
 limit. Packets dropped for being out of a connection's state (stale or
 malformed) aren't blocked attempts and aren't logged.
