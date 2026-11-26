@@ -2,8 +2,10 @@
 # Parallax integration test on Linux network namespaces. Needs root, and:
 # nft, wg, ip, dnsmasq, dig, curl, openssl, ping, python3, and the parallax
 # binary (PARALLAX=...). KEEP_LOG=<file> keeps a copy of the daemon's log.
+# NETNS_PREFIX=<prefix> names the namespaces (default: one per run, so several
+# runs can share a machine). Interfaces live inside them and keep their names.
 #
-# Topology (every namespace is fresh):
+# Topology (every namespace is fresh; names below are without the prefix):
 #   home    192.168.1.5   "nginx" (TLS, picks the site by Host: immich and a sibling
 #           other.mydomain.com) + home DNS + plain HTTP on 8080 + an echo on 7000
 #   gw      eth0 192.168.1.1 (home LAN), wan0 203.0.113.1 (clients), up0 (internet),
@@ -49,7 +51,10 @@ PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
 for t in nft wg ip dnsmasq dig curl openssl ping python3; do command -v $t >/dev/null || { echo "missing $t"; exit 2; }; done
 
-NAMESPACES="home gw client foreign net ctr"
+PREFIX="${NETNS_PREFIX-pxit$$-}"
+[[ $PREFIX =~ ^[A-Za-z0-9_-]*$ ]] || { echo "NETNS_PREFIX may hold only letters, digits, _ and -"; exit 2; }
+NAMESPACES=""
+for ns in home gw client foreign net ctr; do NAMESPACES+=" $PREFIX$ns"; done
 # Cleanup kills everything in these namespaces, so never adopt ones that already exist.
 for ns in $NAMESPACES; do
     ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
@@ -57,17 +62,18 @@ done
 
 WORK=$(mktemp -d /tmp/parallax-it.XXXXXX)
 PIDS=()
+CREATED=() # only these are cleaned up: a run that lost a race for a name leaves the winner's alone
 cleanup() {
     set +e
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
     # $! above is the backgrounded `inns` subshell, not the server it starts: kill
     # whatever still runs in each namespace, or they outlive the test and keep the
     # caller's stdout open.
-    for ns in $NAMESPACES; do
-        ip netns pids $ns 2>/dev/null | xargs -r kill 2>/dev/null
+    for ns in "${CREATED[@]:-}"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null
     done
     sleep 0.2
-    for ns in $NAMESPACES; do ip netns del $ns 2>/dev/null; done
+    for ns in "${CREATED[@]:-}"; do ip netns del "$ns" 2>/dev/null; done
     [ -n "${KEEP_LOG:-}" ] && cp "$WORK/daemon.log" "$KEEP_LOG"
     rm -rf "$WORK"
 }
@@ -79,15 +85,16 @@ fail() {
     [ -s "$WORK/daemon.log" ] && { echo "--- daemon log"; tail -30 "$WORK/daemon.log"; }
     exit 1
 }
-inns() { ip netns exec "$@"; }
+inns() { local ns=$PREFIX$1; shift; ip netns exec "$ns" "$@"; } # role (gw, home, ...), command
 
 # ---------------------------------------------------------------- topology
-for ns in $NAMESPACES; do ip netns add $ns; inns $ns ip link set lo up; done
-ip link add eth0 netns gw type veth peer name lan0 netns home
-ip link add wan0 netns gw type veth peer name wan0 netns client
-ip link add lan0 netns client type veth peer name lan0 netns foreign
-ip link add up0 netns gw type veth peer name up0 netns net
-ip link add vethctr netns gw type veth peer name eth0 netns ctr
+for ns in $NAMESPACES; do ip netns add "$ns"; CREATED+=("$ns"); ip netns exec "$ns" ip link set lo up; done
+veth() { ip link add "$1" netns "$PREFIX$2" type veth peer name "$3" netns "$PREFIX$4"; } # name, ns, peer, ns
+veth eth0 gw lan0 home
+veth wan0 gw wan0 client
+veth lan0 client lan0 foreign
+veth up0 gw up0 net
+veth vethctr gw eth0 ctr
 inns gw ip addr add 192.168.1.1/24 dev eth0;   inns gw ip link set eth0 up
 inns gw ip addr add 203.0.113.1/24 dev wan0;   inns gw ip link set wan0 up
 inns gw ip addr add 198.51.100.1/24 dev up0;   inns gw ip link set up0 up
@@ -202,17 +209,17 @@ serve ctr 0.0.0.0 80 container
 # a "public resolver" on the internet, with one name that points into private space.
 BIG=()
 for i in $(seq 10 49); do BIG+=(--host-record=big.mydomain.com,192.168.1.$i); done
-inns home dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
+inns home dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
     --address=/immich.mydomain.com/192.168.1.5 --address=/other.mydomain.com/192.168.1.5 \
     --host-record=vlan.mydomain.com,10.99.0.5 --host-record=vlan.mydomain.com,192.168.1.6 \
     --host-record=web.mydomain.com,192.168.1.5 --host-record=away.mydomain.com,10.99.0.5 \
     --host-record=game.mydomain.com,1.2.3.4 --host-record=public.mydomain.com,1.2.3.4 \
     "${BIG[@]}" >/dev/null 2>&1 &
 PIDS+=($!)
-inns net dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=9.9.9.9 --bind-interfaces \
+inns net dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts --listen-address=9.9.9.9 --bind-interfaces \
     --address=/example.org/9.9.9.9 --address=/rebind.example.org/192.168.1.5 >/dev/null 2>&1 &
 PIDS+=($!)
-inns foreign dnsmasq --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
+inns foreign dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
     --address=/immich.hisdomain.com/192.168.1.5 >/dev/null 2>&1 &
 PIDS+=($!)
 sleep 1
@@ -231,6 +238,9 @@ private_key_file = "$WORK/wg-server.key"
 public_resolver = "9.9.9.9"
 [server.firewall]
 docker_coexistence = false
+[server.backup]
+directory = "$WORK/backups"
+passphrase_file = "$WORK/backup.passphrase"
 [server.proxy]
 certificates = "$WORK/certs"
 upstream_ca = "$CA"
@@ -276,7 +286,7 @@ inns gw $P doctor > "$WORK/doctor" || { cat "$WORK/doctor"; fail "doctor rejects
 # Root in a user namespace (as under rootless Docker) must be refused. That root
 # maps only uid 0, so run a copy it can reach (not one under someone's home).
 cp "$PARALLAX" "$WORK/parallax"
-if inns gw unshare -U -r "$WORK/parallax" --db "$WORK/parallax.db" doctor > "$WORK/doctor-userns" 2>&1; then
+if inns gw unshare -U -r "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" doctor > "$WORK/doctor-userns" 2>&1; then
     fail "doctor accepted a user namespace"
 fi
 grep -q "^FAIL  user namespace" "$WORK/doctor-userns" || fail "doctor did not name the user namespace"
@@ -616,7 +626,7 @@ named() { # host -> a config granting family a few ports on it, 8080/tcp among t
 }
 [ "$(status_as $GUEST web.mydomain.com)" = REFUSED ] || fail "(p) guest looked up a name it isn't granted"
 apply "$(named web.mydomain.com)"
-$P status | grep -qx "name web.mydomain.com: 192.168.1.5" || { $P status; fail "(p) the name was not looked up on save"; }
+grep -qx "name web.mydomain.com: 192.168.1.5" <<<"$($P status)" || { $P status; fail "(p) the name was not looked up on save"; }
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = home-other ] || fail "(p) guest -> the host granted by name"
 [ "$(short_as $GUEST web.mydomain.com)" = 198.18.1.5 ] || fail "(p) guest could not look up the name it's granted"
 refused() { # host, what the refusal must say
@@ -630,7 +640,7 @@ refused away.mydomain.com "away.mydomain.com resolved to 10.99.0.5, outside ever
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = home-other ] || fail "(p) a refused save changed the gateway"
 apply "$WORK/named-before.toml"
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(p) the grant by name outlived its removal"
-$P status | grep -q "^name " && fail "(p) a name no longer used is still listed"
+grep -q "^name " <<<"$($P status)" && fail "(p) a name no longer used is still listed"
 pass "(p) a host granted by name: looked up on save, reached on its port, its name answers; bad names are refused"
 
 # (o) the home's public IP: guests with internet drop it (the router would hairpin it
@@ -639,10 +649,10 @@ pass "(p) a host granted by name: looked up on save, reached on its port, its na
 # it's saved. A hostname is looked up and re-applied when it changes; an answer with
 # a private address is refused, and the last address found stays.
 public_ip_is() { # address
-    for _ in $(seq 50); do $P status | grep -qx "home public IP: $1" && return 0; sleep 0.1; done
+    for _ in $(seq 50); do grep -qx "home public IP: $1" <<<"$($P status)" && return 0; sleep 0.1; done
     $P status; return 1
 }
-$P status | grep -q "home public IP" && fail "(o) the private endpoint was taken as the public IP"
+grep -q "home public IP" <<<"$($P status)" && fail "(o) the private endpoint was taken as the public IP"
 grep -q "the endpoint 203.0.113.1:51820 is not a public address" "$WORK/daemon.log" \
     || fail "(o) the daemon did not say why the public IP is unknown"
 $P config export > "$WORK/public-ip.toml"
@@ -723,7 +733,7 @@ forward() { # extra friend grants -> a config file
 apply "$(forward '{ kind = "host", host = "game.mydomain.com", ports = ["8080/tcp"] }, { kind = "service", name = "forwarded" }')"
 # Friend's session may still be handshaking with the daemon (n) restarted.
 for _ in $(seq 10); do [ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] && break; done
-$P status | grep -qx "name game.mydomain.com: 1.2.3.4" || { $P status; fail "(q) game.mydomain.com was not looked up"; }
+grep -qx "name game.mydomain.com: 1.2.3.4" <<<"$($P status)" || { $P status; fail "(q) game.mydomain.com was not looked up"; }
 [ "$(curl_as $FRIEND http://1.2.3.4:8080/)" = home-public-other ] || fail "(q) friend -> the granted port forward"
 [ "$(curl_as $FRIEND http://1.2.3.4/)" = BLOCKED ] || fail "(q) friend reached another port on the public IP"
 [ "$(short_as $FRIEND game.mydomain.com)" = 1.2.3.4 ] || fail "(q) friend could not look up the forwarded name"
@@ -752,7 +762,7 @@ sed '/^name = "friend"$/{n;s/^grants = \["friend"\]$/grants = ["friend", "family
     "$WORK/forward-base.toml" > "$WORK/union.toml"
 grep -q '^grants = \["friend", "family"\]$' "$WORK/union.toml" || fail "(r) could not give friend two grants"
 apply "$WORK/union.toml"
-$P peer show friend | grep -q '^friend  grants=family,friend  .*address=10.8.0.4 ' \
+grep -q '^friend  grants=family,friend  .*address=10.8.0.4 ' <<<"$($P peer show friend)" \
     || { $P peer show friend; fail "(r) friend's grants or address"; }
 [ "$(https_as $FRIEND immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(r) friend -> family's Immich"
 [ "$(curl_as $FRIEND http://198.18.1.1:9090/)" = gw-self ] || fail "(r) friend -> family's service on the gateway"
@@ -804,7 +814,7 @@ g grant remove lan-web --force
 for src in $GUEST $FRIEND; do [ "$(web $src)" = BLOCKED ] || fail "(s) $src kept a removed grant"; done
 [ "$(web $LAPTOP)" = home-other ] || fail "(s) laptop's access changed with others' grants"
 [ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(s) guest lost family"
-$P peer show guest | grep -q '^guest  grants=family  .*address=10.8.0.3 ' \
+grep -q '^guest  grants=family  .*address=10.8.0.3 ' <<<"$($P peer show guest)" \
     || { $P peer show guest; fail "(s) guest's grants or address"; }
 [ "$($P export guest --platform mobile 2>/dev/null | grep -v '^#')" = "$GUEST_CONF" ] \
     || fail "(s) guest's client config changed with its grants"
