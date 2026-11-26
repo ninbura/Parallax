@@ -281,10 +281,15 @@ fn ipv4(p: &[u8]) -> Option<Blocked> {
         return None;
     }
     let header = usize::from(first & 0x0f) * 4;
+    if header < 20 || p.len() < header {
+        return None;
+    }
     let protocol = *p.get(9)?;
+    // Only the first fragment carries the ports.
+    let later_fragment = be_u16(p.get(6..8)?)? & 0x1fff != 0;
     // TCP, UDP and SCTP all start with the source and destination ports.
     let port = match protocol {
-        6 | 17 | 132 => p.get(header + 2..header + 4).and_then(be_u16),
+        6 | 17 | 132 if !later_fragment => p.get(header + 2..header + 4).and_then(be_u16),
         _ => None,
     };
     Some(Blocked {
@@ -481,6 +486,16 @@ mod tests {
                 blocked(1, [9, 9, 9, 9], None, false),
             ]
         );
+    }
+
+    #[test]
+    fn bad_headers_and_later_fragments_give_no_ports() {
+        let mut short_header = ip_packet(6, [10, 8, 2, 1], [192, 168, 1, 9], 22);
+        short_header[0] = 0x44; // 16-byte header: too short to be one
+        assert!(ipv4(&short_header).is_none());
+        let mut fragment = ip_packet(6, [10, 8, 2, 1], [192, 168, 1, 9], 22);
+        fragment[7] = 0x10; // offset 16
+        assert_eq!(ipv4(&fragment).unwrap().port, None);
     }
 
     #[test]

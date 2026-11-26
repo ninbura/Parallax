@@ -278,10 +278,10 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
         }
         Event::Blocked(b) => (b.src, LogLevel::Denied),
     };
-    let peer = config
-        .peers
-        .iter()
-        .find(|p| p.wireguard.as_ref().and_then(|w| w.address) == Some(src))?;
+    let peer = config.peers.iter().find(|p| {
+        p.transport == TransportKind::WireGuard
+            && p.wireguard.as_ref().and_then(|w| w.address) == Some(src)
+    })?;
     let level = level(config, peer);
     if level < needed {
         return None;
@@ -311,7 +311,24 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
     };
     Some(match event {
         Event::Opened(f) | Event::Closed(f) => {
-            let real = (f.answered_by != f.dst).then_some(f.answered_by);
+            // HTTPS to a proxied service is redirected to the proxy before
+            // NETMAP, so the proxy answers: the real host is the one the
+            // peer's mapped address stands for.
+            let proxy = config
+                .server
+                .proxy
+                .listen
+                .unwrap_or_else(|| config.server.wireguard.gateway_address());
+            let answered_by = if f.answered_by == proxy && f.dst != proxy {
+                config
+                    .networks
+                    .iter()
+                    .find_map(|n| n.mapping().and_then(|m| m.to_real(f.dst)))
+                    .unwrap_or(f.dst)
+            } else {
+                f.answered_by
+            };
+            let real = (answered_by != f.dst).then_some(answered_by);
             let closed = matches!(event, Event::Closed(_));
             let kind = if closed {
                 RecordKind::Closed
@@ -462,6 +479,20 @@ mod tests {
         assert!(attribute(&cfg, &Event::Opened(flow([10, 8, 9, 9], mark)), 1).is_none());
         cfg.peers[2].log = Some(LogLevel::Off);
         assert!(attribute(&cfg, &closed, 1).is_none());
+    }
+
+    #[test]
+    fn a_proxied_flow_records_the_host_behind_the_proxy() {
+        let mut cfg = canonical_config();
+        cfg.server.logs.level = LogLevel::Connections;
+        let proxy = cfg.server.wireguard.gateway_address();
+        let mut f = flow([10, 8, 2, 1], crate::generate::firewall::FLOW_MARK);
+        f.port = Some(443);
+        f.answered_by = proxy;
+        let r = attribute(&cfg, &Event::Opened(f), 1).unwrap();
+        assert_eq!(r.destination, Ipv4Addr::new(198, 18, 1, 5));
+        assert_eq!(r.real_destination, Some(Ipv4Addr::new(192, 168, 1, 5)));
+        assert_eq!(r.network.as_deref(), Some("home"));
     }
 
     #[test]

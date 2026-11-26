@@ -18,7 +18,7 @@ use parallax_core::model::LogLevel;
 use parallax_core::netlink;
 use parallax_store::logs::{Logs, Writer};
 use rustix::net::netlink::{SocketAddrNetlink, NETFILTER};
-use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketType};
+use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType};
 
 use super::{log, warn, Views};
 
@@ -336,7 +336,14 @@ impl Source {
 }
 
 fn netlink_socket() -> io::Result<OwnedFd> {
-    let fd = rustix::net::socket(AddressFamily::NETLINK, SocketType::RAW, Some(NETFILTER))?;
+    // Close-on-exec, so the tools apply runs never inherit it (a lingering
+    // one could hold the nflog group).
+    let fd = rustix::net::socket_with(
+        AddressFamily::NETLINK,
+        SocketType::RAW,
+        SocketFlags::CLOEXEC,
+        Some(NETFILTER),
+    )?;
     // Past the system's limit needs CAP_NET_ADMIN, which the gateway has;
     // fall back to the most the limit allows.
     if rustix::net::sockopt::set_socket_recv_buffer_size_force(&fd, RECEIVE_BUFFER).is_err() {

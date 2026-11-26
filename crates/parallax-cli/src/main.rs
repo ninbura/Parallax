@@ -384,7 +384,6 @@ fn read_records(ctx: &Ctx, query: &Query) -> anyhow::Result<Vec<(i64, Record)>> 
         query: query.clone(),
     })? {
         Some(Reply::Logs { records }) => Ok(records),
-        Some(Reply::Error { message }) => bail!("{message}"),
         Some(other) => Err(unexpected(other)),
         None => {
             let (config, _, _) = ctx.load_full()?;

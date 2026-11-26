@@ -270,9 +270,14 @@ impl Writer {
         loop {
             match self.write_once(records).await {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < RETRIES && conflict(&e) => attempt += 1,
+                // Busy already waited out its timeout: don't wait again.
                 Err(Error::Db(turso::Error::Busy(_))) => {
                     return Err(Error::Locked(self.path.clone()))
+                }
+                Err(e) if attempt < RETRIES && conflict(&e) => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)))
+                        .await;
                 }
                 Err(e) => return Err(e),
             }
@@ -282,15 +287,16 @@ impl Writer {
     async fn write_once(&self, records: &[Record]) -> Result<()> {
         self.conn.execute("BEGIN CONCURRENT", ()).await?;
         let result = async {
+            let mut insert = self
+                .conn
+                .prepare(
+                    "INSERT INTO records (time, kind, peer, grants, source, destination,
+                        real_destination, network, protocol, port, flow, bytes_out, bytes_in)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                )
+                .await?;
             for r in records {
-                self.conn
-                    .execute(
-                        "INSERT INTO records (time, kind, peer, grants, source, destination,
-                            real_destination, network, protocol, port, flow, bytes_out, bytes_in)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                        row_values(r),
-                    )
-                    .await?;
+                insert.execute(row_values(r)).await?;
             }
             Ok::<(), Error>(())
         }
@@ -313,13 +319,7 @@ impl Writer {
 
 /// Another concurrent transaction won: try again.
 fn conflict(e: &Error) -> bool {
-    match e {
-        Error::Db(e) => {
-            let text = e.to_string().to_ascii_lowercase();
-            text.contains("conflict") || matches!(e, turso::Error::Busy(_))
-        }
-        _ => false,
-    }
+    matches!(e, Error::Db(e) if e.to_string().to_ascii_lowercase().contains("conflict"))
 }
 
 fn row_values(r: &Record) -> Vec<Value> {
