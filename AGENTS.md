@@ -14,7 +14,8 @@ sudo ./tests/integration/netns.sh   # after changes to generate/ or apply
 ```
 
 The netns test needs Linux, root, and `nft`, `wg`, `ip`, `dnsmasq`, `dig`,
-`curl`, `openssl`, `ping` and `python3`. CI runs all of these. The toolchain is pinned in
+`curl`, `openssl`, `ping` and `python3`. Each run makes its own namespaces, so
+two can run on one machine at once. CI runs all of these. The toolchain is pinned in
 `rust-toolchain.toml`.
 
 Golden files: after an intended generator change, run

@@ -2,8 +2,10 @@
 # Parallax integration test on Linux network namespaces. Needs root, and:
 # nft, wg, ip, dnsmasq, dig, curl, openssl, ping, python3, and the parallax
 # binary (PARALLAX=...). KEEP_LOG=<file> keeps a copy of the daemon's log.
+# NETNS_PREFIX=<prefix> names the namespaces (default: one per run, so several
+# runs can share a machine). Interfaces live inside them and keep their names.
 #
-# Topology (every namespace is fresh):
+# Topology (every namespace is fresh; names below are without the prefix):
 #   home    192.168.1.5   "nginx" (TLS, picks the site by Host: immich and a sibling
 #           other.mydomain.com) + home DNS + plain HTTP on 8080 + an echo on 7000
 #   gw      eth0 192.168.1.1 (home LAN), wan0 203.0.113.1 (clients), up0 (internet),
@@ -49,7 +51,9 @@ PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
 for t in nft wg ip dnsmasq dig curl openssl ping python3; do command -v $t >/dev/null || { echo "missing $t"; exit 2; }; done
 
-NAMESPACES="home gw client foreign net ctr"
+PREFIX="${NETNS_PREFIX-pxit$$-}"
+NAMESPACES=""
+for ns in home gw client foreign net ctr; do NAMESPACES+=" $PREFIX$ns"; done
 # Cleanup kills everything in these namespaces, so never adopt ones that already exist.
 for ns in $NAMESPACES; do
     ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
@@ -79,15 +83,16 @@ fail() {
     [ -s "$WORK/daemon.log" ] && { echo "--- daemon log"; tail -30 "$WORK/daemon.log"; }
     exit 1
 }
-inns() { ip netns exec "$@"; }
+inns() { local ns=$PREFIX$1; shift; ip netns exec "$ns" "$@"; } # role (gw, home, ...), command
 
 # ---------------------------------------------------------------- topology
-for ns in $NAMESPACES; do ip netns add $ns; inns $ns ip link set lo up; done
-ip link add eth0 netns gw type veth peer name lan0 netns home
-ip link add wan0 netns gw type veth peer name wan0 netns client
-ip link add lan0 netns client type veth peer name lan0 netns foreign
-ip link add up0 netns gw type veth peer name up0 netns net
-ip link add vethctr netns gw type veth peer name eth0 netns ctr
+for ns in $NAMESPACES; do ip netns add $ns; ip netns exec $ns ip link set lo up; done
+veth() { ip link add "$1" netns "$PREFIX$2" type veth peer name "$3" netns "$PREFIX$4"; } # name, ns, peer, ns
+veth eth0 gw lan0 home
+veth wan0 gw wan0 client
+veth lan0 client lan0 foreign
+veth up0 gw up0 net
+veth vethctr gw eth0 ctr
 inns gw ip addr add 192.168.1.1/24 dev eth0;   inns gw ip link set eth0 up
 inns gw ip addr add 203.0.113.1/24 dev wan0;   inns gw ip link set wan0 up
 inns gw ip addr add 198.51.100.1/24 dev up0;   inns gw ip link set up0 up
