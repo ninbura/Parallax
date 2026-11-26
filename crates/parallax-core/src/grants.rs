@@ -17,8 +17,22 @@ pub struct Added {
     pub already: Vec<String>,
 }
 
+impl Added {
+    /// Record one item, once however often it was named.
+    fn note(&mut self, item: String, added: bool) {
+        if self.added.contains(&item) || self.already.contains(&item) {
+            return;
+        }
+        if added {
+            self.added.push(item);
+        } else {
+            self.already.push(item);
+        }
+    }
+}
+
 /// A new grant, after every existing one.
-pub fn create(config: &mut Config, name: &str, everyone: bool, rules: Vec<Rule>) -> Result<()> {
+pub fn create(config: &mut Config, name: &str, everyone: bool, rules: &[Rule]) -> Result<()> {
     if config.grant(name).is_some() {
         return Err(Error::Refused(format!("grant '{name}' already exists")));
     }
@@ -28,8 +42,8 @@ pub fn create(config: &mut Config, name: &str, everyone: bool, rules: Vec<Rule>)
         rules: Vec::new(),
     };
     for rule in rules {
-        if !grant.rules.contains(&rule) {
-            grant.rules.push(rule);
+        if !grant.rules.contains(rule) {
+            grant.rules.push(rule.clone());
         }
     }
     config.grants.push(grant);
@@ -50,6 +64,7 @@ pub fn remove(config: &mut Config, name: &str) -> Result<Vec<String>> {
 /// Rename a grant, and every peer's reference to it. Returns the peers
 /// whose list changed.
 pub fn rename(config: &mut Config, from: &str, to: &str) -> Result<Vec<String>> {
+    known_grant(config, from)?;
     if config.grant(to).is_some() {
         return Err(Error::Refused(format!(
             "can't rename grant '{from}' to '{to}': grant '{to}' already exists"
@@ -73,12 +88,11 @@ pub fn add_rules(config: &mut Config, grant: &str, rules: &[Rule]) -> Result<Add
     let grant = grant_mut(config, grant)?;
     let mut out = Added::default();
     for rule in rules {
-        if grant.rules.contains(rule) {
-            out.already.push(rule.to_string());
-        } else {
+        let new = !grant.rules.contains(rule);
+        if new {
             grant.rules.push(rule.clone());
-            out.added.push(rule.to_string());
         }
+        out.note(rule.to_string(), new);
     }
     Ok(out)
 }
@@ -126,25 +140,28 @@ pub fn attach(config: &mut Config, grant: &str, peers: &[String]) -> Result<Adde
     let mut out = Added::default();
     for name in peers {
         let peer = peer_mut(config, name)?;
-        if peer.grants.iter().any(|g| g == grant) {
-            out.already.push(name.clone());
-        } else {
+        let new = !peer.grants.iter().any(|g| g == grant);
+        if new {
             peer.grants.push(grant.to_string());
-            out.added.push(name.clone());
         }
+        out.note(name.clone(), new);
     }
     Ok(out)
 }
 
-/// Detach a grant from peers. Each must have it attached.
+/// Detach a grant from peers. Each must have it attached; if one doesn't,
+/// none changes. A grant for everyone stays in effect for them anyway.
 pub fn detach(config: &mut Config, grant: &str, peers: &[String]) -> Result<()> {
     let everyone = known_grant(config, grant)?.everyone;
     known_peers(config, peers)?;
-    for name in peers {
-        let peer = peer_mut(config, name)?;
-        if !peer.grants.iter().any(|g| g == grant) {
-            return Err(not_attached(peer, grant, everyone));
-        }
+    if let Some(peer) = config
+        .peers
+        .iter()
+        .find(|p| peers.contains(&p.name) && !p.grants.iter().any(|g| g == grant))
+    {
+        return Err(not_attached(peer, grant, everyone));
+    }
+    for peer in config.peers.iter_mut().filter(|p| peers.contains(&p.name)) {
         peer.grants.retain(|g| g != grant);
     }
     Ok(())
@@ -165,26 +182,51 @@ pub fn set_peer(config: &mut Config, peer: &str, grants: &[String]) -> Result<()
     Ok(())
 }
 
-/// Attach grants to one peer.
+/// Attach grants to one peer. An unknown grant among them changes nothing.
 pub fn peer_add(config: &mut Config, peer: &str, grants: &[String]) -> Result<Added> {
+    for g in grants {
+        known_grant(config, g)?;
+    }
+    let p = peer_mut(config, peer)?;
     let mut out = Added::default();
     for g in grants {
-        let one = attach(config, g, std::slice::from_ref(&peer.to_string()))?;
-        if one.added.is_empty() {
-            out.already.push(g.clone());
-        } else {
-            out.added.push(g.clone());
+        let new = !p.grants.contains(g);
+        if new {
+            p.grants.push(g.clone());
         }
+        out.note(g.clone(), new);
     }
     Ok(out)
 }
 
-/// Detach grants from one peer. It must have each attached.
+/// Detach grants from one peer. It must have each attached; if it lacks
+/// one, none is detached.
 pub fn peer_remove(config: &mut Config, peer: &str, grants: &[String]) -> Result<()> {
     for g in grants {
-        detach(config, g, std::slice::from_ref(&peer.to_string()))?;
+        let everyone = known_grant(config, g)?.everyone;
+        let p = config.peer(peer).ok_or_else(|| Error::NotFound {
+            kind: "peer",
+            name: peer.to_string(),
+        })?;
+        if !p.grants.contains(g) {
+            return Err(not_attached(p, g, everyone));
+        }
     }
+    peer_mut(config, peer)?
+        .grants
+        .retain(|g| !grants.contains(g));
     Ok(())
+}
+
+/// The peers a grant is attached to, in configuration order. For a grant
+/// for everyone, those keep it when it's switched off.
+pub fn attached<'a>(config: &'a Config, grant: &str) -> Result<Vec<&'a Peer>> {
+    known_grant(config, grant)?;
+    Ok(config
+        .peers
+        .iter()
+        .filter(|p| p.grants.iter().any(|g| g == grant))
+        .collect())
 }
 
 /// Who has a grant: every peer when it applies to everyone, otherwise the
@@ -287,12 +329,12 @@ mod tests {
             &mut cfg,
             "photos",
             false,
-            vec![rule("service:immich"), rule("service:immich")],
+            &[rule("service:immich"), rule("service:immich")],
         )
         .unwrap();
         assert_eq!(cfg.grant("photos").unwrap().rules, [rule("service:immich")]);
         assert_eq!(cfg.grants.last().unwrap().name, "photos");
-        let e = create(&mut cfg, "family", false, Vec::new()).unwrap_err();
+        let e = create(&mut cfg, "family", false, &[]).unwrap_err();
         assert_eq!(e.to_string(), "grant 'family' already exists");
     }
 
@@ -323,7 +365,7 @@ mod tests {
             e.to_string(),
             "can't rename grant 'own' to 'family': grant 'family' already exists"
         );
-        let e = rename(&mut cfg, "ghost", "spirit").unwrap_err();
+        let e = rename(&mut cfg, "ghost", "own").unwrap_err();
         assert_eq!(e.to_string(), "grant 'ghost' not found");
     }
 
@@ -359,7 +401,12 @@ mod tests {
     #[test]
     fn attach_and_detach_from_the_grant_side() {
         let mut cfg = canonical_config();
-        let added = attach(&mut cfg, "family", &strings(&["laptop", "sister-phone"])).unwrap();
+        let added = attach(
+            &mut cfg,
+            "family",
+            &strings(&["laptop", "sister-phone", "laptop"]),
+        )
+        .unwrap();
         assert_eq!(added.added, ["laptop"]);
         assert_eq!(added.already, ["sister-phone"]);
         assert_eq!(grants_of(&cfg, "laptop"), ["personal", "family"]);
@@ -368,6 +415,12 @@ mod tests {
         let before = cfg.clone();
         let e = attach(&mut cfg, "personal", &strings(&["sister-phone", "mom"])).unwrap_err();
         assert_eq!(e.to_string(), "peer 'mom' not found");
+        assert_eq!(cfg, before);
+
+        // One peer without it among several detaches it from none.
+        let before = cfg.clone();
+        let e = detach(&mut cfg, "family", &strings(&["laptop", "router"])).unwrap_err();
+        assert!(e.to_string().contains("peer 'router' doesn't have"), "{e}");
         assert_eq!(cfg, before);
 
         detach(&mut cfg, "family", &strings(&["laptop", "sister-phone"])).unwrap();
@@ -383,7 +436,7 @@ mod tests {
     #[test]
     fn grants_for_everyone_have_every_peer_and_cannot_be_detached() {
         let mut cfg = canonical_config();
-        create(&mut cfg, "public", false, vec![Rule::PublicDns]).unwrap();
+        create(&mut cfg, "public", false, &[Rule::PublicDns]).unwrap();
         assert!(holders(&cfg, "public").unwrap().is_empty());
         assert!(set_everyone(&mut cfg, "public", true).unwrap());
         assert!(!set_everyone(&mut cfg, "public", true).unwrap());
@@ -405,6 +458,14 @@ mod tests {
         let added = peer_add(&mut cfg, "laptop", &strings(&["family", "personal"])).unwrap();
         assert_eq!(added.added, ["family"]);
         assert_eq!(added.already, ["personal"]);
+        let before = cfg.clone();
+        let e = peer_add(&mut cfg, "laptop", &strings(&["family", "ghost"])).unwrap_err();
+        assert_eq!(e.to_string(), "grant 'ghost' not found");
+        let e = peer_remove(&mut cfg, "laptop", &strings(&["family", "ghost"])).unwrap_err();
+        assert_eq!(e.to_string(), "grant 'ghost' not found");
+        let e = peer_remove(&mut cfg, "router", &strings(&["personal", "family"])).unwrap_err();
+        assert!(e.to_string().contains("doesn't have grant 'family'"), "{e}");
+        assert_eq!(cfg, before);
         peer_remove(&mut cfg, "laptop", &strings(&["personal"])).unwrap();
         assert_eq!(grants_of(&cfg, "laptop"), ["family"]);
         set_peer(

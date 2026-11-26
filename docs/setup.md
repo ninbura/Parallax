@@ -210,7 +210,9 @@ rules = [{ kind = "public_dns" }]
 ```
 
 A peer's address never encodes its access, so changing its grants needs no
-new client config.
+new client config, with one exception: a peer with `allowed_ips =
+grants_only` routes only what its grants reach, so after giving it a new
+destination, export its config again (`parallax export <peer>`).
 
 Manage them from the command line, from either side (in the container,
 prefix each with `sudo docker compose exec parallax`):
@@ -226,7 +228,9 @@ parallax grant show                          # every grant, its rules, who has i
 
 Rules are written `all_networks`, `internet`, `public_dns`, `network:<name>`,
 `service:<name>` or `host:<address or name>[:<ports>]`, ports as ufw writes
-them. Each change applies when the command returns. Adding what's already
+them. With the daemon running, the firewall and WireGuard are updated by
+the time the command returns, and the DNS server and HTTPS proxy reload
+right after; without it, run `parallax apply`. Adding what's already
 there does nothing and says so; removing a rule or detaching a grant that
 isn't there is refused, since a typo would otherwise leave the access in
 place. `grant remove` asks for `--force` while anyone has the grant. Renaming

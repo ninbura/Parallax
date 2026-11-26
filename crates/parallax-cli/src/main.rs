@@ -194,7 +194,8 @@ enum PeerCommand {
     Remove { name: String },
     /// Show peers, their addresses and what they can reach.
     Show { name: Option<String> },
-    /// Change which grants a peer has. Its address and client config stay.
+    /// Change which grants a peer has. Its address stays, and so does its
+    /// client config unless it uses allowed_ips = grants_only.
     Grants {
         peer: String,
         #[command(subcommand)]
@@ -1181,7 +1182,10 @@ fn grant_change<T>(
 ) -> anyhow::Result<()> {
     let ((out, warnings), saved) = ctx.update(|config| new_warnings(config, &mut change))?;
     done(&out);
-    print_warnings(&warnings);
+    // Through the daemon, its apply log already carries every warning.
+    if matches!(saved, Saved::Direct) {
+        print_warnings(&warnings);
+    }
     report(saved, "run `parallax apply` to put it into effect")
 }
 
@@ -1219,7 +1223,7 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
             everyone,
         } => grant_change(
             ctx,
-            |c| Ok(grants::create(c, &name, everyone, rules.clone())?),
+            |c| Ok(grants::create(c, &name, everyone, &rules)?),
             |()| {
                 println!(
                     "created grant '{name}'{}",
@@ -1246,6 +1250,9 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
             },
             |had| {
                 println!("removed grant '{name}'");
+                eprintln!(
+                    "note: snippets/parallax-{name}.conf stays on disk with its last allow lines; remove any nginx include of it, delete it, and reload nginx"
+                );
                 if !had.is_empty() {
                     println!("taken from {}", quoted(had));
                 }
@@ -1257,7 +1264,7 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
             |peers| {
                 println!("renamed grant '{from}' to '{to}' (peers {})", quoted(peers));
                 eprintln!(
-                    "note: its nginx snippet is now snippets/parallax-{to}.conf; update any include of parallax-{from}.conf"
+                    "note: its nginx snippet is now snippets/parallax-{to}.conf; parallax-{from}.conf stays on disk with its last allow lines, so point any include at the new one, delete the old, and reload nginx"
                 );
             },
         ),
@@ -1269,17 +1276,29 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow!("grant '{n}' not found"))?],
                 None => config.grants.iter().collect(),
             };
-            for g in shown {
-                let holders: Vec<&str> = grants::holders(&config, &g.name)?
+            let list = |peers: Vec<&Peer>| match peers.is_empty() {
+                true => "-".to_string(),
+                false => peers
                     .iter()
                     .map(|p| p.name.as_str())
-                    .collect();
-                let peers = match (g.everyone, holders.is_empty()) {
-                    (_, true) if !g.everyone => "-".to_string(),
-                    (true, _) => format!("everyone ({})", holders.join(",")),
-                    _ => holders.join(","),
-                };
-                println!("{}  everyone={}  peers={peers}", g.name, g.everyone);
+                    .collect::<Vec<_>>()
+                    .join(","),
+            };
+            for g in shown {
+                let attached = list(grants::attached(&config, &g.name)?);
+                if g.everyone {
+                    // Attachments still matter: they keep it when it's switched off.
+                    let peers = match list(grants::holders(&config, &g.name)?).as_str() {
+                        "-" => "everyone".to_string(),
+                        all => format!("everyone ({all})"),
+                    };
+                    println!(
+                        "{}  everyone=true  peers={peers}  attached={attached}",
+                        g.name
+                    );
+                } else {
+                    println!("{}  everyone=false  peers={attached}", g.name);
+                }
                 if g.rules.is_empty() {
                     println!("    no rules: it gives nothing");
                 }
@@ -1324,10 +1343,18 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
         ),
         GrantCommand::Detach { grant, from } => grant_change(
             ctx,
-            |c| Ok(grants::detach(c, &grant, &from)?),
-            |()| {
+            |c| {
+                grants::detach(c, &grant, &from)?;
+                Ok(c.grant(&grant).is_some_and(|g| g.everyone))
+            },
+            |everyone| {
                 for peer in &from {
                     println!("detached '{grant}' from '{peer}'");
+                }
+                if *everyone {
+                    eprintln!(
+                        "note: '{grant}' applies to everyone, so they still have it until that's switched off"
+                    );
                 }
             },
         ),
@@ -1335,8 +1362,15 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
             let on = matches!(switch, Switch::On);
             grant_change(
                 ctx,
-                |c| Ok(grants::set_everyone(c, &grant, on)?),
-                |changed| {
+                |c| {
+                    let changed = grants::set_everyone(c, &grant, on)?;
+                    let kept: Vec<String> = grants::attached(c, &grant)?
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    Ok((changed, kept))
+                },
+                |(changed, kept)| {
                     let state = if on {
                         "applies to everyone"
                     } else {
@@ -1346,6 +1380,9 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
                         println!("grant '{grant}' now {state}");
                     } else {
                         println!("grant '{grant}' already {state}");
+                    }
+                    if !on {
+                        println!("attached to {}", quoted(kept));
                     }
                 },
             )

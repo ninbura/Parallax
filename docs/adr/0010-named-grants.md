@@ -31,7 +31,8 @@ Access is a set of **named grants**, attached to principals.
 - **Template settings move where they belong.** DNS mode, `allowed_ips`,
   MTU, keepalive and `visible_networks` are per peer (`[peer.wireguard]`),
   with `server.wireguard.peer_defaults` for new ones; changing grants never
-  changes a peer's config. `dns.public` is the `public_dns` rule.
+  changes a peer's config, except the routes of an `allowed_ips =
+  grants_only` peer, which follow what its grants reach. `dns.public` is the `public_dns` rule.
   `dns.tailscale` is `server.headscale.dns` (Headscale's split DNS is
   tailnet-wide). Pools and the Headscale identity are gone.
 
