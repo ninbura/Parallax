@@ -317,17 +317,7 @@ pub fn apply(
     drop_moved_peers(model, sys, &mut log)?;
     apply_firewall(model, bundle, out_dir, sys, &mut log)?;
     for transport in crate::transport::all() {
-        let owned: Vec<_> = bundle
-            .artifacts
-            .iter()
-            .map(|a| crate::generate::Artifact {
-                kind: a.kind,
-                path: out_dir.join(&a.path),
-                contents: String::new(),
-                secret: a.secret,
-            })
-            .collect();
-        log.extend(transport.apply(model, &owned, sys)?);
+        log.extend(transport.apply(model, &bundle.artifacts, sys)?);
     }
     Ok(ApplyReport { log })
 }

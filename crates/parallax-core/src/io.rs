@@ -390,8 +390,14 @@ pub mod real {
                 .map_err(|e| Error::io(format!("spawning {program}"), e))?;
             if let Some(input) = stdin {
                 if let Some(mut pipe) = child.stdin.take() {
-                    pipe.write_all(input.as_bytes())
-                        .map_err(|e| Error::io(format!("feeding stdin to {program}"), e))?;
+                    match pipe.write_all(input.as_bytes()) {
+                        // It stopped reading (usually exited on an error):
+                        // its own output says why, so carry on to collect it.
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                        Err(e) => return Err(Error::io(format!("feeding stdin to {program}"), e)),
+                        Ok(()) => {}
+                    }
+                    // Dropped here: the child sees end of input.
                 }
             }
             let out = child
@@ -402,6 +408,31 @@ pub mod real {
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // More than a pipe buffer (64 KiB on Linux): a large gateway's WireGuard config.
+        const BIG: usize = 1 << 20;
+
+        #[test]
+        fn feeds_input_larger_than_a_pipe_buffer() {
+            let input = "x".repeat(BIG);
+            let out = RealRunner.run("wc", &["-c"], Some(&input)).unwrap();
+            assert!(out.ok(), "{out:?}");
+            assert_eq!(out.stdout.trim(), BIG.to_string());
+        }
+
+        #[test]
+        fn a_child_that_stops_reading_still_reports_its_own_result() {
+            let input = "x".repeat(BIG);
+            let out = RealRunner
+                .run("sh", &["-c", "echo refused >&2; exit 3"], Some(&input))
+                .unwrap();
+            assert_eq!((out.status, out.stderr.trim()), (3, "refused"));
         }
     }
 }

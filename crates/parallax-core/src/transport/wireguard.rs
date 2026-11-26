@@ -144,9 +144,13 @@ impl Transport for WireGuardTransport {
         let cidr = format!("{}/{}", gateway(wg.supernet), wg.supernet.prefix_len());
         sys.runner
             .run_checked("ip", &["address", "replace", &cidr, "dev", iface], None)?;
-        let conf_path = conf.path.to_string_lossy().into_owned();
-        sys.runner
-            .run_checked("wg", &["syncconf", iface, &conf_path], None)?;
+        // Piped, not a path: Ubuntu's AppArmor profile for `wg` lets it open
+        // files only under /etc/wireguard. wg-quick feeds `wg` the same way.
+        sys.runner.run_checked(
+            "wg",
+            &["syncconf", iface, "/dev/stdin"],
+            Some(&conf.contents),
+        )?;
         sys.runner
             .run_checked("ip", &["link", "set", "up", "dev", iface], None)?;
         log.push(format!(
