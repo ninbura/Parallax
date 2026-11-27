@@ -268,6 +268,23 @@ pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolve
     out
 }
 
+/// The names a save of `new` over `old` looks up whatever is known of them:
+/// new to the configuration, or asked through other resolvers than in `old`
+/// (its `upstream_dns` changed, or its zone moved to another network).
+pub fn asked_on_save<'a>(old: Option<&Config>, new: &'a Config) -> BTreeSet<&'a str> {
+    fn resolvers<'c>(config: &'c Config, name: &str) -> Option<&'c [Ipv4Addr]> {
+        network_of(config, name).map(|n| n.upstream_dns.as_slice())
+    }
+    let Some(old) = old else {
+        return used(new);
+    };
+    let had = used(old);
+    used(new)
+        .into_iter()
+        .filter(|name| !had.contains(name) || resolvers(old, name) != resolvers(new, name))
+        .collect()
+}
+
 /// Before saving `new` over `old`: look up the names `new` adds, and refuse
 /// the change if a new name doesn't resolve or the change adds a problem.
 /// `old_public_ip` and `public_ip` are the home's public IP in effect under
@@ -284,27 +301,18 @@ pub fn check_save(
     let mut failed = Vec::new();
     // Names `old` already had, through the same resolvers, keep what they
     // have; one never found is an old problem, and the regular lookups keep
-    // trying it. Every other name is asked now and must resolve, even if an
-    // answer for it is lying around (from a configuration a restore
-    // replaced, or from the resolvers this change replaces).
-    // A known answer `new` no longer allows (its network was renumbered in
-    // this change) is asked again too.
-    fn resolvers<'a>(config: &'a Config, name: &str) -> Option<&'a [Ipv4Addr]> {
-        network_of(config, name).map(|n| n.upstream_dns.as_slice())
-    }
-    let kept: BTreeSet<&str> = match old {
-        Some(old) => used(old)
-            .into_iter()
-            .filter(|name| resolvers(old, name) == resolvers(new, name))
-            .collect(),
-        None => BTreeSet::new(),
-    };
+    // trying it. The others ([`asked_on_save`]) are asked now and must
+    // resolve, even if an answer for one is lying around (from a
+    // configuration a restore replaced, or from the resolvers this change
+    // replaces). A known answer `new` no longer allows (its network was
+    // renumbered in this change) is asked again too.
+    let fresh = asked_on_save(old, new);
     for name in used(new) {
         let still_fine = match known.get(name) {
             Some(addresses) => refused(new, public_ip, name, addresses).is_none(),
             None => true,
         };
-        if kept.contains(name) && still_fine {
+        if !fresh.contains(name) && still_fine {
             continue;
         }
         match lookup(new, public_ip, resolver, name) {
@@ -313,7 +321,7 @@ pub fn check_save(
             }
             // A name kept from `old`: whether this change made it worse is for
             // the comparison of problems below, not the lookup.
-            Err(_) if kept.contains(name) => {}
+            Err(_) if !fresh.contains(name) => {}
             Err(why) => failed.push(why),
         }
     }
@@ -689,6 +697,8 @@ mod tests {
         let mut new = old.clone();
         let other = Ipv4Addr::new(192, 168, 1, 53);
         new.networks[0].upstream_dns = vec![other];
+        assert_eq!(asked_on_save(Some(&old), &new), BTreeSet::from([NAS]));
+        assert!(asked_on_save(Some(&old), &old).is_empty());
         let moved = Ipv4Addr::new(192, 168, 1, 10);
         let r = FakeResolver::new().answer(NAS, Nameserver::Plain(other), &[moved]);
         let resolved = check_save(Some(&old), None, &new, None, &r, &known).unwrap();

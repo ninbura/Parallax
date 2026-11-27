@@ -1289,20 +1289,20 @@ impl Engine {
             message: format!("{e:#}"),
         };
         crate::check(&config).map_err(refuse)?;
+        let old_ip = public_ip::effective(&self.view.config.server, self.view.public_ip);
         // A name may point at the home's public IP. Nothing looked for it
-        // while nothing needed it, so look before telling where a new name
+        // while nothing needed it, so look before telling where a name
         // points (a few seconds at most, and only then).
-        let had = names::used(&self.view.config);
-        if names::used(&config).iter().any(|n| !had.contains(n))
-            && public_ip::effective(&config.server, self.view.public_ip).is_none()
+        let asked = names::asked_on_save(Some(&self.view.config), &config);
+        if !asked.is_empty() && public_ip::effective(&config.server, self.view.public_ip).is_none()
         {
             self.note_public_ip(crate::find_public_ip(&config.server));
         }
-        // Blocks this thread for a new name's lookup only (a few seconds at
-        // most): known names aren't asked again.
+        // Blocks this thread for those names' lookups only (a few seconds
+        // at most): known names aren't asked again.
         let resolved = names::check_save(
             Some(&self.view.config),
-            public_ip::effective(&self.view.config.server, self.view.public_ip),
+            old_ip,
             &config,
             public_ip::effective(&config.server, self.view.public_ip),
             &crate::lookup(&config.server),
