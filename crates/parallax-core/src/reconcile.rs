@@ -133,25 +133,75 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
     LiveState(listing)
 }
 
+/// Which of the parts [`teardown`] removes are on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parts {
+    /// The nftables table (the nftables backend only).
+    pub table: bool,
+    /// The WireGuard interface.
+    pub interface: bool,
+}
+
+/// Which of the parts `apply` sets up for `server` are on the host now.
+/// One that can't be checked counts as there.
+pub fn parts_present(server: &ServerConfig, sys: System<'_>) -> Parts {
+    let there = |program: &str, args: &[&str]| {
+        sys.runner
+            .run(program, args, None)
+            .map_or(true, |out| out.ok())
+    };
+    let table = crate::generate::firewall::TABLE;
+    Parts {
+        table: server.firewall.backend == FirewallBackend::Nftables
+            && there("nft", &["-t", "list", "table", "inet", table]),
+        interface: there(
+            "ip",
+            &["link", "show", "dev", server.wireguard.interface.as_str()],
+        ),
+    }
+}
+
 /// Take down what `apply` set up for `server`: the nftables table and the
 /// WireGuard interface, as the container's shutdown always did. Returns a
 /// log line per step; a step that fails is logged and the next one still runs.
 pub fn teardown(server: &ServerConfig, sys: System<'_>) -> Vec<String> {
+    let all = Parts {
+        table: true,
+        interface: true,
+    };
+    remove(server, all, sys)
+}
+
+/// After a failed apply: take down what it added, the parts on the host
+/// now that weren't in `before` (taken just before it). What was there
+/// already stays, whoever set it up. Log lines as for [`teardown`].
+pub fn teardown_added(server: &ServerConfig, before: Parts, sys: System<'_>) -> Vec<String> {
+    let now = parts_present(server, sys);
+    let added = Parts {
+        table: now.table && !before.table,
+        interface: now.interface && !before.interface,
+    };
+    remove(server, added, sys)
+}
+
+fn remove(server: &ServerConfig, parts: Parts, sys: System<'_>) -> Vec<String> {
     let iface = server.wireguard.interface.as_str();
     let table = crate::generate::firewall::TABLE;
     let mut steps: Vec<(String, &str, Vec<&str>)> = Vec::new();
-    if server.firewall.backend == FirewallBackend::Nftables {
+    if parts.table && server.firewall.backend == FirewallBackend::Nftables {
         steps.push((
             format!("table inet {table}"),
             "nft",
             vec!["delete", "table", "inet", table],
         ));
     }
-    steps.push((
-        format!("interface {iface}"),
-        "ip",
-        vec!["link", "del", "dev", iface],
-    ));
+    if parts.interface {
+        steps.push((
+            format!("interface {iface}"),
+            "ip",
+            vec!["link", "del", "dev", iface],
+        ));
+    }
     steps
         .into_iter()
         .map(
@@ -337,5 +387,104 @@ mod tests {
             "{log:?}"
         );
         assert_eq!(log[1], "removed interface wg0");
+    }
+
+    fn missing() -> Output {
+        Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: "does not exist".into(),
+        }
+    }
+
+    /// The table and the interface as `parts_present` asks for them.
+    fn respond_present(runner: &RecordingRunner, table: bool, interface: bool) {
+        let found = |there| {
+            if there {
+                Output {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }
+            } else {
+                missing()
+            }
+        };
+        runner.respond_to(
+            "nft",
+            &["-t", "list", "table", "inet", "parallax"],
+            found(table),
+        );
+        runner.respond_to("ip", &["link", "show", "dev", "wg0"], found(interface));
+    }
+
+    fn removals(runner: &RecordingRunner) -> Vec<String> {
+        runner
+            .command_lines()
+            .into_iter()
+            .filter(|l| l.contains(" del"))
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_apply_takes_down_what_it_added() {
+        let config = canonical_config();
+        let fs = MemoryFs::new();
+        let runner = RecordingRunner::new();
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        respond_present(&runner, false, false);
+        let before = parts_present(&config.server, sys);
+        assert_eq!(
+            before,
+            Parts {
+                table: false,
+                interface: false
+            }
+        );
+        // The apply got as far as both before it failed.
+        respond_present(&runner, true, true);
+        let log = teardown_added(&config.server, before, sys);
+        assert_eq!(
+            removals(&runner),
+            ["nft delete table inet parallax", "ip link del dev wg0"]
+        );
+        assert_eq!(
+            log,
+            ["removed table inet parallax", "removed interface wg0"]
+        );
+    }
+
+    #[test]
+    fn a_failed_apply_leaves_what_was_there_before_it() {
+        let config = canonical_config();
+        let fs = MemoryFs::new();
+        let runner = RecordingRunner::new();
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        // An interface from before (a crashed daemon's, or someone else's);
+        // the apply added only the table.
+        respond_present(&runner, false, true);
+        let before = parts_present(&config.server, sys);
+        respond_present(&runner, true, true);
+        let log = teardown_added(&config.server, before, sys);
+        assert_eq!(removals(&runner), ["nft delete table inet parallax"]);
+        assert_eq!(log, ["removed table inet parallax"]);
+
+        // It failed before changing anything: nothing to take down.
+        let runner = RecordingRunner::new();
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        respond_present(&runner, false, false);
+        let before = parts_present(&config.server, sys);
+        respond_present(&runner, false, false);
+        assert!(teardown_added(&config.server, before, sys).is_empty());
+        assert!(removals(&runner).is_empty());
     }
 }
