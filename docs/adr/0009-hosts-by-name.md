@@ -69,10 +69,13 @@ home's DNS stays the only place a machine's address is written down.
   never stop the operator removing a peer, and a grant's problem never
   stops changing a peer's other grants. Problems are compared by what
   they're about, not their message: a name, or what a rule opens on the
-  home's public IP (host, ports in any order, proxied or not). A rule that
-  gives nothing there is refused only if no grant opened the same before,
-  so renaming, a new public IP, or taking access away (a grant from a peer
-  that reached everything) is never refused for what it reveals. A name
+  home's public IP (host, ports as merged ranges, proxied or not). A rule
+  that gives nothing there is old if its grant (or the grant a rename
+  replaced) had it before, and it gave nothing then too or the change
+  didn't move the name's answer. So renaming, a new public IP, or taking
+  access away (a grant from a peer that reached everything) is never
+  refused for what it reveals, while adding the rule to a grant, or a
+  resolver change that moves a working rule's name onto the public IP, is. A name
   that doesn't resolve through new resolvers, with no answer known (just
   started, a restore), is refused when the old resolvers still answer for
   it. Without a daemon, the CLI saves without asking DNS; the daemon warns

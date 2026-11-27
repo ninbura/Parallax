@@ -28,8 +28,8 @@
 //!   Problems that were already there don't block unrelated changes, so a
 //!   resolver being down never stops removing a peer or a grant. They're
 //!   told apart by what they're about (a name, or what a rule opens), not
-//!   their message, and a rule is refused only if no grant opened the same
-//!   before.
+//!   their message, and a rule is refused only if its grant didn't have it
+//!   or the change moved its name's answer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
