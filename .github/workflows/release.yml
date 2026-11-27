@@ -3,8 +3,8 @@ name: release
 #   - the static binaries, the .deb and the Arch package from ci.yml's
 #     package job, with SHA256SUMS, on a GitHub Release;
 #   - ghcr.io/<owner>/parallax and parallax-headscale for amd64 and arm64,
-#     tagged X.Y.Z, and X.Y and latest unless X.Y.Z is a pre-release;
-#   - a build provenance attestation for every file and image.
+#     tagged X.Y.Z, plus X.Y and latest when it's the newest of those;
+#   - a build provenance attestation for each of them.
 # Nothing is published unless the whole of ci.yml passes first, and image
 # tags move only once both images are pushed and run.
 on:
@@ -14,21 +14,33 @@ on:
 permissions:
   contents: read
 
+# One release at a time, so latest and X.Y can't end up on different
+# versions for the two images.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}
-      prerelease: ${{ steps.check.outputs.prerelease }}
+      tags: ${{ steps.check.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # for the check that the tag is on main
+          fetch-depth: 0 # main and every tag, for the checks below
       - run: rustup install # the version in rust-toolchain.toml
       - id: check
         shell: bash
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "parallax-cli") | .version')
+          # Final releases only: a pre-release's version doesn't carry over
+          # into the Arch package (nfpm drops it) or a .deb's file name.
+          if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version $version in Cargo.toml isn't X.Y.Z; pre-releases aren't published"
+            exit 1
+          fi
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml ($version); expected v$version"
             exit 1
@@ -37,12 +49,20 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME points at $GITHUB_SHA, which isn't on main"
             exit 1
           fi
-          case $version in
-            *-*) prerelease=true ;;
-            *) prerelease=false ;;
-          esac
+          # Image tags: X.Y.Z always; X.Y and latest only if no newer release
+          # has them, so a late or re-run older release can't move them back.
+          releases=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          minor=${version%.*}
+          tags=$version
+          if [ "$(grep -E "^v${minor//./\\.}\.[0-9]+$" <<< "$releases" | tail -n 1)" = "v$version" ]; then
+            tags="$tags $minor"
+          fi
+          if [ "$(tail -n 1 <<< "$releases")" = "v$version" ]; then
+            tags="$tags latest"
+          fi
+          echo "image tags: $tags"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
   ci:
     needs: version
@@ -129,7 +149,7 @@ jobs:
       attestations: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+      TAGS: ${{ needs.version.outputs.tags }}
       REGISTRY: ${{ needs.images.outputs.registry }}
       PARALLAX_DIGEST: ${{ needs.images.outputs.parallax }}
       HEADSCALE_DIGEST: ${{ needs.images.outputs.headscale }}
@@ -157,15 +177,35 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - shell: bash
+      - name: refuse to replace a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          # X.Y.Z always; X.Y and latest only for a final release.
-          tags=("$VERSION")
-          if [ "$PRERELEASE" = false ]; then tags+=("${VERSION%.*}" latest); fi
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "::error::release $GITHUB_REF_NAME is already published"
+            exit 1
+          fi
+          # A re-run of this job alone finds its own digests here and goes on;
+          # a re-run that rebuilt the images would swap what X.Y.Z points at.
+          for image in parallax:$PARALLAX_DIGEST parallax-headscale:$HEADSCALE_DIGEST; do
+            name=$REGISTRY/${image%%:*}
+            if current=$(docker buildx imagetools inspect "$name:$VERSION" --format '{{json .Manifest}}' 2> /dev/null); then
+              current=$(jq -er .digest <<< "$current")
+              if [ "$current" != "${image#*:}" ]; then
+                echo "::error::$name:$VERSION already points at $current, not ${image#*:}"
+                exit 1
+              fi
+            fi
+          done
+      - name: tag the images
+        shell: bash
+        run: |
           for image in parallax:$PARALLAX_DIGEST parallax-headscale:$HEADSCALE_DIGEST; do
             name=$REGISTRY/${image%%:*}
             args=()
-            for tag in "${tags[@]}"; do args+=(-t "$name:$tag"); done
+            for tag in $TAGS; do args+=(-t "$name:$tag"); done
             docker buildx imagetools create "${args[@]}" "$name@${image#*:}"
           done
       - shell: bash
@@ -173,7 +213,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          flags=()
-          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
-            --title "Parallax $VERSION" "${flags[@]}" release/*
+            --title "Parallax $VERSION" release/*
