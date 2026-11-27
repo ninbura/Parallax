@@ -38,13 +38,19 @@ With the `iptables-nft` backend, Parallax's jumps share the built-in chains
 with Docker's, and order decides: an accept in a chain that comes first ends
 `FORWARD` before Parallax's tiers see the packet. Docker puts its
 `DOCKER-USER` jump back on top whenever it starts (issue #74). So
-`DOCKER-USER` starts with a jump to `PARALLAX_FORWARD` (the accepts follow
-it), and apply makes each `PARALLAX_*` jump the first rule of its built-in
-chain (a hold aside), moving it back up when something got above it. Either
-`FORWARD` order, Parallax's or Docker's after a restart, has Parallax decide
-first, so the two don't keep reordering each other. Drift detection records
-whether each chain decides first, so a rule put above it is repaired at the
-next check.
+`DOCKER-USER` starts with a jump to `PARALLAX_FORWARD`, followed only by the
+accepts toward a tunnel (that chain gives every packet from a tunnel its
+verdict). Apply makes each `PARALLAX_*` jump the first rule of its built-in
+chain (a hold aside), moving it back up when something got above it; each
+such change, and the refill of `DOCKER-USER`, is one `iptables-restore`
+transaction, so no packet finds a jump missing. Either `FORWARD` order,
+Parallax's or Docker's after a restart, has Parallax decide first, so the
+two don't keep reordering each other. While a restore's holds are up they
+sit at the top of `DOCKER-USER` too. Drift detection treats any rule above
+Parallax's as drift, so it's repaired at the next check (a minute by
+default). Until then, what Docker's own chains accept (published container
+ports) comes first: that window, from Docker starting to the next check, is
+left open.
 
 ## Rejected
 

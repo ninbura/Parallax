@@ -143,7 +143,7 @@ fn apply_firewall(
             }
         }
         FirewallBackend::IptablesNft => {
-            use crate::generate::firewall::iptables::CHAINS;
+            use crate::generate::firewall::iptables::DOCKER_USER;
             let rs = crate::generate::firewall::build(model)?;
             // Fill a fresh set and swap it in: flushing the live one would
             // briefly leave `! --match-set not_public` matching everything.
@@ -186,110 +186,52 @@ fn apply_firewall(
                 &["--test", "--noflush", &main_str],
                 None,
             )?;
-            for rule in hold_rules(model.server()) {
-                // A failed apply may have left it: keep that one rather than
-                // lift it for a moment.
-                if !sys
-                    .runner
-                    .run("iptables", &hold_args("-C", &rule), None)?
-                    .ok()
-                {
-                    sys.runner
-                        .run_checked("iptables", &hold_args("-I", &rule), None)?;
-                }
-            }
-            sys.runner
-                .run_checked("iptables-restore", &["--noflush", &main_str], None)
-                .map_err(|e| match e {
-                    Error::Command {
-                        command,
-                        status,
-                        stderr,
-                    } => Error::Command {
-                        command,
-                        status,
-                        stderr: format!(
-                            "{}; tunnel peers can't open new connections until an apply succeeds (issue #56)",
-                            stderr.trim_end()
-                        ),
-                    },
-                    e => e,
-                })?;
-            let listing = sys
+            // The holds go in at the top of their chains, in one transaction.
+            // Any a failed apply left come out and go back in with the rest,
+            // so none is lifted for a moment, and none stays below a rule
+            // that got above it since (a jump of Parallax's, or Docker's:
+            // issue #74). Docker's chain, when Parallax shares it, gets them
+            // too: Docker puts its jump to it above the holds whenever it
+            // starts.
+            let before = sys
                 .runner
                 .run_checked("iptables", &["-t", "filter", "-S"], None)?;
-            // Docker's chain before the hooks, so a FORWARD that Docker's jump
-            // heads already counts as Parallax deciding first (issue #74);
-            // and before the hold comes off, so nothing new starts while
-            // Parallax's rules there are out.
-            if let Some(docker) = bundle.of_kind(ArtifactKind::FirewallDockerUser).next() {
-                let exists = sys
-                    .runner
-                    .run(
-                        "iptables",
-                        &["-t", "filter", "-L", "DOCKER-USER", "-n"],
-                        None,
-                    )?
-                    .ok();
-                if exists {
-                    // Remove previous parallax rules, then insert the generated ones.
-                    let listing =
-                        sys.runner
-                            .run("iptables", &["-t", "filter", "-S", "DOCKER-USER"], None)?;
-                    for rule in docker_user_rules(&listing.stdout) {
-                        let mut del = vec!["-t", "filter", "-D"];
-                        del.extend(rule.iter().map(String::as_str));
-                        sys.runner.run("iptables", &del, None)?;
-                    }
-                    for line in docker.contents.lines().filter(|l| l.starts_with("-I")) {
-                        let words = iptables_words(line);
-                        let args: Vec<&str> = words.iter().map(String::as_str).collect();
-                        sys.runner.run_checked("iptables", &args, None)?;
-                    }
-                    log.push("firewall: DOCKER-USER rules refreshed".into());
-                } else {
+            let docker = match bundle.of_kind(ArtifactKind::FirewallDockerUser).next() {
+                Some(d)
+                    if before
+                        .stdout
+                        .lines()
+                        .any(|l| l == format!("-N {DOCKER_USER}")) =>
+                {
+                    Some(d.contents.as_str())
+                }
+                Some(_) => {
                     log.push("firewall: DOCKER-USER chain not present, skipping Docker coexistence rules".into());
+                    None
+                }
+                None => None,
+            };
+            let mut holds = hold_rules(model.server());
+            if docker.is_some() {
+                holds.extend(docker_user_holds(&holds));
+            }
+            let mut lines: Vec<String> = hold_lines(&before.stdout)
+                .map(|rule| format!("-D {rule}"))
+                .collect();
+            for rule in &holds {
+                if let Some((chain, rest)) = rule.split_first() {
+                    lines.push(format!("-I {chain} 1 {}", rest.join(" ")));
                 }
             }
-            // Hooks next, then the hold comes off: until both tables are
-            // attached nothing new starts. `nat` first: a filter jump goes in
-            // above the hold, so once it's there both tables must be. A jump
-            // that's present but below someone else's rules (Docker's, after
-            // it restarts: issue #74) moves to the top. Every hold goes, also
-            // one for an interface since renamed.
-            for (table, builtin, own) in CHAINS.iter().rev() {
-                let live = sys
-                    .runner
-                    .run_checked("iptables", &["-t", table, "-S"], None)?;
-                // Present too, not only reached through DOCKER-USER: Docker
-                // may drop its jump, and then nothing would lead to Parallax.
-                let jump = format!("-A {builtin} -j {own}");
-                let present = live.stdout.lines().filter(|l| *l == jump).count();
-                if present > 0 && decides_first(&live.stdout, builtin, own) {
-                    continue;
-                }
-                for _ in 0..present {
-                    sys.runner.run_checked(
-                        "iptables",
-                        &["-t", table, "-D", builtin, "-j", own],
-                        None,
-                    )?;
-                }
-                sys.runner.run_checked(
-                    "iptables",
-                    &["-t", table, "-I", builtin, "1", "-j", own],
-                    None,
-                )?;
-                if present > 0 {
-                    log.push(format!(
-                        "firewall: other rules came before {own} in {builtin}; its jump is first again"
-                    ));
-                }
-            }
-            for args in held(&listing.stdout) {
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                sys.runner.run_checked("iptables", &args, None)?;
-            }
+            commit("filter", &lines, sys)?;
+            sys.runner
+                .run_checked("iptables-restore", &["--noflush", &main_str], None)
+                .map_err(still_held)?;
+            let listing = sys
+                .runner
+                .run_checked("iptables", &["-t", "filter", "-S"], None)
+                .map_err(still_held)?;
+            attach(docker, &listing.stdout, sys, log).map_err(still_held)?;
             // Chains of tiers that no longer exist: nothing jumps to them
             // since the restore, so they can go.
             for chain in listing
@@ -332,6 +274,74 @@ fn apply_firewall(
     Ok(())
 }
 
+/// After the restore: hook the PARALLAX_* chains, refill Docker's chain,
+/// and lift the holds. Until both tables are attached nothing new starts.
+/// `nat` first: a filter jump goes in above the hold, so once it's there
+/// both tables must be. A jump that's there but below someone else's rules
+/// (Docker's, after it restarts: issue #74) moves to the top. Each change
+/// is one transaction, so no packet finds a jump missing on the way.
+/// `docker` is Docker's chain's rules, when Parallax shares it; `listing` is
+/// `iptables -t filter -S` from after the restore.
+fn attach(
+    docker: Option<&str>,
+    listing: &str,
+    sys: System<'_>,
+    log: &mut Vec<String>,
+) -> Result<()> {
+    use crate::generate::firewall::iptables::DOCKER_USER;
+    let nat = sys
+        .runner
+        .run_checked("iptables", &["-t", "nat", "-S"], None)?;
+    commit("nat", &hook_moves("nat", &nat.stdout, log), sys)?;
+    // Docker's chain before filter's hooks, so a FORWARD that Docker's jump
+    // heads already counts as Parallax deciding first.
+    if let Some(docker) = docker {
+        let live =
+            sys.runner
+                .run_checked("iptables", &["-t", "filter", "-S", DOCKER_USER], None)?;
+        let mut lines: Vec<String> = docker_user_lines(&live.stdout)
+            .map(|rule| format!("-D {rule}"))
+            .collect();
+        lines.extend(
+            docker
+                .lines()
+                .filter(|l| l.starts_with("-I"))
+                .map(String::from),
+        );
+        commit("filter", &lines, sys)?;
+        log.push("firewall: DOCKER-USER rules refreshed".into());
+    }
+    let filter = sys
+        .runner
+        .run_checked("iptables", &["-t", "filter", "-S"], None)?;
+    commit("filter", &hook_moves("filter", &filter.stdout, log), sys)?;
+    // Every hold goes, also one for an interface since renamed.
+    for args in held(listing) {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        sys.runner.run_checked("iptables", &args, None)?;
+    }
+    Ok(())
+}
+
+/// A failure once the holds are in leaves them: say so.
+fn still_held(e: Error) -> Error {
+    match e {
+        Error::Command {
+            command,
+            status,
+            stderr,
+        } => Error::Command {
+            command,
+            status,
+            stderr: format!(
+                "{}; tunnel peers can't open new connections until an apply succeeds (issue #56)",
+                stderr.trim_end()
+            ),
+        },
+        e => e,
+    }
+}
+
 /// The words of an iptables rule as `iptables -S` lists it, or as the
 /// generator writes it: split on spaces, a double-quoted word kept whole and
 /// unquoted, `\"` and `\\` inside it unescaped. The generator's rules are
@@ -370,16 +380,62 @@ pub(crate) fn iptables_words(line: &str) -> Vec<String> {
 /// words after `-A`: those commented exactly `parallax`, and `"parallax"`
 /// with the quotes, as builds before this one inserted them.
 pub(crate) fn docker_user_rules(listing: &str) -> Vec<Vec<String>> {
+    docker_user_lines(listing).map(iptables_words).collect()
+}
+
+/// The same rules as [`docker_user_rules`], each as the listing has it
+/// after `-A `, quoting kept, as `iptables-restore` reads it back.
+fn docker_user_lines(listing: &str) -> impl Iterator<Item = &str> {
     listing
         .lines()
-        .map(iptables_words)
-        .filter(|w| w.first().is_some_and(|a| a == "-A"))
-        .filter(|w| {
-            w.windows(2)
+        .filter_map(|l| l.strip_prefix("-A "))
+        .filter(|rule| {
+            iptables_words(rule)
+                .windows(2)
                 .any(|p| p[0] == "--comment" && (p[1] == "parallax" || p[1] == "\"parallax\""))
         })
-        .map(|w| w[1..].to_vec())
-        .collect()
+}
+
+/// What puts each of `table`'s jumps from a built-in chain first, as
+/// `iptables-restore` lines (none when every one is): every copy out, one
+/// in at the top. `listing` is `iptables -t <table> -S`.
+fn hook_moves(table: &str, listing: &str, log: &mut Vec<String>) -> Vec<String> {
+    use crate::generate::firewall::iptables::CHAINS;
+    let mut lines = Vec::new();
+    for (_, builtin, own) in CHAINS.iter().filter(|(t, ..)| *t == table) {
+        // Present too, not only reached through DOCKER-USER: Docker may drop
+        // its jump, and then nothing would lead to Parallax.
+        let jump = format!("-A {builtin} -j {own}");
+        let present = listing.lines().filter(|l| *l == jump).count();
+        // One copy only: a second further down would come first again once
+        // something got in between.
+        let first = decides_first(listing, builtin, own);
+        if present == 1 && first {
+            continue;
+        }
+        lines.extend(std::iter::repeat_n(
+            format!("-D {builtin} -j {own}"),
+            present,
+        ));
+        lines.push(format!("-I {builtin} 1 -j {own}"));
+        if present > 0 && !first {
+            log.push(format!(
+                "firewall: other rules came before {own} in {builtin}; its jump is first again"
+            ));
+        }
+    }
+    lines
+}
+
+/// Make `lines` (`-D` and `-I` rules) in `table` as one transaction.
+fn commit(table: &str, lines: &[String], sys: System<'_>) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let text = format!("*{table}\n{}\nCOMMIT\n", lines.join("\n"));
+    sys.runner
+        .run_checked("iptables-restore", &["--noflush"], Some(&text))?;
+    Ok(())
 }
 
 /// The scratch set each set is filled in before it's swapped in. A failed
@@ -526,7 +582,7 @@ pub const HOLD_COMMENT: &str = "parallax-hold";
 /// swaps the rules (issue #56): rules at the top of INPUT and FORWARD that
 /// drop new flows from each tunnel interface, and in FORWARD those toward
 /// it (LAN-initiated, which NETMAP's source map would mislabel). Each is the
-/// rule as `iptables -t filter <-C|-I>` takes it.
+/// rule's chain, then its matches and target.
 pub fn hold_rules(server: &crate::model::ServerConfig) -> Vec<Vec<String>> {
     let mut rules = Vec::new();
     for t in crate::transport::all() {
@@ -556,14 +612,26 @@ pub fn hold_rules(server: &crate::model::ServerConfig) -> Vec<Vec<String>> {
     rules
 }
 
+/// The FORWARD holds again at the top of Docker's `DOCKER-USER`: Docker
+/// puts its jump to that chain above the holds whenever it starts (issue
+/// #74), and the restore may be half done then.
+fn docker_user_holds(holds: &[Vec<String>]) -> Vec<Vec<String>> {
+    use crate::generate::firewall::iptables::DOCKER_USER;
+    holds
+        .iter()
+        .filter(|r| r.first().is_some_and(|c| c == "FORWARD"))
+        .map(|r| {
+            std::iter::once(DOCKER_USER.to_string())
+                .chain(r.iter().skip(1).cloned())
+                .collect()
+        })
+        .collect()
+}
+
 /// `iptables` arguments that delete every hold in `listing` (`iptables -t
 /// filter -S`), whatever interface it names.
 pub fn held(listing: &str) -> Vec<Vec<String>> {
-    let marker = format!("--comment {HOLD_COMMENT} ");
-    listing
-        .lines()
-        .filter(|l| l.contains(&marker))
-        .filter_map(|l| l.strip_prefix("-A "))
+    hold_lines(listing)
         .map(|rule| {
             ["-t", "filter", "-D"]
                 .into_iter()
@@ -572,6 +640,15 @@ pub fn held(listing: &str) -> Vec<Vec<String>> {
                 .collect()
         })
         .collect()
+}
+
+/// The holds in `listing`, each as it has it after `-A `.
+fn hold_lines(listing: &str) -> impl Iterator<Item = &str> {
+    let marker = format!("--comment {HOLD_COMMENT} ");
+    listing
+        .lines()
+        .filter(move |l| l.contains(&marker))
+        .filter_map(|l| l.strip_prefix("-A "))
 }
 
 /// Whether Parallax's chain `own` sees every packet of the built-in chain
@@ -612,15 +689,6 @@ pub fn decides_first(listing: &str, builtin: &str, own: &str) -> bool {
                 own,
             ]
         })
-}
-
-/// `iptables` arguments to check for (`-C`) or insert (`-I`, at the top)
-/// one of [`hold_rules`].
-pub fn hold_args<'a>(op: &'a str, rule: &'a [String]) -> Vec<&'a str> {
-    ["-t", "filter", op]
-        .into_iter()
-        .chain(rule.iter().map(String::as_str))
-        .collect()
 }
 
 #[cfg(test)]
@@ -785,9 +853,21 @@ mod tests {
         assert!(!decides_first(&listing, "INPUT", "PARALLAX_INPUT"));
     }
 
+    /// The text of each `iptables-restore --noflush` from stdin: the hook
+    /// and DOCKER-USER transactions.
+    fn transactions(runner: &RecordingRunner) -> Vec<String> {
+        runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(p, a, _)| p == "iptables-restore" && a == &["--noflush"])
+            .filter_map(|(_, _, stdin)| stdin.clone())
+            .collect()
+    }
+
     /// Issue #74, through a whole apply: a jump that's there but below
-    /// Docker's moves to the top; Docker's chain gets Parallax's rules before
-    /// the hold comes off.
+    /// Docker's moves to the top in one transaction; Docker's chain gets a
+    /// hold of its own, and Parallax's rules before the holds come off.
     #[test]
     fn an_iptables_apply_puts_its_jump_back_on_top() {
         let mut cfg = crate::testing::canonical_config();
@@ -798,7 +878,6 @@ mod tests {
             crate::testing::keypair(200).private.expose_base64(),
         );
         let bundle = crate::generate::generate_all(&model, &fs).unwrap();
-        let runner = RecordingRunner::new();
         let listing = |forward: &str| {
             Output {
             status: 0,
@@ -811,72 +890,102 @@ mod tests {
             stderr: String::new(),
         }
         };
-        let docker_first = "-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n";
-        // After the restore (holds), then the FORWARD hook, then INPUT.
-        for _ in 0..3 {
-            runner.respond_to("iptables", &["-t", "filter", "-S"], listing(docker_first));
-        }
-        let sys = System {
-            fs: &fs,
-            runner: &runner,
+        let run = |forward: &str| {
+            let runner = RecordingRunner::new();
+            // Before the holds, after the restore (to lift them), for the hooks.
+            for _ in 0..3 {
+                runner.respond_to("iptables", &["-t", "filter", "-S"], listing(forward));
+            }
+            runner.respond_to(
+                "iptables",
+                &["-t", "filter", "-S", "DOCKER-USER"],
+                Output {
+                    status: 0,
+                    stdout: "-N DOCKER-USER\n\
+                             -A DOCKER-USER -i wg0 -m comment --comment \"\\\"parallax\\\"\" -j ACCEPT\n\
+                             -A DOCKER-USER -j RETURN\n"
+                        .into(),
+                    stderr: String::new(),
+                },
+            );
+            let sys = System {
+                fs: &fs,
+                runner: &runner,
+            };
+            let report = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+            (runner.command_lines(), transactions(&runner), report.log)
         };
-        let report = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
-        let lines = runner.command_lines();
-        let pos = |line: &str| lines.iter().position(|l| l == line);
-        let removed = lines
-            .iter()
-            .filter(|l| *l == "iptables -t filter -D FORWARD -j PARALLAX_FORWARD")
-            .count();
-        assert_eq!(removed, 2, "{lines:#?}");
-        let top = pos("iptables -t filter -I FORWARD 1 -j PARALLAX_FORWARD").unwrap();
+
+        let (lines, txns, log) = run("-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n");
+        // Holds, nat (nothing there: both jumps in), Docker's chain, filter.
+        assert_eq!(txns.len(), 4, "{txns:#?}");
+        // The one there moves up with the rest; Docker's chain gets its own.
+        let hold = "-i wg0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP";
         assert!(
-            pos("iptables -t filter -D FORWARD -j PARALLAX_FORWARD").unwrap() < top,
-            "{lines:#?}"
+            txns[0].starts_with(&format!("*filter\n-D FORWARD {hold}\n")),
+            "{txns:#?}"
         );
-        // INPUT's jump is first: left alone.
-        assert!(!lines
-            .iter()
-            .any(|l| l.contains("INPUT -j PARALLAX_INPUT") && !l.contains(" -S")));
-        let docker =
-            pos("iptables -I DOCKER-USER 1 -m comment --comment parallax -j PARALLAX_FORWARD")
-                .unwrap();
+        for chain in ["INPUT", "FORWARD", "DOCKER-USER"] {
+            assert!(
+                txns[0].contains(&format!("\n-I {chain} 1 {hold}\n")),
+                "{txns:#?}"
+            );
+        }
+        assert_eq!(
+            txns[1],
+            "*nat\n-I PREROUTING 1 -j PARALLAX_PREROUTING\n-I POSTROUTING 1 -j PARALLAX_POSTROUTING\nCOMMIT\n"
+        );
+        // The old build's accept goes, quoting kept; the new rules go in, the
+        // jump at the top, no accept from a tunnel.
+        assert!(txns[2].starts_with("*filter\n-D DOCKER-USER -i wg0 -m comment --comment \"\\\"parallax\\\"\" -j ACCEPT\n-I DOCKER-USER 1 -m comment --comment \"parallax\" -j PARALLAX_FORWARD\n-I DOCKER-USER 2 -o wg0 "), "{txns:#?}");
+        assert!(
+            !txns[2].contains("RETURN") && !txns[2].contains("-I DOCKER-USER 3 -i"),
+            "{txns:#?}"
+        );
+        // Both copies out and one in at the top, together; INPUT's is first
+        // already.
+        assert_eq!(
+            txns[3],
+            "*filter\n-D FORWARD -j PARALLAX_FORWARD\n-D FORWARD -j PARALLAX_FORWARD\n-I FORWARD 1 -j PARALLAX_FORWARD\nCOMMIT\n"
+        );
+        assert!(
+            log.iter()
+                .any(|l| l.contains("PARALLAX_FORWARD in FORWARD")),
+            "{log:#?}"
+        );
+        // Every hook in before a hold comes off.
         let lifted = lines
             .iter()
             .position(|l| l.contains(" -D FORWARD -i wg0 ") && l.contains(HOLD_COMMENT))
             .unwrap();
-        assert!(docker < top && top < lifted, "{lines:#?}");
-        assert!(
-            report
-                .log
-                .iter()
-                .any(|l| l.contains("PARALLAX_FORWARD in FORWARD")),
-            "{:#?}",
-            report.log
-        );
+        let last_txn = lines
+            .iter()
+            .rposition(|l| l == "iptables-restore --noflush")
+            .unwrap();
+        assert!(last_txn < lifted, "{lines:#?}");
 
         // DOCKER-USER first and starting with Parallax's jump, but no jump
         // of Parallax's own in FORWARD (a first apply beside Docker): it goes
         // in at the top, or nothing leads to Parallax once Docker drops its
         // jump.
-        let runner = RecordingRunner::new();
-        let through_docker = "-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n\
-             -A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD\n";
-        for _ in 0..3 {
-            runner.respond_to("iptables", &["-t", "filter", "-S"], listing(through_docker));
-        }
-        let sys = System {
-            fs: &fs,
-            runner: &runner,
-        };
-        apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
-        let lines = runner.command_lines();
-        assert!(
-            lines.contains(&"iptables -t filter -I FORWARD 1 -j PARALLAX_FORWARD".into()),
-            "{lines:#?}"
+        let (_, txns, _) = run("-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n\
+             -A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD\n");
+        assert_eq!(
+            txns.last().unwrap(),
+            "*filter\n-I FORWARD 1 -j PARALLAX_FORWARD\nCOMMIT\n"
         );
-        assert!(!lines
-            .iter()
-            .any(|l| l.contains("-D FORWARD -j PARALLAX_FORWARD")));
+        // And with it there too, nothing moves.
+        let (_, txns, _) = run(
+            "-A FORWARD -j DOCKER-USER\n-A FORWARD -j PARALLAX_FORWARD\n\
+             -A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD\n",
+        );
+        assert!(
+            !txns
+                .last()
+                .unwrap()
+                .contains("FORWARD 1 -j PARALLAX_FORWARD"),
+            "{txns:#?}"
+        );
     }
 
     /// Exactly `parallax`, or `"parallax"` from builds that kept the
@@ -976,11 +1085,18 @@ mod tests {
                 failing,
                 failed("iptables-restore: line 12 failed"),
             );
-            // A failed apply left one hold; the others aren't there.
+            // A failed apply left one hold, below a jump that went in after it.
+            let left = "INPUT -i wg0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP";
+            runner.respond_to(
+                "iptables",
+                &["-t", "filter", "-S"],
+                Output {
+                    status: 0,
+                    stdout: format!("-A INPUT -j PARALLAX_INPUT\n-A {left}\n"),
+                    stderr: String::new(),
+                },
+            );
             let holds = hold_rules(model.server());
-            for rule in &holds[1..] {
-                runner.respond_to("iptables", &hold_args("-C", rule), failed("Bad rule"));
-            }
             let sys = System {
                 fs: &fs,
                 runner: &runner,
@@ -996,17 +1112,29 @@ mod tests {
             assert!(ran(failing), "{lines:#?}");
             assert_eq!(ran(&restore), failing == restore, "{lines:#?}");
             // The hold: never placed when the dry run fails. When the
-            // restore fails, placed for both transports (the one already
-            // there kept, never lifted for a moment) and left in, which the
-            // error says.
+            // restore fails, placed for both transports at the top in one
+            // transaction (the one already there moved up with them, never
+            // lifted for a moment) and left in, which the error says.
+            let txns = transactions(&runner);
             let touched: Vec<&String> = lines.iter().filter(|l| l.contains(HOLD_COMMENT)).collect();
+            assert!(touched.is_empty(), "{lines:#?}");
             if failing == dry_run {
-                assert!(touched.is_empty(), "{lines:#?}");
+                assert!(txns.is_empty(), "{txns:#?}");
             } else {
                 assert_eq!(holds.len(), 6);
-                let placed = touched.iter().filter(|l| l.contains(" -I ")).count();
-                assert_eq!(placed, 5, "{lines:#?}");
-                assert!(!touched.iter().any(|l| l.contains(" -D ")), "{lines:#?}");
+                assert_eq!(txns.len(), 1, "{txns:#?}");
+                let txn: Vec<&str> = txns[0].lines().collect();
+                assert_eq!(txn[1], format!("-D {left}"));
+                assert_eq!(
+                    txn.iter()
+                        .filter(|l| l.contains(" 1 ") && l.contains(HOLD_COMMENT))
+                        .count(),
+                    6
+                );
+                assert!(
+                    txn.contains(&format!("-I {}", left.replacen(" ", " 1 ", 1)).as_str()),
+                    "{txn:#?}"
+                );
                 assert!(
                     err.contains("tunnel peers can't open new connections until an apply succeeds"),
                     "{err}"
