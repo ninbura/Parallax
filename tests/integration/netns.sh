@@ -1237,8 +1237,12 @@ PY
         --port=0 >> "$HS/phone.log" 2>&1 &
     PIDS+=($!)
     for _ in $(seq 50); do [ -S "$HS/phone/sock" ] && break; sleep 0.1; done
+    # --accept-dns=false: a tailscaled in a namespace still reaches the host's
+    # systemd-resolved over D-Bus, and would set DNS on whichever host link has
+    # its tailscale0's interface index.
     printf '%s' "$PHONE_AUTH" | inns tsc timeout 30 "$TAILSCALE" --socket="$HS/phone/sock" up \
-        --login-server=http://203.0.114.1:18080 --auth-key=file:/dev/stdin --hostname=phone --accept-routes >/dev/null 2>&1 \
+        --login-server=http://203.0.114.1:18080 --auth-key=file:/dev/stdin --hostname=phone --accept-routes \
+        --accept-dns=false >/dev/null 2>&1 \
         || { tail -20 "$HS/phone.log"; fail "(w) the phone did not log in"; }
     read -r PHONE PHONE_IP < <(hs_api GET /api/v1/node | python3 -c '
 import json, sys
