@@ -9,9 +9,9 @@
 //! answers pointing inward are dropped.
 //!
 //! It holds no records and doesn't recurse: it forwards, with a small cache.
-//! It reads only the routes file `apply` generates
-//! ([`parallax_core::generate::dns`]); the daemon runs it and has it re-read
-//! the routes after each apply ([`Dns::reload_trigger`]).
+//! It answers by the routes `apply` generates
+//! ([`parallax_core::generate::dns`]); the daemon runs it and hands it new
+//! routes around each apply ([`Dns::reloader`], [`overlap`]).
 
 mod answer;
 mod error;
@@ -20,4 +20,4 @@ mod server;
 
 pub use error::{Error, Result};
 pub use lookup::Lookup;
-pub use server::Dns;
+pub use server::{overlap, Dns, Reload};

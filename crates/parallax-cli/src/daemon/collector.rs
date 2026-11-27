@@ -7,8 +7,16 @@
 //! A source runs only while some peer is logged at its level: with nobody
 //! logged the kernel isn't asked for a single event, and the taps want
 //! nobody's.
+//!
+//! It goes by the configuration of the last apply that worked, since that's
+//! who WireGuard gives each address to, and logs an address only where the
+//! saved configuration gives it to the same peer: while a save that moves
+//! an address isn't applied yet, or its apply is under way, nothing from
+//! that address is logged rather than put under the wrong peer (issue #37).
 
+use std::collections::HashMap;
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -16,14 +24,48 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parallax_core::generate::firewall::LOG_GROUP;
-use parallax_core::logging::{self, Event, Tap};
-use parallax_core::model::LogLevel;
+use parallax_core::logging::{self, Event, Logged, Record, Tap};
+use parallax_core::model::{Config, LogLevel, TransportKind};
 use parallax_core::netlink;
 use parallax_store::logs::{Logs, Writer};
 use rustix::net::netlink::{SocketAddrNetlink, NETFILTER};
 use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType};
 
 use super::{log, warn, Views};
+
+/// What the log goes by: the last configuration that applied, and the
+/// saved one. `None` before the first apply has worked.
+fn configs(views: &Views) -> Option<(Arc<Config>, Arc<Config>)> {
+    let view = views.borrow();
+    let view = view.as_ref()?;
+    Some((Arc::clone(view.applied.as_ref()?), Arc::clone(&view.config)))
+}
+
+/// The WireGuard peer `config` gives `address` to.
+fn holder(config: &Config, address: Ipv4Addr) -> Option<&str> {
+    config
+        .peers
+        .iter()
+        .find(|p| {
+            p.transport == TransportKind::WireGuard
+                && p.wireguard.as_ref().and_then(|w| w.address) == Some(address)
+        })
+        .map(|p| p.name.as_str())
+}
+
+/// `record` if the saved configuration gives its address to the same peer.
+fn agreed(record: Option<Record>, saved: &Config) -> Option<Record> {
+    record.filter(|r| holder(saved, r.source) == Some(r.peer.as_str()))
+}
+
+/// The clients a tap wants, less those the saved configuration gives to
+/// another peer.
+fn agreed_clients(clients: HashMap<Ipv4Addr, Logged>, saved: &Config) -> HashMap<Ipv4Addr, Logged> {
+    clients
+        .into_iter()
+        .filter(|(address, logged)| holder(saved, *address) == Some(logged.peer.as_str()))
+        .collect()
+}
 
 /// Records are written at least this often...
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
@@ -213,7 +255,7 @@ pub async fn supervise(mut views: Views, slot: Slot, taps: Taps) {
             }
             _ = check.tick() => {}
         }
-        let Some(config) = views.borrow().as_ref().map(|v| Arc::clone(&v.config)) else {
+        let Some((config, saved)) = configs(&views) else {
             continue;
         };
         for feed in &mut feeds {
@@ -221,8 +263,11 @@ pub async fn supervise(mut views: Views, slot: Slot, taps: Taps) {
         }
         // The proxy's refusals are blocked attempts, so whoever logs at
         // `blocked` or more.
-        proxy.set_clients(logging::level_clients(&config, LogLevel::Blocked));
-        let dns_clients = logging::dns_clients(&config);
+        proxy.set_clients(agreed_clients(
+            logging::level_clients(&config, LogLevel::Blocked),
+            &saved,
+        ));
+        let dns_clients = agreed_clients(logging::dns_clients(&config), &saved);
         let wanted = feeds.iter().any(|f| f.wanted) || !dns_clients.is_empty();
         dns.set_clients(dns_clients);
         // A new place for the records: the old database is let go first, so
@@ -378,11 +423,11 @@ impl Source {
                 Ok((n, _)) => {
                     let events = (self.parse)(&buf[..n]);
                     if !events.is_empty() {
-                        let config = self.views.borrow().as_ref().map(|v| Arc::clone(&v.config));
-                        if let Some(config) = config {
+                        if let Some((config, saved)) = configs(&self.views) {
                             let time = now_ms();
                             batch.extend(events.iter().filter_map(|e| {
-                                open.settle(e, logging::attribute(&config, e, time))
+                                let record = logging::attribute(&config, e, time);
+                                open.settle(e, agreed(record, &saved))
                             }));
                         }
                     }
@@ -549,8 +594,10 @@ impl Sink {
     }
 
     fn attribute(&self, event: Event, pending: &mut Pending) {
-        let config = self.views.borrow().as_ref().map(|v| Arc::clone(&v.config));
-        if let Some(record) = config.and_then(|c| logging::attribute(&c, &event, now_ms())) {
+        let Some((config, saved)) = configs(&self.views) else {
+            return;
+        };
+        if let Some(record) = agreed(logging::attribute(&config, &event, now_ms()), &saved) {
             pending.push(record);
         }
     }
@@ -709,6 +756,34 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #37: 10.8.1.1 is `router`'s in the applied configuration, and the
+    /// saved one gives it to a new peer. Until that's applied, nothing from
+    /// it is logged under either.
+    #[test]
+    fn an_address_changing_hands_logs_nothing_until_applied() {
+        let applied = parallax_core::testing::canonical_config();
+        let router = holder(&applied, "10.8.1.1".parse().unwrap())
+            .unwrap()
+            .to_string();
+        let mut saved = applied.clone();
+        saved.peers[0].name = "new-key".into();
+        let mut r = record(1);
+        r.peer = router.clone();
+        r.source = "10.8.1.1".parse().unwrap();
+        assert!(agreed(Some(r.clone()), &applied).is_some());
+        assert!(agreed(Some(r), &saved).is_none());
+        let clients: HashMap<Ipv4Addr, Logged> = [(
+            "10.8.1.1".parse().unwrap(),
+            Logged {
+                peer: router,
+                level: LogLevel::Detailed,
+            },
+        )]
+        .into();
+        assert_eq!(agreed_clients(clients.clone(), &applied), clients);
+        assert!(agreed_clients(clients, &saved).is_empty());
+    }
 
     fn record(n: u64) -> logging::Record {
         logging::Record {

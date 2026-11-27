@@ -2,13 +2,14 @@
 //! and truncation; this answers each query by the caller's tier, forwarding
 //! through one caching resolver per zone (and one for public names).
 //!
-//! The routes live behind a lock. A reload swaps in a new state; a reload
-//! that fails leaves none, and every query is refused until one succeeds,
-//! rather than keep answering by grants that may have been revoked.
+//! The routes live behind a lock. The daemon hands new ones over a channel
+//! ([`Reload`]); taking them swaps in a new state. Routes that fail to load
+//! leave none, and every query is refused until good ones come, rather than
+//! keep answering by grants that may have been revoked.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -23,11 +24,11 @@ use hickory_server::resolver::TokioResolver;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use hickory_server::Server;
-use parallax_core::generate::dns::{DnsRoutes, Route};
+use parallax_core::generate::dns::{DnsRoutes, DnsTier, Route};
 use parallax_core::logging::{Event, Logged, Query, QueryOutcome, Tap};
 use parallax_core::netmap::Mapping;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{answer, Error, Result};
 
@@ -92,10 +93,7 @@ fn resolver(upstreams: &[Ipv4Addr], port: u16) -> Result<TokioResolver> {
         .map_err(|e| Error::dns(format!("setting up the resolver for {upstreams:?}"), e))
 }
 
-fn load_state(routes_path: &Path, upstream_port: u16) -> Result<State> {
-    let text = std::fs::read_to_string(routes_path)
-        .map_err(|e| Error::io(format!("reading {}", routes_path.display()), e))?;
-    let routes = DnsRoutes::from_toml(&text)?;
+fn load_state(routes: DnsRoutes, upstream_port: u16) -> Result<State> {
     let mappings = routes.mapping_list()?;
     let mut home = HashMap::new();
     for zone in &routes.zones {
@@ -110,26 +108,54 @@ fn load_state(routes_path: &Path, upstream_port: u16) -> Result<State> {
     })
 }
 
+/// Routes on their way to the server, and who to tell once they're in force.
+type Handover = (DnsRoutes, oneshot::Sender<()>);
+
+/// Hands a DNS server new routes ([`Dns::reloader`]).
+#[derive(Debug, Clone)]
+pub struct Reload(mpsc::UnboundedSender<Handover>);
+
+impl Reload {
+    /// Have the server answer by `routes`. The receiver gets `()` once
+    /// queries that come in from then on are (or, routes that didn't load,
+    /// once every query is refused), and an error if the server has
+    /// stopped. Routes are taken in the order sent.
+    pub fn send(&self, routes: DnsRoutes) -> oneshot::Receiver<()> {
+        let (done, taken) = oneshot::channel();
+        // A stopped server drops `done`, which the receiver reports.
+        let _ = self.0.send((routes, done));
+        taken
+    }
+}
+
 /// A loaded DNS server, ready to run on its sockets.
 pub struct Dns {
-    routes_path: PathBuf,
     upstream_port: u16,
     state: Arc<State>,
-    reload: Arc<Notify>,
+    reload: Reload,
+    reloads: mpsc::UnboundedReceiver<Handover>,
     tap: Option<Tap>,
 }
 
 impl Dns {
-    /// Read the routes. Upstreams are asked on `upstream_port` (53, except
-    /// in tests).
-    pub fn load(routes_path: &Path, upstream_port: u16) -> Result<Dns> {
+    /// Answer by `routes`. Upstreams are asked on `upstream_port` (53,
+    /// except in tests).
+    pub fn new(routes: DnsRoutes, upstream_port: u16) -> Result<Dns> {
+        let (reload, reloads) = mpsc::unbounded_channel();
         Ok(Dns {
-            routes_path: routes_path.to_path_buf(),
             upstream_port,
-            state: Arc::new(load_state(routes_path, upstream_port)?),
-            reload: Arc::new(Notify::new()),
+            state: Arc::new(load_state(routes, upstream_port)?),
+            reload: Reload(reload),
+            reloads,
             tap: None,
         })
+    }
+
+    /// [`Dns::new`] with the routes file `apply` writes.
+    pub fn load(routes_path: &Path, upstream_port: u16) -> Result<Dns> {
+        let text = std::fs::read_to_string(routes_path)
+            .map_err(|e| Error::io(format!("reading {}", routes_path.display()), e))?;
+        Dns::new(DnsRoutes::from_toml(&text)?, upstream_port)
     }
 
     /// Hand the queries of peers whose DNS is logged to `tap`
@@ -144,9 +170,10 @@ impl Dns {
         self.state.routes.listen
     }
 
-    /// Notifying this re-reads the routes (the daemon does after each apply).
-    pub fn reload_trigger(&self) -> Arc<Notify> {
-        Arc::clone(&self.reload)
+    /// What hands this server new routes (the daemon does around each
+    /// apply).
+    pub fn reloader(&self) -> Reload {
+        self.reload.clone()
     }
 
     /// Serve on `udp` and `tcp` until the task is dropped.
@@ -161,13 +188,14 @@ impl Dns {
         ));
         let listening = self.state.routes.listen;
         let shared: Shared = Arc::new(RwLock::new(Some(self.state)));
-        tokio::spawn(reloader(
+        // Part of this future, not a task of its own: once it's dropped, no
+        // routes are confirmed.
+        let reloading = reloader(
             listening,
-            self.routes_path,
             self.upstream_port,
             Arc::clone(&shared),
-            self.reload,
-        ));
+            self.reloads,
+        );
         let mut server = Server::new(Handler {
             state: shared,
             inflight: Arc::default(),
@@ -176,23 +204,25 @@ impl Dns {
         });
         server.register_socket(udp);
         server.register_listener(tcp, TCP_TIMEOUT, TCP_QUEUE);
-        server
-            .block_until_done()
-            .await
-            .map_err(|e| Error::dns(format!("serving on {local}"), e))
+        let serving = server.block_until_done();
+        tokio::pin!(serving, reloading);
+        let done = tokio::select! {
+            done = &mut serving => done,
+            // Nobody can hand it routes anymore: serve on.
+            () = &mut reloading => serving.await,
+        };
+        done.map_err(|e| Error::dns(format!("serving on {local}"), e))
     }
 }
 
 async fn reloader(
     listening: SocketAddrV4,
-    routes_path: PathBuf,
     upstream_port: u16,
     shared: Shared,
-    reload: Arc<Notify>,
+    mut reloads: mpsc::UnboundedReceiver<Handover>,
 ) {
-    loop {
-        reload.notified().await;
-        let next = match load_state(&routes_path, upstream_port) {
+    while let Some((routes, done)) = reloads.recv().await {
+        let next = match load_state(routes, upstream_port) {
             Ok(state) => {
                 if state.routes.listen != listening {
                     log(format!(
@@ -215,7 +245,75 @@ async fn reloader(
             }
         };
         *shared.write().unwrap_or_else(|p| p.into_inner()) = next;
+        // Queries that come in from now on take the new state.
+        let _ = done.send(());
     }
+}
+
+/// What both `served` and `new` let each member look up: for while an
+/// apply is under way, which can leave either configuration's firewall and
+/// WireGuard peers live (or, failing partway, a mix). A member keeps the
+/// zones both give it, the names both allow (by name or by their whole
+/// zone), and public names if both do; a member only one of them has gets
+/// nothing. So an address moving to another peer answers neither owner's
+/// names beyond what both may see. Zones, mappings and resolvers stay
+/// `served`'s.
+pub fn overlap(served: &DnsRoutes, new: &DnsRoutes) -> DnsRoutes {
+    fn allows(routes: &DnsRoutes, tier: &DnsTier, name: &str) -> bool {
+        tier.names.iter().any(|n| n == name)
+            || routes
+                .zone_of(name)
+                .is_some_and(|z| tier.zones.contains(&z.name))
+    }
+    let mut out = DnsRoutes {
+        tiers: Vec::new(),
+        ..served.clone()
+    };
+    for old in &served.tiers {
+        for member in &old.members {
+            let Some(next) = new.tiers.iter().find(|t| t.members.contains(member)) else {
+                continue;
+            };
+            let same =
+                old.zones == next.zones && old.names == next.names && old.public == next.public;
+            let (zones, names) = if same {
+                (old.zones.clone(), old.names.clone())
+            } else {
+                let zones: Vec<String> = old
+                    .zones
+                    .iter()
+                    .filter(|z| next.zones.contains(z))
+                    .cloned()
+                    .collect();
+                let mut names: Vec<String> = old
+                    .names
+                    .iter()
+                    .chain(&next.names)
+                    .filter(|n| allows(served, old, n) && allows(new, next, n))
+                    .filter(|n| !served.zone_of(n).is_some_and(|z| zones.contains(&z.name)))
+                    .cloned()
+                    .collect();
+                names.sort();
+                names.dedup();
+                (zones, names)
+            };
+            let public = old.public && next.public;
+            let alike = |t: &&mut DnsTier| {
+                t.tier == old.tier && t.zones == zones && t.names == names && t.public == public
+            };
+            match out.tiers.iter_mut().find(alike) {
+                Some(tier) => tier.members.push(*member),
+                None => out.tiers.push(DnsTier {
+                    tier: old.tier.clone(),
+                    members: vec![*member],
+                    zones,
+                    names,
+                    public,
+                }),
+            }
+        }
+    }
+    out
 }
 
 fn ipv4(ip: IpAddr) -> Option<Ipv4Addr> {

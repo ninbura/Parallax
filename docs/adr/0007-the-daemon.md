@@ -25,8 +25,14 @@ socket.
   *Amended (issue #71):* the daemon hands the proxy its routes itself, with
   no file. Before an apply changes anything live, the proxy gets only what
   the old and the new routes both grant, and the daemon waits until it
-  serves them. It gets the new routes in full once the apply has worked. A
-  failed reload still refuses everything until one works. If either task
+  serves them. It gets the new routes in full once the apply has worked.
+  *Amended (issue #37):* the DNS server gets its routes the same way. Before
+  an apply changes anything live, each member is answered only what both
+  routes let it look up, so an address moving to another peer answers
+  neither owner's names beyond that while WireGuard may give it to either.
+  The activity log goes by the last configuration that applied, and logs
+  nothing from an address the saved configuration gives to another peer.
+  A failed reload still refuses everything until one works. If either task
   stops, the daemon exits non-zero and Docker's restart policy takes over.
   Automatic backups (`backup create --if-due` every 10 minutes) run inside
   it too, on its open database.
