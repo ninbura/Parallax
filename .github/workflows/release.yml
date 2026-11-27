@@ -25,16 +25,15 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}
-      tags: ${{ steps.check.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # main and every tag, for the checks below
+          fetch-depth: 0 # for the check that the tag is on main
       - run: rustup install # the version in rust-toolchain.toml
       - id: check
         shell: bash
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "parallax-cli") | .version')
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "parallax-cli") | .version')
           # Final releases only: a pre-release's version doesn't carry over
           # into the Arch package (nfpm drops it) or a .deb's file name.
           if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -49,20 +48,7 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME points at $GITHUB_SHA, which isn't on main"
             exit 1
           fi
-          # Image tags: X.Y.Z always; X.Y and latest only if no newer release
-          # has them, so a late or re-run older release can't move them back.
-          releases=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
-          minor=${version%.*}
-          tags=$version
-          if [ "$(grep -E "^v${minor//./\\.}\.[0-9]+$" <<< "$releases" | tail -n 1)" = "v$version" ]; then
-            tags="$tags $minor"
-          fi
-          if [ "$(tail -n 1 <<< "$releases")" = "v$version" ]; then
-            tags="$tags latest"
-          fi
-          echo "image tags: $tags"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
   ci:
     needs: version
@@ -123,8 +109,11 @@ jobs:
           HEADSCALE: ${{ steps.build.outputs.registry }}/parallax-headscale@${{ steps.build.outputs.headscale }}
         run: |
           for arch in amd64 arm64; do
-            docker run --rm --platform linux/$arch --entrypoint parallax "$PARALLAX" --version | grep -Fx "parallax $VERSION"
-            docker run --rm --platform linux/$arch "$HEADSCALE" version
+            # --pull=always: one digest names both platforms, and the local
+            # copy from the last loop is the other one.
+            docker run --rm --pull=always --platform linux/$arch --entrypoint parallax "$PARALLAX" --version \
+              | grep -Fx "parallax $VERSION"
+            docker run --rm --pull=always --platform linux/$arch "$HEADSCALE" version
           done
       - uses: actions/attest-build-provenance@v4
         with:
@@ -139,7 +128,8 @@ jobs:
 
   release:
     # The files and their checksums, attested; then the image tags; then
-    # the GitHub Release, last, so it appears only once everything is out.
+    # the GitHub Release, published last, once everything is out. Safe to
+    # re-run on its own (docs/releasing.md).
     needs: [version, images]
     runs-on: ubuntu-latest
     permissions:
@@ -149,11 +139,23 @@ jobs:
       attestations: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      TAGS: ${{ needs.version.outputs.tags }}
       REGISTRY: ${{ needs.images.outputs.registry }}
       PARALLAX_DIGEST: ${{ needs.images.outputs.parallax }}
       HEADSCALE_DIGEST: ${{ needs.images.outputs.headscale }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # main and every tag, for the image tags below
+      - name: refuse to replace a published release
+        shell: bash
+        run: |
+          draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2> /dev/null || true)
+          if [ "$draft" = false ]; then
+            echo "::error::release $GITHUB_REF_NAME is already published"
+            exit 1
+          fi
       - uses: actions/download-artifact@v4
         with:
           pattern: parallax-*
@@ -172,46 +174,65 @@ jobs:
       - uses: actions/attest-build-provenance@v4
         with:
           subject-checksums: release/SHA256SUMS
+      - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: refuse to replace a published release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            echo "::error::release $GITHUB_REF_NAME is already published"
-            exit 1
-          fi
-          # A re-run of this job alone finds its own digests here and goes on;
-          # a re-run that rebuilt the images would swap what X.Y.Z points at.
-          for image in parallax:$PARALLAX_DIGEST parallax-headscale:$HEADSCALE_DIGEST; do
-            name=$REGISTRY/${image%%:*}
-            if current=$(docker buildx imagetools inspect "$name:$VERSION" --format '{{json .Manifest}}' 2> /dev/null); then
-              current=$(jq -er .digest <<< "$current")
-              if [ "$current" != "${image#*:}" ]; then
-                echo "::error::$name:$VERSION already points at $current, not ${image#*:}"
-                exit 1
-              fi
-            fi
-          done
       - name: tag the images
         shell: bash
         run: |
+          # X.Y.Z always; X.Y and latest only if no newer release on main has
+          # them, so a late or re-run older release can't move them back.
+          # Worked out here, not in an earlier job, so a re-run sees the
+          # releases made since.
+          releases=$(git tag --merged origin/main -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          minor=${VERSION%.*}
+          tags=("$VERSION")
+          if [ "$(grep -E "^v${minor//./\\.}\.[0-9]+$" <<< "$releases" | tail -n 1)" = "v$VERSION" ]; then
+            tags+=("$minor")
+          fi
+          if [ "$(tail -n 1 <<< "$releases")" = "v$VERSION" ]; then
+            tags+=(latest)
+          fi
+          echo "image tags: ${tags[*]}"
+
+          # digest <image:tag>: what it points at, nothing if there's no such tag.
+          digest() {
+            local out
+            if out=$(docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>&1); then
+              jq -er .digest <<< "$out"
+            elif ! grep -qi 'not found' <<< "$out"; then
+              echo "::error::can't inspect $1: $out" >&2
+              return 1
+            fi
+          }
+
           for image in parallax:$PARALLAX_DIGEST parallax-headscale:$HEADSCALE_DIGEST; do
-            name=$REGISTRY/${image%%:*}
-            args=()
-            for tag in $TAGS; do args+=(-t "$name:$tag"); done
-            docker buildx imagetools create "${args[@]}" "$name@${image#*:}"
+            name=$REGISTRY/${image%%:*} want=${image#*:}
+            # A re-run of this job alone finds its own digests here and goes on;
+            # one that rebuilt the images would swap what X.Y.Z points at.
+            current=$(digest "$name:$VERSION")
+            if [ -n "$current" ] && [ "$current" != "$want" ]; then
+              echo "::error::$name:$VERSION already points at $current, not $want"
+              exit 1
+            fi
+            # --prefer-index=false: copy the index as it is, so the tags name
+            # the attested digest.
+            for tag in "${tags[@]}"; do
+              docker buildx imagetools create --prefer-index=false -t "$name:$tag" "$name@$want"
+              test "$(digest "$name:$tag")" = "$want"
+            done
           done
-      - shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: publish the GitHub Release
+        shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
-            --title "Parallax $VERSION" release/*
+          # As a draft until every file is up, so a failed upload leaves
+          # nothing half published, and a re-run picks the draft up.
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes \
+              --title "Parallax $VERSION"
+          fi
+          gh release upload "$GITHUB_REF_NAME" --clobber release/*
+          gh release edit "$GITHUB_REF_NAME" --draft=false

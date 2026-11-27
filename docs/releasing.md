@@ -38,11 +38,12 @@ them. `SHA256SUMS` itself isn't attested; it lists the attested files.
 The workflow fails before publishing anything if the tag isn't
 `v<Cargo.toml version>` or the commit isn't on `main`. If a later job fails
 (a flaky runner, say), re-run **the failed jobs**, not all jobs. Image tags
-move and the GitHub Release appears only in the last job, once everything
-else is out. That job refuses to run if the release is already published,
-or if `X.Y.Z` already points at other images than the ones this run built
-(what "re-run all jobs" after a half-finished release would do). Releases
-run one at a time.
+move and the GitHub Release is published only in the last job, once
+everything else is out; until its files are all uploaded it's a draft. That
+job refuses to run if the release is already published, or if `X.Y.Z`
+already points at other images than the ones this run built (what "re-run
+all jobs" after a half-finished release would do). Releases run one at a
+time.
 
 ## Once per repository
 

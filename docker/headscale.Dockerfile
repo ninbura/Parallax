@@ -8,7 +8,6 @@
 # The build runs on the builder's own platform and cross-compiles, so a
 # multi-arch build (release.yml) doesn't compile Go under emulation.
 FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine3.24 AS build
-ARG TARGETOS TARGETARCH
 # A commit on main after #3554 (2026-11-25, "CHANGELOG: describe the
 # configuration overhaul").
 ARG HEADSCALE_COMMIT=d9bf885c4911bfd079842ba70165b809e7c52c6d
@@ -20,6 +19,8 @@ RUN git init -q \
     && git fetch -q --depth 1 origin "$HEADSCALE_COMMIT" \
     && git checkout -q FETCH_HEAD \
     && test "$(git rev-parse HEAD)" = "$HEADSCALE_COMMIT"
+# Declared here, after the fetch, so both platforms share the steps above.
+ARG TARGETOS TARGETARCH
 ENV CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH
 RUN go build -trimpath -ldflags "-s -w" -o /headscale ./cmd/headscale
 # Headscale's license and those of every module linked into it (Tailscale's
