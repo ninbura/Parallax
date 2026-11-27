@@ -218,8 +218,14 @@ fn internet_grant_and_masquerade_match_golden() {
     assert!(rule("family").contains("ip daddr != @not_public"));
     // Merged, since nft rejects overlapping intervals: the configured
     // 192.168.1.0/24 sits inside 192.168.0.0/16.
-    assert!(fw.contents.contains("192.168.0.0/16"));
-    assert!(!fw.contents.contains("192.168.1.0/24,"));
+    let not_public = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("set not_public_"))
+        .find(|l| l.contains("elements = "))
+        .unwrap();
+    assert!(not_public.contains("192.168.0.0/16"), "{not_public}");
+    assert!(!not_public.contains("192.168.1.0/24"), "{not_public}");
 }
 
 #[test]

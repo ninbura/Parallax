@@ -173,10 +173,11 @@ fn apply_firewall(
             // it or flushes it in the same transaction as its refill, so no
             // chain is ever empty. But each table commits at its own COMMIT:
             // if `nat` fails, `filter` is already in (issue #56). The dry run
-            // catches most failures (syntax, a missing set or extension)
-            // before either table changes. What it can't catch leaves new
-            // filter rules with old NAT, which can't reach more than the
-            // filter allows (`firewall::check_layers`); the daemon retries.
+            // stops syntax errors and missing sets before either table
+            // changes. A kernel refusing a `nat` rule still leaves new
+            // filter rules with old NAT, which reach no more than the filter
+            // allows (`firewall::check_layers`, docs/design.md); the daemon
+            // retries.
             sys.runner.run_checked(
                 "iptables-restore",
                 &["--test", "--noflush", &main_str],

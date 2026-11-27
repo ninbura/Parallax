@@ -459,16 +459,26 @@ the old rules with exactly the sets they had (issue #35).
 
 Unlike `nft -f`, `iptables-restore` commits each table at its own `COMMIT`:
 a restore whose `nat` part fails leaves the new `filter` rules running with
-the old NAT (issue #56). apply runs `iptables-restore --test` first, which
-catches most failures (syntax, a missing set or extension) before either
-table changes. What's left can't widen access, because the tables keep to
-their jobs: NAT only translates (prefix maps, the proxy redirect,
-masquerade), and filter decides on addresses as they are after NAT, real
-addresses and interfaces, never a virtual one. Real subnets can't overlap,
-so a real address names one network under any configuration, and a mix of
-two configurations' tables reaches at most what the live filter allows. It
-can misroute (a stale prefix map, a missing redirect) until the daemon's
-next apply. `firewall::build` refuses a ruleset that breaks this.
+the old NAT (issue #56). apply runs `iptables-restore --test` first: it
+parses the whole file and checks that every set exists, so those failures
+stop before either table changes. It doesn't ask the kernel, so a kernel
+that refuses a rule can still fail the real `nat` commit.
+
+What a mix of two configurations' tables can do is bounded, because the
+tables keep to their jobs. NAT only translates (prefix maps, the proxy
+redirect, masquerade). Filter decides on addresses as they are after NAT
+and on interfaces, never on a virtual address, and `internet` excludes
+every configured prefix, real and virtual: a range one configuration maps
+away may be the other's real LAN, and isn't the internet under either.
+So the mix lets a peer reach, by address and interface, at most what the
+live filter allows. Until the daemon's next apply (and, for a connection
+opened meanwhile, until it ends, since conntrack keeps its NAT) it can
+still get two things wrong: where an address leads (a stale prefix map, a
+missing proxy redirect), and the source a LAN host sees (a stale masquerade
+shows a newly granted peer as the gateway). The nftables backend has
+neither window. `firewall::build` refuses a ruleset that breaks the
+layering, and validation keeps the DNS shim and the proxy off virtual
+addresses.
 
 ## Apply order and idempotency
 

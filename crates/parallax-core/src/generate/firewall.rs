@@ -36,7 +36,7 @@
 //!   accepts or drops, and no filter rule matches a virtual address. So a
 //!   mix of one configuration's NAT and another's filter (iptables commits
 //!   the two tables one after the other) never reaches more than the live
-//!   filter allows ([`check_layers`], issue #56).
+//!   filter allows (`check_layers`, issue #56).
 //! - Tunnel peers are IPv4-only: IPv6 from a tunnel interface is dropped.
 //! - Activity logging ([`crate::logging`]): new flows of logged peers get
 //!   [`FLOW_MARK`] in their connection mark, so the collector keeps only
@@ -435,10 +435,21 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
     // home's public IP. Both are masqueraded, and both need `lan_real`.
     let internet = model.any_internet() || any_home_public(model);
     if internet {
+        // Virtual prefixes too: after NAT no packet has one, so this changes
+        // nothing under one configuration. Under a mix (issue #56), a range
+        // one configuration maps away may be another's real LAN; `internet`
+        // must not reach it through the other's stale NAT.
+        let mut elements = configured.clone();
+        elements.extend(
+            cfg.networks
+                .iter()
+                .filter_map(|n| n.mapping())
+                .map(|m| m.virt()),
+        );
         rs.sets.push(AddressSet {
             name: LAN_SET.into(),
-            elements: configured.clone(),
-            comment: "real prefixes of every configured network".into(),
+            elements,
+            comment: "every configured network's prefixes, real and virtual".into(),
         });
     }
     if tiers
@@ -854,11 +865,13 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
 /// old NAT (issue #56). That's harmless only while the tables keep to
 /// their jobs. NAT only translates (prefix maps, the proxy redirect,
 /// masquerade). Filter decides on what a packet is after NAT: real
-/// addresses and interfaces, which name one network each, since real
-/// subnets can't overlap. A filter rule matching a virtual address would
+/// addresses and interfaces. A filter rule matching a virtual address would
 /// mean something else under another configuration's NAT. Negated matches
 /// are allowed: an address left untranslated then fails them, which only
-/// denies.
+/// denies. (`lan_real` lists virtual prefixes for that reason: one
+/// configuration's virtual prefix may be another's real LAN.) What NAT can
+/// still change in a mix, the route and the source a LAN host sees, is in
+/// docs/design.md.
 fn check_layers(rs: &Ruleset, cfg: &crate::Config) -> Result<()> {
     let virtual_prefixes: Vec<Ipv4Net> = cfg
         .networks
@@ -1564,12 +1577,13 @@ mod tests {
         );
 
         // Through a set, and a whole mapped prefix inside a wider match.
-        let mut rs = good.clone();
-        rs.sets.push(AddressSet {
+        let mut with_set = good.clone();
+        with_set.sets.push(AddressSet {
             name: "virtual".into(),
             elements: vec![virt],
             comment: String::new(),
         });
+        let mut rs = with_set.clone();
         rs.rules.push(
             Rule::new(Chain::Input, Action::Drop, "by set").src(Match::Set("virtual".into())),
         );
@@ -1581,8 +1595,8 @@ mod tests {
         .contains("'wide'"));
 
         // A negated match may hold virtual addresses: untranslated, they
-        // fail it, which only denies.
-        let mut rs = good.clone();
+        // fail it, which only denies. (`lan_real` in `good` holds one too.)
+        let mut rs = with_set;
         rs.rules.push(
             Rule::new(Chain::Tier(0), Action::Accept, "not virtual")
                 .dst(Match::NotSet("virtual".into())),

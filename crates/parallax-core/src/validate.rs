@@ -692,6 +692,23 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
             ));
         }
     }
+    // A virtual address is a LAN host's as clients see it, and NAT maps it
+    // to the host. The firewall decides only on addresses after NAT, never
+    // on a virtual one (issue #56), so neither listener may take one.
+    for (what, listen) in [
+        ("server.dns.listen", server.dns.listen),
+        ("server.proxy.listen", server.proxy.listen),
+    ] {
+        let Some(listen) = listen else { continue };
+        for n in &config.networks {
+            if n.mapped_to.is_some_and(|v| v.contains(&listen)) {
+                errors.push(format!(
+                    "{what} {listen} is inside network '{}''s virtual prefix, where it would stand for one of its hosts; use one of the gateway's own addresses outside it",
+                    n.name
+                ));
+            }
+        }
+    }
     if let Some(mtu) = wg.peer_defaults.mtu {
         if !(1280..=1500).contains(&mtu) {
             errors.push(format!(
@@ -1332,6 +1349,14 @@ mod tests {
                 "{e:?}"
             );
         }
+        // Not a virtual address: it stands for a host behind NAT (#56).
+        let host: Ipv4Addr = "198.18.1.200".parse().unwrap();
+        let inside =
+            |field: &str| format!("{field} 198.18.1.200 is inside network 'home''s virtual prefix");
+        let e = errors_of(|c| c.server.proxy.listen = Some(host));
+        assert!(has(&e, &inside("server.proxy.listen")), "{e:?}");
+        let e = errors_of(|c| c.server.dns.listen = Some(host));
+        assert!(has(&e, &inside("server.dns.listen")), "{e:?}");
         // Inside the supernet is fine, unless a peer holds the address.
         assert!(
             errors_of(|c| c.server.proxy.listen = Some("10.8.2.9".parse().unwrap())).is_empty()
