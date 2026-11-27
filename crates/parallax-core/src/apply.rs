@@ -186,12 +186,17 @@ fn apply_firewall(
                 &["--test", "--noflush", &main_str],
                 None,
             )?;
-            let hold = hold_rules(model.server());
-            for rule in &hold {
-                // At most one of each: a failed apply may have left it.
-                sys.runner.run("iptables", &hold_args("-D", rule), None)?;
-                sys.runner
-                    .run_checked("iptables", &hold_args("-I", rule), None)?;
+            for rule in hold_rules(model.server()) {
+                // A failed apply may have left it: keep that one rather than
+                // lift it for a moment.
+                if !sys
+                    .runner
+                    .run("iptables", &hold_args("-C", &rule), None)?
+                    .ok()
+                {
+                    sys.runner
+                        .run_checked("iptables", &hold_args("-I", &rule), None)?;
+                }
             }
             sys.runner
                 .run_checked("iptables-restore", &["--noflush", &main_str], None)
@@ -210,15 +215,31 @@ fn apply_firewall(
                     },
                     e => e,
                 })?;
-            for rule in &hold {
-                sys.runner
-                    .run_checked("iptables", &hold_args("-D", rule), None)?;
-            }
-            // Chains of tiers that no longer exist: nothing jumps to them
-            // since the restore, so they can go.
             let listing = sys
                 .runner
                 .run_checked("iptables", &["-t", "filter", "-S"], None)?;
+            // Hooks first, then the hold comes off: until both tables are
+            // attached nothing new starts. Every hold goes, also one for an
+            // interface since renamed.
+            for (table, builtin, own) in CHAINS {
+                let present = sys
+                    .runner
+                    .run("iptables", &["-t", table, "-C", builtin, "-j", own], None)?
+                    .ok();
+                if !present {
+                    sys.runner.run_checked(
+                        "iptables",
+                        &["-t", table, "-I", builtin, "-j", own],
+                        None,
+                    )?;
+                }
+            }
+            for args in held(&listing.stdout) {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                sys.runner.run_checked("iptables", &args, None)?;
+            }
+            // Chains of tiers that no longer exist: nothing jumps to them
+            // since the restore, so they can go.
             for chain in listing
                 .stdout
                 .lines()
@@ -251,19 +272,6 @@ fn apply_firewall(
                         "firewall: stale set {name} stays: {}",
                         destroy.stderr.trim()
                     ));
-                }
-            }
-            for (table, builtin, own) in CHAINS {
-                let present = sys
-                    .runner
-                    .run("iptables", &["-t", table, "-C", builtin, "-j", own], None)?
-                    .ok();
-                if !present {
-                    sys.runner.run_checked(
-                        "iptables",
-                        &["-t", table, "-I", builtin, "-j", own],
-                        None,
-                    )?;
                 }
             }
             log.push("firewall: PARALLAX_* chains restored".into());
@@ -431,18 +439,19 @@ pub fn apply(
 pub const HOLD_COMMENT: &str = "parallax-hold";
 
 /// What keeps tunnel peers from opening connections while `iptables-restore`
-/// swaps the rules (issue #56): one rule per tunnel interface at the top of
-/// INPUT and FORWARD, dropping their new flows. Each is the rule as
-/// `iptables -t filter <-I|-D>` takes it.
+/// swaps the rules (issue #56): rules at the top of INPUT and FORWARD that
+/// drop new flows from each tunnel interface, and in FORWARD those toward
+/// it (LAN-initiated, which NETMAP's source map would mislabel). Each is the
+/// rule as `iptables -t filter <-C|-I>` takes it.
 pub fn hold_rules(server: &crate::model::ServerConfig) -> Vec<Vec<String>> {
     let mut rules = Vec::new();
     for t in crate::transport::all() {
         let iface = t.ingress_interface(server);
-        for chain in ["INPUT", "FORWARD"] {
+        for (chain, dir) in [("INPUT", "-i"), ("FORWARD", "-i"), ("FORWARD", "-o")] {
             rules.push(
                 [
                     chain,
-                    "-i",
+                    dir,
                     &iface,
                     "-m",
                     "conntrack",
@@ -463,8 +472,26 @@ pub fn hold_rules(server: &crate::model::ServerConfig) -> Vec<Vec<String>> {
     rules
 }
 
-/// `iptables` arguments to insert (`-I`, at the top) or delete (`-D`) one
-/// of [`hold_rules`].
+/// `iptables` arguments that delete every hold in `listing` (`iptables -t
+/// filter -S`), whatever interface it names.
+pub fn held(listing: &str) -> Vec<Vec<String>> {
+    let marker = format!("--comment {HOLD_COMMENT} ");
+    listing
+        .lines()
+        .filter(|l| l.contains(&marker))
+        .filter_map(|l| l.strip_prefix("-A "))
+        .map(|rule| {
+            ["-t", "filter", "-D"]
+                .into_iter()
+                .chain(rule.split(' '))
+                .map(String::from)
+                .collect()
+        })
+        .collect()
+}
+
+/// `iptables` arguments to check for (`-C`) or insert (`-I`, at the top)
+/// one of [`hold_rules`].
 pub fn hold_args<'a>(op: &'a str, rule: &'a [String]) -> Vec<&'a str> {
     ["-t", "filter", op]
         .into_iter()
@@ -641,6 +668,11 @@ mod tests {
                 failing,
                 failed("iptables-restore: line 12 failed"),
             );
+            // A failed apply left one hold; the others aren't there.
+            let holds = hold_rules(model.server());
+            for rule in &holds[1..] {
+                runner.respond_to("iptables", &hold_args("-C", rule), failed("Bad rule"));
+            }
             let sys = System {
                 fs: &fs,
                 runner: &runner,
@@ -655,19 +687,18 @@ mod tests {
             };
             assert!(ran(failing), "{lines:#?}");
             assert_eq!(ran(&restore), failing == restore, "{lines:#?}");
-            // The hold: never placed when the dry run fails; placed for
-            // both transports' INPUT and FORWARD, and left, when the
-            // restore fails, which the error says.
-            let holds: Vec<&String> = lines.iter().filter(|l| l.contains(HOLD_COMMENT)).collect();
+            // The hold: never placed when the dry run fails. When the
+            // restore fails, placed for both transports (the one already
+            // there kept, never lifted for a moment) and left in, which the
+            // error says.
+            let touched: Vec<&String> = lines.iter().filter(|l| l.contains(HOLD_COMMENT)).collect();
             if failing == dry_run {
-                assert!(holds.is_empty(), "{lines:#?}");
+                assert!(touched.is_empty(), "{lines:#?}");
             } else {
-                let placed = holds.iter().filter(|l| l.contains(" -I ")).count();
-                assert_eq!(placed, 4, "{lines:#?}");
-                assert!(
-                    holds.last().is_some_and(|l| l.contains(" -I ")),
-                    "{lines:#?}"
-                );
+                assert_eq!(holds.len(), 6);
+                let placed = touched.iter().filter(|l| l.contains(" -I ")).count();
+                assert_eq!(placed, 5, "{lines:#?}");
+                assert!(!touched.iter().any(|l| l.contains(" -D ")), "{lines:#?}");
                 assert!(
                     err.contains("tunnel peers can't open new connections until an apply succeeds"),
                     "{err}"
