@@ -1,0 +1,179 @@
+name: release
+# A tag vX.Y.Z publishes Parallax X.Y.Z (docs/releasing.md):
+#   - the static binaries, the .deb and the Arch package from ci.yml's
+#     package job, with SHA256SUMS, on a GitHub Release;
+#   - ghcr.io/<owner>/parallax and parallax-headscale for amd64 and arm64,
+#     tagged X.Y.Z, and X.Y and latest unless X.Y.Z is a pre-release;
+#   - a build provenance attestation for every file and image.
+# Nothing is published unless the whole of ci.yml passes first, and image
+# tags move only once both images are pushed and run.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # for the check that the tag is on main
+      - run: rustup install # the version in rust-toolchain.toml
+      - id: check
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "parallax-cli") | .version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml ($version); expected v$version"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME points at $GITHUB_SHA, which isn't on main"
+            exit 1
+          fi
+          case $version in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  images:
+    # Both images pushed by digest only, run, and attested. release tags them.
+    needs: [version, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      registry: ${{ steps.build.outputs.registry }}
+      parallax: ${{ steps.build.outputs.parallax }}
+      headscale: ${{ steps.build.outputs.headscale }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: parallax-*
+          path: dist
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        shell: bash
+        run: |
+          registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}
+          echo "registry=$registry" >> "$GITHUB_OUTPUT"
+          # build <image> <licenses> <buildx args...>; outputs <image>=<digest>
+          build() {
+            local image=$1 licenses=$2
+            shift 2
+            docker buildx build --platform linux/amd64,linux/arm64 \
+              --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+              --annotation "index:org.opencontainers.image.version=$VERSION" \
+              --annotation "index:org.opencontainers.image.licenses=$licenses" \
+              --output "type=image,name=$registry/$image,push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file "$image.json" "$@"
+            echo "${image#parallax-}=$(jq -er '."containerimage.digest"' "$image.json")" >> "$GITHUB_OUTPUT"
+          }
+          build parallax "MIT OR Apache-2.0" -f docker/Dockerfile --target release .
+          build parallax-headscale BSD-3-Clause -f docker/headscale.Dockerfile docker
+      - name: the pushed images run
+        shell: bash
+        env:
+          PARALLAX: ${{ steps.build.outputs.registry }}/parallax@${{ steps.build.outputs.parallax }}
+          HEADSCALE: ${{ steps.build.outputs.registry }}/parallax-headscale@${{ steps.build.outputs.headscale }}
+        run: |
+          for arch in amd64 arm64; do
+            docker run --rm --platform linux/$arch --entrypoint parallax "$PARALLAX" --version | grep -Fx "parallax $VERSION"
+            docker run --rm --platform linux/$arch "$HEADSCALE" version
+          done
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ steps.build.outputs.registry }}/parallax
+          subject-digest: ${{ steps.build.outputs.parallax }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ steps.build.outputs.registry }}/parallax-headscale
+          subject-digest: ${{ steps.build.outputs.headscale }}
+          push-to-registry: true
+
+  release:
+    # The files and their checksums, attested; then the image tags; then
+    # the GitHub Release, last, so it appears only once everything is out.
+    needs: [version, images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+      REGISTRY: ${{ needs.images.outputs.registry }}
+      PARALLAX_DIGEST: ${{ needs.images.outputs.parallax }}
+      HEADSCALE_DIGEST: ${{ needs.images.outputs.headscale }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: parallax-*
+          path: dist
+      - shell: bash
+        run: |
+          mkdir release
+          for arch in amd64 arm64; do
+            cp "dist/parallax-$arch/parallax" "release/parallax-$VERSION-linux-$arch"
+            cp dist/parallax-$arch/*.deb dist/parallax-$arch/*.pkg.tar.zst release/
+          done
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" = 6
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: release/SHA256SUMS
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - shell: bash
+        run: |
+          # X.Y.Z always; X.Y and latest only for a final release.
+          tags=("$VERSION")
+          if [ "$PRERELEASE" = false ]; then tags+=("${VERSION%.*}" latest); fi
+          for image in parallax:$PARALLAX_DIGEST parallax-headscale:$HEADSCALE_DIGEST; do
+            name=$REGISTRY/${image%%:*}
+            args=()
+            for tag in "${tags[@]}"; do args+=(-t "$name:$tag"); done
+            docker buildx imagetools create "${args[@]}" "$name@${image#*:}"
+          done
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            --title "Parallax $VERSION" "${flags[@]}" release/*

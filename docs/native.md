@@ -18,8 +18,14 @@ Docker.
 
 ## Install
 
-Packages and static binaries for x86_64 and aarch64 are built by CI (the
-`package` job's artifacts) until releases are published.
+Packages and static binaries for x86_64 and aarch64 are on the
+[releases page](https://github.com/ninbura/Parallax/releases), with a
+`SHA256SUMS` file. To check a download was built by this repository's CI
+(needs the GitHub CLI; [releasing.md](releasing.md)):
+
+```sh
+gh attestation verify parallax_<version>-1_amd64.deb --repo ninbura/Parallax
+```
 
 **Debian, Ubuntu:**
 
@@ -217,8 +223,9 @@ Headscale is the control plane only. Tailscale traffic doesn't pass through
 it, except relayed packets when its embedded DERP relay is on. It can run
 anywhere Parallax can reach `server_url`: in rootless Docker (the
 `headscale` service in `docker/compose.yml` works as it is: `docker compose
-up -d headscale` builds it from the commit Parallax is tested with, ADR
-0014), its own package, or another machine. Rootless Docker isn't supported for Parallax
+up -d headscale` pulls `parallax-headscale`, built from the commit Parallax
+is tested with, ADR 0014; set `PARALLAX_VERSION` in `docker/.env` to the
+Parallax version you installed), its own package, or another machine. Rootless Docker isn't supported for Parallax
 itself (setup.md explains why), but it is for Headscale. Parallax reads its
 nodes with the API key in `/etc/parallax/headscale-api.key` (mode 0600,
 owned by `parallax`); see setup.md, Headscale.

@@ -26,7 +26,9 @@ Tailscale's API, with scoped OAuth credentials, but can't create users.
 
 - **Headscale is built from a pinned commit of `main`**
   (`docker/headscale.Dockerfile`), and `docker/compose.yml` builds it
-  instead of pulling a release. The shipped `docker/headscale/config.yaml`
+  instead of pulling a release *(since step 20, CI publishes that build as
+  `ghcr.io/ninbura/parallax-headscale`, versioned with Parallax, and compose
+  pulls it: docs/releasing.md)*. The shipped `docker/headscale/config.yaml`
   passes that build's `headscale check config`, with certificates ready to
   turn on once a DNS provider is set. We go back to the latest stable
   release once one includes certificates.

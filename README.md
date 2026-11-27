@@ -48,7 +48,8 @@ EDITOR=nvim $parallax config edit -o /tmp/parallax-out
 
 `apply` needs Linux with `nft`, `wg` and `ip`. Run the gateway in rootful
 Docker (`docker/`, `docs/setup.md`), or natively as an unprivileged systemd
-service from a `.deb`, an Arch package or a static binary (`docs/native.md`). Backups (automatic, encrypted, one-command restore):
+service from a `.deb`, an Arch package or a static binary (`docs/native.md`).
+Releases: `docs/releasing.md`. Backups (automatic, encrypted, one-command restore):
 `docs/backup.md`. Per-peer activity logging: `docs/logging.md`.
 
 ## Layout
@@ -66,7 +67,8 @@ service from a `.deb`, an Arch package or a static binary (`docs/native.md`). Ba
   `peer add|remove|show|grants`,
   `export`, `doctor`, `backup create|list|restore|passphrase`. While the
   daemon runs, every command goes through its socket.
-- `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
+- `docker/`: images, entrypoint, compose with `parallax` + `headscale`
+  (pulls the released images from GHCR; `compose.build.yml` builds them).
 - `packaging/`: the native install: systemd unit, sysusers.d, tmpfiles.d,
   modules-load.d, sysctl.d, and the nfpm config for the `.deb` and Arch
   package.
@@ -86,3 +88,9 @@ UPDATE_GOLDEN=1 cargo test -p parallax-core --test golden   # refresh goldens af
 sudo ./tests/integration/netns.sh # Linux only, needs root
 sudo dev/staging/staging.sh up && sudo dev/staging/staging.sh smoke   # staging gateway, see dev/staging/README.md
 ```
+
+## License
+
+MIT or Apache-2.0, at your option (`LICENSE-MIT`, `LICENSE-APACHE`). The
+`parallax-headscale` image also carries Headscale's BSD-3-Clause license and
+those of the Go modules built into it, under `/usr/share/licenses/headscale`.

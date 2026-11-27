@@ -1,7 +1,10 @@
 name: ci
 on:
+  # Tags run this through release.yml, which publishes only if it passes.
   push:
+    branches: ['**']
   pull_request:
+  workflow_call:
 
 jobs:
   check:
@@ -61,7 +64,8 @@ jobs:
 
   package:
     # Static (musl) binaries, and the .deb and Arch package built from them
-    # (packaging/nfpm.yaml), kept as artifacts. Publishing releases is step 20.
+    # (packaging/nfpm.yaml), kept as artifacts. A tag publishes them
+    # (release.yml).
     needs: check
     strategy:
       fail-fast: false
@@ -117,6 +121,36 @@ jobs:
           name: parallax-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
+
+  images:
+    # The release images as release.yml builds them, for both architectures,
+    # without pushing: parallax from the package job's binaries, Headscale
+    # cross-compiled. Each one is loaded and run, arm64 under QEMU.
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: parallax-*
+          path: dist
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          for arch in amd64 arm64; do
+            docker buildx build --platform linux/$arch --load -t parallax:$arch \
+              -f docker/Dockerfile --target release .
+            docker run --rm --platform linux/$arch --entrypoint parallax parallax:$arch --version \
+              | grep -Fx "parallax $version"
+            docker buildx build --platform linux/$arch --load -t parallax-headscale:$arch \
+              -f docker/headscale.Dockerfile docker
+            docker run --rm --platform linux/$arch parallax-headscale:$arch version
+            docker run --rm --platform linux/$arch --entrypoint ls parallax-headscale:$arch \
+              /usr/share/licenses/headscale/tailscale.com/LICENSE
+          done
 
   install-deb:
     # The .deb on a fresh Ubuntu, run as the real service: the user, the
