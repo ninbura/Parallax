@@ -285,8 +285,8 @@ pub fn asked_on_save<'a>(old: Option<&Config>, new: &'a Config) -> BTreeSet<&'a 
         .collect()
 }
 
-/// Before saving `new` over `old`: look up the names `new` adds, and refuse
-/// the change if a new name doesn't resolve or the change adds a problem.
+/// Before saving `new` over `old`: look up the names [`asked_on_save`], and
+/// refuse the change if one doesn't resolve or the change adds a problem.
 /// `old_public_ip` and `public_ip` are the home's public IP in effect under
 /// each. Returns the names to use from now on.
 pub fn check_save(
@@ -307,6 +307,7 @@ pub fn check_save(
     // replaces). A known answer `new` no longer allows (its network was
     // renumbered in this change) is asked again too.
     let fresh = asked_on_save(old, new);
+    let had = old.map(used).unwrap_or_default();
     for name in used(new) {
         let still_fine = match known.get(name) {
             Some(addresses) => refused(new, public_ip, name, addresses).is_none(),
@@ -319,9 +320,12 @@ pub fn check_save(
             Ok(addresses) => {
                 resolved.insert(name.to_string(), addresses);
             }
-            // A name kept from `old`: whether this change made it worse is for
-            // the comparison of problems below, not the lookup.
-            Err(_) if !fresh.contains(name) => {}
+            // A name kept from `old`, or one `old` never found either (a
+            // resolver change mustn't need every broken name fixed first):
+            // whether this change made it worse is for the comparison of
+            // problems below, not the lookup.
+            Err(_)
+                if !fresh.contains(name) || (had.contains(name) && !known.contains_key(name)) => {}
             Err(why) => failed.push(why),
         }
     }
@@ -480,14 +484,9 @@ mod tests {
         let known: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
         let mut new = old.clone();
         new.networks[0].subnet = "192.168.2.0/24".parse().unwrap();
-        new.networks[0].upstream_dns = vec![Ipv4Addr::new(192, 168, 2, 1)];
         new.services[0].host = Host::Ip(Ipv4Addr::new(192, 168, 2, 5));
-        // Asked again, DNS still has the old address.
-        let r = FakeResolver::new().answer(
-            NAS,
-            Nameserver::Plain(Ipv4Addr::new(192, 168, 2, 1)),
-            &[nas_addr()],
-        );
+        // Asked again through the same resolver, which still has the old address.
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
         let err = check_save(Some(&old), None, &new, None, &r, &known).unwrap_err();
         assert!(
             err[0].contains("resolved to 192.168.1.9, outside every configured network"),
@@ -769,5 +768,36 @@ mod tests {
             err[0].contains("not the home's public IP 1.2.3.40"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_name_never_found_doesnt_block_a_resolver_change() {
+        // OLDBOX was already missing; NAS resolves through the new resolver.
+        const OLDBOX: &str = "oldbox.mydomain.com";
+        let mut old = named();
+        old.grants[1].rules.push(Rule::Host {
+            host: Host::Name(OLDBOX.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 22)],
+        });
+        let known: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
+        let mut new = old.clone();
+        let other = Ipv4Addr::new(192, 168, 1, 53);
+        new.networks[0].upstream_dns = vec![other];
+        let r = FakeResolver::new().answer(NAS, Nameserver::Plain(other), &[nas_addr()]);
+        let resolved = check_save(Some(&old), None, &new, None, &r, &known).unwrap();
+        assert_eq!(resolved, known);
+    }
+
+    #[test]
+    fn a_zone_moved_to_another_network_is_asked_again() {
+        // A more specific zone on a second network takes NAS's name over.
+        let old = named();
+        let mut new = old.clone();
+        let mut lab = new.networks[0].clone();
+        lab.name = "lab".into();
+        lab.domains = vec![NAS.into()];
+        lab.upstream_dns = vec![Ipv4Addr::new(192, 168, 1, 53)];
+        new.networks.push(lab);
+        assert_eq!(asked_on_save(Some(&old), &new), BTreeSet::from([NAS]));
     }
 }
