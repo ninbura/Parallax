@@ -21,6 +21,13 @@
 //! re-applies when one changes ([`parallax_core::headscale`]). When
 //! Headscale doesn't answer, the last answer stays in effect.
 //!
+//! While a peer is on Tailscale, it keeps the subnet router (the
+//! `tailscaled` at `--tailscale-socket`) logged in and routing what the
+//! configuration says: every 30 seconds and after each saved change
+//! ([`parallax_core::subnet_router`]). The machine's own Tailscale is left
+//! alone; what its operator has to run is logged. Parallax's own router
+//! follows route changes even with no peer on Tailscale, but isn't logged in.
+//!
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
 //! arrive during an apply queue up, and a batch of them shares one apply.
@@ -46,6 +53,7 @@ use parallax_core::names::{self, Refreshed, Resolved};
 use parallax_core::public_ip::{self, Found};
 use parallax_core::reconcile::{self, Reconciler};
 use parallax_core::secret::Secret;
+use parallax_core::subnet_router;
 use parallax_core::Config;
 use parallax_store::{backup, Store, TempDir};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -65,6 +73,8 @@ pub struct Options {
     pub db: PathBuf,
     pub socket: PathBuf,
     pub out: PathBuf,
+    /// The subnet router's `tailscaled`.
+    pub tailscale_socket: String,
     /// Between checks for drift and a new day.
     pub reconcile_every: Duration,
 }
@@ -78,6 +88,13 @@ const PUBLIC_IP_EVERY: Duration = Duration::from_secs(300);
 const NAMES_EVERY: Duration = Duration::from_secs(300);
 /// How often Headscale is asked for its nodes.
 const TAILNET_EVERY: Duration = Duration::from_secs(headscale::POLL_SECONDS);
+/// How often the subnet router is looked at.
+const ROUTER_EVERY: Duration = Duration::from_secs(subnet_router::POLL_SECONDS);
+/// How soon it's looked at again after a change, so a router that just
+/// logged in gets its routes approved without waiting a whole poll.
+const ROUTER_SOON: Duration = Duration::from_secs(2);
+/// The longest wait between looks while the router keeps failing.
+const ROUTER_BACKOFF: Duration = Duration::from_secs(900);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -144,11 +161,15 @@ type Views = watch::Receiver<Option<View>>;
 
 pub fn run(opts: Options) -> anyhow::Result<()> {
     not_root_in_anothers_place(&opts)?;
-    tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("starting the async runtime")?
-        .block_on(serve(opts))
+        .context("starting the async runtime")?;
+    let result = rt.block_on(serve(opts));
+    // A lookup still blocking a thread (a wedged `tailscale`, a slow
+    // Headscale) mustn't keep the process from exiting.
+    rt.shutdown_timeout(Duration::from_secs(5));
+    result
 }
 
 /// Before anything: a daemon run as root where another user's files are
@@ -240,6 +261,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let refresher = tokio::spawn(refresh_public_ip(tx.clone(), views.clone()));
     let names = tokio::spawn(refresh_names(tx.clone(), views.clone()));
     let tailnet = tokio::spawn(refresh_tailnet(tx.clone(), views.clone()));
+    let router = tokio::spawn(keep_router(views.clone(), opts.tailscale_socket.clone()));
     let logs = collector::Slot::default();
     let collecting = tokio::spawn(collector::supervise(views.clone(), Arc::clone(&logs), taps));
     let server = tokio::spawn(accept(listener, tx.clone(), views, database, logs));
@@ -271,6 +293,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     refresher.abort();
     names.abort();
     tailnet.abort();
+    router.abort();
     // Only our own: another daemon may have bound the path since.
     if file_id(&opts.socket) == Some(socket_id) {
         if let Err(e) = std::fs::remove_file(&opts.socket) {
@@ -724,6 +747,80 @@ async fn refresh_tailnet(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
     }
 }
 
+/// Keep the subnet router as the configuration says, every
+/// [`ROUTER_EVERY`] and when the configuration changes. Logs what it did,
+/// and each problem (or what the operator still has to do) once. After a
+/// failure it waits longer each time, up to [`ROUTER_BACKOFF`], so a login
+/// that keeps failing doesn't mint a pre-auth key every poll.
+async fn keep_router(mut views: Views, socket: String) {
+    let config = |views: &Views| views.borrow().as_ref().map(|v| Arc::clone(&v.config));
+    let mut last = config(&views);
+    let mut said: Option<String> = None;
+    let mut wait = Duration::ZERO;
+    let mut failures: u32 = 0;
+    // The last look was the quick one after a change.
+    let mut quick = false;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            changed = views.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                // Every apply publishes; only a new configuration counts.
+                if config(&views) == last {
+                    continue;
+                }
+                failures = 0;
+            }
+        }
+        wait = ROUTER_EVERY;
+        last = config(&views);
+        let Some(config) = last.clone() else {
+            continue;
+        };
+        if !subnet_router::needed(&config) {
+            // Nothing to report: the machine may have no Tailscale at all.
+            said = None;
+        }
+        let socket = socket.clone();
+        let Ok(looked) =
+            tokio::task::spawn_blocking(move || crate::sync_router(&config, &socket)).await
+        else {
+            continue;
+        };
+        let note = match looked {
+            Ok((done, _)) if !done.is_empty() => {
+                done.iter().for_each(log);
+                // Once more soon (a router that just logged in gets its
+                // routes approved), then the usual pace.
+                quick = !quick;
+                if quick {
+                    wait = ROUTER_SOON;
+                }
+                continue;
+            }
+            Ok((_, note)) => {
+                (failures, quick) = (0, false);
+                note
+            }
+            Err(e) => {
+                quick = false;
+                failures = failures.saturating_add(1);
+                wait = (ROUTER_EVERY * 2u32.saturating_pow(failures.min(5))).min(ROUTER_BACKOFF);
+                Some(e)
+            }
+        };
+        if note != said {
+            match &note {
+                Some(note) => warn(format!("subnet router: {note}")),
+                None => log("subnet router: in place"),
+            }
+            said = note;
+        }
+    }
+}
+
 fn engine_thread(
     db: &Path,
     out: PathBuf,
@@ -757,9 +854,15 @@ fn engine_thread(
     // until Headscale answers, so a restart mustn't wait a poll for it.
     let found = crate::find_tailnet(&engine.view.config);
     engine.note_tailnet(found);
-    // A failed first apply leaves the host as it is (nothing here was set
-    // up yet, as far as this process knows); Docker restarts and tries again.
+    // A failed first apply takes down what it set up before failing: the
+    // process exits, and nothing else would ever remove a table and an
+    // interface left behind (#53). What was there before it started stays,
+    // whoever set it up. Docker or systemd starts it again.
+    let before = reconcile::parts_present(&engine.view.config.server, sys());
     if let Err(e) = engine.first_apply() {
+        for line in reconcile::teardown_added(&engine.view.config.server, before, sys()) {
+            log(line);
+        }
         let _ = ready.send(Err(e));
         return;
     }

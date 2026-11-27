@@ -55,6 +55,10 @@ pub enum Error {
     #[error("{0}")]
     Headscale(String),
 
+    /// The router's `tailscaled` couldn't be asked, or answered nonsense.
+    #[error("{0}")]
+    Tailscale(String),
+
     /// The operation is defined by the design but not built in this milestone.
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),

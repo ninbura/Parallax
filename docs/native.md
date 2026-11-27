@@ -113,8 +113,9 @@ Then set the backup passphrase and keep it in your password manager:
 sudo parallax backup passphrase --generate
 ```
 
-Stopping the service (`sudo systemctl stop parallax`) removes the firewall
-table and `wg0`. `sudo systemctl reload parallax` re-applies, like SIGHUP in
+Stopping the service (`sudo systemctl stop parallax`) removes what it set
+up: the firewall table (on iptables-nft, its `PARALLAX_*` chains and ipsets),
+its rules in Docker's `DOCKER-USER` chain, and `wg0`. `sudo systemctl reload parallax` re-applies, like SIGHUP in
 Docker. Every saved change applies anyway.
 
 ## Running `parallax` commands
@@ -237,6 +238,31 @@ Parallax version you installed), its own package, or another machine. Rootless D
 itself (setup.md explains why), but it is for Headscale. Parallax reads its
 nodes with the API key in `/etc/parallax/headscale-api.key` (mode 0600,
 owned by `parallax`); see setup.md, Headscale.
+
+### The subnet router
+
+Tailscale peers need a Tailscale client on this machine as the subnet
+router (setup.md, The subnet router). Install `tailscale` from your
+distribution (Arch) or Tailscale's own repository (Debian, Ubuntu), then:
+
+- **This machine isn't on Tailscale yet:** use Parallax's own unit, which
+  the daemon logs in and manages. Disable Tailscale's unit first; the two
+  conflict.
+
+  ```sh
+  sudo systemctl disable --now tailscaled
+  sudo systemctl enable --now parallax-tailscaled
+  ```
+
+  It runs as root, but with only `CAP_NET_ADMIN` and `CAP_NET_RAW`, only
+  `/dev/net/tun`, and the same sandbox as the service
+  (`systemd-analyze security` rates it 2.3). It makes `parallax` its
+  operator, so the service can log it in and change its routes. Its state is
+  in `/var/lib/parallax-tailscale`; its socket is Tailscale's usual one, so
+  `tailscale status` works as always.
+- **This machine is already on Tailscale** (`tailscaled.service`, logged in
+  to your Headscale): leave `parallax-tailscaled` off. Parallax uses that
+  client without changing it; `parallax doctor` says what to run.
 
 ## What the service may do
 

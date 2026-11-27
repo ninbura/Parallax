@@ -1,7 +1,8 @@
 #!/bin/sh
 # Parallax container entrypoint.
 #   run       on first start import the configuration, check the host
-#             (`parallax doctor`), create the server key, start tailscaled,
+#             (`parallax doctor`), create the server key, start tailscaled
+#             (unless the host's own is used),
 #             then become `parallax daemon`: it applies, serves DNS and the
 #             HTTPS proxy, applies every saved change, repairs drift and backs
 #             up when due. SIGHUP re-applies; SIGTERM takes the gateway down.
@@ -57,10 +58,22 @@ fi
 # Creates the key and records its public half only when the key file is missing.
 parallax keygen --if-missing --write-config
 
-# --- tailscaled: always on; M2 logs it into Headscale as the subnet router -----
-# --netfilter-mode=off is passed at `tailscale up` time (M2); tailscaled itself owns no rules.
-tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock \
-    --tun=tailscale0 --port=41641 >/var/log/tailscaled.log 2>&1 &
+# --- tailscaled: the subnet router ----------------------------------------------
+# The daemon logs it in to Headscale and keeps its settings (its own filtering and
+# NAT off: Parallax's firewall is the gate). PARALLAX_TAILSCALED=host: this machine
+# already runs Tailscale, its socket is mounted at /var/run/tailscale (compose.yml),
+# and Parallax uses that client without changing its settings.
+case "${PARALLAX_TAILSCALED:-own}" in
+    own)
+        tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock \
+            --tun=tailscale0 --port=41641 >/var/log/tailscaled.log 2>&1 &
+        ;;
+    host) ;;
+    *)
+        echo "parallax: PARALLAX_TAILSCALED is own (the default) or host, not '$PARALLAX_TAILSCALED'" >&2
+        exit 1
+        ;;
+esac
 
 # The daemon holds the database from here on; `docker exec parallax parallax ...`
 # goes through its socket. tini (the image's init) forwards signals to it and

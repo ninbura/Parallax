@@ -51,6 +51,16 @@ certificates sections here apply to both.
   sudo ufw allow in on wg0 to <proxy address, e.g. 10.8.0.1> port 8443 proto tcp
   ```
 
+  With Tailscale peers, the same for `tailscale0`, and the subnet router's
+  port (41641/udp) so devices can connect to it directly instead of through
+  a relay:
+
+  ```sh
+  sudo ufw allow 41641/udp
+  sudo ufw allow in on tailscale0 to <DNS address> port 53
+  sudo ufw allow in on tailscale0 to <proxy address> port 8443 proto tcp
+  ```
+
   The DNS server and the proxy run in the host network namespace, so ufw
   sees their tunnel traffic as incoming to the host. TCP carries DNS answers
   too large for UDP. The proxy rule matters only with proxied services
@@ -394,6 +404,34 @@ every 10 seconds and applies again when an address changes. Each node can be
 only one peer. `parallax
 headscale status` shows each node and its peer, and `parallax status` the
 addresses in effect.
+
+### The subnet router
+
+Tailscale devices reach your networks through the gateway's own Tailscale
+client, the subnet router. While any peer is on Tailscale, the daemon logs
+it in to Headscale as `server.headscale.subnet_router_node`, under a
+Headscale user of its own (`parallax`), with a single-use pre-auth key. It
+advertises every network as peers address it (`mapped_to`, if set) and the
+DNS and proxy addresses, and approves exactly those routes. Its own
+filtering and NAT stay off: Parallax's firewall decides what each device
+reaches, and each network's `masquerade` decides NAT, as for WireGuard. The
+daemon looks every 30 seconds and after each saved change, and puts back
+any setting that drifted. `parallax doctor` shows its state.
+
+Devices accept the routes as usual (`tailscale up --accept-routes` on Linux;
+the apps on phones and TVs do by default). Point Headscale's split DNS for
+your zones at the DNS address (`dns.nameservers.split` in `config.yaml`).
+
+**If this machine is already on Tailscale** (its own `tailscaled`, logged
+in to the same Headscale as another node), don't start a second one: they'd
+share `tailscale0`, its port and its routing table. Parallax then uses that
+client as the router and never changes its settings or its routes; the
+daemon's log and `parallax doctor` say what to run (`tailscale set
+--advertise-routes=...` and the route approval). Parallax uses a client only
+when it's logged out or logged in as its own node. With Docker, mount the
+host's socket and set `PARALLAX_TAILSCALED=host` (commented out in
+`docker/compose.yml`). A machine on Tailscale's hosted service rather than
+your Headscale can't be the router: Parallax reads its nodes from Headscale.
 
 ### Certificates for Tailscale devices
 

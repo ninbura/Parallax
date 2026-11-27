@@ -30,6 +30,7 @@ pub mod plan;
 pub mod public_ip;
 pub mod reconcile;
 pub mod secret;
+pub mod subnet_router;
 pub mod testing;
 pub mod tier;
 pub mod transport;
