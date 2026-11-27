@@ -1,19 +1,22 @@
 //! The activity collector (docs/logging.md, docs/adr/0012-netlink-collector.md).
-//! Reads connection tracking's events and the firewall's nflog group,
+//! Reads connection tracking's events and the firewall's nflog group, and
+//! what the HTTPS proxy and the DNS server hand over through their taps;
 //! attributes each to its peer ([`logging::attribute`]) and writes the
 //! records to `logs.db`, each source on its own thread and connection.
 //!
 //! A source runs only while some peer is logged at its level: with nobody
-//! logged the kernel isn't asked for a single event.
+//! logged the kernel isn't asked for a single event, and the taps want
+//! nobody's.
 
 use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parallax_core::generate::firewall::LOG_GROUP;
-use parallax_core::logging::{self, Event};
+use parallax_core::logging::{self, Event, Tap};
 use parallax_core::model::LogLevel;
 use parallax_core::netlink;
 use parallax_store::logs::{Logs, Writer};
@@ -43,6 +46,31 @@ const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// The open activity database, for answering `parallax log` too.
 pub type Slot = Arc<RwLock<Option<Arc<Logs>>>>;
+
+/// Events a tap holds before more are dropped: several seconds of a busy
+/// peer's requests or lookups.
+const TAP_QUEUE: usize = 16 * 1024;
+
+/// Where the HTTPS proxy and the DNS server hand over what logged peers do.
+pub struct Taps {
+    pub proxy: Tap,
+    pub dns: Tap,
+    proxy_events: Receiver<Event>,
+    dns_events: Receiver<Event>,
+}
+
+impl Taps {
+    pub fn new() -> Taps {
+        let (proxy, proxy_events) = Tap::new(TAP_QUEUE);
+        let (dns, dns_events) = Tap::new(TAP_QUEUE);
+        Taps {
+            proxy,
+            dns,
+            proxy_events,
+            dns_events,
+        }
+    }
+}
 
 /// One feed and its thread, when it runs.
 struct Feed {
@@ -127,9 +155,38 @@ impl Feed {
     }
 }
 
-/// Keep the feeds in line with the configuration, restart any that fail,
-/// and purge.
-pub async fn supervise(mut views: Views, slot: Slot) {
+/// Keep the feeds and taps in line with the configuration, restart any
+/// feed that fails, and purge.
+pub async fn supervise(mut views: Views, slot: Slot, taps: Taps) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let Taps {
+        proxy,
+        dns,
+        proxy_events,
+        dns_events,
+    } = taps;
+    let mut tapped = Vec::new();
+    for (name, tap, events) in [
+        ("proxied requests", &proxy, proxy_events),
+        ("DNS queries", &dns, dns_events),
+    ] {
+        let sink = Sink {
+            name,
+            events,
+            tap: tap.clone(),
+            views: views.clone(),
+            slot: Arc::clone(&slot),
+            stop: Arc::clone(&stop),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        match std::thread::Builder::new()
+            .name(format!("parallax {name}"))
+            .spawn(move || sink.run())
+        {
+            Ok(thread) => tapped.push(thread),
+            Err(e) => warn(format!("activity logging: can't record {name}: {e}")),
+        }
+    }
     let mut feeds = [
         Feed::new(
             "connections",
@@ -162,7 +219,12 @@ pub async fn supervise(mut views: Views, slot: Slot) {
         for feed in &mut feeds {
             feed.wanted = logging::configured(&config, feed.level);
         }
-        let wanted = feeds.iter().any(|f| f.wanted);
+        // The proxy's refusals are blocked attempts, so whoever logs at
+        // `blocked` or more.
+        proxy.set_clients(logging::level_clients(&config, LogLevel::Blocked));
+        let dns_clients = logging::dns_clients(&config);
+        let wanted = feeds.iter().any(|f| f.wanted) || !dns_clients.is_empty();
+        dns.set_clients(dns_clients);
         // A new place for the records: the old database is let go first, so
         // nothing reads or purges it under the new settings.
         if path.as_ref() != Some(&config.server.logs.path) {
@@ -200,8 +262,14 @@ pub async fn supervise(mut views: Views, slot: Slot) {
             }
         }
     }
+    proxy.set_clients(Default::default());
+    dns.set_clients(Default::default());
     for feed in &mut feeds {
         feed.stop().await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for thread in tapped {
+        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
     }
 }
 
@@ -376,6 +444,102 @@ fn hand_over(
     let n = batch.len() as u64;
     if tx.try_send(std::mem::take(batch)).is_err() {
         lost.records += n;
+    }
+}
+
+/// One tap's records: attributes what it hands over, batches, writes.
+struct Sink {
+    name: &'static str,
+    events: Receiver<Event>,
+    tap: Tap,
+    views: Views,
+    slot: Slot,
+    stop: Arc<AtomicBool>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Sink {
+    fn run(self) {
+        let mut batch = Vec::new();
+        let mut flushed = Instant::now();
+        let mut writer: Option<(Arc<Logs>, Writer)> = None;
+        loop {
+            match self.events.recv_timeout(READ_TIMEOUT) {
+                Ok(event) => self.attribute(event, &mut batch),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if batch.len() >= BATCH || flushed.elapsed() >= FLUSH_EVERY {
+                self.flush(&mut batch, &mut writer);
+                flushed = Instant::now();
+            }
+        }
+        // What was handed over before the stop.
+        while let Ok(event) = self.events.try_recv() {
+            self.attribute(event, &mut batch);
+        }
+        self.flush(&mut batch, &mut writer);
+    }
+
+    fn attribute(&self, event: Event, batch: &mut Vec<logging::Record>) {
+        let config = self.views.borrow().as_ref().map(|v| Arc::clone(&v.config));
+        if let Some(record) = config.and_then(|c| logging::attribute(&c, &event, now_ms())) {
+            batch.push(record);
+        }
+    }
+
+    /// Write `batch` to the open database. With none open yet (the
+    /// supervisor opens it within seconds of logging starting), keep a
+    /// batch's worth and drop the rest.
+    fn flush(&self, batch: &mut Vec<logging::Record>, writer: &mut Option<(Arc<Logs>, Writer)>) {
+        let dropped = self.tap.take_dropped();
+        if dropped > 0 {
+            warn(format!(
+                "activity logging: {dropped} {} dropped while the collector was behind",
+                self.name
+            ));
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let current = self.slot.read().ok().and_then(|s| s.clone());
+        let Some(current) = current else {
+            *writer = None;
+            if batch.len() > BATCH {
+                warn(format!(
+                    "activity logging: {} records of {} dropped: no database open",
+                    batch.len() - BATCH,
+                    self.name
+                ));
+                batch.truncate(BATCH);
+            }
+            return;
+        };
+        if !writer
+            .as_ref()
+            .is_some_and(|(l, _)| Arc::ptr_eq(l, &current))
+        {
+            *writer = match current.writer() {
+                Ok(w) => Some((Arc::clone(&current), w)),
+                Err(e) => {
+                    warn(format!("activity logging: writing {}: {e}", self.name));
+                    None
+                }
+            };
+        }
+        if let Some((_, w)) = writer {
+            if let Err(e) = self.runtime.block_on(w.write(batch)) {
+                warn(format!(
+                    "activity logging: writing {} records of {} failed: {e}",
+                    batch.len(),
+                    self.name
+                ));
+            }
+        }
+        batch.clear();
     }
 }
 

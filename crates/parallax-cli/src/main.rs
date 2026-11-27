@@ -385,13 +385,26 @@ enum LogCommand {
         #[arg(long)]
         grant: Option<String>,
     },
+    /// Log DNS queries (name, type, outcome; never the answer): for
+    /// everyone (`server.logs.dns`), a grant's peers, or one peer. No level
+    /// implies it. A peer's own setting wins, then on if any of its grants
+    /// turn it on, then the global one.
+    Dns {
+        setting: DnsArg,
+        /// Set this peer's own (`inherit`: follow its grants again).
+        #[arg(long, conflicts_with = "grant")]
+        peer: Option<String>,
+        /// Set this grant's for the peers that have it (`inherit`: none).
+        #[arg(long)]
+        grant: Option<String>,
+    },
     /// Show activity records, oldest first.
     Show {
         /// Only this peer's.
         #[arg(long)]
         peer: Option<String>,
-        /// Only these kinds: opened, closed, blocked, blocked_gateway (repeat,
-        /// or separate with commas).
+        /// Only these kinds: opened, closed, blocked, blocked_gateway,
+        /// request, refused, query (repeat, or separate with commas).
         #[arg(long, value_delimiter = ',', value_parser = parse_record_kind)]
         kind: Vec<RecordKind>,
         /// Only from this long ago: 30m, 6h, 1d.
@@ -546,6 +559,31 @@ fn record_line(r: &Record) -> String {
         (None, Some(n)) => line.push_str(&format!(" ({n})")),
         (None, None) => {}
     }
+    // A proxied request: method, site, status; a DNS query: name, type,
+    // outcome; a refusal: what was refused, and why.
+    let detail: Vec<String> = [
+        r.method.clone(),
+        r.hostname.clone(),
+        r.query_type.clone(),
+        r.status.map(|s| s.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut detail = detail.join(" ");
+    if let Some(outcome) = &r.outcome {
+        let sep = match (detail.is_empty(), r.kind) {
+            (true, _) => "",
+            (false, RecordKind::Refused) => ": ",
+            (false, _) => " ",
+        };
+        detail.push_str(sep);
+        detail.push_str(outcome);
+    }
+    if !detail.is_empty() {
+        line.push_str("  ");
+        line.push_str(&detail);
+    }
     if let (Some(out), Some(back)) = (r.bytes_out, r.bytes_in) {
         line.push_str(&format!("  {} out, {} in", bytes(out), bytes(back)));
     }
@@ -595,9 +633,22 @@ impl LevelArg {
     }
 }
 
+fn log_target(peer: Option<String>, grant: Option<String>) -> logging::Target {
+    match (peer, grant) {
+        (Some(p), _) => logging::Target::Peer(p),
+        (None, Some(g)) => logging::Target::Grant(g),
+        (None, None) => logging::Target::Global,
+    }
+}
+
 fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
     let (level, peer, grant) = match command {
         LogCommand::Level { level, peer, grant } => (level, peer, grant),
+        LogCommand::Dns {
+            setting,
+            peer,
+            grant,
+        } => return log_dns(ctx, log_target(peer, grant), setting.on()),
         LogCommand::Show {
             peer,
             kind,
@@ -616,11 +667,7 @@ fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
             return show_records(ctx, query, follow);
         }
     };
-    let target = match (peer, grant) {
-        (Some(p), _) => logging::Target::Peer(p),
-        (None, Some(g)) => logging::Target::Grant(g),
-        (None, None) => logging::Target::Global,
-    };
+    let target = log_target(peer, grant);
     let level = level.level();
     grant_change(
         ctx,
@@ -657,6 +704,72 @@ fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
             Ok(())
         },
     )
+}
+
+/// `parallax log dns`: turn DNS query logging on or off for `target`, or
+/// with `None` clear a peer's or grant's own.
+fn log_dns(ctx: &Ctx, target: logging::Target, on: Option<bool>) -> anyhow::Result<()> {
+    let logs = |on: bool| {
+        if on {
+            "logs DNS queries"
+        } else {
+            "logs no DNS queries"
+        }
+    };
+    grant_change(
+        ctx,
+        |c| {
+            let changed = logging::set_dns(c, &target, on)?;
+            let effective = match (&target, on) {
+                (logging::Target::Peer(p), None) => c.peer(p).map(|peer| logging::dns(c, peer)),
+                _ => None,
+            };
+            Ok((changed, effective))
+        },
+        |(changed, effective)| {
+            let what = match (&target, on) {
+                (logging::Target::Global, Some(on)) => format!("everyone {} by default", logs(on)),
+                (logging::Target::Peer(p), Some(on)) => format!("peer '{p}' {}", logs(on)),
+                (logging::Target::Peer(p), None) => {
+                    format!("peer '{p}' follows its grants and the global setting for DNS queries")
+                }
+                (logging::Target::Grant(g), Some(on)) => {
+                    format!("grant '{g}' {} for its peers", logs(on))
+                }
+                (logging::Target::Grant(g), None) => {
+                    format!("grant '{g}' sets nothing for DNS queries")
+                }
+                (logging::Target::Global, None) => String::new(),
+            };
+            if *changed {
+                outln!("{what} now")?;
+            } else {
+                outln!("{what} already")?;
+            }
+            if let Some(on) = effective {
+                outln!("in effect: {}", logs(*on))?;
+            }
+            Ok(())
+        },
+    )
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DnsArg {
+    On,
+    Off,
+    /// Clear a peer's or grant's own setting.
+    Inherit,
+}
+
+impl DnsArg {
+    fn on(self) -> Option<bool> {
+        match self {
+            DnsArg::On => Some(true),
+            DnsArg::Off => Some(false),
+            DnsArg::Inherit => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

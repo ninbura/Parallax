@@ -38,6 +38,11 @@ pub struct Grant {
     /// the grant sets no level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<super::LogLevel>,
+    /// Whether to log the DNS queries of the peers that have it, unless a
+    /// peer sets its own (docs/logging.md). No level implies it. Unset: the
+    /// grant says nothing either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_dns: Option<bool>,
     #[serde(default)]
     pub rules: Vec<Rule>,
 }

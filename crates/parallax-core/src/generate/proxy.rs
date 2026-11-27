@@ -22,7 +22,7 @@ use crate::validate::Model;
 use crate::{Error, Result};
 
 /// The port of every proxied service: validated to be exactly `443/tcp`.
-const HTTPS: u16 = 443;
+pub const HTTPS: u16 = 443;
 
 /// Where the routes file lives, relative to the output directory.
 pub const PATH: &str = "proxy/routes.toml";

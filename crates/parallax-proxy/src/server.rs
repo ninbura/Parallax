@@ -12,6 +12,8 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -22,15 +24,17 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::UPGRADE;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use parallax_core::generate::proxy::{ProxyRoutes, ProxySite};
+use parallax_core::logging::{self, Event, Tap};
 use rustls::server::Acceptor;
 use rustls::{ClientConfig, ServerConfig};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Notify};
 use tokio::time::timeout;
@@ -57,7 +61,7 @@ const CERT_REFRESH: Duration = Duration::from_secs(60);
 const MAX_PER_SOURCE: usize = 64;
 
 type Body = BoxBody<Bytes, hyper::Error>;
-type Upstream = Client<HttpsConnector<HttpConnector<FixedResolver>>, Incoming>;
+type Upstream = Client<HttpsConnector<HttpConnector<FixedResolver>>, Body>;
 
 // Best effort: a log line nobody can read is dropped. `eprintln!` would panic
 // the task, and the daemon stops the gateway when this server's task ends.
@@ -115,6 +119,7 @@ pub struct Proxy {
     state: Arc<State>,
     refresh: Duration,
     reload: Arc<Notify>,
+    tap: Option<Tap>,
 }
 
 impl Proxy {
@@ -125,7 +130,15 @@ impl Proxy {
             state: Arc::new(load_state(routes_path)?),
             refresh: CERT_REFRESH,
             reload: Arc::new(Notify::new()),
+            tap: None,
         })
+    }
+
+    /// Hand what logged peers do to `tap` (docs/logging.md): each request
+    /// and refusal, never a URL path.
+    pub fn tap(mut self, tap: Tap) -> Self {
+        self.tap = Some(tap);
+        self
     }
 
     /// The address the routes say to listen on.
@@ -168,7 +181,8 @@ impl Proxy {
                         ));
                         continue;
                     };
-                    tokio::spawn(handle(stream, client, rx.clone(), slot));
+                    let tap = self.tap.clone();
+                    tokio::spawn(handle(stream, client, rx.clone(), slot, tap));
                 }
                 Err(e) => {
                     // Usually out of file descriptors; back off rather than spin.
@@ -412,7 +426,34 @@ async fn while_authorized<F: Future>(work: F, mut state: Shared, hostname: &str,
     }
 }
 
-async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot) {
+/// `tap`, if it wants what `client` does.
+fn tapped(tap: Option<&Tap>, client: Ipv4Addr) -> Option<&Tap> {
+    tap.filter(|t| t.wants(client))
+}
+
+/// Tell the tap, if it wants `client`, that a connection was refused before
+/// any request.
+fn refused_connection(
+    tap: Option<&Tap>,
+    client: Ipv4Addr,
+    hostname: Option<&str>,
+    upstream: Option<SocketAddrV4>,
+    why: &'static str,
+) {
+    if let Some(tap) = tapped(tap, client) {
+        tap.send(Event::Request(logging::Request {
+            client,
+            hostname: hostname.map(str::to_string),
+            upstream,
+            method: None,
+            status: None,
+            refused: Some(why),
+            bytes: None,
+        }));
+    }
+}
+
+async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot, tap: Option<Tap>) {
     let start = match timeout(
         HANDSHAKE_TIMEOUT,
         LazyConfigAcceptor::new(Acceptor::default(), stream),
@@ -434,6 +475,11 @@ async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot)
                 "{client}: refused, no site for {}",
                 sni.as_deref().unwrap_or("a connection without SNI")
             ));
+            let why = match sni {
+                Some(_) => "no site for this hostname",
+                None => "no hostname given (SNI)",
+            };
+            refused_connection(tap.as_ref(), client, sni.as_deref(), None, why);
             return;
         };
         Arc::clone(site)
@@ -443,12 +489,26 @@ async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot)
         log(format!(
             "{client}: refused {hostname}: not allowed from this address"
         ));
+        refused_connection(
+            tap.as_ref(),
+            client,
+            Some(&hostname),
+            Some(site.route.upstream),
+            "not allowed from this address",
+        );
         return;
     }
     let Some(tls) = site.tls.clone() else {
         log(format!(
             "{client}: refused {hostname}: no certificate covers it"
         ));
+        refused_connection(
+            tap.as_ref(),
+            client,
+            Some(&hostname),
+            Some(site.route.upstream),
+            "no certificate covers this hostname",
+        );
         return;
     };
     let stream = match timeout(HANDSHAKE_TIMEOUT, start.into_stream(tls)).await {
@@ -459,7 +519,10 @@ async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot)
     let io = TokioIo::new(stream);
     let service = {
         let (hostname, state) = (hostname.clone(), state.clone());
-        service_fn(move |req| forward(req, hostname.clone(), client, state.clone()))
+        service_fn(move |req| {
+            let tap = tapped(tap.as_ref(), client).cloned();
+            forward(req, hostname.clone(), client, state.clone(), tap)
+        })
     };
     // The protocol comes from ALPN, so the HTTP/1 header timeout runs from the
     // first byte: an idle peer can't hold the socket.
@@ -503,24 +566,178 @@ fn chain(e: &dyn std::error::Error) -> String {
     s
 }
 
+/// A logged peer's request, handed to the tap once its response is done
+/// with (sent, or abandoned by the peer), with the bytes of the bodies
+/// each way.
+struct Exchange {
+    tap: Tap,
+    event: Option<logging::Request>,
+    out: Arc<AtomicU64>,
+    back: Arc<AtomicU64>,
+}
+
+impl Exchange {
+    fn new(tap: Tap, client: Ipv4Addr, hostname: &str, method: &Method) -> Self {
+        Exchange {
+            tap,
+            event: Some(logging::Request {
+                client,
+                hostname: Some(hostname.to_string()),
+                upstream: None,
+                method: Some(method.to_string()),
+                status: None,
+                refused: None,
+                bytes: None,
+            }),
+            out: Arc::default(),
+            back: Arc::default(),
+        }
+    }
+
+    fn event(&mut self) -> Option<&mut logging::Request> {
+        self.event.as_mut()
+    }
+
+    /// The request's body, counted on its way upstream.
+    fn count_out(&self, body: Incoming) -> Body {
+        counted(body, Arc::clone(&self.out))
+    }
+
+    /// Answer with `resp`, counting its body on the way to the peer.
+    fn answer(mut self, resp: Response<Body>) -> Response<Body> {
+        if let Some(e) = self.event() {
+            e.status = Some(resp.status().as_u16());
+        }
+        let back = Arc::clone(&self.back);
+        resp.map(|body| {
+            // The record goes when the body does, which keeps `self` until then.
+            body.map_frame(move |frame| {
+                if let Some(data) = frame.data_ref() {
+                    back.fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                let _ = &self;
+                frame
+            })
+            .boxed()
+        })
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        if let Some(mut event) = self.event.take() {
+            event.bytes = Some((
+                self.out.load(Ordering::Relaxed),
+                self.back.load(Ordering::Relaxed),
+            ));
+            self.tap.send(Event::Request(event));
+        }
+    }
+}
+
+fn counted(body: Incoming, n: Arc<AtomicU64>) -> Body {
+    body.map_frame(move |frame| {
+        if let Some(data) = frame.data_ref() {
+            n.fetch_add(data.len() as u64, Ordering::Relaxed);
+        }
+        frame
+    })
+    .boxed()
+}
+
+/// A stream that adds the bytes read from it to a tally.
+struct Counting<T> {
+    io: T,
+    read: Arc<AtomicU64>,
+}
+
+impl<T> Counting<T> {
+    fn new(io: T, read: Arc<AtomicU64>) -> Self {
+        Counting { io, read }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counting<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.io).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = polled {
+            let n = buf.filled().len().saturating_sub(before);
+            self.read.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counting<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// `resp` for the peer, recorded if `exchange` is.
+fn respond(exchange: Option<Exchange>, resp: Response<Body>) -> Response<Body> {
+    match exchange {
+        Some(x) => x.answer(resp),
+        None => resp,
+    }
+}
+
+/// Refuse with `status` and say `why`, recorded as a refusal if `exchange`
+/// is.
+fn refuse(mut exchange: Option<Exchange>, status: StatusCode, why: &'static str) -> Response<Body> {
+    if let Some(e) = exchange.as_mut().and_then(Exchange::event) {
+        e.refused = Some(why);
+    }
+    respond(exchange, reply(status, why))
+}
+
+/// Forward one request. `tap` is set only when the peer is logged.
 async fn forward(
     mut req: Request<Incoming>,
     hostname: String,
     client: Ipv4Addr,
     state: Shared,
+    tap: Option<Tap>,
 ) -> std::result::Result<Response<Body>, Infallible> {
+    let mut exchange = tap.map(|t| Exchange::new(t, client, &hostname, req.method()));
     // Look the site up per request: a reload may have revoked or moved it.
     let Some(site) = state.borrow().authorized(&hostname, client).cloned() else {
-        return Ok(reply(StatusCode::FORBIDDEN, "access was revoked"));
+        return Ok(refuse(
+            exchange,
+            StatusCode::FORBIDDEN,
+            "access was revoked",
+        ));
     };
+    if let Some(e) = exchange.as_mut().and_then(Exchange::event) {
+        e.upstream = Some(site.route.upstream);
+    }
     if let Err(r) = http::check(&req, &hostname) {
         log(format!("{client}: {hostname}: {}", r.message()));
-        return Ok(reply(r.status(), r.message()));
+        return Ok(refuse(exchange, r.status(), r.message()));
     }
     let downstream_upgrade = http::upgrade(&req).map(|_| hyper::upgrade::on(&mut req));
+    let req = match &exchange {
+        Some(x) => req.map(|b| x.count_out(b)),
+        None => req.map(BodyExt::boxed),
+    };
     let up = match http::upstream_request(req, &hostname, site.route.upstream.port(), client) {
         Ok(up) => up,
-        Err(r) => return Ok(reply(r.status(), r.message())),
+        Err(r) => return Ok(refuse(exchange, r.status(), r.message())),
     };
     let mut resp = match site.upstream.request(up).await {
         Ok(resp) => resp,
@@ -530,15 +747,15 @@ async fn forward(
                 site.route.upstream,
                 chain(&e)
             ));
-            return Ok(reply(
-                StatusCode::BAD_GATEWAY,
-                "the upstream is unreachable",
+            return Ok(respond(
+                exchange,
+                reply(StatusCode::BAD_GATEWAY, "the upstream is unreachable"),
             ));
         }
     };
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
         http::strip_hop_by_hop(resp.headers_mut(), None);
-        return Ok(resp.map(BodyExt::boxed));
+        return Ok(respond(exchange, resp.map(BodyExt::boxed)));
     }
     // Only a WebSocket switch we asked for: another protocol on the raw
     // stream would carry requests the checks above never see.
@@ -547,20 +764,36 @@ async fn forward(
         .get(UPGRADE)
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
     let (Some(downstream), true) = (downstream_upgrade, confirmed) else {
-        return Ok(reply(StatusCode::BAD_GATEWAY, "unexpected protocol switch"));
+        return Ok(respond(
+            exchange,
+            reply(StatusCode::BAD_GATEWAY, "unexpected protocol switch"),
+        ));
     };
     let upgrade = resp.headers().get(UPGRADE).cloned();
     http::strip_hop_by_hop(resp.headers_mut(), upgrade);
     let upstream = hyper::upgrade::on(&mut resp);
+    // A WebSocket's record goes when it closes, with what it carried.
+    if let Some(e) = exchange.as_mut().and_then(Exchange::event) {
+        e.status = Some(StatusCode::SWITCHING_PROTOCOLS.as_u16());
+    }
     tokio::spawn(async move {
         if let (Ok(down), Ok(up)) = tokio::join!(downstream, upstream) {
-            let relay = async move {
-                let _ =
-                    tokio::io::copy_bidirectional(&mut TokioIo::new(down), &mut TokioIo::new(up))
-                        .await;
+            // Counted as read, so the tally survives a relay that ends in an
+            // error (a peer gone, an upstream closing without TLS's goodbye).
+            let (out, back) = match &exchange {
+                Some(x) => (Arc::clone(&x.out), Arc::clone(&x.back)),
+                None => Default::default(),
+            };
+            let relay = async {
+                let _ = tokio::io::copy_bidirectional(
+                    &mut Counting::new(TokioIo::new(down), out),
+                    &mut Counting::new(TokioIo::new(up), back),
+                )
+                .await;
             };
             while_authorized(relay, state, &hostname, client).await;
         }
+        drop(exchange);
     });
     Ok(resp.map(BodyExt::boxed))
 }

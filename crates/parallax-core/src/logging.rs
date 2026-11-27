@@ -3,11 +3,15 @@
 //! attempts to the collector; nothing is marked or handed over for peers
 //! at `off`, so logging nobody costs nothing.
 
-use std::net::Ipv4Addr;
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, RwLock};
 
 use ipnet::Ipv4Net;
 
-use crate::model::{LogLevel, Peer, TransportKind};
+use crate::model::{LogLevel, LogsServer, Peer, TransportKind};
 use crate::{Config, Error, Model, Result};
 
 /// Whose level `parallax log level` sets.
@@ -19,47 +23,93 @@ pub enum Target {
     Grant(String),
 }
 
-/// Set a level, or with `None` clear a peer's or grant's own so it follows
-/// the rest again. True when something changed.
-pub fn set_level(config: &mut Config, target: &Target, level: Option<LogLevel>) -> Result<bool> {
+/// A setting `parallax log` changes: the global one, or a peer's or
+/// grant's own.
+enum Setting<'a> {
+    Global(&'a mut LogsServer),
+    Own {
+        log: &'a mut Option<LogLevel>,
+        log_dns: &'a mut Option<bool>,
+    },
+}
+
+fn setting<'a>(config: &'a mut Config, target: &Target) -> Result<Setting<'a>> {
     let not_found = |kind: &'static str, name: &str| Error::NotFound {
         kind,
         name: name.to_string(),
     };
-    let slot = match target {
-        Target::Global => {
-            let Some(level) = level else {
-                return Err(Error::Malformed {
-                    what: "log level",
-                    detail: "the global level (server.logs.level) has nothing to inherit from; \
-                             set off, blocked, connections or detailed"
-                        .into(),
-                });
-            };
-            let changed = config.server.logs.level != level;
-            config.server.logs.level = level;
-            return Ok(changed);
-        }
+    Ok(match target {
+        Target::Global => Setting::Global(&mut config.server.logs),
         Target::Peer(name) => {
-            &mut config
+            let p = config
                 .peers
                 .iter_mut()
                 .find(|p| &p.name == name)
-                .ok_or_else(|| not_found("peer", name))?
-                .log
+                .ok_or_else(|| not_found("peer", name))?;
+            Setting::Own {
+                log: &mut p.log,
+                log_dns: &mut p.log_dns,
+            }
         }
         Target::Grant(name) => {
-            &mut config
+            let g = config
                 .grants
                 .iter_mut()
                 .find(|g| &g.name == name)
-                .ok_or_else(|| not_found("grant", name))?
-                .log
+                .ok_or_else(|| not_found("grant", name))?;
+            Setting::Own {
+                log: &mut g.log,
+                log_dns: &mut g.log_dns,
+            }
         }
-    };
-    let changed = *slot != level;
-    *slot = level;
-    Ok(changed)
+    })
+}
+
+/// Replace `slot` with `value`; true when that changed it.
+fn put<T: PartialEq>(slot: &mut T, value: T) -> bool {
+    let changed = *slot != value;
+    *slot = value;
+    changed
+}
+
+/// `inherit` for the global setting, which has nothing above it.
+fn nothing_to_inherit(what: &'static str, global: &str, choices: &str) -> Error {
+    Error::Malformed {
+        what,
+        detail: format!("the global {global} has nothing to inherit from; set {choices}"),
+    }
+}
+
+/// Set a level, or with `None` clear a peer's or grant's own so it follows
+/// the rest again. True when something changed.
+pub fn set_level(config: &mut Config, target: &Target, level: Option<LogLevel>) -> Result<bool> {
+    Ok(match setting(config, target)? {
+        Setting::Global(logs) => {
+            let level = level.ok_or_else(|| {
+                nothing_to_inherit(
+                    "log level",
+                    "level (server.logs.level)",
+                    "off, blocked, connections or detailed",
+                )
+            })?;
+            put(&mut logs.level, level)
+        }
+        Setting::Own { log, .. } => put(log, level),
+    })
+}
+
+/// Turn DNS query logging on or off, or with `None` clear a peer's or
+/// grant's own so it follows the rest again. True when something changed.
+pub fn set_dns(config: &mut Config, target: &Target, on: Option<bool>) -> Result<bool> {
+    Ok(match setting(config, target)? {
+        Setting::Global(logs) => {
+            let on = on.ok_or_else(|| {
+                nothing_to_inherit("DNS logging", "setting (server.logs.dns)", "on or off")
+            })?;
+            put(&mut logs.dns, on)
+        }
+        Setting::Own { log_dns, .. } => put(log_dns, on),
+    })
 }
 
 /// The level that applies to `peer`: its own `log` if set, otherwise the
@@ -78,6 +128,22 @@ pub fn level(config: &Config, peer: &Peer) -> LogLevel {
         .unwrap_or(config.server.logs.level)
 }
 
+/// Whether `peer`'s DNS queries are logged: its own `log_dns` if set,
+/// otherwise on if any of its grants that set one turn it on, otherwise
+/// `server.logs.dns`. The same precedence as [`level`]; no level implies it.
+pub fn dns(config: &Config, peer: &Peer) -> bool {
+    if let Some(own) = peer.log_dns {
+        return own;
+    }
+    config
+        .grants
+        .iter()
+        .filter(|g| g.everyone || peer.grants.contains(&g.name))
+        .filter_map(|g| g.log_dns)
+        .max()
+        .unwrap_or(config.server.logs.dns)
+}
+
 /// Tunnel addresses of the active WireGuard peers logged at `at_least` or
 /// more, sorted. Tailscale nodes join in M2, when their addresses come from
 /// Headscale.
@@ -92,17 +158,34 @@ pub fn addresses(model: &Model<'_>, at_least: LogLevel) -> Vec<Ipv4Net> {
     out
 }
 
+/// Tunnel addresses of the enabled WireGuard peers that `logged` picks.
+/// From the configuration alone; expired peers count, which only means
+/// listening for traffic nobody sends.
+fn logged_clients(config: &Config, logged: impl Fn(&Peer) -> bool) -> HashSet<Ipv4Addr> {
+    config
+        .peers
+        .iter()
+        .filter(|p| p.enabled && p.transport == TransportKind::WireGuard)
+        .filter(|p| logged(p))
+        .filter_map(|p| p.wireguard.as_ref().and_then(|w| w.address))
+        .collect()
+}
+
+/// Tunnel addresses of the peers logged at `at_least` or more: whose
+/// requests the HTTPS proxy hands over (at `blocked` and up).
+pub fn level_clients(config: &Config, at_least: LogLevel) -> HashSet<Ipv4Addr> {
+    logged_clients(config, |p| level(config, p) >= at_least)
+}
+
+/// Tunnel addresses of the peers whose DNS queries are logged.
+pub fn dns_clients(config: &Config) -> HashSet<Ipv4Addr> {
+    logged_clients(config, |p| dns(config, p))
+}
+
 /// Whether some enabled WireGuard peer with an address is logged at
-/// `at_least` or more: what the collector reads for. From the
-/// configuration alone; expired peers count, which only means reading
-/// events nobody's marked.
+/// `at_least` or more: what the collector reads for.
 pub fn configured(config: &Config, at_least: LogLevel) -> bool {
-    config.peers.iter().any(|p| {
-        p.enabled
-            && p.transport == TransportKind::WireGuard
-            && p.wireguard.as_ref().and_then(|w| w.address).is_some()
-            && level(config, p) >= at_least
-    })
+    !level_clients(config, at_least).is_empty()
 }
 
 /// Whether some peer the firewall can mark is logged at `at_least` or
@@ -143,12 +226,121 @@ pub struct Blocked {
     pub addressed: Option<Ipv4Addr>,
 }
 
-/// What the collector hears from the kernel.
+/// A request the HTTPS proxy forwarded or refused, or a connection it
+/// refused before reading any request. Never the URL path: that says what
+/// someone did inside a service, not only which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub client: Ipv4Addr,
+    /// The site the peer asked for (the TLS server name), if it named one.
+    pub hostname: Option<String>,
+    /// The site's upstream, when the hostname is a configured site.
+    pub upstream: Option<SocketAddrV4>,
+    /// None for a connection refused before a request was read.
+    pub method: Option<String>,
+    pub status: Option<u16>,
+    /// Why the proxy refused it; none when it was forwarded.
+    pub refused: Option<&'static str>,
+    /// Bytes of the request's body and of the response's.
+    pub bytes: Option<(u64, u64)>,
+}
+
+/// A DNS query the gateway's DNS server answered, as the peer asked it.
+/// Never the addresses in the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Query {
+    pub client: Ipv4Addr,
+    /// The DNS server's address.
+    pub server: Ipv4Addr,
+    pub protocol: u8,
+    pub name: String,
+    /// `A`, `AAAA`, `HTTPS` and so on.
+    pub query_type: String,
+    pub outcome: QueryOutcome,
+}
+
+/// How the DNS server answered a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryOutcome {
+    /// With addresses or without (a name that has no `AAAA`, say).
+    Answered,
+    /// The peer's tier may not look the name up, or the query isn't one
+    /// the server answers.
+    Refused,
+    /// The name doesn't exist.
+    NxDomain,
+    /// The upstream failed or the query was malformed.
+    Failed,
+}
+
+impl QueryOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QueryOutcome::Answered => "answered",
+            QueryOutcome::Refused => "refused",
+            QueryOutcome::NxDomain => "nxdomain",
+            QueryOutcome::Failed => "failed",
+        }
+    }
+}
+
+/// What the collector hears: from the kernel, the HTTPS proxy and the DNS
+/// server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Opened(Flow),
     Closed(Flow),
     Blocked(Blocked),
+    Request(Request),
+    Query(Query),
+}
+
+/// Where the HTTPS proxy and the DNS server hand over what logged peers do.
+/// Only callers in its set are handed over, so with nobody logged nothing
+/// is; a full queue drops (and counts) rather than slow anyone down.
+#[derive(Debug, Clone)]
+pub struct Tap {
+    tx: SyncSender<Event>,
+    clients: Arc<RwLock<HashSet<Ipv4Addr>>>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Tap {
+    /// A tap and the end its events come out of, holding up to `capacity`.
+    pub fn new(capacity: usize) -> (Tap, Receiver<Event>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        let tap = Tap {
+            tx,
+            clients: Arc::default(),
+            dropped: Arc::default(),
+        };
+        (tap, rx)
+    }
+
+    /// Whether what `client` does is wanted.
+    pub fn wants(&self, client: Ipv4Addr) -> bool {
+        self.clients
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&client)
+    }
+
+    /// Hand `event` over, or count it as dropped if the queue is full.
+    pub fn send(&self, event: Event) {
+        if let Err(TrySendError::Full(_)) = self.tx.try_send(event) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whose events are wanted from now on.
+    pub fn set_clients(&self, clients: HashSet<Ipv4Addr>) {
+        *self.clients.write().unwrap_or_else(|p| p.into_inner()) = clients;
+    }
+
+    /// Events dropped since the last call.
+    pub fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
 }
 
 /// One stored activity record. Names are kept as they were, so the
@@ -175,6 +367,15 @@ pub struct Record {
     pub flow: Option<u32>,
     pub bytes_out: Option<u64>,
     pub bytes_in: Option<u64>,
+    /// The site a proxied request was for, or the name a DNS query asked.
+    pub hostname: Option<String>,
+    /// A proxied request's method and the status it was answered with.
+    pub method: Option<String>,
+    pub status: Option<u16>,
+    /// A DNS query's type.
+    pub query_type: Option<String>,
+    /// How a DNS query was answered, or why the proxy refused.
+    pub outcome: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -186,14 +387,23 @@ pub enum RecordKind {
     Blocked,
     /// Blocked on its way to the gateway host itself.
     BlockedGateway,
+    /// A request the HTTPS proxy forwarded.
+    Request,
+    /// A connection or request the HTTPS proxy refused.
+    Refused,
+    /// A DNS query.
+    Query,
 }
 
 impl RecordKind {
-    pub const ALL: [RecordKind; 4] = [
+    pub const ALL: [RecordKind; 7] = [
         RecordKind::Opened,
         RecordKind::Closed,
         RecordKind::Blocked,
         RecordKind::BlockedGateway,
+        RecordKind::Request,
+        RecordKind::Refused,
+        RecordKind::Query,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -202,6 +412,9 @@ impl RecordKind {
             RecordKind::Closed => "closed",
             RecordKind::Blocked => "blocked",
             RecordKind::BlockedGateway => "blocked_gateway",
+            RecordKind::Request => "request",
+            RecordKind::Refused => "refused",
+            RecordKind::Query => "query",
         }
     }
 }
@@ -214,7 +427,10 @@ impl std::str::FromStr for RecordKind {
             .find(|k| k.as_str() == s)
             .ok_or_else(|| Error::Malformed {
                 what: "record kind",
-                detail: format!("'{s}' is not one of opened, closed, blocked, blocked_gateway"),
+                detail: format!(
+                    "'{s}' is not one of {}",
+                    RecordKind::ALL.map(RecordKind::as_str).join(", ")
+                ),
             })
     }
 }
@@ -248,7 +464,7 @@ impl OpenFlows {
                 (Some(began), Some(r)) if began != r.peer => None,
                 (_, record) => record,
             },
-            Event::Blocked(_) => record,
+            Event::Blocked(_) | Event::Request(_) | Event::Query(_) => record,
         }
     }
 }
@@ -265,33 +481,36 @@ pub fn protocol_name(protocol: u8) -> String {
 }
 
 /// The record for `event` at `time`, or none when it isn't one to keep:
-/// not from a peer, or more than the peer's level covers. The firewall
-/// already marks only logged peers' flows; this checks again against the
-/// configuration now, which may have changed since.
+/// not from a peer, or more than the peer's level covers (or, for a DNS
+/// query, its queries aren't logged). The firewall already marks only
+/// logged peers' flows, and the proxy and DNS server hand over only logged
+/// peers'; this checks again against the configuration now, which may have
+/// changed since.
 pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
-    let (src, needed) = match event {
-        Event::Opened(f) => {
-            if f.mark & crate::generate::firewall::FLOW_MARK == 0 {
-                return None;
-            }
-            (f.src, LogLevel::Connections)
-        }
-        // A flow's end says only its bytes: below `detailed` there's nothing
-        // to record (and half the writes saved).
-        Event::Closed(f) => {
-            if f.mark & crate::generate::firewall::FLOW_MARK == 0 {
-                return None;
-            }
-            (f.src, LogLevel::Detailed)
-        }
-        Event::Blocked(b) => (b.src, LogLevel::Blocked),
+    let marked = |f: &Flow| f.mark & crate::generate::firewall::FLOW_MARK != 0;
+    let src = match event {
+        Event::Opened(f) | Event::Closed(f) if !marked(f) => return None,
+        Event::Opened(f) | Event::Closed(f) => f.src,
+        Event::Blocked(b) => b.src,
+        Event::Request(r) => r.client,
+        Event::Query(q) => q.client,
     };
     let peer = config.peers.iter().find(|p| {
         p.transport == TransportKind::WireGuard
             && p.wireguard.as_ref().and_then(|w| w.address) == Some(src)
     })?;
     let level = level(config, peer);
-    if level < needed {
+    let wanted = match event {
+        Event::Opened(_) => level >= LogLevel::Connections,
+        // A flow's end says only its bytes: below `detailed` there's nothing
+        // to record (and half the writes saved).
+        Event::Closed(_) => level >= LogLevel::Detailed,
+        Event::Blocked(_) => level >= LogLevel::Blocked,
+        Event::Request(r) if r.refused.is_some() => level >= LogLevel::Blocked,
+        Event::Request(_) => level >= LogLevel::Connections,
+        Event::Query(_) => dns(config, peer),
+    };
+    if !wanted {
         return None;
     }
     let grants = crate::tier::grant_names(config, peer).join(",");
@@ -316,17 +535,22 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
         flow: None,
         bytes_out: None,
         bytes_in: None,
+        hostname: None,
+        method: None,
+        status: None,
+        query_type: None,
+        outcome: None,
     };
+    // HTTPS to a proxied service is redirected to the proxy before NETMAP,
+    // so the proxy answers.
+    let proxy = config
+        .server
+        .proxy
+        .listen
+        .unwrap_or_else(|| config.server.wireguard.gateway_address());
     Some(match event {
         Event::Opened(f) | Event::Closed(f) => {
-            // HTTPS to a proxied service is redirected to the proxy before
-            // NETMAP, so the proxy answers: the real host is the one the
-            // peer's mapped address stands for.
-            let proxy = config
-                .server
-                .proxy
-                .listen
-                .unwrap_or_else(|| config.server.wireguard.gateway_address());
+            // The real host is the one the peer's mapped address stands for.
             let answered_by = if f.answered_by == proxy && f.dst != proxy {
                 config
                     .networks
@@ -366,6 +590,46 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
             let real = (addressed != b.dst).then_some(b.dst);
             record(kind, addressed, real, b.protocol, b.port)
         }
+        // The proxy can't see where the peer sent the connection, only the
+        // site it named: a site's upstream as the peer reaches it (mapped
+        // when its network is), and for a name that's no site, the proxy.
+        Event::Request(q) => {
+            let (destination, real, port) = match q.upstream {
+                Some(up) => {
+                    let real = *up.ip();
+                    let mapped = config
+                        .networks
+                        .iter()
+                        .find_map(|n| n.mapping().and_then(|m| m.to_virtual(real)))
+                        .unwrap_or(real);
+                    (mapped, (mapped != real).then_some(real), up.port())
+                }
+                None => (proxy, None, crate::generate::proxy::HTTPS),
+            };
+            let kind = if q.refused.is_some() {
+                RecordKind::Refused
+            } else {
+                RecordKind::Request
+            };
+            let mut r = record(kind, destination, real, 6, Some(port));
+            r.hostname = q.hostname.clone();
+            r.method = q.method.clone();
+            r.status = q.status;
+            r.outcome = q.refused.map(str::to_string);
+            if let (Some((out, back)), LogLevel::Detailed) = (q.bytes, level) {
+                r.bytes_out = Some(out);
+                r.bytes_in = Some(back);
+            }
+            r
+        }
+        Event::Query(q) => {
+            let mut r = record(RecordKind::Query, q.server, None, q.protocol, Some(53));
+            r.network = None;
+            r.hostname = Some(q.name.clone());
+            r.query_type = Some(q.query_type.clone());
+            r.outcome = Some(q.outcome.as_str().to_string());
+            r
+        }
     })
 }
 
@@ -396,6 +660,7 @@ mod tests {
             name: "watched".into(),
             everyone: true,
             log: Some(LogLevel::Blocked),
+            log_dns: None,
             rules: Vec::new(),
         });
         assert_eq!(level(&cfg, &peer), LogLevel::Blocked, "grant for everyone");
@@ -540,6 +805,161 @@ mod tests {
 
     /// Levels survive TOML (import, export, `config edit`). The daemon's
     /// socket reads through the same form (its test is in the CLI).
+    fn request(refused: Option<&'static str>) -> Request {
+        Request {
+            client: Ipv4Addr::new(10, 8, 2, 1),
+            hostname: Some("immich.example.com".into()),
+            upstream: Some("192.168.1.5:443".parse().unwrap()),
+            method: Some("GET".into()),
+            status: Some(if refused.is_some() { 421 } else { 200 }),
+            refused,
+            bytes: Some((0, 4096)),
+        }
+    }
+
+    #[test]
+    fn proxied_requests_need_connections_and_refusals_blocked() {
+        let mut cfg = canonical_config();
+        let ok = Event::Request(request(None));
+        let refused = Event::Request(request(Some("this connection serves a different hostname")));
+        cfg.server.logs.level = LogLevel::Blocked;
+        assert!(attribute(&cfg, &ok, 1).is_none());
+        let r = attribute(&cfg, &refused, 1).unwrap();
+        assert_eq!(r.kind, RecordKind::Refused);
+        assert_eq!(r.status, Some(421));
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some("this connection serves a different hostname")
+        );
+
+        cfg.server.logs.level = LogLevel::Connections;
+        let r = attribute(&cfg, &ok, 1).unwrap();
+        assert_eq!(r.kind, RecordKind::Request);
+        assert_eq!(r.peer, "sister-phone");
+        assert_eq!(r.hostname.as_deref(), Some("immich.example.com"));
+        assert_eq!((r.method.as_deref(), r.status), (Some("GET"), Some(200)));
+        // As the peer reached it: the mapped address, then the real one.
+        assert_eq!(r.destination, Ipv4Addr::new(198, 18, 1, 5));
+        assert_eq!(r.real_destination, Some(Ipv4Addr::new(192, 168, 1, 5)));
+        assert_eq!((r.protocol.as_str(), r.port), ("tcp", Some(443)));
+        assert_eq!(r.network.as_deref(), Some("home"));
+        assert_eq!((r.bytes_out, r.bytes_in), (None, None), "bytes at detailed");
+
+        cfg.server.logs.level = LogLevel::Detailed;
+        let r = attribute(&cfg, &ok, 1).unwrap();
+        assert_eq!((r.bytes_out, r.bytes_in), (Some(0), Some(4096)));
+    }
+
+    #[test]
+    fn a_name_that_is_no_site_is_recorded_at_the_proxy() {
+        let mut cfg = canonical_config();
+        cfg.server.logs.level = LogLevel::Blocked;
+        let event = Event::Request(Request {
+            hostname: Some("router.example.com".into()),
+            upstream: None,
+            method: None,
+            status: None,
+            bytes: None,
+            ..request(Some("no site for this hostname"))
+        });
+        let r = attribute(&cfg, &event, 1).unwrap();
+        assert_eq!(r.kind, RecordKind::Refused);
+        assert_eq!(r.destination, cfg.server.wireguard.gateway_address());
+        assert_eq!(r.real_destination, None);
+        assert_eq!(r.port, Some(443));
+    }
+
+    fn query() -> Event {
+        Event::Query(Query {
+            client: Ipv4Addr::new(10, 8, 2, 1),
+            server: Ipv4Addr::new(10, 8, 0, 1),
+            protocol: 17,
+            name: "immich.example.com.".into(),
+            query_type: "A".into(),
+            outcome: QueryOutcome::Answered,
+        })
+    }
+
+    #[test]
+    fn dns_queries_are_their_own_opt_in() {
+        let mut cfg = canonical_config();
+        cfg.server.logs.level = LogLevel::Detailed;
+        assert!(
+            attribute(&cfg, &query(), 1).is_none(),
+            "no level implies it"
+        );
+        cfg.server.logs.dns = true;
+        cfg.server.logs.level = LogLevel::Off;
+        let r = attribute(&cfg, &query(), 1).unwrap();
+        assert_eq!(r.kind, RecordKind::Query);
+        assert_eq!(r.hostname.as_deref(), Some("immich.example.com."));
+        assert_eq!(r.query_type.as_deref(), Some("A"));
+        assert_eq!(r.outcome.as_deref(), Some("answered"));
+        assert_eq!((r.protocol.as_str(), r.port), ("udp", Some(53)));
+        assert_eq!(r.destination, Ipv4Addr::new(10, 8, 0, 1));
+        assert_eq!(r.network, None);
+    }
+
+    #[test]
+    fn a_peer_s_own_dns_setting_wins_then_any_grant_then_the_global_one() {
+        let mut cfg = canonical_config();
+        let mut peer = cfg.peers[1].clone();
+        peer.grants = vec!["family".into()];
+        assert!(!dns(&cfg, &peer), "off by default");
+        cfg.server.logs.dns = true;
+        assert!(dns(&cfg, &peer), "the global setting");
+        let family = cfg.grants.iter().position(|g| g.name == "family").unwrap();
+        cfg.grants[family].log_dns = Some(false);
+        assert!(!dns(&cfg, &peer), "its grant");
+        cfg.grants.push(Grant {
+            name: "watched".into(),
+            everyone: true,
+            log: None,
+            log_dns: Some(true),
+            rules: Vec::new(),
+        });
+        assert!(dns(&cfg, &peer), "any grant that turns it on");
+        peer.log_dns = Some(false);
+        assert!(!dns(&cfg, &peer), "its own");
+    }
+
+    #[test]
+    fn dns_logging_is_set_and_cleared_by_name() {
+        let mut cfg = canonical_config();
+        let peer = Target::Peer("sister-phone".into());
+        assert!(set_dns(&mut cfg, &peer, Some(true)).unwrap());
+        assert!(!set_dns(&mut cfg, &peer, Some(true)).unwrap(), "unchanged");
+        assert_eq!(cfg.peer("sister-phone").unwrap().log_dns, Some(true));
+        assert!(set_dns(&mut cfg, &peer, None).unwrap());
+        assert!(set_dns(&mut cfg, &Target::Grant("family".into()), Some(true)).unwrap());
+        assert!(set_dns(&mut cfg, &Target::Global, Some(true)).unwrap());
+        assert!(cfg.server.logs.dns);
+        let e = set_dns(&mut cfg, &Target::Global, None).unwrap_err();
+        assert!(e.to_string().contains("nothing to inherit"), "{e}");
+        let e = set_dns(&mut cfg, &Target::Peer("nobody".into()), Some(true)).unwrap_err();
+        assert!(e.to_string().contains("nobody"), "{e}");
+        // The level is untouched.
+        assert_eq!(cfg.server.logs.level, LogLevel::Off);
+    }
+
+    #[test]
+    fn a_tap_hands_over_only_the_peers_it_wants_and_counts_what_it_drops() {
+        let (tap, events) = Tap::new(1);
+        let sister = Ipv4Addr::new(10, 8, 2, 1);
+        assert!(!tap.wants(sister), "nobody to begin with");
+        let mut cfg = canonical_config();
+        cfg.server.logs.dns = true;
+        tap.set_clients(dns_clients(&cfg));
+        assert!(tap.wants(sister));
+        tap.send(query());
+        tap.send(query());
+        assert_eq!(events.try_iter().count(), 1);
+        assert_eq!(tap.take_dropped(), 1);
+        assert_eq!(tap.take_dropped(), 0);
+        cfg.peers.iter_mut().for_each(|p| p.enabled = false);
+        assert!(dns_clients(&cfg).is_empty(), "disabled peers aren't wanted");
+    }
+
     #[test]
     fn levels_survive_toml() {
         let mut cfg = canonical_config();

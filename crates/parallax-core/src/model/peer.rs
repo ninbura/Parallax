@@ -59,6 +59,11 @@ pub struct Peer {
     /// otherwise `server.logs.level`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<super::LogLevel>,
+    /// Whether to log this peer's DNS queries, whatever its grants say
+    /// (docs/logging.md). Unset: on if any of its grants that say turn it
+    /// on, otherwise `server.logs.dns`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_dns: Option<bool>,
     pub transport: TransportKind,
     #[serde(default = "default_true")]
     pub enabled: bool,
