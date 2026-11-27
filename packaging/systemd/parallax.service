@@ -7,7 +7,9 @@
 Description=Parallax gateway (WireGuard, DNS and HTTPS proxy)
 Documentation=https://github.com/ninbura/Parallax/blob/main/docs/native.md
 Wants=network-online.target
-After=network-online.target
+# The subnet router, if this machine has one: Parallax's own or the host's.
+# Ordering only; the daemon keeps trying while it's down.
+After=network-online.target parallax-tailscaled.service tailscaled.service
 
 [Service]
 # Ready once it has applied and answers on its socket, so `systemctl start`

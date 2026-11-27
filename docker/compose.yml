@@ -32,7 +32,13 @@ services:
       # are easy to copy elsewhere. Best on another disk. docs/backup.md.
       - ./backups:/var/lib/parallax/backups
       - tailscale-state:/var/lib/tailscale
+      # This machine already on Tailscale? Use its client as the subnet
+      # router instead of starting a second one (they'd clash): mount its
+      # socket here and set PARALLAX_TAILSCALED below. Parallax then never
+      # changes its settings; `parallax doctor` says what to run. docs/setup.md.
+      # - /run/tailscale:/var/run/tailscale
     environment:
+      # PARALLAX_TAILSCALED: host
       PARALLAX_CONFIG: /etc/parallax/parallax.toml
       PARALLAX_DB: /var/lib/parallax/parallax.db
       PARALLAX_OUT: /var/lib/parallax

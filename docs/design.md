@@ -510,3 +510,16 @@ answering, the last answer stays. The
 logic is `parallax_core::headscale`, behind the `HeadscaleApi` trait in
 `io.rs`; the real client is `parallax-cli`'s `headscale.rs`, and Headscale
 itself is built from a pinned commit (`docker/headscale.Dockerfile`).
+
+Tailscale traffic enters through the subnet router, a `tailscaled` on the
+gateway (ADR 0015). While any peer is on Tailscale, the daemon looks at it
+every 30 seconds and after each saved change, through the `tailscale` CLI
+(`--tailscale-socket`) and Headscale's API. Logged out, it gets logged in as
+`subnet_router_node` under the Headscale user `parallax` with a single-use
+pre-auth key. As Parallax's own node, it's kept advertising exactly
+`subnet_router::routes` (each network's client subnet, the DNS and proxy
+addresses) with its filtering, SNAT, DNS and route acceptance off, and
+exactly those routes are approved. As anyone else's node (the machine's own
+Tailscale), it's left alone and the operator is told what to run. The
+logic is `parallax_core::subnet_router`, pure apart from the
+`ProcessRunner` and `HeadscaleApi` it's given.

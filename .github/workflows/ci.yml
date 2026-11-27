@@ -46,7 +46,9 @@ jobs:
       - run: cargo build -p parallax-cli
       - run: sudo env PATH="$PATH" NETNS_DAEMON=${{ matrix.daemon }} HEADSCALE="$HEADSCALE" TAILSCALED="$TAILSCALED" TAILSCALE="$TAILSCALE" ./tests/integration/netns.sh
       - if: matrix.daemon == 'unit'
-        run: systemd-analyze security --offline=true --threshold=20 packaging/systemd/parallax.service
+        run: |
+          systemd-analyze security --offline=true --threshold=20 packaging/systemd/parallax.service
+          systemd-analyze security --offline=true --threshold=30 packaging/systemd/parallax-tailscaled.service
 
   docker:
     runs-on: ubuntu-latest
@@ -236,5 +238,5 @@ jobs:
       - run: pacman -U --noconfirm dist/parallax-*-x86_64.pkg.tar.zst
       - run: parallax --version
       - run: getent passwd parallax && test "$(stat -c %U:%a /etc/parallax)" = parallax:700
-      - run: test -f /usr/lib/systemd/system/parallax.service && test -f /usr/lib/sysctl.d/90-parallax.conf
+      - run: test -f /usr/lib/systemd/system/parallax.service && test -f /usr/lib/systemd/system/parallax-tailscaled.service && test -f /usr/lib/sysctl.d/90-parallax.conf
       - run: test -s /usr/share/licenses/parallax/THIRD-PARTY-LICENSES

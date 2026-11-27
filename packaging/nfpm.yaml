@@ -21,7 +21,9 @@ homepage: https://github.com/ninbura/Parallax
 license: MIT OR Apache-2.0
 
 # What the daemon runs (`nft`, `wg`, `ip`); systemd for the unit, sysusers
-# and tmpfiles. iptables and ipset only for `backend = "iptables-nft"`.
+# and tmpfiles. iptables and ipset only for `backend = "iptables-nft"`;
+# tailscale only for Tailscale peers (not a Recommends: its own tailscaled
+# unit would start next to parallax-tailscaled).
 depends:
   - systemd
   - nftables
@@ -30,6 +32,7 @@ depends:
 suggests:
   - iptables
   - ipset
+  - tailscale
 
 contents:
   - src: ${BINARY}
@@ -39,6 +42,10 @@ contents:
       mode: 0755
   - src: packaging/systemd/parallax.service
     dst: /usr/lib/systemd/system/parallax.service
+    file_info:
+      mode: 0644
+  - src: packaging/systemd/parallax-tailscaled.service
+    dst: /usr/lib/systemd/system/parallax-tailscaled.service
     file_info:
       mode: 0644
   - src: packaging/sysusers.d/parallax.conf

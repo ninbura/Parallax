@@ -24,6 +24,7 @@
 #           10.99.0.5 (a private subnet the router knows but Parallax doesn't, like
 #           another VLAN)
 #   ctr     172.17.0.2, a "container" behind the gateway's Docker bridge
+#   tsc     wan0 203.0.114.2 -> gw wan1 203.0.114.1; a phone on Tailscale, for (w)
 #
 # Grants: personal (all_networks + internet, public DNS), family (the proxied
 # Immich, a service on the gateway host, two echo ports), friend (internet only),
@@ -48,8 +49,10 @@
 # change access when they return, and a refused one changes nothing, (t) activity
 # logging records logged peers' connections, bytes, blocked attempts, proxied
 # requests and (when asked) DNS queries, and nobody else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
-# node's address from Headscale. Every change goes through the daemon and takes
-# effect without SIGHUP.
+# node's address from Headscale, (w) the subnet router: the daemon logs Parallax's
+# tailscaled in to Headscale, advertises and approves the mapped routes, and a phone
+# on Tailscale reaches what its grant allows, DNS included. Every change goes through
+# the daemon and takes effect without SIGHUP.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -60,7 +63,7 @@ for t in nft wg ip dnsmasq dig curl openssl ping python3; do command -v $t >/dev
 PREFIX="${NETNS_PREFIX-pxit$$-}"
 [[ $PREFIX =~ ^[A-Za-z0-9_-]*$ ]] || { echo "NETNS_PREFIX may hold only letters, digits, _ and -"; exit 2; }
 NAMESPACES=""
-for ns in home gw client foreign net ctr; do NAMESPACES+=" $PREFIX$ns"; done
+for ns in home gw client foreign net ctr tsc; do NAMESPACES+=" $PREFIX$ns"; done
 # Cleanup kills everything in these namespaces, so never adopt ones that already exist.
 for ns in $NAMESPACES; do
     ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
@@ -116,9 +119,11 @@ veth wan0 gw wan0 client
 veth lan0 client lan0 foreign
 veth up0 gw up0 net
 veth vethctr gw eth0 ctr
+veth wan1 gw wan0 tsc
 inns gw ip addr add 192.168.1.1/24 dev eth0;   inns gw ip link set eth0 up
 inns gw ip addr add 203.0.113.1/24 dev wan0;   inns gw ip link set wan0 up
 inns gw ip addr add 198.51.100.1/24 dev up0;   inns gw ip link set up0 up
+inns gw ip addr add 203.0.114.1/24 dev wan1;   inns gw ip link set wan1 up
 inns gw ip route add default via 198.51.100.2
 inns gw ip link add docker0 type bridge
 inns gw ip addr add 172.17.0.1/16 dev docker0; inns gw ip link set docker0 up
@@ -151,6 +156,7 @@ inns net ip addr add 10.99.0.5/32 dev lo
 inns net ip addr add 1.2.3.4/32 dev lo
 inns ctr ip addr add 172.17.0.2/16 dev eth0; inns ctr ip link set eth0 up
 inns ctr ip route add default via 172.17.0.1
+inns tsc ip addr add 203.0.114.2/24 dev wan0; inns tsc ip link set wan0 up
 inns gw sysctl -qw net.ipv4.ip_forward=1
 
 # ---------------------------------------------------------------- certificates
@@ -315,10 +321,18 @@ SOCK="$WORK/run/parallax.sock"
 # would /usr/bin/parallax: it starts the CLI again as the service's user for
 # the service's files, and that user can't reach a build under a home.
 cp "$PARALLAX" "$WORK/parallax"
+# The subnet router's socket, (w); the daemon runs `tailscale` from PATH.
+TS_SOCK="$WORK/tsr/sock"
+mkdir -p "$WORK/bin" "$WORK/tsr"
+if [ -n "${TAILSCALE:-}" ] && [ -n "${TAILSCALED:-}" ]; then
+    cp "$TAILSCALE" "$WORK/bin/tailscale"
+    cp "$TAILSCALED" "$WORK/bin/tailscaled"
+fi
+export PATH="$WORK/bin:$PATH"
 if [ "$MODE" = unit ]; then
-    P="$WORK/parallax --db $WORK/parallax.db --socket $SOCK"
+    P="$WORK/parallax --db $WORK/parallax.db --socket $SOCK --tailscale-socket $TS_SOCK"
 else
-    P="$PARALLAX --db $WORK/parallax.db --socket $SOCK"
+    P="$PARALLAX --db $WORK/parallax.db --socket $SOCK --tailscale-socket $TS_SOCK"
 fi
 $P config import "$WORK/parallax.toml" >/dev/null
 $P keygen --write-config >/dev/null
@@ -353,7 +367,8 @@ if [ "$MODE" = unit ]; then
     printf '%s\n' "${SANDBOX[@]}" | grep -q '^AmbientCapabilities=CAP_NET_ADMIN' \
         || fail "could not read the sandbox from $UNIT_FILE"
     AS_UNIT=(systemd-run --quiet --collect -p User=nobody -p "NetworkNamespacePath=/run/netns/${PREFIX}gw"
-        -p "ReadWritePaths=$WORK" "${SANDBOX[@]}")
+        -p "ReadWritePaths=$WORK" -p "Environment=PATH=$WORK/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+        "${SANDBOX[@]}")
     # A first start from nothing: the unit's own ExecStartPre lines, in order,
     # pointed at a fresh directory.
     for d in first bad none; do mkdir "$WORK/$d"; done
@@ -400,7 +415,7 @@ start_daemon() { # reconcile interval in seconds
         UNITS+=("$unit")
         "${AS_UNIT[@]}" --unit="$unit" -p "StandardOutput=append:$WORK/daemon.log" \
             -p "StandardError=append:$WORK/daemon.log" \
-            "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" \
+            "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" --tailscale-socket "$TS_SOCK" \
             daemon -o "$WORK/out" --reconcile-every "$1"
     else
         inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/daemon.pid" \
@@ -1094,6 +1109,18 @@ fi
 if [ -n "${HEADSCALE:-}" ] && [ -n "${TAILSCALED:-}" ] && [ -n "${TAILSCALE:-}" ]; then
     HS="$WORK/hs"
     mkdir -p "$HS/ts"
+    # A tailscaled in a namespace still reaches the host's systemd-resolved over
+    # the system D-Bus, and resets DNS on whichever host link has its
+    # tailscale0's interface index. Each one here gets no D-Bus and a plain
+    # resolv.conf, so it leaves the host's DNS alone.
+    printf '# netns test: not systemd-resolved\nnameserver 192.0.2.53\n' > "$WORK/ts-resolv.conf"
+    chmod 0644 "$WORK/ts-resolv.conf"
+    no_host_dns() { # ns, command...  (a private mount namespace)
+        local ns=$1; shift
+        inns "$ns" unshare -m --propagation private sh -c \
+            'mount --bind "$0" /etc/resolv.conf && { [ ! -d /run/dbus ] || mount -t tmpfs tmpfs /run/dbus; } && exec "$@"' \
+            "$WORK/ts-resolv.conf" "$@"
+    }
     # No internet here: one offline DERP region, so Headscale starts.
     cat > "$HS/derp.yaml" <<YAML
 regions:
@@ -1108,7 +1135,8 @@ regions:
 YAML
     cat > "$HS/config.yaml" <<YAML
 server_url: http://127.0.0.1:18080
-listen_addr: 127.0.0.1:18080
+# Also on wan1, for the phone in (w).
+listen_addr: 0.0.0.0:18080
 metrics_listen_addr: ""
 unix_socket: $HS/headscale.sock
 noise:
@@ -1142,7 +1170,7 @@ YAML
     HS_USER=$(hs_api POST /api/v1/user '{"name":"family"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["user"]["id"])')
     AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"2099-01-01T00:00:00Z\"}" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
-    inns gw "$TAILSCALED" --tun=userspace-networking --state=mem: --socket="$HS/ts/sock" \
+    no_host_dns gw "$TAILSCALED" --tun=userspace-networking --state=mem: --socket="$HS/ts/sock" \
         --statedir="$HS/ts" --port=0 >> "$HS/tailscaled.log" 2>&1 &
     PIDS+=($!)
     for _ in $(seq 50); do [ -S "$HS/ts/sock" ] && break; sleep 0.1; done
@@ -1191,8 +1219,118 @@ PY
     hs_api DELETE "/api/v1/node/$NODE" >/dev/null || fail "(u) could not delete the node"
     wait_set out || fail "(u) a deleted node kept its peer's access"
     pass "(u) a Tailscale peer gets its node's address from Headscale, keeps it while Headscale is down, loses it with the node"
+
+    # (w) The subnet router. Parallax's own tailscaled (kernel tun, as the image
+    # and parallax-tailscaled.service run it), logged out; the daemon logs it in,
+    # advertises the mapped network and the DNS address, and approves them. A
+    # phone on Tailscale in its own namespace then reaches what its grant allows,
+    # exactly what the WireGuard guest with the same grant reaches.
+    TSD_UNIT="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax-tailscaled.service"
+    ROUTER_ARGS=(--state="$WORK/tsr/state" --statedir="$WORK/tsr" --socket="$TS_SOCK" --tun=tailscale0 --port=41641)
+    if [ "$MODE" = unit ]; then
+        # parallax-tailscaled.service's sandbox, root as there, then its
+        # ExecStartPost: the daemon's user may manage it.
+        TSD_SANDBOX=()
+        while IFS= read -r line; do
+            case ${line%%=*} in
+                Type | Exec* | Restart* | StateDirectory* | RuntimeDirectory*) ;;
+                *) TSD_SANDBOX+=(-p "$line") ;;
+            esac
+        done < <(sed -n '/^\[Service\]/,/^\[/p' "$TSD_UNIT" | grep -E '^[A-Za-z]+=')
+        printf '%s\n' "${TSD_SANDBOX[@]}" | grep -q '^CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW$' \
+            || fail "(w) could not read the sandbox from $TSD_UNIT"
+        # Root without CAP_DAC_OVERRIDE: its directory is root's, as
+        # StateDirectory and RuntimeDirectory make it, and $WORK (the
+        # service's) only traversable.
+        chmod 0711 "$WORK"
+        chown root:root "$WORK/tsr"
+        chmod 0755 "$WORK/tsr"
+        UNITS+=("${PREFIX}tailscaled")
+        systemd-run --quiet --collect --unit="${PREFIX}tailscaled" -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" \
+            -p "ReadWritePaths=$WORK" -p "StandardOutput=append:$HS/router.log" -p "StandardError=append:$HS/router.log" \
+            -p "BindReadOnlyPaths=$WORK/ts-resolv.conf:/etc/resolv.conf" -p "TemporaryFileSystem=/run/dbus" \
+            "${TSD_SANDBOX[@]}" "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}"
+    else
+        no_host_dns gw "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}" >> "$HS/router.log" 2>&1 &
+        PIDS+=($!)
+    fi
+    for _ in $(seq 50); do [ -S "$TS_SOCK" ] && break; sleep 0.1; done
+    [ -S "$TS_SOCK" ] || { cat "$HS/router.log"; fail "(w) the router's tailscaled did not start"; }
+    if [ "$MODE" = unit ]; then
+        # The unit's ExecStartPost, in its sandbox, with the test's user.
+        systemd-run --quiet --collect --unit="${PREFIX}tailscaled-operator" -p Type=exec --wait --pipe \
+            -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" -p "ReadWritePaths=$WORK" "${TSD_SANDBOX[@]}" \
+            "$WORK/bin/tailscale" --socket="$TS_SOCK" set --operator=nobody \
+            || fail "(w) could not make the service the router's operator"
+    fi
+
+    # Short-lived, and on stdin, as Parallax passes its own.
+    PHONE_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
+    mkdir -p "$HS/phone"
+    no_host_dns tsc "$TAILSCALED" --tun=tailscale0 --state=mem: --socket="$HS/phone/sock" --statedir="$HS/phone" \
+        --port=0 >> "$HS/phone.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 50); do [ -S "$HS/phone/sock" ] && break; sleep 0.1; done
+    # --accept-dns=false too: the phone has no DNS of its own to set.
+    printf '%s' "$PHONE_AUTH" | inns tsc timeout 30 "$TAILSCALE" --socket="$HS/phone/sock" up \
+        --login-server=http://203.0.114.1:18080 --auth-key=file:/dev/stdin --hostname=phone --accept-routes \
+        --accept-dns=false >/dev/null 2>&1 \
+        || { tail -20 "$HS/phone.log"; fail "(w) the phone did not log in"; }
+    read -r PHONE PHONE_IP < <(hs_api GET /api/v1/node | python3 -c '
+import json, sys
+n = next(n for n in json.load(sys.stdin)["nodes"] if n["givenName"] == "phone")
+print(n["id"], next(a for a in n["ipAddresses"] if "." in a))')
+    $P config export > "$WORK/current.toml"
+    printf '\n[[peer]]\nname = "phone"\ngrants = ["family"]\ntransport = "tailscale"\n[peer.tailscale]\nnode_id = %s\n' \
+        "$PHONE" >> "$WORK/current.toml"
+    apply "$WORK/current.toml"
+    router_routes() {
+        hs_api GET /api/v1/node | python3 -c '
+import json, sys
+for n in json.load(sys.stdin)["nodes"]:
+    if n["givenName"] == "parallax-gateway" and n["user"]["name"] == "parallax":
+        print(",".join(sorted(n["approvedRoutes"])), ",".join(sorted(n["availableRoutes"])))'
+    }
+    for _ in $(seq 60); do
+        [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] && break
+        sleep 0.5
+    done
+    [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] \
+        || { hs_api GET /api/v1/node; tail -20 "$HS/router.log"; fail "(w) the router's routes were not advertised and approved"; }
+    grep -q "logged the router in to Headscale" "$WORK/daemon.log" || fail "(w) the router's login was not logged"
+    inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+assert p["NetfilterMode"] == 0 and p["NoSNAT"] and not p["CorpDNS"] and not p["RouteAll"], p' \
+        || fail "(w) the router does not have its own filtering, SNAT, DNS and routes off"
+    for _ in $(seq 60); do
+        inns tsc ip route show table 52 | grep -q '^198.18.1.0/24 dev tailscale0' && break
+        sleep 0.5
+    done
+    inns tsc ip route show table 52 | grep -q '^198.18.1.0/24 dev tailscale0' \
+        || { inns tsc ip route show table 52; fail "(w) the phone has no route to the mapped network"; }
+    phone() { inns tsc curl -s -m 3 "$@" || echo BLOCKED; }
+    # The first packets may wait for the path between the two to be found.
+    for _ in $(seq 20); do [ "$(phone http://198.18.1.1:9090/)" = gw-self ] && break; sleep 0.5; done
+    [ "$(phone http://198.18.1.1:9090/)" = gw-self ] || fail "(w) phone -> the granted service on the gateway host"
+    for url in http://198.18.1.1:9090/ http://198.18.1.1:9091/ http://198.18.1.1:8080/ http://198.18.1.5:8080/ http://198.18.1.5:7000/ http://9.9.9.9/; do
+        [ "$(phone "$url")" = "$(curl_as $GUEST "$url")" ] || fail "(w) the phone and the guest, same grant, differ on $url"
+    done
+    [ "$(phone http://198.18.1.1:9091/)" = BLOCKED ] || fail "(w) the phone reached a port its grant lacks"
+    ANS=$(inns tsc dig +short +time=2 +tries=1 @10.8.0.1 immich.mydomain.com || true)
+    [ -n "$ANS" ] && [ "$ANS" = "$(inns client dig +short +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)" ] \
+        || fail "(w) the phone's DNS answer for immich ('$ANS') is not the guest's"
+    [ "$(inns tsc curl -s -m 3 --cacert "$CA" --resolve "immich.mydomain.com:443:$ANS" https://immich.mydomain.com/ || echo BLOCKED)" = home-immich ] \
+        || fail "(w) the phone did not reach Immich through the proxy"
+    [ "$(inns tsc dig +time=2 +tries=1 @10.8.0.1 other.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')" = REFUSED ] \
+        || fail "(w) the phone looked up a name its grant lacks"
+    inns gw $P doctor > "$WORK/doctor-router" 2>&1 || true
+    grep -q "^ok    tailscale router: Parallax's router is node" "$WORK/doctor-router" \
+        || { cat "$WORK/doctor-router"; fail "(w) doctor does not see the router in place"; }
+    pass "(w) the daemon logs the subnet router in and approves its routes; a Tailscale phone reaches what its grant allows, DNS and the proxy included"
 else
-    echo "SKIP: (u) Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
+    echo "SKIP: (u) and (w), Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
 fi
 
 echo "ALL PASS"

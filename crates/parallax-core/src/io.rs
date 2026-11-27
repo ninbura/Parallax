@@ -99,6 +99,8 @@ pub struct HttpReply {
 pub trait HeadscaleApi {
     /// `GET path` (`/api/v1/node`) with the API key.
     fn get(&self, path: &str) -> Result<HttpReply>;
+    /// `POST path` with the API key and a JSON body.
+    fn post(&self, path: &str, body: &str) -> Result<HttpReply>;
 }
 
 /// Everything `apply` needs, bundled.
@@ -269,11 +271,12 @@ pub mod memory {
     }
 
     /// Answers from a table of paths; anything else is unreachable.
-    /// Records every path asked for.
+    /// Records every path asked for, and every POST with its body.
     #[derive(Debug, Default)]
     pub struct FakeHeadscale {
         replies: BTreeMap<String, HttpReply>,
         pub asked: RefCell<Vec<String>>,
+        pub posted: RefCell<Vec<(String, String)>>,
     }
 
     impl FakeHeadscale {
@@ -299,6 +302,16 @@ pub mod memory {
                 .get(path)
                 .cloned()
                 .ok_or_else(|| Error::Headscale(format!("GET {path}: connection refused")))
+        }
+        /// Answered from the table under `POST path`.
+        fn post(&self, path: &str, body: &str) -> Result<HttpReply> {
+            self.posted
+                .borrow_mut()
+                .push((path.to_string(), body.to_string()));
+            self.replies
+                .get(&format!("POST {path}"))
+                .cloned()
+                .ok_or_else(|| Error::Headscale(format!("POST {path}: connection refused")))
         }
     }
 

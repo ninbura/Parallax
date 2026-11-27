@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::{header, Request, Uri};
 use hyper_rustls::HttpsConnectorBuilder;
@@ -79,7 +79,8 @@ impl Api {
         Ok(Some(Secret::new(key)))
     }
 
-    async fn ask(&self, path: &str) -> std::result::Result<HttpReply, String> {
+    /// `body` set: a POST of that JSON; otherwise a GET.
+    async fn ask(&self, path: &str, body: Option<&str>) -> std::result::Result<HttpReply, String> {
         let uri: Uri = format!("{}{path}", self.url).parse().map_err(|e| {
             format!(
                 "server.headscale.server_url '{}' isn't a URL: {e}",
@@ -107,7 +108,11 @@ impl Api {
         let mut http = HttpConnector::new();
         http.enforce_http(false);
         http.set_connect_timeout(Some(TIMEOUT));
-        let mut request = Request::get(uri).header(header::ACCEPT, "application/json");
+        let mut request = match body {
+            Some(_) => Request::post(uri).header(header::CONTENT_TYPE, "application/json"),
+            None => Request::get(uri),
+        }
+        .header(header::ACCEPT, "application/json");
         if let Some(key) = &key {
             let mut value = header::HeaderValue::try_from(format!("Bearer {}", key.expose()))
                 .map_err(|_| {
@@ -121,7 +126,7 @@ impl Api {
             request = request.header(header::AUTHORIZATION, value);
         }
         let request = request
-            .body(Empty::<Bytes>::new())
+            .body(Full::new(Bytes::from(body.unwrap_or_default().to_owned())))
             .map_err(|e| e.to_string())?;
         let exchange = async {
             // TLS only for https: plain HTTP mustn't need the CA bundle.
@@ -169,24 +174,35 @@ impl Api {
     }
 }
 
-impl HeadscaleApi for Api {
+impl Api {
     /// Blocks. Runs on a thread and runtime of its own, so it works from
     /// anywhere, inside an async runtime too (where it blocks that thread).
-    fn get(&self, path: &str) -> Result<HttpReply> {
+    fn exchange(&self, path: &str, body: Option<&str>) -> Result<HttpReply> {
         let run = || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| format!("starting a runtime: {e}"))?
-                .block_on(self.ask(path))
+                .block_on(self.ask(path, body))
         };
+        let method = if body.is_some() { "POST" } else { "GET" };
         std::thread::scope(|scope| {
             scope
                 .spawn(run)
                 .join()
                 .unwrap_or_else(|_| Err("the request thread panicked".into()))
         })
-        .map_err(|e| Error::Headscale(format!("Headscale at {}: GET {path}: {e}", self.url)))
+        .map_err(|e| Error::Headscale(format!("Headscale at {}: {method} {path}: {e}", self.url)))
+    }
+}
+
+impl HeadscaleApi for Api {
+    fn get(&self, path: &str) -> Result<HttpReply> {
+        self.exchange(path, None)
+    }
+
+    fn post(&self, path: &str, body: &str) -> Result<HttpReply> {
+        self.exchange(path, Some(body))
     }
 }
 
@@ -235,6 +251,36 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("parallax-hs-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn posts_json_with_the_key() {
+        let dir = scratch("post");
+        let key_file = dir.join("headscale-api.key");
+        std::fs::write(&key_file, "hskey-api-test\n").unwrap();
+        let (url, request) = serve_once(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+        );
+        let reply = api(&url, key_file)
+            .post("/api/v1/user", r#"{"name":"parallax"}"#)
+            .unwrap();
+        let request = request.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(reply.status, 200);
+        assert!(
+            request.starts_with("POST /api/v1/user HTTP/1.1"),
+            "{request}"
+        );
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-type: application/json\r\n"),
+            "{request}"
+        );
+        assert!(
+            lower.contains("authorization: bearer hskey-api-test\r\n"),
+            "{request}"
+        );
+        assert!(request.ends_with(r#"{"name":"parallax"}"#), "{request}");
     }
 
     #[test]

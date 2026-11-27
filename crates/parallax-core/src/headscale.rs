@@ -22,6 +22,7 @@ use serde::Deserialize;
 use crate::doctor::{Check, Outcome};
 use crate::io::{HeadscaleApi, HttpReply};
 use crate::model::{Config, HeadscaleServer, TransportKind};
+use crate::secret::Secret;
 use crate::{Error, Result, TAILSCALE_CGNAT};
 
 /// How often the daemon asks Headscale for its nodes. A new node gets its
@@ -46,6 +47,11 @@ pub struct Node {
     /// Its tailnet IPv4 address; `None` when Headscale gave it only IPv6.
     pub address: Option<Ipv4Addr>,
     pub online: bool,
+    /// `nodekey:...`, as its client reports it.
+    pub node_key: String,
+    /// The routes it advertises, and those Headscale approved.
+    pub available_routes: Vec<String>,
+    pub approved_routes: Vec<String>,
 }
 
 /// Each node's IPv4 address, by node id: what generation needs.
@@ -114,9 +120,90 @@ pub fn nodes(server: &HeadscaleServer, api: &dyn HeadscaleApi) -> Result<Vec<Nod
                 user: n.user.map(|u| u.name).unwrap_or_default(),
                 address,
                 online: n.online,
+                node_key: n.node_key,
+                available_routes: n.available_routes,
+                approved_routes: n.approved_routes,
             })
         })
         .collect()
+}
+
+/// The user called `name`, if there is one.
+pub fn user(server: &HeadscaleServer, api: &dyn HeadscaleApi, name: &str) -> Result<Option<User>> {
+    #[derive(Deserialize)]
+    struct Users {
+        users: Vec<WireUser>,
+    }
+    // Names Parallax asks for are its own constants: nothing to escape.
+    let path = format!("/api/v1/user?name={name}");
+    let body = get(server, api, &path)?;
+    let users: Users = parse(server, &path, &body)?;
+    users
+        .users
+        .into_iter()
+        .find(|u| u.name == name)
+        .map(|u| u.into_user(server, &path))
+        .transpose()
+}
+
+/// Create the user `name`.
+pub fn create_user(server: &HeadscaleServer, api: &dyn HeadscaleApi, name: &str) -> Result<User> {
+    #[derive(Deserialize)]
+    struct Created {
+        user: WireUser,
+    }
+    const PATH: &str = "/api/v1/user";
+    let body = post(server, api, PATH, &serde_json::json!({ "name": name }))?;
+    let created: Created = parse(server, PATH, &body)?;
+    created.user.into_user(server, PATH)
+}
+
+/// A single-use pre-auth key for `user`, void after `expires` (UTC
+/// midnight). Headscale shows the key only in this reply.
+pub fn create_pre_auth_key(
+    server: &HeadscaleServer,
+    api: &dyn HeadscaleApi,
+    user: u64,
+    expires: crate::date::Date,
+) -> Result<Secret> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Created {
+        pre_auth_key: Key,
+    }
+    #[derive(Deserialize)]
+    struct Key {
+        key: String,
+    }
+    const PATH: &str = "/api/v1/preauthkey";
+    let request = serde_json::json!({
+        "user": user.to_string(),
+        "reusable": false,
+        "ephemeral": false,
+        "expiration": format!("{expires}T00:00:00Z"),
+    });
+    let body = post(server, api, PATH, &request)?;
+    // Not `parse`: its error would quote serde's, which can quote the key.
+    let created: Created = serde_json::from_str(&body).map_err(|_| {
+        Error::Headscale(format!(
+            "Headscale at {} answered POST {PATH} with a reply Parallax can't read",
+            server.server_url
+        ))
+    })?;
+    Ok(Secret::new(created.pre_auth_key.key))
+}
+
+/// Approve exactly `routes` for node `id`; any other approved route is
+/// withdrawn.
+pub fn approve_routes(
+    server: &HeadscaleServer,
+    api: &dyn HeadscaleApi,
+    id: u64,
+    routes: &[ipnet::Ipv4Net],
+) -> Result<()> {
+    let path = format!("/api/v1/node/{id}/approve_routes");
+    let routes: Vec<String> = routes.iter().map(ToString::to_string).collect();
+    post(server, api, &path, &serde_json::json!({ "routes": routes })).map(drop)
 }
 
 /// The address of every node that has an IPv4 one.
@@ -249,6 +336,12 @@ struct WireNode {
     id: String,
     given_name: String,
     #[serde(default)]
+    node_key: String,
+    #[serde(default)]
+    available_routes: Vec<String>,
+    #[serde(default)]
+    approved_routes: Vec<String>,
+    #[serde(default)]
     ip_addresses: Vec<String>,
     /// A tagged node may have none.
     #[serde(default)]
@@ -276,14 +369,27 @@ impl WireUser {
 fn id(server: &HeadscaleServer, path: &str, id: &str) -> Result<u64> {
     id.parse().map_err(|_| {
         Error::Headscale(format!(
-            "Headscale at {} answered GET {path} with id '{id}', which isn't a number",
+            "Headscale at {} answered {path} with id '{id}', which isn't a number",
             server.server_url
         ))
     })
 }
 
 fn get(server: &HeadscaleServer, api: &dyn HeadscaleApi, path: &str) -> Result<String> {
-    let reply = api.get(path)?;
+    answer(server, "GET", path, api.get(path)?)
+}
+
+fn post(
+    server: &HeadscaleServer,
+    api: &dyn HeadscaleApi,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<String> {
+    answer(server, "POST", path, api.post(path, &body.to_string())?)
+}
+
+/// The body of a 200, or an error naming the request and Headscale's words.
+fn answer(server: &HeadscaleServer, method: &str, path: &str, reply: HttpReply) -> Result<String> {
     if reply.status == 200 {
         return Ok(reply.body);
     }
@@ -295,7 +401,7 @@ fn get(server: &HeadscaleServer, api: &dyn HeadscaleApi, path: &str) -> Result<S
         _ => String::new(),
     };
     Err(Error::Headscale(format!(
-        "Headscale at {} answered GET {path} with {}{hint}",
+        "Headscale at {} answered {method} {path} with {}{hint}",
         server.server_url,
         Problem(&reply)
     )))
@@ -308,7 +414,7 @@ fn parse<T: for<'de> Deserialize<'de>>(
 ) -> Result<T> {
     serde_json::from_str(body).map_err(|e| {
         Error::Headscale(format!(
-            "Headscale at {} answered GET {path} with a reply Parallax can't read ({e}); is that a Headscale built from the commit docker/headscale pins?",
+            "Headscale at {} answered {path} with a reply Parallax can't read ({e}); is that a Headscale built from the commit docker/headscale pins?",
             server.server_url
         ))
     })
@@ -386,6 +492,11 @@ mod tests {
                 user: "sister".into(),
                 address: Some(Ipv4Addr::new(100, 64, 0, 1)),
                 online: true,
+                node_key:
+                    "nodekey:a93ccc9b8648498b9e074dd63e438110f9dcdb4778f43c14e296a4793a4b4d3f"
+                        .into(),
+                available_routes: vec!["198.18.0.0/24".into()],
+                approved_routes: vec![],
             }]
         );
         assert_eq!(
