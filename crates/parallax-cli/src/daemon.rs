@@ -1363,8 +1363,10 @@ impl Engine {
             Some(Ok(found)) => Some(found.address),
             _ => self.view.public_ip,
         };
-        // Blocks this thread for those names' lookups only (a few seconds
-        // at most): known names aren't asked again.
+        // Blocks this thread for those names' lookups only, up to a few
+        // seconds per resolver asked (a name the new resolvers can't answer
+        // and nothing knows is asked through the old ones too): known names
+        // aren't asked again.
         let resolved = names::check_save(
             Some(&self.view.config),
             old_ip,
