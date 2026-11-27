@@ -83,25 +83,27 @@ impl Api {
                 self.url
             )
         })?;
-        match uri.scheme_str() {
-            Some("http" | "https") => {}
+        let https = match uri.scheme_str() {
+            Some("https") => true,
+            Some("http") => false,
             _ => {
                 return Err(format!(
                     "server.headscale.server_url '{}' must start with http:// or https://",
                     self.url
                 ))
             }
+        };
+        // `path` is appended: a query or fragment would swallow it.
+        if uri.authority().is_none() || self.url.contains(['?', '#']) {
+            return Err(format!(
+                "server.headscale.server_url '{}' must be Headscale's own URL, like https://headscale.example.com",
+                self.url
+            ));
         }
         let key = self.key(path).map_err(|e| e.to_string())?;
         let mut http = HttpConnector::new();
         http.enforce_http(false);
         http.set_connect_timeout(Some(TIMEOUT));
-        let https = HttpsConnectorBuilder::new()
-            .with_tls_config(self.tls()?)
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http);
-        let client = Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(https);
         let mut request = Request::get(uri).header(header::ACCEPT, "application/json");
         if let Some(key) = &key {
             let mut value = header::HeaderValue::try_from(format!("Bearer {}", key.expose()))
@@ -115,9 +117,28 @@ impl Api {
             value.set_sensitive(true);
             request = request.header(header::AUTHORIZATION, value);
         }
-        let request = request.body(Empty::new()).map_err(|e| e.to_string())?;
+        let request = request
+            .body(Empty::<Bytes>::new())
+            .map_err(|e| e.to_string())?;
         let exchange = async {
-            let response = client.request(request).await.map_err(|e| chain(&e))?;
+            // TLS only for https: plain HTTP mustn't need the CA bundle.
+            let response = if https {
+                let connector = HttpsConnectorBuilder::new()
+                    .with_tls_config(self.tls()?)
+                    .https_only()
+                    .enable_http1()
+                    .wrap_connector(http);
+                Client::builder(TokioExecutor::new())
+                    .build(connector)
+                    .request(request)
+                    .await
+            } else {
+                Client::builder(TokioExecutor::new())
+                    .build(http)
+                    .request(request)
+                    .await
+            }
+            .map_err(|e| chain(&e))?;
             let status = response.status().as_u16();
             let body = Limited::new(response.into_body(), MAX_REPLY)
                 .collect()
@@ -286,6 +307,28 @@ mod tests {
             "{e}"
         );
         assert!(!e.contains("hskey-api-test"), "{e}");
+    }
+
+    #[test]
+    fn plain_http_needs_no_ca_bundle() {
+        let (url, request) =
+            serve_once("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+        let mut api = api(&url, PathBuf::from("/nonexistent/key"));
+        api.ca = PathBuf::from("/nonexistent/ca.pem");
+        assert_eq!(api.get("/version").unwrap().status, 200);
+        request.join().unwrap();
+    }
+
+    #[test]
+    fn a_url_with_a_query_is_refused() {
+        let e = api(
+            "https://headscale.example.com/?x=1",
+            PathBuf::from("/nonexistent"),
+        )
+        .get("/version")
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("must be Headscale's own URL"), "{e}");
     }
 
     #[test]

@@ -1080,12 +1080,16 @@ impl Engine {
         true
     }
 
-    /// What Headscale said, if `config` names the same Headscale: node ids
-    /// mean nothing on another one.
+    /// What Headscale said, if `config` names the same Headscale (node ids
+    /// mean nothing on another one) and still asks it (an answer nobody
+    /// refreshes would come back stale with the next node peer).
     fn tailnet_for(&self, config: &Config) -> Option<Tailnet> {
         let same =
             config.server.headscale.server_url == self.view.config.server.headscale.server_url;
-        self.view.tailnet.clone().filter(|_| same)
+        self.view
+            .tailnet
+            .clone()
+            .filter(|_| same && headscale::needed(config))
     }
 
     fn set_apply_error(&mut self, error: Option<String>) {

@@ -1086,13 +1086,14 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
         fs: &RealFs,
         runner: &runner,
     };
-    let loaded = ctx.load_for_generation().map_err(|e| format!("{e:#}"));
+    // Not `load_for_generation`: the Headscale check below asks it itself.
+    let loaded = ctx.load_full().map_err(|e| format!("{e:#}"));
     let config = loaded
         .as_ref()
-        .map(|(config, _)| config)
+        .map(|(config, _, _)| config)
         .map_err(Clone::clone);
     let mut checks = parallax_core::doctor::diagnose(config.clone(), sys);
-    if let Ok((config, learned)) = &loaded {
+    if let Ok((config, _, learned)) = &loaded {
         let known = public_ip::effective(&config.server, learned.public_ip);
         checks.push(parallax_core::doctor::public_ip_check(config, known));
         let api = headscale::Api::new(&config.server);
@@ -1788,7 +1789,7 @@ fn peer_command(ctx: &Ctx, command: PeerCommand) -> anyhow::Result<()> {
                 let tier = model.tier_of(p);
                 let addr = match p.transport {
                     TransportKind::WireGuard => p.wireguard.as_ref().and_then(|w| w.address),
-                    TransportKind::Tailscale => p.tailscale.as_ref().and_then(|t| t.address),
+                    TransportKind::Tailscale => transport::TailscaleTransport::address(&model, p),
                 };
                 outln!(
                     "{}  grants={}  transport={}  address={}  active={}{}",

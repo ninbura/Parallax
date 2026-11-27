@@ -16,6 +16,19 @@ use crate::{Error, Result, TAILSCALE_CGNAT};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TailscaleTransport;
 
+impl TailscaleTransport {
+    /// A Tailscale peer's address: its node's, wherever Headscale says, and
+    /// none until it has said (a configured address could be another
+    /// node's by now). A peer that names no node has its configured one.
+    pub fn address(model: &Model<'_>, peer: &Peer) -> Option<std::net::Ipv4Addr> {
+        let ts = peer.tailscale.as_ref()?;
+        match ts.node_id {
+            Some(id) => model.tailnet()?.get(&id).copied(),
+            None => ts.address,
+        }
+    }
+}
+
 impl Transport for TailscaleTransport {
     fn kind(&self) -> TransportKind {
         TransportKind::Tailscale
@@ -38,20 +51,15 @@ impl Transport for TailscaleTransport {
     }
 
     fn tier_members(&self, model: &Model<'_>, tier: &Tier<'_>) -> Vec<Ipv4Net> {
-        model
+        let mut members: Vec<Ipv4Net> = model
             .members_on(tier, TransportKind::Tailscale)
-            .filter_map(|p| {
-                let ts = p.tailscale.as_ref()?;
-                // A peer that names a node is wherever Headscale says, and
-                // nowhere until it has said: a configured address could be
-                // another node's by now.
-                match ts.node_id {
-                    Some(id) => model.tailnet()?.get(&id).copied(),
-                    None => ts.address,
-                }
-            })
+            .filter_map(|p| Self::address(model, p))
             .map(Ipv4Net::from)
-            .collect()
+            .collect();
+        // An address twice would be a conflicting interval to nft.
+        members.sort();
+        members.dedup();
+        members
     }
 
     fn provision(

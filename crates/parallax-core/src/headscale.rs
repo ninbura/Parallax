@@ -111,7 +111,7 @@ pub fn nodes(server: &HeadscaleServer, api: &dyn HeadscaleApi) -> Result<Vec<Nod
             Ok(Node {
                 id,
                 name: n.given_name,
-                user: n.user.into_user(server, PATH)?.name,
+                user: n.user.map(|u| u.name).unwrap_or_default(),
                 address,
                 online: n.online,
             })
@@ -250,7 +250,9 @@ struct WireNode {
     given_name: String,
     #[serde(default)]
     ip_addresses: Vec<String>,
-    user: WireUser,
+    /// A tagged node may have none.
+    #[serde(default)]
+    user: Option<WireUser>,
     #[serde(default)]
     online: bool,
 }
@@ -410,6 +412,15 @@ mod tests {
         let nodes = nodes(&server(), &api).unwrap();
         assert_eq!(nodes[0].address, None);
         assert!(tailnet(&nodes).is_empty());
+    }
+
+    #[test]
+    fn a_node_without_a_user_is_still_read() {
+        let body = NODES.replacen(r#""user":{"id":"1","name":"sister","createdAt":"2026-11-26T17:07:09.44141579-07:00","displayName":"","email":"","providerId":"","provider":"","profilePicUrl":""},"lastSeen""#, r#""user":null,"lastSeen""#, 1);
+        assert!(body.contains(r#""user":null"#));
+        let api = FakeHeadscale::new().reply("/api/v1/node", 200, &body);
+        let nodes = nodes(&server(), &api).unwrap();
+        assert_eq!((nodes[0].id, nodes[0].user.as_str()), (1, ""));
     }
 
     #[test]

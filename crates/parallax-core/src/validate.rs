@@ -1162,6 +1162,11 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                             "{ctx}: tailscale address {addr} is outside {TAILSCALE_CGNAT}"
                         ));
                     }
+                    if let Some(other) = addresses.insert(addr, &p.name) {
+                        errors.push(format!(
+                            "{ctx}: address {addr} is already used by peer '{other}'"
+                        ));
+                    }
                 }
             }
         }
