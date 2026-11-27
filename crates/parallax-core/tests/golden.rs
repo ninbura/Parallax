@@ -858,10 +858,15 @@ fn iptables_apply_refills_chains_in_one_restore() {
         }
     }
     assert_eq!(placed, holds.len());
-    let hooks = lines
-        .iter()
-        .rposition(|l| l.starts_with("iptables -t nat -C POSTROUTING"))
-        .unwrap();
+    // nat hooked before filter: a filter jump goes in above the hold.
+    let hook = |chain: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(&format!(" -C {chain} -j PARALLAX_{chain}")))
+            .unwrap()
+    };
+    assert!(hook("POSTROUTING") < hook("FORWARD") && hook("PREROUTING") < hook("INPUT"));
+    let hooks = hook("INPUT").max(hook("FORWARD"));
     for rule in [
         format!("INPUT -i wg0 {suffix}"),
         format!("FORWARD -o tailscale0 {suffix}"),

@@ -219,9 +219,10 @@ fn apply_firewall(
                 .runner
                 .run_checked("iptables", &["-t", "filter", "-S"], None)?;
             // Hooks first, then the hold comes off: until both tables are
-            // attached nothing new starts. Every hold goes, also one for an
-            // interface since renamed.
-            for (table, builtin, own) in CHAINS {
+            // attached nothing new starts. `nat` first: a filter jump goes in
+            // above the hold, so once it's there both tables must be. Every
+            // hold goes, also one for an interface since renamed.
+            for (table, builtin, own) in CHAINS.iter().rev() {
                 let present = sys
                     .runner
                     .run("iptables", &["-t", table, "-C", builtin, "-j", own], None)?
@@ -544,8 +545,8 @@ pub fn held(listing: &str) -> Vec<Vec<String>> {
         .map(|rule| {
             ["-t", "filter", "-D"]
                 .into_iter()
-                .chain(rule.split(' '))
                 .map(String::from)
+                .chain(iptables_words(rule))
                 .collect()
         })
         .collect()
