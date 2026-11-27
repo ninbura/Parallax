@@ -966,10 +966,9 @@ fn a_closed_stderr_changes_nothing() {
     assert!(ok && shown.contains("tablet"), "{shown}{err}");
 }
 
-/// What root runs as the service's user to write or remove a file the
-/// configuration names (`owner::ConfigFiles`): stdin replaces the file,
-/// owner-only, its directory made if missing; removing a missing file says
-/// so with exit 4.
+/// What root runs as the service's user for a file the configuration names
+/// (`owner::ConfigFiles`): stdin replaces the file, owner-only, its
+/// directory made if missing; read prints it; a missing file is exit 4.
 #[test]
 fn file_writes_and_removes_as_whoever_runs_it() {
     use std::io::Write;
@@ -992,9 +991,22 @@ fn file_writes_and_removes_as_whoever_runs_it() {
     let (_, help, _) = s.run(&["--help"]);
     assert!(!help.contains("\n  file "), "{help}");
 
+    let read = s.command(&["file", "read", &path]).output().unwrap();
+    assert!(read.status.success());
+    assert_eq!(read.stdout, b"secret\n");
+    // What `ConfigFiles` passes: `--`, so a path starting with `-` is a path.
+    let dashed = s
+        .command(&["file", "read", "--", "-not-a-flag"])
+        .current_dir(&s.dir)
+        .output()
+        .unwrap();
+    assert_eq!(dashed.status.code(), Some(4), "{dashed:?}");
+
     let removed = s.command(&["file", "remove", &path]).status().unwrap();
     assert!(removed.success());
     assert!(!target.exists());
     let again = s.command(&["file", "remove", &path]).status().unwrap();
     assert_eq!(again.code(), Some(4));
+    let gone = s.command(&["file", "read", &path]).status().unwrap();
+    assert_eq!(gone.code(), Some(4));
 }

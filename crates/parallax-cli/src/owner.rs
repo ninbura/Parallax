@@ -177,6 +177,8 @@ fn as_user(
     let mut child = Command::new(exe)
         .arg("file")
         .arg(op)
+        // A path starting with `-` is still a path.
+        .arg("--")
         .arg(&path)
         .uid(user.uid)
         .gid(user.gid)
@@ -228,12 +230,9 @@ impl FileSystem for ConfigFiles {
     /// through here is a secret or a probe.
     fn write(&self, path: &Path, contents: &str, _secret: bool) -> parallax_core::Result<()> {
         let Some(user) = self.user_for(path) else {
-            return crate::backup::write_atomic(path, contents).map_err(|e| {
-                io_error(
-                    format!("writing {}", path.display()),
-                    std::io::Error::other(format!("{e:#}")),
-                )
-            });
+            // `write_atomic`'s message already names the file.
+            return crate::backup::write_atomic(path, contents)
+                .map_err(|e| parallax_core::Error::Refused(format!("{e:#}")));
         };
         let out = as_user(user, "write", path, Some(contents))?;
         match out.status.success() {

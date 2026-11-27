@@ -81,14 +81,24 @@ fn now_secs() -> u64 {
 }
 
 /// The passphrase in `path`, if one is set there.
-pub(crate) fn read_passphrase(fs: &dyn FileSystem, path: &Path) -> anyhow::Result<Option<Secret>> {
-    match fs.read(path)? {
-        Some(text) => {
-            let pass = text.trim_end_matches(['\n', '\r']);
-            Ok((!pass.is_empty()).then(|| Secret::new(pass)))
-        }
-        None => Ok(None),
-    }
+pub(crate) fn read_passphrase(path: &Path) -> anyhow::Result<Option<Secret>> {
+    passphrase_in(RealFs.read(path)?)
+}
+
+/// The same for the file the configuration names, read as the user it came
+/// from ([`crate::owner::ConfigFiles::read_secret`]).
+fn read_configured_passphrase(
+    files: &crate::owner::ConfigFiles,
+    path: &Path,
+) -> anyhow::Result<Option<Secret>> {
+    passphrase_in(files.read_secret(path)?)
+}
+
+fn passphrase_in(text: Option<String>) -> anyhow::Result<Option<Secret>> {
+    Ok(text.and_then(|text| {
+        let pass = text.trim_end_matches(['\n', '\r']);
+        (!pass.is_empty()).then(|| Secret::new(pass))
+    }))
 }
 
 /// The passphrase new backups are encrypted with, or none when encryption is off.
@@ -96,7 +106,7 @@ fn backup_passphrase(settings: &BackupServer) -> anyhow::Result<Option<Secret>> 
     if !settings.encrypt {
         return Ok(None);
     }
-    match read_passphrase(&RealFs, &settings.passphrase_file)? {
+    match read_passphrase(&settings.passphrase_file)? {
         Some(p) => Ok(Some(p)),
         None => bail!(
             "backups are encrypted, but no passphrase is set ({} is missing); set one with `parallax backup passphrase`, or turn encryption off with server.backup.encrypt = false",
@@ -315,7 +325,7 @@ fn set_passphrase(ctx: &Ctx, generate: bool, replace: bool) -> anyhow::Result<()
     let config = ctx.load()?;
     let files = ctx.config_files();
     let path = &config.server.backup.passphrase_file;
-    if read_passphrase(&files, path)?.is_some() && !replace {
+    if read_configured_passphrase(&files, path)?.is_some() && !replace {
         bail!(
             "a backup passphrase is already set in {}; backups made with it need it to restore. Pass --replace to set a new one",
             path.display()
@@ -398,18 +408,18 @@ fn open_backup(
     file: &Path,
     given: Option<&Path>,
     server_file: &Path,
-    files: &dyn FileSystem,
+    files: &crate::owner::ConfigFiles,
 ) -> anyhow::Result<(backup::Contents, Option<Secret>)> {
     if let Some(given) = given {
         if !given.exists() {
             bail!("the passphrase file {} doesn't exist", given.display());
         }
-        let pass = read_passphrase(&RealFs, given)?
+        let pass = read_passphrase(given)?
             .ok_or_else(|| anyhow!("{} holds no passphrase", given.display()))?;
         let contents = backup::open(file, Some(&pass))?;
         return Ok((contents, Some(pass)));
     }
-    if let Some(pass) = read_passphrase(files, server_file)? {
+    if let Some(pass) = read_configured_passphrase(files, server_file)? {
         match backup::open(file, Some(&pass)) {
             Ok(contents) => return Ok((contents, None)),
             Err(parallax_store::Error::WrongPassphrase(_)) => eoutln!(
@@ -626,7 +636,7 @@ pub(crate) async fn restore_into(
     let wanted = &restored.server.backup;
     if let Some(pass) = typed.filter(|_| wanted.encrypt) {
         let file = &wanted.passphrase_file;
-        let kept = match read_passphrase(&files, file) {
+        let kept = match read_configured_passphrase(&files, file) {
             Ok(Some(_)) => Ok(false),
             Ok(None) => files
                 .write(file, &format!("{}\n", pass.expose()), true)

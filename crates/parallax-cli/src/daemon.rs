@@ -1243,16 +1243,15 @@ impl Engine {
         let key = match (&passphrase, manifest.encrypted) {
             (_, false) => None,
             (Some(given), true) => Some(given.clone()),
-            (None, true) => Some(
-                crate::backup::read_passphrase(&parallax_core::io::real::RealFs, server_file)?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "backup {} is encrypted and no passphrase is set in {}",
-                            path.display(),
-                            server_file.display()
-                        )
-                    })?,
-            ),
+            (None, true) => {
+                Some(crate::backup::read_passphrase(server_file)?.ok_or_else(|| {
+                    anyhow!(
+                        "backup {} is encrypted and no passphrase is set in {}",
+                        path.display(),
+                        server_file.display()
+                    )
+                })?)
+            }
         };
         let contents = backup::open(path, key.as_ref())?;
         if contents.manifest.contents_sha256 != shown {

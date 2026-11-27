@@ -492,8 +492,24 @@ fn read_records(ctx: &Ctx, query: &Query) -> anyhow::Result<Vec<(i64, Record)>> 
         Some(Reply::Logs { records }) => Ok(records),
         Some(other) => Err(unexpected(other)),
         None => {
-            let (config, _, _) = ctx.load_full()?;
+            let (config, revision, _) = ctx.load_full()?;
+            // A daemon that skipped the logs but answered for the
+            // configuration: its logs.db isn't root's to open.
+            if revision.is_some() {
+                bail!(
+                    "the daemon at {} didn't answer for the logs; run it again",
+                    ctx.socket.display()
+                );
+            }
             let path = config.server.logs.path;
+            if let Some((who, sudo_u)) = owner::database_belongs_to_another_user(&path) {
+                bail!(
+                    "{} belongs to {who}, and no daemon answers on {}: start the service, or \
+                     run this as that user (`sudo -u {sudo_u} parallax log ...`)",
+                    path.display(),
+                    ctx.socket.display()
+                );
+            }
             if !path.exists() {
                 return Ok(Vec::new());
             }
@@ -1354,7 +1370,7 @@ fn keygen(ctx: &Ctx, write_config: bool, if_missing: bool) -> anyhow::Result<()>
     let config = ctx.load()?;
     let fs = ctx.config_files();
     let path = config.server.wireguard.private_key_file.clone();
-    if let Some(existing) = fs.read(&path)? {
+    if let Some(existing) = fs.read_secret(&path)? {
         if if_missing {
             // Finish an earlier run that wrote the key but stopped before
             // recording its public half.
