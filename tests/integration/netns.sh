@@ -90,7 +90,9 @@ WORK_IN=$([ "$MODE" = unit ] && echo /run || echo /tmp)
 # The run copies the binary (and Tailscale's) in, and both are often RAM-backed
 # tmpfs: a full one fails a case halfway with "No space left on device". Say so
 # first. Twice the binary leaves room for databases, logs and Headscale.
-need=$(( $(stat -c %s "$PARALLAX") * 2 / 1024 ))
+need=$(( $(stat -L -c %s "$PARALLAX") * 2 ))
+for t in "${TAILSCALE:-}" "${TAILSCALED:-}"; do [ -z "$t" ] || need=$((need + $(stat -L -c %s "$t"))); done
+need=$((need / 1024))
 free=$(df --output=avail -k "$WORK_IN" | tail -n1)
 [ "$free" -ge "$need" ] || { echo "only $((free / 1024)) MiB free in $WORK_IN; a run needs about $((need / 1024)) MiB"; exit 2; }
 WORK=$(mktemp -d "$WORK_IN/parallax-it.XXXXXX")
@@ -1252,13 +1254,13 @@ YAML
             "$HEADSCALE" serve -c "$HS/config.yaml" >> "$HS/headscale.log" 2>&1 &
         PIDS+=($!)
         # The backgrounded subshell lives as long as Headscale does.
-        local pid=$! i
+        local pid=$! start=$SECONDS
         # A first start makes its database and keys, which can take a while
         # on a busy CI runner (#91). One that exits says so at once.
-        for i in $(seq 300); do
+        while [ $((SECONDS - start)) -lt 30 ]; do
             inns gw curl -sf -m 1 http://127.0.0.1:18080/version >/dev/null && return 0
             kill -0 "$pid" 2>/dev/null \
-                || { cat "$HS/headscale.log"; fail "(u) Headscale exited before it answered (after $((i / 10)) s)"; }
+                || { cat "$HS/headscale.log"; fail "(u) Headscale exited before it answered (after $((SECONDS - start)) s)"; }
             sleep 0.1
         done
         cat "$HS/headscale.log"; fail "(u) Headscale is running but didn't answer in 30 s"
@@ -1314,6 +1316,8 @@ PY
     HS_PID=$(cat "$HS/headscale.pid")
     kill "$HS_PID"
     for _ in $(seq 50); do kill -0 "$HS_PID" 2>/dev/null || break; sleep 0.1; done
+    # Else the restart below could be answered by this one.
+    kill -0 "$HS_PID" 2>/dev/null && fail "(u) Headscale did not stop within 5 s"
     sleep 12
     in_set || fail "(u) the node lost its access while Headscale was down"
     grep -q "keeping the addresses it gave last" "$WORK/daemon.log" || fail "(u) Headscale being down was not logged"
