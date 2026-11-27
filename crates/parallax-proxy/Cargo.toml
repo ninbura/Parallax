@@ -25,7 +25,6 @@ hyper-rustls.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
-toml.workspace = true
 
 [lints]
 workspace = true
