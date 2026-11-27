@@ -54,6 +54,9 @@
 # on Tailscale reaches what its grant allows, DNS included. Every change goes through
 # the daemon and takes effect without SIGHUP.
 set -euo pipefail
+# Under pipefail `cmd | grep -q` fails when grep stops reading before cmd has
+# written everything (SIGPIPE), so a check can flake or a `&& fail` pass
+# (issue #89). Let grep read it all: `cmd | grep >/dev/null pattern`.
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
 [ -x "$PARALLAX" ] || { echo "parallax binary not found at $PARALLAX (cargo build first)"; exit 2; }
@@ -66,14 +69,18 @@ NAMESPACES=""
 for ns in home gw client foreign net ctr tsc; do NAMESPACES+=" $PREFIX$ns"; done
 # Cleanup kills everything in these namespaces, so never adopt ones that already exist.
 for ns in $NAMESPACES; do
-    ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
+    ip netns list | grep >/dev/null "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
 done
 
 MODE="${NETNS_DAEMON:-root}"
 case $MODE in
     root) ;;
     unit) command -v systemd-run >/dev/null && command -v runuser >/dev/null && [ -d /run/systemd/system ] \
-              || { echo "NETNS_DAEMON=unit needs systemd and runuser"; exit 2; } ;;
+              || { echo "NETNS_DAEMON=unit needs systemd and runuser"; exit 2; }
+          # The iptables-nft backend's capability check, below.
+          for t in iptables iptables-restore ipset; do
+              command -v $t >/dev/null || { echo "NETNS_DAEMON=unit needs $t"; exit 2; }
+          done ;;
     *) echo "NETNS_DAEMON is root or unit"; exit 2 ;;
 esac
 UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.service"
@@ -141,7 +148,7 @@ docker_user_is_dockers() {
     local listing
     listing=$(inns gw nft list chain ip filter DOCKER-USER) || return 1
     grep -q 'return' <<< "$listing" || return 1
-    inns gw nft list chain ip filter FORWARD | grep -q 'jump DOCKER-USER' || return 1
+    inns gw nft list chain ip filter FORWARD | grep 'jump DOCKER-USER' >/dev/null || return 1
     ! grep -q 'comment "parallax"' <<< "$listing"
 }
 inns home ip addr add 192.168.1.5/24 dev lan0; inns home ip link set lan0 up
@@ -364,7 +371,7 @@ if [ "$MODE" = unit ]; then
             *) SANDBOX+=(-p "$line") ;;
         esac
     done < <(sed -n '/^\[Service\]/,/^\[/p' "$UNIT_FILE" | grep -E '^[A-Za-z]+=')
-    printf '%s\n' "${SANDBOX[@]}" | grep -q '^AmbientCapabilities=CAP_NET_ADMIN' \
+    printf '%s\n' "${SANDBOX[@]}" | grep >/dev/null '^AmbientCapabilities=CAP_NET_ADMIN' \
         || fail "could not read the sandbox from $UNIT_FILE"
     AS_UNIT=(systemd-run --quiet --collect -p User=nobody -p "NetworkNamespacePath=/run/netns/${PREFIX}gw"
         -p "ReadWritePaths=$WORK" -p "Environment=PATH=$WORK/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
@@ -404,6 +411,65 @@ if [ "$MODE" = unit ]; then
     grep -q "^ok    CAP_NET_ADMIN: held, and ambient" "$WORK/doctor-unit" \
         || { cat "$WORK/doctor-unit"; fail "doctor did not see CAP_NET_ADMIN as ambient"; }
     pass "doctor passes as the native service: unprivileged, sandboxed, two ambient capabilities"
+
+    # The iptables-nft backend (issue #52): `iptables-restore` looks the ipsets its
+    # rules match up through a raw socket. The unit leaves CAP_NET_RAW out, so
+    # doctor stops the start; docs/native.md's drop-in adds it. A drop-in's
+    # capability lines add to the unit's, but systemd-run's -p replaces them, so
+    # the merged sets are spelled out here.
+    WITH_NET_RAW=()
+    for p in "${AS_UNIT[@]}"; do
+        case $p in
+            CapabilityBoundingSet=* | AmbientCapabilities=*) WITH_NET_RAW+=("$p CAP_NET_RAW") ;;
+            *) WITH_NET_RAW+=("$p") ;;
+        esac
+    done
+    [ "$(printf '%s\n' "${WITH_NET_RAW[@]}" | grep -c ' CAP_NET_RAW$')" = 2 ] \
+        || fail "could not add CAP_NET_RAW to the unit's capabilities"
+    mkdir "$WORK/ipt"
+    sed 's|^docker_coexistence = true$|&\nbackend = "iptables-nft"|' "$WORK/parallax.toml" > "$WORK/ipt/parallax.toml"
+    grep -q '^backend = "iptables-nft"$' "$WORK/ipt/parallax.toml" || fail "could not set the iptables-nft backend"
+    printf '*filter\n:PARALLAX_PROBE - [0:0]\n-A PARALLAX_PROBE -m set --match-set netraw_probe src -j ACCEPT\nCOMMIT\n' \
+        > "$WORK/ipt/rules"
+    chown -R nobody "$WORK/ipt"
+    "${AS_UNIT[@]}" --unit="${PREFIX}ipt-import" -p Type=exec --wait --pipe \
+        "$WORK/parallax" --db "$WORK/ipt/parallax.db" --socket "$WORK/ipt/parallax.sock" \
+        config import "$WORK/ipt/parallax.toml" > "$WORK/ipt/import" 2>&1 \
+        || { cat "$WORK/ipt/import"; fail "could not import the iptables-nft configuration as the service"; }
+    ipt_doctor() { # unit name, then systemd-run's options
+        local name=$1; shift
+        "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe \
+            "$WORK/parallax" --db "$WORK/ipt/parallax.db" --socket "$WORK/ipt/parallax.sock" doctor
+    }
+    ipt_restore() { # unit name, then systemd-run's options
+        local name=$1; shift
+        "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe \
+            /bin/sh -c 'ipset create -exist netraw_probe hash:net && iptables-restore --noflush "$1"' sh "$WORK/ipt/rules"
+    }
+    if ipt_doctor ipt-doctor "${AS_UNIT[@]}" > "$WORK/ipt/doctor" 2>&1; then
+        cat "$WORK/ipt/doctor"; fail "doctor passed iptables-nft under the unit without CAP_NET_RAW"
+    fi
+    grep -q '^FAIL  CAP_NET_RAW: missing' "$WORK/ipt/doctor" \
+        || { cat "$WORK/ipt/doctor"; fail "doctor did not name the missing CAP_NET_RAW"; }
+    if ipt_restore ipt-restore "${AS_UNIT[@]}" > "$WORK/ipt/restore" 2>&1; then
+        fail "iptables-restore matched an ipset under the unit without CAP_NET_RAW (is the unit too wide?)"
+    fi
+    grep -q "Can't open socket to ipset" "$WORK/ipt/restore" \
+        || { cat "$WORK/ipt/restore"; fail "iptables-restore failed under the unit for another reason"; }
+    ipt_doctor ipt-doctor-raw "${WITH_NET_RAW[@]}" > "$WORK/ipt/doctor-raw" 2>&1 \
+        || { cat "$WORK/ipt/doctor-raw"; fail "doctor fails iptables-nft under the unit with the drop-in"; }
+    grep -q '^ok    CAP_NET_RAW: held, and ambient' "$WORK/ipt/doctor-raw" \
+        || { cat "$WORK/ipt/doctor-raw"; fail "doctor did not see CAP_NET_RAW as ambient with the drop-in"; }
+    inns gw iptables -S PARALLAX_PROBE >/dev/null 2>&1 && fail "iptables-restore loaded rules without CAP_NET_RAW"
+    # With it the service makes the set and commits the rule itself, as apply does.
+    ipt_restore ipt-restore-raw "${WITH_NET_RAW[@]}" > "$WORK/ipt/restore-raw" 2>&1 \
+        || { cat "$WORK/ipt/restore-raw"; fail "the service can't make an ipset and load a rule matching it with the drop-in"; }
+    inns gw iptables -S PARALLAX_PROBE | grep -- '-m set --match-set netraw_probe src -j ACCEPT' >/dev/null \
+        || { inns gw iptables -S PARALLAX_PROBE; fail "the rule matching the service's ipset is not in"; }
+    inns gw iptables -F PARALLAX_PROBE
+    inns gw iptables -X PARALLAX_PROBE
+    inns gw ipset destroy netraw_probe
+    pass "iptables-nft under the unit: doctor asks for CAP_NET_RAW; with the drop-in the service makes an ipset and loads a rule matching it"
 fi
 
 # The daemon applies, then serves DNS and the proxy on the tunnel address. Drift
@@ -423,8 +489,8 @@ start_daemon() { # reconcile interval in seconds
         PIDS+=($!)
     fi
     for _ in $(seq 100); do
-        if $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep -q . \
-            && inns gw ss -Hltn 'sport = :8443' | grep -q .; then
+        if $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep >/dev/null . \
+            && inns gw ss -Hltn 'sport = :8443' | grep >/dev/null .; then
             if [ "$MODE" = unit ]; then
                 # 0 would mean it already exited, and `kill 0` hits this whole test.
                 local pid
@@ -739,7 +805,7 @@ pass "(l) DNS: personal gets home and public names; guest only its hostname; fri
 # (m) large answers: truncated over plain UDP, then complete over TCP (dig retries itself)
 BIG_ANS=$(short_as $LAPTOP big.mydomain.com +noedns)
 [ "$(grep -c '^198\.18\.1\.' <<<"$BIG_ANS")" = 40 ] || fail "(m) big.mydomain.com over UDP then TCP: '$BIG_ANS'"
-inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydomain.com | grep -q 'flags: qr tc' \
+inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydomain.com | grep >/dev/null 'flags: qr tc' \
     || fail "(m) the 512-byte UDP answer was not truncated"
 [ "$(short_as $LAPTOP big.mydomain.com +tcp | grep -c '^198\.18\.1\.')" = 40 ] || fail "(m) big.mydomain.com over TCP"
 pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rewritten"
@@ -872,8 +938,8 @@ ip netns exec "${PREFIX}gw" python3 -c 'import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 51820)); time.sleep(60)' &
 HOLDER=$!
 PIDS+=($HOLDER)
-for _ in $(seq 50); do inns gw ss -Hlun 'sport = :51820' | grep -q . && break; sleep 0.1; done
-inns gw ss -Hlun 'sport = :51820' | grep -q . || fail "(n) could not hold WireGuard's port"
+for _ in $(seq 50); do inns gw ss -Hlun 'sport = :51820' | grep >/dev/null . && break; sleep 0.1; done
+inns gw ss -Hlun 'sport = :51820' | grep >/dev/null . || fail "(n) could not hold WireGuard's port"
 if [ "$MODE" = unit ]; then
     UNITS+=("${PREFIX}held")
     held=(timeout 30 "${AS_UNIT[@]}" --unit="${PREFIX}held" --wait --pipe "$WORK/parallax"
@@ -887,7 +953,7 @@ status=0
 case $status in 0|124) cat "$WORK/held.log"; fail "(n) the daemon started with WireGuard's port taken" ;; esac
 kill "$HOLDER" 2>/dev/null || true
 wait "$HOLDER" 2>/dev/null || true
-inns gw ss -Hlun 'sport = :51820' | grep -q . && fail "(n) WireGuard's port is still held"
+inns gw ss -Hlun 'sport = :51820' | grep >/dev/null . && fail "(n) WireGuard's port is still held"
 grep -q "the first apply failed" "$WORK/held.log" || { cat "$WORK/held.log"; fail "(n) the held port didn't fail the first apply"; }
 inns gw nft list table inet parallax >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left the table"; }
 inns gw ip link show wg0 >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left wg0"; }
@@ -1026,7 +1092,7 @@ pass "(s) grant and peer grants commands change access on return; refused ones c
 # and by peer record what each level covers (guest at `blocked`: its blocked
 # attempts, not its connections; laptop at `detailed`: connections and their bytes),
 # with both destinations, and nothing of anyone else; off again, the rules go.
-inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
+inns gw nft list table inet parallax | grep 'log_flows\|log prefix' >/dev/null \
     && fail "(t) logging rules with nobody logged"
 # Byte counts are a host setting; a short TIME_WAIT ends closed TCP flows at once.
 inns gw sysctl -qw net.netfilter.nf_conntrack_acct=1
@@ -1050,19 +1116,19 @@ feed_up connections
 # A flow's end is reported when connection tracking's periodic sweep removes it,
 # some seconds after TIME_WAIT (about 11 s on a 7.2 kernel); wait for it.
 for _ in $(seq 60); do
-    $P log show --peer laptop --kind closed | grep -q . && break
+    $P log show --peer laptop --kind closed | grep >/dev/null . && break
     sleep 1
 done
 LOGS=$($P log show --limit 1000)
-echo "$LOGS" | grep -q '  guest  blocked  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family$' \
+echo "$LOGS" | grep >/dev/null '  guest  blocked  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family$' \
     || { echo "$LOGS"; fail "(t) guest's blocked attempt, with both destinations"; }
-echo "$LOGS" | grep -q '  guest  \(opened\|closed\)  ' \
+echo "$LOGS" | grep >/dev/null '  guest  \(opened\|closed\)  ' \
     && { echo "$LOGS"; fail "(t) guest's connections recorded at blocked"; }
-echo "$LOGS" | grep -q '  laptop  opened  tcp 198.18.1.5:8080 (192.168.1.5, home)' \
+echo "$LOGS" | grep >/dev/null '  laptop  opened  tcp 198.18.1.5:8080 (192.168.1.5, home)' \
     || { echo "$LOGS"; fail "(t) laptop's connection"; }
-echo "$LOGS" | grep -q '  laptop  closed  tcp 198.18.1.5:8080 (192.168.1.5, home)  [0-9.]* [KMG]*i*B out, [0-9.]* [KMG]*i*B in' \
+echo "$LOGS" | grep >/dev/null '  laptop  closed  tcp 198.18.1.5:8080 (192.168.1.5, home)  [0-9.]* [KMG]*i*B out, [0-9.]* [KMG]*i*B in' \
     || { echo "$LOGS"; fail "(t) laptop's bytes when the flow ended"; }
-echo "$LOGS" | grep -q '  friend  ' && { echo "$LOGS"; fail "(t) friend is logged at off"; }
+echo "$LOGS" | grep >/dev/null '  friend  ' && { echo "$LOGS"; fail "(t) friend is logged at off"; }
 [ "$($P log show --peer guest --kind blocked | wc -l)" -ge 1 ] || fail "(t) log show --peer --kind"
 # The proxy and DNS: at `connections` one record per proxied request (never its
 # path) and each refusal; DNS queries only once `log dns` turns them on.
@@ -1080,21 +1146,21 @@ for _ in $(seq 20); do
     sleep 0.5
 done
 LOGS=$($P log show --peer guest --kind request,refused,query --limit 1000)
-echo "$LOGS" | grep -q '  guest  request  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 200  grants family$' \
+echo "$LOGS" | grep >/dev/null '  guest  request  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 200  grants family$' \
     || { echo "$LOGS"; fail "(t) guest's proxied request"; }
-echo "$LOGS" | grep -q '  guest  refused  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 421: this connection serves a different hostname' \
+echo "$LOGS" | grep >/dev/null '  guest  refused  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 421: this connection serves a different hostname' \
     || { echo "$LOGS"; fail "(t) guest's misdirected request"; }
-echo "$LOGS" | grep -q 'secret-album-42' && { echo "$LOGS"; fail "(t) a URL path was recorded"; }
+echo "$LOGS" | grep >/dev/null 'secret-album-42' && { echo "$LOGS"; fail "(t) a URL path was recorded"; }
 [ "$(echo "$LOGS" | grep -c '  guest  query  ')" -eq 2 ] \
     || { echo "$LOGS"; fail "(t) only the queries after log dns on"; }
-echo "$LOGS" | grep -q '  guest  query  udp 10.8.0.1:53  immich.mydomain.com. A answered  grants family$' \
+echo "$LOGS" | grep >/dev/null '  guest  query  udp 10.8.0.1:53  immich.mydomain.com. A answered  grants family$' \
     || { echo "$LOGS"; fail "(t) guest's DNS query"; }
-echo "$LOGS" | grep -q '  guest  query  udp 10.8.0.1:53  other.mydomain.com. A refused' \
+echo "$LOGS" | grep >/dev/null '  guest  query  udp 10.8.0.1:53  other.mydomain.com. A refused' \
     || { echo "$LOGS"; fail "(t) guest's refused DNS query"; }
 g log dns inherit --peer guest
 g log level inherit --grant family
 g log level inherit --peer laptop
-inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
+inns gw nft list table inet parallax | grep 'log_flows\|log prefix' >/dev/null \
     && fail "(t) logging rules left after everyone went back to off"
 # The records stay readable with logging off.
 [ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
@@ -1258,7 +1324,7 @@ PY
                 *) TSD_SANDBOX+=(-p "$line") ;;
             esac
         done < <(sed -n '/^\[Service\]/,/^\[/p' "$TSD_UNIT" | grep -E '^[A-Za-z]+=')
-        printf '%s\n' "${TSD_SANDBOX[@]}" | grep -q '^CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW$' \
+        printf '%s\n' "${TSD_SANDBOX[@]}" | grep >/dev/null '^CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW$' \
             || fail "(w) could not read the sandbox from $TSD_UNIT"
         # Root without CAP_DAC_OVERRIDE: its directory is root's, as
         # StateDirectory and RuntimeDirectory make it, and $WORK (the
@@ -1326,10 +1392,10 @@ p = json.load(sys.stdin)
 assert p["NetfilterMode"] == 0 and p["NoSNAT"] and not p["CorpDNS"] and not p["RouteAll"], p' \
         || fail "(w) the router does not have its own filtering, SNAT, DNS and routes off"
     for _ in $(seq 60); do
-        inns tsc ip route show table 52 | grep -q '^198.18.1.0/24 dev tailscale0' && break
+        inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0' && break
         sleep 0.5
     done
-    inns tsc ip route show table 52 | grep -q '^198.18.1.0/24 dev tailscale0' \
+    inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0' \
         || { inns tsc ip route show table 52; fail "(w) the phone has no route to the mapped network"; }
     phone() { inns tsc curl -s -m 3 "$@" || echo BLOCKED; }
     # The first packets may wait for the path between the two to be found.

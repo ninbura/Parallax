@@ -40,7 +40,8 @@ ReadWritePaths=/etc/parallax
 UMask=0077
 
 # CAP_NET_ADMIN: wg0, nftables, routes. CAP_NET_BIND_SERVICE: DNS on port 53.
-# Ambient, so `nft`, `ip` and `wg` get them too.
+# Ambient, so `nft`, `ip` and `wg` get them too. The iptables-nft backend also
+# needs CAP_NET_RAW, through a drop-in (docs/native.md): nftables doesn't.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
@@ -62,7 +63,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RemoveIPC=yes
-# Netlink drives wg0, nftables and routes; no raw or packet sockets.
+# Netlink drives wg0, nftables and routes; no packet sockets. Raw IPv4
+# sockets need CAP_NET_RAW, which only the iptables-nft drop-in adds.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
