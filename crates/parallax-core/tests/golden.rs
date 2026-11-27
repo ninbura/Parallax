@@ -858,7 +858,6 @@ fn iptables_apply_refills_chains_in_one_restore() {
     // per tunnel interface goes in after the dry run, in one transaction at
     // the top of each chain, Docker's too; every hold the listing after the
     // restore shows comes out once the hooks are in.
-    let hold_line = |op: &str, rule: &str| format!("iptables -t filter {op} {rule}");
     let suffix = "-m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP";
     let (at, placing) = &txns[0];
     assert!(dry_run < *at && *at < restore, "{lines:#?}");
@@ -882,7 +881,10 @@ fn iptables_apply_refills_chains_in_one_restore() {
     // missing jump goes in at the top; one that's first already, holds
     // aside, stays (#74). Each table's in one transaction, Docker's chain
     // in between.
-    let texts: Vec<&str> = txns[1..].iter().map(|(_, t)| t.as_str()).collect();
+    let texts: Vec<&str> = txns[1..txns.len() - 1]
+        .iter()
+        .map(|(_, t)| t.as_str())
+        .collect();
     assert_eq!(
         texts,
         [
@@ -894,23 +896,17 @@ fn iptables_apply_refills_chains_in_one_restore() {
         ],
         "{lines:#?}"
     );
-    let hooks = txns.last().unwrap().0;
+    // Last, every hold the listing after the restore shows comes off at
+    // once, also one for an interface since renamed.
+    let lift = &txns.last().unwrap().1;
     for rule in [
         format!("INPUT -i wg0 {suffix}"),
         format!("FORWARD -o tailscale0 {suffix}"),
         format!("FORWARD -i wg9 {suffix}"),
     ] {
-        let lifted = pos(&hold_line("-D", &rule)).unwrap();
-        assert!(hooks < lifted, "{rule}: {lines:#?}");
+        assert!(lift.contains(&format!("\n-D {rule}\n")), "{rule}: {lift}");
     }
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.contains("parallax-hold") && l.contains(" -D "))
-            .count(),
-        3,
-        "{lines:#?}"
-    );
+    assert_eq!(lift.lines().count(), 5, "{lift}");
     let gone = |set: &str| pos(&format!("ipset destroy {set}"));
     assert!(gone("wg_0000000000000000").unwrap() > restore);
     assert!(gone("not_public").is_none() && gone("ts_family").is_none());

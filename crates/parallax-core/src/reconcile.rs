@@ -159,7 +159,11 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
                     listing.push_str(&out.stdout);
                 }
             }
-            Err(e) => listing.push_str(&format!("error {e}\n")),
+            Err(e) => {
+                listing.push_str(&format!("error {e}\n"));
+                // No listing, so no knowing the order: not a baseline.
+                out_of_order |= program == "iptables-save";
+            }
         }
     }
     LiveState {

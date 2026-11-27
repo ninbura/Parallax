@@ -232,12 +232,12 @@ fn apply_firewall(
                 .run_checked("iptables", &["-t", "filter", "-S"], None)
                 .map_err(still_held)?;
             attach(docker, sys, log).map_err(still_held)?;
-            // Every hold goes, also one for an interface since renamed. The
-            // hooks are above them by now, so one left over holds nothing.
-            for args in held(&listing.stdout) {
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                sys.runner.run_checked("iptables", &args, None)?;
-            }
+            // Every hold goes, together. The hooks are above them by now, so
+            // one left over would hold nothing.
+            let lift: Vec<String> = hold_lines(&listing.stdout)
+                .map(|rule| format!("-D {rule}"))
+                .collect();
+            commit("filter", &lift, sys)?;
             // Chains of tiers that no longer exist: nothing jumps to them
             // since the restore, so they can go.
             for chain in listing
@@ -912,8 +912,9 @@ mod tests {
         };
 
         let (lines, txns, log) = run("-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n");
-        // Holds, nat (nothing there: both jumps in), Docker's chain, filter.
-        assert_eq!(txns.len(), 4, "{txns:#?}");
+        // Holds, nat (nothing there: both jumps in), Docker's chain, filter,
+        // and last the holds off.
+        assert_eq!(txns.len(), 5, "{txns:#?}");
         // The one there moves up with the rest; Docker's chain gets its own.
         let hold = "-i wg0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP";
         assert!(
@@ -948,16 +949,12 @@ mod tests {
                 .any(|l| l.contains("PARALLAX_FORWARD in FORWARD")),
             "{log:#?}"
         );
-        // Every hook in before a hold comes off.
-        let lifted = lines
-            .iter()
-            .position(|l| l.contains(" -D FORWARD -i wg0 ") && l.contains(HOLD_COMMENT))
-            .unwrap();
-        let last_txn = lines
-            .iter()
-            .rposition(|l| l == "iptables-restore --noflush")
-            .unwrap();
-        assert!(last_txn < lifted, "{lines:#?}");
+        // Every hook in before the holds come off, all at once.
+        assert_eq!(txns[4], format!("*filter\n-D FORWARD {hold}\nCOMMIT\n"));
+        assert!(
+            !lines.iter().any(|l| l.contains(HOLD_COMMENT)),
+            "{lines:#?}"
+        );
 
         // DOCKER-USER first and starting with Parallax's jump, but no jump
         // of Parallax's own in FORWARD (a first apply beside Docker): it goes
@@ -966,7 +963,7 @@ mod tests {
         let (_, txns, _) = run("-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n\
              -A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD\n");
         assert_eq!(
-            txns.last().unwrap(),
+            txns[3],
             "*filter\n-I FORWARD 1 -j PARALLAX_FORWARD\nCOMMIT\n"
         );
         // And with it there too, nothing moves.
@@ -976,9 +973,8 @@ mod tests {
         );
         assert!(
             !txns
-                .last()
-                .unwrap()
-                .contains("FORWARD 1 -j PARALLAX_FORWARD"),
+                .iter()
+                .any(|t| t.contains("FORWARD -j PARALLAX_FORWARD")),
             "{txns:#?}"
         );
     }
