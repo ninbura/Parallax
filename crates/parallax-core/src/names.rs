@@ -986,6 +986,107 @@ mod tests {
 
     // Lane C's repros of the #93 post-merge findings.
     #[test]
+    fn lc_g1_attaching_a_grant_held_only_by_an_owner_tier_is_refused() {
+        let mut old = named();
+        old.grants[0].rules = vec![Rule::AllNetworks, Rule::Internet];
+        let mut web = old.grants[1].clone();
+        web.name = "web".into();
+        web.rules = vec![Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+        }];
+        old.grants.push(web);
+        old.peers[0].grants.push("web".into());
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert!(problems(&old, Some(HOME), &known).is_empty());
+        let r = FakeResolver::new();
+        let mut attached = old.clone();
+        attached.peers[2].grants.push("web".into());
+        assert!(check_save(Some(&old), Some(HOME), &attached, Some(HOME), &r, &known).is_err());
+        let mut everyone = old.clone();
+        everyone.grants[2].everyone = true;
+        assert!(check_save(Some(&old), Some(HOME), &everyone, Some(HOME), &r, &known).is_err());
+    }
+
+    #[test]
+    fn lc_g2_renaming_one_grant_must_not_bless_an_unheld_grant() {
+        let mut old = named();
+        old.grants[0].rules = vec![
+            Rule::AllNetworks,
+            Rule::Internet,
+            Rule::Host {
+                host: Host::Name(NAS.into()),
+                ports: vec![PortSpec::one(Proto::Tcp, 443)],
+            },
+        ];
+        let mut unheld = old.grants[1].clone();
+        unheld.name = "unheld".into();
+        unheld.rules = vec![Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+        }];
+        old.grants.push(unheld);
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert!(problems(&old, Some(HOME), &known).is_empty());
+        let mut new = old.clone();
+        new.grants[0].name = "owner".into();
+        for g in new.peers.iter_mut().flat_map(|p| &mut p.grants) {
+            if g == "personal" {
+                *g = "owner".into();
+            }
+        }
+        new.peers[2].grants.push("unheld".into());
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_err());
+    }
+
+    #[test]
+    fn lc_g3_with_nothing_known_adding_raw_web_is_refused() {
+        let old = named();
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[HOME]);
+        let mut raw_web = old.clone();
+        raw_web.grants[1].rules.push(Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+        });
+        assert!(check_save(
+            Some(&old),
+            Some(HOME),
+            &raw_web,
+            Some(HOME),
+            &r,
+            &Resolved::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lc_g4_setting_the_public_ip_to_a_working_hosts_address_is_refused() {
+        let mut old = named();
+        old.networks[0].subnet = "5.6.7.0/24".parse().unwrap();
+        old.services[0].host = Host::Ip(Ipv4Addr::new(5, 6, 7, 5));
+        old.grants[1].rules.push(Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+        });
+        let at = Ipv4Addr::new(5, 6, 7, 8);
+        let known: Resolved = [(NAS.to_string(), vec![at])].into();
+        assert!(problems(&old, Some(HOME), &known).is_empty());
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &old, Some(at), &r, &known).is_err());
+    }
+
+    #[test]
+    fn lc_g5_a_stale_refused_answer_doesnt_block_removing_a_peer() {
+        let (old, known) = every_port_at_home();
+        let moved = Ipv4Addr::new(5, 6, 7, 8);
+        let mut drop_peer = old.clone();
+        drop_peer.peers.remove(1);
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[moved]);
+        assert!(check_save(Some(&old), Some(moved), &drop_peer, Some(moved), &r, &known).is_ok());
+    }
+
+    #[test]
     fn lc_one_gone_grant_doesnt_make_two_new_ones_old() {
         let (old, known) = every_port_at_home();
         let mut new = old.clone();
