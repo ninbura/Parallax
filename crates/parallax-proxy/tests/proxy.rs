@@ -22,6 +22,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parallax_core::generate::proxy::{ProxyRoutes, ProxySite};
+use parallax_core::logging::{Event, Tap};
 use parallax_proxy::{certs, Proxy};
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -167,6 +168,11 @@ impl Drop for Env {
 
 impl Env {
     async fn start() -> Env {
+        Env::start_tapped(None).await
+    }
+
+    /// With the proxy handing what it does over to `tap`.
+    async fn start_tapped(tap: Option<Tap>) -> Env {
         let dir = temp_dir();
         let ca = Ca::new();
         std::fs::write(dir.join("ca.pem"), ca.0.pem()).unwrap();
@@ -193,9 +199,12 @@ impl Env {
         };
         let routes_path = dir.join("routes.toml");
         std::fs::write(&routes_path, toml::to_string(&routes).unwrap()).unwrap();
-        let proxy = Proxy::load(&routes_path)
+        let mut proxy = Proxy::load(&routes_path)
             .unwrap()
             .refresh_every(Duration::from_millis(100));
+        if let Some(tap) = tap {
+            proxy = proxy.tap(tap);
+        }
         let reload = proxy.reload_trigger();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -524,4 +533,129 @@ async fn a_renewal_caught_halfway_keeps_the_working_certificate() {
         }
     }
     panic!("the completed renewal was never served");
+}
+
+/// The requests the tap got within a second or two, in no set order.
+fn requests(events: &std::sync::mpsc::Receiver<Event>) -> Vec<parallax_core::logging::Request> {
+    let mut out = Vec::new();
+    while let Ok(event) = events.recv_timeout(Duration::from_millis(1500)) {
+        match event {
+            Event::Request(r) => out.push(r),
+            other => panic!("not a request: {other:?}"),
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_logged_peer_s_requests_and_refusals_are_handed_over_without_paths() {
+    let (tap, events) = tap_for(parallax_core::model::LogLevel::Detailed);
+    let env = Env::start_tapped(Some(tap)).await;
+    let (status, body) = env
+        .h1(IMMICH, get("/api/assets/3f2a9c/thumbnail", IMMICH))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = env.h1(IMMICH, get("/", OTHER)).await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+    assert!(env.connect("nope.example.test", b"http/1.1").await.is_err());
+    assert!(env.connect(OTHER, b"http/1.1").await.is_err());
+    {
+        let mut io = websocket(&env).await;
+        io.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        io.read_exact(&mut buf).await.unwrap();
+    }
+
+    let got = requests(&events);
+    assert!(
+        !format!("{got:?}").contains("3f2a9c"),
+        "never a path: {got:?}"
+    );
+    let find = |f: &dyn Fn(&parallax_core::logging::Request) -> bool| {
+        got.iter()
+            .find(|r| f(r))
+            .unwrap_or_else(|| panic!("not in {got:?}"))
+    };
+    let ok = find(&|r| r.status == Some(200));
+    assert_eq!(ok.hostname.as_deref(), Some(IMMICH));
+    assert_eq!(ok.method.as_deref(), Some("GET"));
+    assert_eq!(ok.refused, None);
+    assert_eq!(ok.upstream, Some(env.routes.sites[0].upstream));
+    assert_eq!(ok.bytes, Some((0, body.len() as u64)));
+
+    let misdirected = find(&|r| r.status == Some(421));
+    assert_eq!(
+        misdirected.refused,
+        Some("this connection serves a different hostname")
+    );
+    let unknown = find(&|r| r.hostname.as_deref() == Some("nope.example.test"));
+    assert_eq!(unknown.refused, Some("no site for this hostname"));
+    assert_eq!((unknown.method.as_ref(), unknown.upstream), (None, None));
+    let other = find(&|r| r.hostname.as_deref() == Some(OTHER) && r.method.is_none());
+    assert_eq!(other.refused, Some("not allowed from this address"));
+    // A WebSocket's record comes when it closes, with what it carried.
+    let socket = find(&|r| r.status == Some(101));
+    assert_eq!(socket.bytes, Some((4, 4)));
+    assert_eq!(got.len(), 5, "{got:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peers_nobody_logs_hand_nothing_over() {
+    let (tap, events) = Tap::new(64);
+    let env = Env::start_tapped(Some(tap)).await;
+    let (status, _) = env.h1(IMMICH, get("/", IMMICH)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(env.connect("nope.example.test", b"http/1.1").await.is_err());
+    assert!(requests(&events).is_empty());
+}
+
+fn tap_for(level: parallax_core::model::LogLevel) -> (Tap, std::sync::mpsc::Receiver<Event>) {
+    let (tap, events) = Tap::new(64);
+    tap.set_clients(
+        [(
+            std::net::Ipv4Addr::LOCALHOST,
+            parallax_core::logging::Logged {
+                peer: "guest".into(),
+                level,
+            },
+        )]
+        .into(),
+    );
+    (tap, events)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_logged_at_blocked_hands_over_only_refusals() {
+    let (tap, events) = tap_for(parallax_core::model::LogLevel::Blocked);
+    let env = Env::start_tapped(Some(tap)).await;
+    assert_eq!(env.h1(IMMICH, get("/", IMMICH)).await.0, StatusCode::OK);
+    assert_eq!(
+        env.h1(IMMICH, get("/", OTHER)).await.0,
+        StatusCode::MISDIRECTED_REQUEST
+    );
+    let got = requests(&events);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].status, Some(421));
+    assert_eq!(got[0].peer, "guest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logging_keeps_a_reply_s_length() {
+    let (tap, _events) = tap_for(parallax_core::model::LogLevel::Detailed);
+    let env = Env::start_tapped(Some(tap)).await;
+    let tls = env.connect(IMMICH, b"http/1.1").await.unwrap();
+    let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    // The proxy's own reply, and the upstream's.
+    for host in [OTHER, IMMICH] {
+        let resp = send.send_request(get("/", host)).await.unwrap();
+        assert!(
+            resp.headers().contains_key(hyper::header::CONTENT_LENGTH),
+            "{host}: {:?}",
+            resp.headers()
+        );
+        resp.into_body().collect().await.unwrap();
+    }
 }

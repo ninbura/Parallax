@@ -20,6 +20,11 @@ fn record(time: u64, peer: &str, kind: RecordKind) -> Record {
         flow: Some(42),
         bytes_out: (kind == RecordKind::Closed).then_some(1200),
         bytes_in: (kind == RecordKind::Closed).then_some(u64::from(u32::MAX) + 1),
+        hostname: None,
+        method: None,
+        status: None,
+        query_type: None,
+        outcome: None,
     }
 }
 
@@ -50,6 +55,33 @@ async fn records_come_back_as_written_oldest_first() {
             protocol: "icmp".into(),
             ..record(3000, "laptop", RecordKind::BlockedGateway)
         },
+        Record {
+            flow: None,
+            hostname: Some("immich.example.com".into()),
+            method: Some("GET".into()),
+            status: Some(200),
+            bytes_out: Some(0),
+            bytes_in: Some(4096),
+            ..record(4000, "sister-phone", RecordKind::Request)
+        },
+        Record {
+            flow: None,
+            hostname: Some("photos.example.com".into()),
+            outcome: Some("no site for this hostname".into()),
+            ..record(5000, "sister-phone", RecordKind::Refused)
+        },
+        Record {
+            destination: Ipv4Addr::new(10, 8, 0, 1),
+            real_destination: None,
+            network: None,
+            protocol: "udp".into(),
+            port: Some(53),
+            flow: None,
+            hostname: Some("immich.example.com.".into()),
+            query_type: Some("A".into()),
+            outcome: Some("answered".into()),
+            ..record(6000, "sister-phone", RecordKind::Query)
+        },
     ];
     logs.writer().unwrap().write(&written).await.unwrap();
     let read: Vec<Record> = logs
@@ -70,7 +102,7 @@ async fn records_come_back_as_written_oldest_first() {
             .await
             .unwrap()
             .len(),
-        3
+        written.len()
     );
     #[cfg(unix)]
     {

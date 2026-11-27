@@ -201,6 +201,7 @@ mod tests {
             name: "public".into(),
             everyone: true,
             log: None,
+            log_dns: None,
             rules: vec![Rule::PublicDns],
         });
         cfg.peers[2].grants.clear();

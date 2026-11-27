@@ -69,7 +69,7 @@ pub struct ServerConfig {
                                       // subnet_router_node, dns (tailnet-wide)
     pub dns: DnsServer,               // listen (default: WG gateway addr), port, public_resolver
     pub firewall: FirewallServer,     // backend (nftables | iptables-nft), docker_coexistence
-    pub logs: LogsServer,             // level, path, keep, max_size (docs/logging.md)
+    pub logs: LogsServer,             // level, dns, path, keep, max_size (docs/logging.md)
     pub wan_interface: Option<String>,
 }
 
@@ -93,6 +93,7 @@ pub struct Grant {
     pub name: String,
     pub everyone: bool,                 // every peer has it, unattached
     pub log: Option<LogLevel>,          // sets its peers' log level (docs/logging.md)
+    pub log_dns: Option<bool>,          // and whether their DNS queries are logged
     pub rules: Vec<Rule>,
 }
 
@@ -105,6 +106,7 @@ pub struct Peer {
     pub name: String,
     pub grants: Vec<String>,             // besides every `everyone` grant
     pub log: Option<LogLevel>,           // its own log level, over its grants'
+    pub log_dns: Option<bool>,           // its own DNS query logging, over its grants'
     pub transport: TransportKind,        // WireGuard | Tailscale (a device fact)
     pub enabled: bool,
     pub expires: Option<Date>,
@@ -143,8 +145,16 @@ peer needs them. `netlink.rs` parses the bytes into events,
 `logging::attribute` turns each into a record (peer and grant names as they
 are now, the destination as addressed and as real), and each feed commits
 its batches to `logs.db` (`parallax_store::logs`) with `BEGIN CONCURRENT`.
-The daemon purges by age and size every 10 minutes and answers `parallax log
-show` from the same database.
+The HTTPS proxy and the DNS server hand what logged peers do to the
+collector through a `logging::Tap` each: a bounded queue plus the set of
+tunnel addresses it wants, which the collector keeps current (peers at
+`blocked` and up for the proxy; peers whose `log_dns` is on for DNS, which
+no level implies). The proxy hands over each request when its response is
+done (site, method, status, body bytes; never the path) and each refusal;
+the DNS server each query's name, type and outcome, never the answer. A
+writer thread per tap attributes and commits like the feeds. The daemon
+purges by age and size every 10 minutes and answers `parallax log show`
+from the same database.
 
 Ports are lists, written the way ufw writes them: `445/tcp`, `137-138/udp`,
 or a bare `25565` for TCP and UDP. A service is a named host and its ports

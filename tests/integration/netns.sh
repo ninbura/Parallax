@@ -46,8 +46,8 @@
 # reaches both and nothing more, a grant for everyone reaches every peer, and changing
 # grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
 # change access when they return, and a refused one changes nothing, (t) activity
-# logging records logged peers' connections, bytes and blocked attempts and nobody
-# else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
+# logging records logged peers' connections, bytes, blocked attempts, proxied
+# requests and (when asked) DNS queries, and nobody else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
 # node's address from Headscale. Every change goes through the daemon and takes
 # effect without SIGHUP.
 set -euo pipefail
@@ -978,13 +978,41 @@ echo "$LOGS" | grep -q '  laptop  closed  tcp 198.18.1.5:8080 (192.168.1.5, home
     || { echo "$LOGS"; fail "(t) laptop's bytes when the flow ended"; }
 echo "$LOGS" | grep -q '  friend  ' && { echo "$LOGS"; fail "(t) friend is logged at off"; }
 [ "$($P log show --peer guest --kind blocked | wc -l)" -ge 1 ] || fail "(t) log show --peer --kind"
+# The proxy and DNS: at `connections` one record per proxied request (never its
+# path) and each refusal; DNS queries only once `log dns` turns them on.
+g log level connections --grant family
+ANS=$(inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
+[ "$(curl_as $GUEST --cacert "$CA" --resolve "immich.mydomain.com:443:$ANS" https://immich.mydomain.com/secret-album-42)" = home-immich ] \
+    || fail "(t) guest -> immich through the proxy"
+https_as $GUEST immich.mydomain.com "$ANS" --http1.1 -H 'Host: other.mydomain.com' -o /dev/null >/dev/null || true
+g log dns on --peer guest
+inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com >/dev/null || true
+inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 other.mydomain.com >/dev/null || true
+for _ in $(seq 20); do
+    [ "$($P log show --peer guest --kind query | wc -l)" -ge 2 ] \
+        && [ "$($P log show --peer guest --kind request,refused | wc -l)" -ge 2 ] && break
+    sleep 0.5
+done
+LOGS=$($P log show --peer guest --kind request,refused,query --limit 1000)
+echo "$LOGS" | grep -q '  guest  request  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 200  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's proxied request"; }
+echo "$LOGS" | grep -q '  guest  refused  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 421: this connection serves a different hostname' \
+    || { echo "$LOGS"; fail "(t) guest's misdirected request"; }
+echo "$LOGS" | grep -q 'secret-album-42' && { echo "$LOGS"; fail "(t) a URL path was recorded"; }
+[ "$(echo "$LOGS" | grep -c '  guest  query  ')" -eq 2 ] \
+    || { echo "$LOGS"; fail "(t) only the queries after log dns on"; }
+echo "$LOGS" | grep -q '  guest  query  udp 10.8.0.1:53  immich.mydomain.com. A answered  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's DNS query"; }
+echo "$LOGS" | grep -q '  guest  query  udp 10.8.0.1:53  other.mydomain.com. A refused' \
+    || { echo "$LOGS"; fail "(t) guest's refused DNS query"; }
+g log dns inherit --peer guest
 g log level inherit --grant family
 g log level inherit --peer laptop
 inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
     && fail "(t) logging rules left after everyone went back to off"
 # The records stay readable with logging off.
 [ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
-pass "(t) each level records what it covers (blocked attempts; connections and bytes) with both destinations; nobody else's; off removes the rules"
+pass "(t) each level records what it covers (blocked attempts; connections and bytes; proxied requests and refusals, no paths) with both destinations; DNS queries only when asked; nobody else's; off removes the rules"
 
 # (v) Root writes what the service's configuration names as the service: a
 # configuration naming a file in root's own directory gets no write from root.

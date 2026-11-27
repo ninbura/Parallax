@@ -101,6 +101,7 @@ struct PeerToml {
     template: Option<String>,
     grants: Option<Vec<String>>,
     log: Option<super::LogLevel>,
+    log_dns: Option<bool>,
     transport: TransportKind,
     #[serde(default = "default_true")]
     enabled: bool,
@@ -133,6 +134,7 @@ impl TryFrom<ConfigToml> for Config {
                 name: t.name.clone(),
                 everyone: false,
                 log: None,
+                log_dns: None,
                 rules,
             });
         }
@@ -178,6 +180,7 @@ impl TryFrom<ConfigToml> for Config {
                 name: p.name,
                 grants,
                 log: p.log,
+                log_dns: p.log_dns,
                 transport: p.transport,
                 enabled: p.enabled,
                 expires: p.expires,

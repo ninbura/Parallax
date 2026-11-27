@@ -68,6 +68,7 @@ pub(crate) fn everything_config() -> Config {
     };
     c.server.logs = LogsServer {
         level: LogLevel::Connections,
+        dns: true,
         path: "/mnt/ssd/parallax-logs.db".into(),
         keep: "7d".parse().unwrap(),
         max_size: "256MiB".parse().unwrap(),
@@ -121,6 +122,7 @@ pub(crate) fn everything_config() -> Config {
         name: "public".into(),
         everyone: true,
         log: Some(LogLevel::Blocked),
+        log_dns: Some(false),
         rules: Vec::new(),
     });
     let wg = c.peers[0].wireguard.as_mut().unwrap();
@@ -134,6 +136,7 @@ pub(crate) fn everything_config() -> Config {
         name: "tv".into(),
         grants: vec!["family".into()],
         log: Some(LogLevel::Off),
+        log_dns: Some(true),
         transport: TransportKind::Tailscale,
         enabled: false,
         expires: Some(today()),
@@ -144,6 +147,7 @@ pub(crate) fn everything_config() -> Config {
         name: "tablet".into(),
         grants: Vec::new(),
         log: None,
+        log_dns: None,
         transport: TransportKind::Tailscale,
         enabled: true,
         expires: None,
@@ -739,6 +743,7 @@ async fn templates_become_grants_with_the_same_access() {
         name: "tv".into(),
         grants: vec!["personal".into()],
         log: None,
+        log_dns: None,
         transport: TransportKind::Tailscale,
         enabled: true,
         expires: None,
@@ -753,6 +758,7 @@ async fn templates_become_grants_with_the_same_access() {
         name: "spare".into(),
         everyone: false,
         log: None,
+        log_dns: None,
         rules: vec![
             Rule::Host {
                 host: Ipv4Addr::new(192, 168, 1, 9).into(),

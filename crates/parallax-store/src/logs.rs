@@ -14,7 +14,10 @@ use turso::{Row, Value};
 
 use crate::{create_file, Error, Result, Store, BUSY_TIMEOUT};
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/logs/0001_records.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/logs/0001_records.sql"),
+    include_str!("../migrations/logs/0002_requests_and_queries.sql"),
+];
 
 /// How often a batch is retried when another writer's commit conflicts.
 const RETRIES: u32 = 5;
@@ -122,7 +125,8 @@ impl Logs {
         params.push(i64::from(query.limit).into());
         let sql = format!(
             "SELECT id, time, kind, peer, grants, source, destination, real_destination,
-                    network, protocol, port, flow, bytes_out, bytes_in
+                    network, protocol, port, flow, bytes_out, bytes_in,
+                    hostname, method, status, query_type, outcome
              FROM records {filter} ORDER BY id DESC LIMIT ?{}",
             params.len()
         );
@@ -298,8 +302,10 @@ impl Writer {
                 .conn
                 .prepare(
                     "INSERT INTO records (time, kind, peer, grants, source, destination,
-                        real_destination, network, protocol, port, flow, bytes_out, bytes_in)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        real_destination, network, protocol, port, flow, bytes_out, bytes_in,
+                        hostname, method, status, query_type, outcome)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                        ?14, ?15, ?16, ?17, ?18)",
                 )
                 .await?;
             for r in records {
@@ -346,6 +352,11 @@ fn row_values(r: &Record) -> Vec<Value> {
         r.flow.map_or(Value::Null, |f| Value::from(i64::from(f))),
         int_opt(r.bytes_out),
         int_opt(r.bytes_in),
+        text_opt(r.hostname.clone()),
+        text_opt(r.method.clone()),
+        r.status.map_or(Value::Null, |s| Value::from(i64::from(s))),
+        text_opt(r.query_type.clone()),
+        text_opt(r.outcome.clone()),
     ]
 }
 
@@ -381,6 +392,13 @@ fn record(path: &Path, r: &Row) -> Result<(i64, Record)> {
                 .and_then(|f| u32::try_from(f).ok()),
             bytes_out: unsigned(r.get(12)?),
             bytes_in: unsigned(r.get(13)?),
+            hostname: r.get(14)?,
+            method: r.get(15)?,
+            status: r
+                .get::<Option<i64>>(16)?
+                .and_then(|s| u16::try_from(s).ok()),
+            query_type: r.get(17)?,
+            outcome: r.get(18)?,
         },
     ))
 }

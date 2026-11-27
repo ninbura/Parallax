@@ -70,6 +70,11 @@ impl std::str::FromStr for LogLevel {
 pub struct LogsServer {
     #[serde(default)]
     pub level: LogLevel,
+    /// Whether to log peers' DNS queries. Separate from `level`, which never
+    /// implies it: the names someone looks up say more about them than
+    /// their connections do.
+    #[serde(default)]
+    pub dns: bool,
     /// The activity database, kept apart from the configuration so it can
     /// live on another disk (an SSD instead of a Pi's SD card) or `tmpfs`.
     #[serde(default = "default_logs_path")]
@@ -86,6 +91,7 @@ impl Default for LogsServer {
     fn default() -> Self {
         LogsServer {
             level: LogLevel::Off,
+            dns: false,
             path: default_logs_path(),
             keep: default_logs_keep(),
             max_size: default_logs_max_size(),

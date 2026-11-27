@@ -222,8 +222,9 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     }
 
     let mut engine_alive = true;
+    let taps = collector::Taps::new();
     let started = async {
-        let servers = start_servers(&opts.out).await?;
+        let servers = start_servers(&opts.out, &taps).await?;
         let listener = bind_socket(&opts.socket)?;
         anyhow::Ok((servers, listener))
     }
@@ -240,7 +241,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let names = tokio::spawn(refresh_names(tx.clone(), views.clone()));
     let tailnet = tokio::spawn(refresh_tailnet(tx.clone(), views.clone()));
     let logs = collector::Slot::default();
-    let collecting = tokio::spawn(collector::supervise(views.clone(), Arc::clone(&logs)));
+    let collecting = tokio::spawn(collector::supervise(views.clone(), Arc::clone(&logs), taps));
     let server = tokio::spawn(accept(listener, tx.clone(), views, database, logs));
     let timers = tokio::spawn(timers(tx.clone(), opts.reconcile_every));
     log(format!(
@@ -316,8 +317,8 @@ type Servers = (
 /// Start the DNS server and the HTTPS proxy on the routes the first apply
 /// wrote. Both listen on the gateway address, which the WireGuard interface
 /// carries since that apply.
-async fn start_servers(out: &Path) -> anyhow::Result<Servers> {
-    let dns = parallax_dns::Dns::load(&out.join(generate::dns::PATH), 53)?;
+async fn start_servers(out: &Path, taps: &collector::Taps) -> anyhow::Result<Servers> {
+    let dns = parallax_dns::Dns::load(&out.join(generate::dns::PATH), 53)?.tap(taps.dns.clone());
     let listen = dns.listen();
     let udp = UdpSocket::bind(listen)
         .await
@@ -325,7 +326,8 @@ async fn start_servers(out: &Path) -> anyhow::Result<Servers> {
     let tcp = TcpListener::bind(listen)
         .await
         .with_context(|| format!("the DNS server can't listen on tcp {listen}"))?;
-    let proxy = parallax_proxy::Proxy::load(&out.join(generate::proxy::PATH))?;
+    let proxy =
+        parallax_proxy::Proxy::load(&out.join(generate::proxy::PATH))?.tap(taps.proxy.clone());
     let listen = proxy.listen();
     let listener = TcpListener::bind(listen)
         .await

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use hickory_server::proto::op::{Edns, Message, OpCode, Query, ResponseCode};
 use hickory_server::proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_server::proto::rr::{Name, RData, Record, RecordType};
+use parallax_core::logging::{Event, QueryOutcome, Tap};
 use parallax_dns::Dns;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -220,6 +221,11 @@ struct Running {
 static NEXT_DIR: AtomicU16 = AtomicU16::new(0);
 
 async fn start() -> Running {
+    start_tapped(None).await
+}
+
+/// With the server handing queries over to `tap`.
+async fn start_tapped(tap: Option<Tap>) -> Running {
     let upstream = upstream().await;
     let dir = std::env::temp_dir().join(format!(
         "parallax-dns-test-{}-{}",
@@ -229,7 +235,10 @@ async fn start() -> Running {
     std::fs::create_dir_all(&dir).unwrap();
     let routes_path = dir.join("routes.toml");
     std::fs::write(&routes_path, routes(false)).unwrap();
-    let dns = Dns::load(&routes_path, upstream.port).unwrap();
+    let mut dns = Dns::load(&routes_path, upstream.port).unwrap();
+    if let Some(tap) = tap {
+        dns = dns.tap(tap);
+    }
     let reload = dns.reload_trigger();
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = udp.local_addr().unwrap();
@@ -515,4 +524,56 @@ async fn reloads_take_effect_and_a_broken_one_refuses_everything() {
     )
     .await;
     assert_eq!(addresses(&m), ["198.18.1.5"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_logged_peer_s_queries_are_handed_over_without_answers() {
+    let (tap, events) = Tap::new(64);
+    tap.set_clients(
+        [(
+            FAMILY.parse().unwrap(),
+            parallax_core::logging::Logged {
+                peer: "guest".into(),
+                level: parallax_core::model::LogLevel::Detailed,
+            },
+        )]
+        .into(),
+    );
+    let s = start_tapped(Some(tap)).await;
+    ask(FAMILY, s.addr, "Immich.MyDomain.com.", RecordType::A).await;
+    ask(FAMILY, s.addr, "other.mydomain.com.", RecordType::A).await;
+    ask_tcp(FAMILY, s.addr, "immich.mydomain.com.", RecordType::AAAA).await;
+    // Not logged: nothing handed over.
+    ask(PERSONAL, s.addr, "missing.mydomain.com.", RecordType::A).await;
+    let mut got = Vec::new();
+    while let Ok(event) = events.recv_timeout(Duration::from_millis(500)) {
+        match event {
+            Event::Query(q) => got.push(q),
+            other => panic!("not a query: {other:?}"),
+        }
+    }
+    let seen: Vec<_> = got
+        .iter()
+        .map(|q| {
+            (
+                q.name.as_str(),
+                q.query_type.as_str(),
+                q.protocol,
+                q.outcome,
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("immich.mydomain.com.", "A", 17, QueryOutcome::Answered),
+            ("other.mydomain.com.", "A", 17, QueryOutcome::Refused),
+            ("immich.mydomain.com.", "AAAA", 6, QueryOutcome::Answered),
+        ]
+    );
+    assert!(got.iter().all(|q| q.client.to_string() == FAMILY));
+    assert!(
+        !format!("{got:?}").contains("198.18"),
+        "never the answer: {got:?}"
+    );
 }
