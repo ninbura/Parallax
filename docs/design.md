@@ -431,6 +431,10 @@ clients/<peer>/<platform>.conf     only for peers that retain their private key 
 
 `iptables-nft` backend writes `iptables/parallax.rules` (iptables-restore
 format, PARALLAX_* chains) and `iptables/docker-user.rules` instead.
+Its sets live in the host's one ipset namespace, so apply removes only
+stale sets named as Parallax names them (`wg_` or `ts_` and a 16-digit hex
+tier key, `log_flows`, `log_denied`) and leaves every other set alone. Builds before named grants made
+empty `ts_<template>` sets; those stay until removed with `ipset destroy`.
 
 ## Apply order and idempotency
 
