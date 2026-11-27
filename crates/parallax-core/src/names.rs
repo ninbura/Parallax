@@ -26,7 +26,10 @@
 //!   whose resolvers changed, must resolve, and a change mustn't leave a
 //!   known address outside every network or off the home's public IP.
 //!   Problems that were already there don't block unrelated changes, so a
-//!   resolver being down never stops removing a peer or a grant.
+//!   resolver being down never stops removing a peer or a grant. They're
+//!   told apart by what they're about (a name, or what a rule opens), not
+//!   their message, and a rule is refused only if no grant opened the same
+//!   before.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;

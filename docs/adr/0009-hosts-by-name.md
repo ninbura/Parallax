@@ -67,9 +67,16 @@ home's DNS stays the only place a machine's address is written down.
   home's public IP (`server.public_ip.address` edited). Problems that were
   already there don't block unrelated changes: a resolver being down must
   never stop the operator removing a peer, and a grant's problem never
-  stops changing a peer's other grants. A problem is named by its grant
-  and rule, not by who holds them. Without a daemon, the CLI saves without asking
-  DNS; the daemon warns when it starts.
+  stops changing a peer's other grants. Problems are compared by what
+  they're about, not their message: a name, or what a rule opens on the
+  home's public IP (host, ports in any order, proxied or not). A rule that
+  gives nothing there is refused only if no grant opened the same before,
+  so renaming, a new public IP, or taking access away (a grant from a peer
+  that reached everything) is never refused for what it reveals. A name
+  that doesn't resolve through new resolvers, with no answer known (just
+  started, a restore), is refused when the old resolvers still answer for
+  it. Without a daemon, the CLI saves without asking DNS; the daemon warns
+  when it starts.
 - **DNS for the tier.** A host granted by name, or a granted service whose
   host is a name, lets the tier look that name up (one name, not its zone),
   like a service's `hostnames`.
