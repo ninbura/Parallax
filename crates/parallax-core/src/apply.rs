@@ -483,4 +483,44 @@ mod tests {
             ]
         );
     }
+
+    /// Through a whole iptables-nft apply: a stale set of Parallax's goes,
+    /// the operator's own `wg_external_allow` stays.
+    #[test]
+    fn an_iptables_apply_keeps_the_operators_sets() {
+        let mut cfg = crate::testing::canonical_config();
+        cfg.server.firewall.backend = crate::FirewallBackend::IptablesNft;
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "ipset",
+            &["list", "-n"],
+            Output {
+                status: 0,
+                stdout: "not_public\nwg_fedcba9876543210\nwg_external_allow\n".into(),
+                stderr: String::new(),
+            },
+        );
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+        let lines = runner.command_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "ipset destroy wg_fedcba9876543210"),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l == "ipset destroy wg_external_allow"),
+            "{lines:#?}"
+        );
+    }
 }
