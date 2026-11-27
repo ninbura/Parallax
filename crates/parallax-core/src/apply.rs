@@ -26,33 +26,39 @@ pub struct ApplyReport {
 /// Check the host has the tools apply runs. Returns one message per missing tool.
 pub fn preflight(backend: FirewallBackend, sys: System<'_>) -> Vec<String> {
     let mut missing = Vec::new();
-    let fw_bin = match backend {
-        FirewallBackend::Nftables => "nft",
-        FirewallBackend::IptablesNft => "iptables",
+    // `--version`'s output, or None when the tool doesn't run.
+    let version = |tool: &str| {
+        sys.runner
+            .run(tool, &["--version"], None)
+            .ok()
+            .filter(|o| o.ok())
+            .map(|o| o.stdout)
     };
-    if sys
-        .runner
-        .run(fw_bin, &["--version"], None)
-        .map(|o| !o.ok())
-        .unwrap_or(true)
-    {
-        missing.push(format!(
-            "`{fw_bin}` is not available: install {}",
-            match backend {
-                FirewallBackend::Nftables => "nftables",
-                FirewallBackend::IptablesNft => "iptables (nft variant)",
+    match backend {
+        FirewallBackend::Nftables => {
+            if version("nft").is_none() {
+                missing.push("`nft` is not available: install nftables".into());
             }
-        ));
-    }
-    if backend == FirewallBackend::IptablesNft {
-        for (tool, package) in [("iptables-restore", "iptables"), ("ipset", "ipset")] {
-            if sys
-                .runner
-                .run(tool, &["--version"], None)
-                .map(|o| !o.ok())
-                .unwrap_or(true)
-            {
-                missing.push(format!("`{tool}` is not available: install {package}"));
+        }
+        FirewallBackend::IptablesNft => {
+            for tool in ["iptables", "iptables-restore"] {
+                match version(tool) {
+                    None => missing.push(format!(
+                        "`{tool}` is not available: install iptables (nft variant)"
+                    )),
+                    // Debian and Ubuntu switch both with one alternative. The
+                    // legacy variant writes other tables, and takes a lock in
+                    // /run that the native service can't write.
+                    Some(v) if v.contains("(legacy)") => missing.push(format!(
+                        "`{tool}` is the legacy variant ({}); `backend = \"iptables-nft\"` needs \
+                         the nf_tables one: `update-alternatives --set iptables /usr/sbin/iptables-nft`",
+                        v.trim()
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if version("ipset").is_none() {
+                missing.push("`ipset` is not available: install ipset".into());
             }
         }
     }
@@ -181,11 +187,13 @@ fn apply_firewall(
             // both tables are in. Open ones carry on under the NAT they
             // started with. If the restore fails, the hold stays until an
             // apply succeeds (the daemon retries).
-            sys.runner.run_checked(
-                "iptables-restore",
-                &["--test", "--noflush", &main_str],
-                None,
-            )?;
+            sys.runner
+                .run_checked(
+                    "iptables-restore",
+                    &["--test", "--noflush", &main_str],
+                    None,
+                )
+                .map_err(net_raw_hint)?;
             // The holds go in at the top of their chains, in one transaction.
             // Any a failed apply left come out and go back in with the rest,
             // so none is lifted for a moment, and none stays below a rule
@@ -195,7 +203,8 @@ fn apply_firewall(
             // starts.
             let before = sys
                 .runner
-                .run_checked("iptables", &["-t", "filter", "-S"], None)?;
+                .run_checked("iptables", &["-t", "filter", "-S"], None)
+                .map_err(net_raw_hint)?;
             let docker = match bundle.of_kind(ArtifactKind::FirewallDockerUser).next() {
                 Some(d)
                     if before
@@ -230,6 +239,7 @@ fn apply_firewall(
             let listing = sys
                 .runner
                 .run_checked("iptables", &["-t", "filter", "-S"], None)
+                .map_err(net_raw_hint)
                 .map_err(still_held)?;
             attach(docker, sys, log).map_err(still_held)?;
             // Every hold goes, together. The hooks are above them by now, so
@@ -572,6 +582,29 @@ pub fn apply(
 
 /// Comment on the hold rules, one word so `iptables -S` prints it plain.
 pub const HOLD_COMMENT: &str = "parallax-hold";
+
+/// `iptables-restore` looks up each `--match-set` ipset through a raw socket,
+/// and `iptables -S` does to print one, so without CAP_NET_RAW they fail with
+/// only iptables' own words. The shipped
+/// unit leaves the capability out (it's only for this backend); say how to
+/// add it. `doctor` catches this at start, but the backend can change later.
+fn net_raw_hint(e: Error) -> Error {
+    match e {
+        Error::Command {
+            command,
+            status,
+            stderr,
+        } if stderr.contains("Can't open socket to ipset") => Error::Command {
+            command,
+            status,
+            stderr: format!(
+                "{}; matching ipsets needs CAP_NET_RAW (docs/native.md, The iptables-nft backend)",
+                stderr.trim_end()
+            ),
+        },
+        e => e,
+    }
+}
 
 /// What keeps tunnel peers from opening connections while `iptables-restore`
 /// swaps the rules (issue #56): rules at the top of INPUT and FORWARD that
@@ -1140,6 +1173,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #52: under the shipped unit `iptables-restore` can't open its
+    /// raw socket to look sets up. The dry run stops it before anything
+    /// changes, and the error says what's missing.
+    #[test]
+    fn an_iptables_restore_without_net_raw_names_the_capability() {
+        let mut cfg = crate::testing::canonical_config();
+        cfg.server.firewall.backend = crate::FirewallBackend::IptablesNft;
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "iptables-restore",
+            &[
+                "--test",
+                "--noflush",
+                "/var/lib/parallax/iptables/parallax.rules",
+            ],
+            failed("iptables-restore v1.8.13 (nf_tables): Can't open socket to ipset.\n"),
+        );
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        let err = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "Can't open socket to ipset.; matching ipsets needs CAP_NET_RAW \
+                 (docs/native.md, The iptables-nft backend)"
+            ),
+            "{err}"
+        );
+        let lines = runner.command_lines();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("iptables-restore --noflush")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn the_net_raw_hint_is_only_for_the_ipset_socket() {
+        let command = |stderr: &str| Error::Command {
+            command: "iptables-restore --test".into(),
+            status: 2,
+            stderr: stderr.into(),
+        };
+        let other = "iptables-restore: line 12 failed";
+        assert_eq!(
+            net_raw_hint(command(other)).to_string(),
+            command(other).to_string()
+        );
+        assert!(net_raw_hint(command("Can't open socket to ipset.\n"))
+            .to_string()
+            .contains("needs CAP_NET_RAW"));
     }
 
     /// Through a whole iptables-nft apply: once the rules are restored, a
