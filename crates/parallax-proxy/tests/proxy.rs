@@ -650,6 +650,9 @@ async fn logging_keeps_a_reply_s_length() {
     tokio::spawn(conn);
     // The proxy's own reply, and the upstream's.
     for host in [OTHER, IMMICH] {
+        // The connection takes the next request once it has finished the
+        // last; sending sooner fails now and then ("connection was not ready").
+        send.ready().await.unwrap();
         let resp = send.send_request(get("/", host)).await.unwrap();
         assert!(
             resp.headers().contains_key(hyper::header::CONTENT_LENGTH),
@@ -658,4 +661,28 @@ async fn logging_keeps_a_reply_s_length() {
         );
         resp.into_body().collect().await.unwrap();
     }
+}
+
+/// A client's method is the one field of a record it chooses freely: a long
+/// extension method is kept cut short, so one guest can't write records of
+/// hundreds of KiB (#65). Refusals count, at `blocked`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_method_is_recorded_cut_short() {
+    let (tap, events) = tap_for(parallax_core::model::LogLevel::Blocked);
+    let env = Env::start_tapped(Some(tap)).await;
+    // The first 32 characters are kept, and only those.
+    let kept = "PROPFIND-0123456789abcdefghijklm";
+    assert_eq!(kept.len(), 32);
+    let long = format!("{kept}{}", "z".repeat(300_000));
+    let method = hyper::Method::from_bytes(long.as_bytes()).unwrap();
+    let req = Request::builder()
+        .method(method)
+        .uri("/")
+        .header(HOST, OTHER)
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    assert_eq!(env.h1(IMMICH, req).await.0, StatusCode::MISDIRECTED_REQUEST);
+    let got = requests(&events);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].method.as_deref(), Some(kept));
 }

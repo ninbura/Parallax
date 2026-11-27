@@ -110,7 +110,8 @@ Each line is one record:
 The destination is the address the peer used, then in brackets the real one
 and its network. `blocked_gateway` is a blocked attempt at the gateway host
 itself. `request` is a request through the HTTPS proxy (method, site,
-status), recorded when its response is done (a WebSocket's when it closes,
+status; a method other than the standard ones is kept to its first 32
+characters), recorded when its response is done (a WebSocket's when it closes,
 with what it carried); `refused` is one the proxy turned away, with why: a
 request naming another site, or a connection for a site the peer may not
 use, or one that's no site at all (then the destination is the proxy
