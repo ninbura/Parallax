@@ -1087,6 +1087,18 @@ fi
 if [ -n "${HEADSCALE:-}" ] && [ -n "${TAILSCALED:-}" ] && [ -n "${TAILSCALE:-}" ]; then
     HS="$WORK/hs"
     mkdir -p "$HS/ts"
+    # A tailscaled in a namespace still reaches the host's systemd-resolved over
+    # the system D-Bus, and resets DNS on whichever host link has its
+    # tailscale0's interface index. Each one here gets no D-Bus and a plain
+    # resolv.conf, so it leaves the host's DNS alone.
+    printf '# netns test: not systemd-resolved\nnameserver 192.0.2.53\n' > "$WORK/ts-resolv.conf"
+    chmod 0644 "$WORK/ts-resolv.conf"
+    no_host_dns() { # ns, command...  (a private mount namespace)
+        local ns=$1; shift
+        inns "$ns" unshare -m --propagation private sh -c \
+            'mount --bind "$0" /etc/resolv.conf && { [ ! -d /run/dbus ] || mount -t tmpfs tmpfs /run/dbus; } && exec "$@"' \
+            "$WORK/ts-resolv.conf" "$@"
+    }
     # No internet here: one offline DERP region, so Headscale starts.
     cat > "$HS/derp.yaml" <<YAML
 regions:
@@ -1136,7 +1148,7 @@ YAML
     HS_USER=$(hs_api POST /api/v1/user '{"name":"family"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["user"]["id"])')
     AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"2099-01-01T00:00:00Z\"}" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
-    inns gw "$TAILSCALED" --tun=userspace-networking --state=mem: --socket="$HS/ts/sock" \
+    no_host_dns gw "$TAILSCALED" --tun=userspace-networking --state=mem: --socket="$HS/ts/sock" \
         --statedir="$HS/ts" --port=0 >> "$HS/tailscaled.log" 2>&1 &
     PIDS+=($!)
     for _ in $(seq 50); do [ -S "$HS/ts/sock" ] && break; sleep 0.1; done
@@ -1214,9 +1226,10 @@ PY
         UNITS+=("${PREFIX}tailscaled")
         systemd-run --quiet --collect --unit="${PREFIX}tailscaled" -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" \
             -p "ReadWritePaths=$WORK" -p "StandardOutput=append:$HS/router.log" -p "StandardError=append:$HS/router.log" \
+            -p "BindReadOnlyPaths=$WORK/ts-resolv.conf:/etc/resolv.conf" -p "TemporaryFileSystem=/run/dbus" \
             "${TSD_SANDBOX[@]}" "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}"
     else
-        inns gw "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}" >> "$HS/router.log" 2>&1 &
+        no_host_dns gw "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}" >> "$HS/router.log" 2>&1 &
         PIDS+=($!)
     fi
     for _ in $(seq 50); do [ -S "$TS_SOCK" ] && break; sleep 0.1; done
@@ -1233,13 +1246,11 @@ PY
     PHONE_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
     mkdir -p "$HS/phone"
-    inns tsc "$TAILSCALED" --tun=tailscale0 --state=mem: --socket="$HS/phone/sock" --statedir="$HS/phone" \
+    no_host_dns tsc "$TAILSCALED" --tun=tailscale0 --state=mem: --socket="$HS/phone/sock" --statedir="$HS/phone" \
         --port=0 >> "$HS/phone.log" 2>&1 &
     PIDS+=($!)
     for _ in $(seq 50); do [ -S "$HS/phone/sock" ] && break; sleep 0.1; done
-    # --accept-dns=false: a tailscaled in a namespace still reaches the host's
-    # systemd-resolved over D-Bus, and would set DNS on whichever host link has
-    # its tailscale0's interface index.
+    # --accept-dns=false too: the phone has no DNS of its own to set.
     printf '%s' "$PHONE_AUTH" | inns tsc timeout 30 "$TAILSCALE" --socket="$HS/phone/sock" up \
         --login-server=http://203.0.114.1:18080 --auth-key=file:/dev/stdin --hostname=phone --accept-routes \
         --accept-dns=false >/dev/null 2>&1 \
