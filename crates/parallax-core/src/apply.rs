@@ -170,8 +170,18 @@ fn apply_firewall(
                 sys.runner.run_checked("ipset", &["destroy", next], None)?;
             }
             // The restore file declares every PARALLAX_* chain, which creates
-            // it or flushes it in the same transaction as the refill: no
-            // window with empty chains, and a failed restore changes nothing.
+            // it or flushes it in the same transaction as its refill, so no
+            // chain is ever empty. But each table commits at its own COMMIT:
+            // if `nat` fails, `filter` is already in (issue #56). The dry run
+            // catches most failures (syntax, a missing set or extension)
+            // before either table changes. What it can't catch leaves new
+            // filter rules with old NAT, which can't reach more than the
+            // filter allows (`firewall::check_layers`); the daemon retries.
+            sys.runner.run_checked(
+                "iptables-restore",
+                &["--test", "--noflush", &main_str],
+                None,
+            )?;
             sys.runner
                 .run_checked("iptables-restore", &["--noflush", &main_str], None)?;
             // Chains of tiers that no longer exist: nothing jumps to them
@@ -505,8 +515,10 @@ mod tests {
     }
 
     /// Issue #35: a failed restore leaves the old rules in place, so the
-    /// sets they use must be exactly as they were: none of the old ruleset's
-    /// sets is filled, swapped or destroyed, only new ones made beside them.
+    /// sets they use must be exactly as they were: no set only the old
+    /// ruleset uses is filled, swapped or destroyed, only new ones made
+    /// beside them. Issue #56: a failed dry run stops before the real restore, which can
+    /// commit `filter` without `nat`.
     #[test]
     fn a_failed_iptables_restore_leaves_the_old_sets_alone() {
         let mut cfg = crate::testing::canonical_config();
@@ -526,35 +538,54 @@ mod tests {
             crate::testing::keypair(200).private.expose_base64(),
         );
         let bundle = crate::generate::generate_all(&model, &fs).unwrap();
-        let runner = RecordingRunner::new();
-        runner.respond_to(
-            "ipset",
-            &["list", "-n"],
-            Output {
-                status: 0,
-                stdout: old.join("\n"),
-                stderr: String::new(),
-            },
-        );
-        runner.respond(
-            "iptables-restore",
-            failed("iptables-restore: line 12 failed"),
-        );
-        let sys = System {
-            fs: &fs,
-            runner: &runner,
-        };
-        assert!(apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).is_err());
-        let lines = runner.command_lines();
-        assert!(
-            lines.iter().any(|l| l.starts_with("iptables-restore")),
-            "{lines:#?}"
-        );
-        for name in &old {
-            assert!(
-                !lines.iter().any(|l| l.split(' ').any(|w| w == name)),
-                "{name} was touched: {lines:#?}"
+        // A set both rulesets name means the same in both (its name is a
+        // hash of its members), so refilling it changes nothing. The ones
+        // only the old rules use must stay as they are.
+        let new = crate::generate::firewall::build(&model).unwrap().sets;
+        let retired: Vec<&String> = old
+            .iter()
+            .filter(|o| !new.iter().any(|n| n.name == **o))
+            .collect();
+        assert!(!retired.is_empty());
+        let rules = "/var/lib/parallax/iptables/parallax.rules";
+        let dry_run = ["--test", "--noflush", rules];
+        let restore = ["--noflush", rules];
+        for failing in [&dry_run[..], &restore[..]] {
+            let runner = RecordingRunner::new();
+            runner.respond_to(
+                "ipset",
+                &["list", "-n"],
+                Output {
+                    status: 0,
+                    stdout: old.join("\n"),
+                    stderr: String::new(),
+                },
             );
+            runner.respond_to(
+                "iptables-restore",
+                failing,
+                failed("iptables-restore: line 12 failed"),
+            );
+            let sys = System {
+                fs: &fs,
+                runner: &runner,
+            };
+            assert!(apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).is_err());
+            let lines = runner.command_lines();
+            let ran = |args: &[&str]| {
+                let line = format!("iptables-restore {}", args.join(" "));
+                lines.contains(&line)
+            };
+            assert!(ran(failing), "{lines:#?}");
+            assert_eq!(ran(&restore), failing == restore, "{lines:#?}");
+            for name in &retired {
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|l| l.split(" ").any(|w| w == name.as_str())),
+                    "{name} was touched: {lines:#?}"
+                );
+            }
         }
     }
 

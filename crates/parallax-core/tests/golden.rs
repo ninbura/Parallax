@@ -804,6 +804,13 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
     // Stale sets go after the restore; live ones and others' stay.
     let restore = pos("iptables-restore --noflush").unwrap();
+    // A dry run first, once every set it names exists (#56).
+    let dry_run = pos("iptables-restore --test --noflush").unwrap();
+    let last_set = lines
+        .iter()
+        .rposition(|l| l.starts_with("ipset swap"))
+        .unwrap();
+    assert!(last_set < dry_run && dry_run < restore, "{lines:#?}");
     let gone = |set: &str| pos(&format!("ipset destroy {set}"));
     assert!(gone("wg_0000000000000000").unwrap() > restore);
     assert!(gone("not_public").is_none() && gone("ts_family").is_none());

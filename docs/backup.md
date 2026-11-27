@@ -104,6 +104,10 @@ still need the old one.
 - **TLS certificates** for proxied services (`server.proxy.certificates`):
   they belong to whoever issues them (certbot), so back them up with that.
 - **The backup passphrase.** Keep it in your password manager.
+- **Activity logs** (`logs.db`, [logging](logging.md)), on purpose: a backup
+  would keep who-went-where records past `server.logs.keep`, in every copy
+  of it, and they aren't needed to rebuild the gateway. A restore leaves
+  the current `logs.db` alone.
 - **Headscale's own data** (the `headscale` container's volume), until
   Parallax drives Headscale (M2).
 

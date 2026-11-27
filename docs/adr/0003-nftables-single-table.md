@@ -15,7 +15,8 @@ nftables form of 1:1 prefix translation (nftables >= 0.9.4). Rules are built
 as a small IR (`generate::firewall::Rule`) and rendered by the chosen backend;
 the `iptables-nft` renderer produces an `iptables-restore --noflush` file
 with dedicated `PARALLAX_*` chains and uses `ipset` for the Tailscale node
-sets.
+sets. That restore is atomic per table, not across `filter` and `nat`; why
+that's safe is in `docs/design.md` (issue #56).
 
 ## The gateway host is not a destination
 

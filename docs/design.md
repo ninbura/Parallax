@@ -457,6 +457,19 @@ filled beside the old one, the restore moves every rule to the new sets in
 one step, and the old ones are destroyed after it. A failed restore leaves
 the old rules with exactly the sets they had (issue #35).
 
+Unlike `nft -f`, `iptables-restore` commits each table at its own `COMMIT`:
+a restore whose `nat` part fails leaves the new `filter` rules running with
+the old NAT (issue #56). apply runs `iptables-restore --test` first, which
+catches most failures (syntax, a missing set or extension) before either
+table changes. What's left can't widen access, because the tables keep to
+their jobs: NAT only translates (prefix maps, the proxy redirect,
+masquerade), and filter decides on addresses as they are after NAT, real
+addresses and interfaces, never a virtual one. Real subnets can't overlap,
+so a real address names one network under any configuration, and a mix of
+two configurations' tables reaches at most what the live filter allows. It
+can misroute (a stale prefix map, a missing redirect) until the daemon's
+next apply. `firewall::build` refuses a ruleset that breaks this.
+
 ## Apply order and idempotency
 
 firewall (`nft -c -f` then `nft -f`) → WireGuard (`ip link add` if missing,

@@ -32,6 +32,11 @@
 //!   `all_networks` (then it's everything outside the configured networks).
 //!   Public-only tiers also exclude the home's own public IP, which the
 //!   router would hairpin back into the home ([`crate::public_ip`]).
+//! - NAT only translates, and filter decides on real addresses: no NAT rule
+//!   accepts or drops, and no filter rule matches a virtual address. So a
+//!   mix of one configuration's NAT and another's filter (iptables commits
+//!   the two tables one after the other) never reaches more than the live
+//!   filter allows ([`check_layers`], issue #56).
 //! - Tunnel peers are IPv4-only: IPv6 from a tunnel interface is dropped.
 //! - Activity logging ([`crate::logging`]): new flows of logged peers get
 //!   [`FLOW_MARK`] in their connection mark, so the collector keeps only
@@ -838,7 +843,76 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         }
     }
     name_sets(&mut rs, tiers, &transports);
+    check_layers(&rs, cfg)?;
     Ok(rs)
+}
+
+/// Refuse a ruleset in which NAT decides access, or filter depends on NAT.
+///
+/// `iptables-restore` commits `filter` and `nat` one after the other: a
+/// restore whose `nat` part fails leaves the new filter running with the
+/// old NAT (issue #56). That's harmless only while the tables keep to
+/// their jobs. NAT only translates (prefix maps, the proxy redirect,
+/// masquerade). Filter decides on what a packet is after NAT: real
+/// addresses and interfaces, which name one network each, since real
+/// subnets can't overlap. A filter rule matching a virtual address would
+/// mean something else under another configuration's NAT. Negated matches
+/// are allowed: an address left untranslated then fails them, which only
+/// denies.
+fn check_layers(rs: &Ruleset, cfg: &crate::Config) -> Result<()> {
+    let virtual_prefixes: Vec<Ipv4Net> = cfg
+        .networks
+        .iter()
+        .filter_map(|n| n.mapping())
+        .map(|m| m.virt())
+        .collect();
+    let set = |name: &str| {
+        rs.sets
+            .iter()
+            .find(|s| s.name == name)
+            .map_or(&[][..], |s| s.elements.as_slice())
+    };
+    let virtual_in = |m: &Match| -> Option<Ipv4Net> {
+        let nets: &[Ipv4Net] = match m {
+            Match::Any | Match::NotSet(_) => &[],
+            Match::Cidr(n) => std::slice::from_ref(n),
+            Match::Cidrs(ns) => ns,
+            Match::Set(name) => set(name),
+        };
+        nets.iter().copied().find(|n| {
+            virtual_prefixes
+                .iter()
+                .any(|v| v.contains(n) || n.contains(v))
+        })
+    };
+    let bug = |r: &Rule, what: String| {
+        Err(crate::Error::Refused(format!(
+            "firewall rule '{}' {what}, so a failed iptables restore could mix two configurations' access (issue #56). This is a bug in Parallax: please report it",
+            r.comment
+        )))
+    };
+    for r in rs.rules.iter().chain(&rs.docker_user) {
+        let translates = matches!(
+            r.action,
+            Action::Dnat { .. }
+                | Action::NetmapDst { .. }
+                | Action::NetmapSrc { .. }
+                | Action::Masquerade
+        );
+        let nat = matches!(r.chain, Chain::Prerouting | Chain::Postrouting);
+        if nat && !translates {
+            return bug(r, "decides access in the nat table".into());
+        }
+        if !nat && translates {
+            return bug(r, "translates addresses in the filter table".into());
+        }
+        if !nat {
+            if let Some(v) = virtual_in(&r.src).or_else(|| virtual_in(&r.dst)) {
+                return bug(r, format!("matches the virtual addresses {v}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Name every set after what it means: its members, and every rule that
@@ -1454,6 +1528,66 @@ mod tests {
         assert!(before.starts_with("not_public_") && before.len() == 27);
         assert_ne!(shared(Some([1, 2, 3, 4].into())), before, "the home's IP");
         assert_eq!(shared(None), before);
+    }
+
+    /// Issue #56: iptables commits filter and nat separately, which is safe
+    /// only while NAT never decides access and filter never matches a
+    /// virtual address. Every generated ruleset is checked; these aren't.
+    #[test]
+    fn nat_never_decides_and_filter_never_sees_virtual_addresses() {
+        let cfg = crate::testing::canonical_config();
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let good = build(&model).unwrap();
+        let virt: Ipv4Net = "198.18.1.5/32".parse().unwrap();
+        let refused = |rule: Rule| {
+            let mut rs = good.clone();
+            rs.rules.push(rule);
+            check_layers(&rs, &cfg).unwrap_err().to_string()
+        };
+
+        let e = refused(Rule::new(Chain::Prerouting, Action::Drop, "nat drop"));
+        assert!(
+            e.contains("'nat drop' decides access in the nat table"),
+            "{e}"
+        );
+        let e = refused(Rule::new(Chain::Forward, Action::Masquerade, "filter nat"));
+        assert!(
+            e.contains("translates addresses in the filter table"),
+            "{e}"
+        );
+        let e = refused(
+            Rule::new(Chain::Tier(0), Action::Accept, "virtual accept").dst(Match::Cidr(virt)),
+        );
+        assert!(
+            e.contains("matches the virtual addresses 198.18.1.5/32"),
+            "{e}"
+        );
+
+        // Through a set, and a whole mapped prefix inside a wider match.
+        let mut rs = good.clone();
+        rs.sets.push(AddressSet {
+            name: "virtual".into(),
+            elements: vec![virt],
+            comment: String::new(),
+        });
+        rs.rules.push(
+            Rule::new(Chain::Input, Action::Drop, "by set").src(Match::Set("virtual".into())),
+        );
+        assert!(check_layers(&rs, &cfg).is_err());
+        assert!(refused(
+            Rule::new(Chain::Forward, Action::Accept, "wide")
+                .dst(Match::Cidrs(vec!["198.16.0.0/13".parse().unwrap()]))
+        )
+        .contains("'wide'"));
+
+        // A negated match may hold virtual addresses: untranslated, they
+        // fail it, which only denies.
+        let mut rs = good.clone();
+        rs.rules.push(
+            Rule::new(Chain::Tier(0), Action::Accept, "not virtual")
+                .dst(Match::NotSet("virtual".into())),
+        );
+        check_layers(&rs, &cfg).unwrap();
     }
 
     #[test]
