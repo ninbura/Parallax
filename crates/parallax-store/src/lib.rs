@@ -18,6 +18,7 @@
 pub mod backup;
 mod config;
 mod error;
+pub mod logs;
 mod state;
 mod tempdir;
 
@@ -36,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_host_names.sql"),
     include_str!("../migrations/0005_ports.sql"),
     include_str!("../migrations/0006_grants.sql"),
+    include_str!("../migrations/0007_logs.sql"),
 ];
 
 /// Tables holding what the daemon learned on this machine, not
@@ -43,7 +45,7 @@ const MIGRATIONS: &[&str] = &[
 const RUNTIME_TABLES: &[&str] = &["daemon_state"];
 
 /// The journal mode every database runs in (docs/adr/0011-mvcc.md).
-const MVCC: &str = "mvcc";
+pub(crate) const MVCC: &str = "mvcc";
 
 /// How long a write waits for another connection's write to commit.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +53,9 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 /// An open database.
 pub struct Store {
     path: PathBuf,
+    /// The schema this database follows: [`MIGRATIONS`], or the activity
+    /// database's ([`logs`]).
+    migrations: &'static [&'static str],
     // Kept alive for as long as the connection is in use.
     db: turso::Database,
     conn: turso::Connection,
@@ -68,21 +73,21 @@ impl Store {
         if !path.exists() {
             return Err(Error::Missing(path.to_path_buf()));
         }
-        Store::open_inner(path, true).await
+        Store::open_inner(path, MIGRATIONS, true).await
     }
 
     /// Open a database, creating an empty one (and its directory, 0700) if
     /// there is none.
     pub async fn create(path: &Path) -> Result<Store> {
         create_file(path)?;
-        Store::open_inner(path, true).await
+        Store::open_inner(path, MIGRATIONS, true).await
     }
 
     /// Create a database left in the default journal mode, which `sqlite3`
     /// can open: what a backup's copy is rebuilt into.
     async fn create_plain(path: &Path) -> Result<Store> {
         create_file(path)?;
-        Store::open_inner(path, false).await
+        Store::open_inner(path, MIGRATIONS, false).await
     }
 
     /// Where the database lives.
@@ -90,7 +95,11 @@ impl Store {
         &self.path
     }
 
-    async fn open_inner(path: &Path, mvcc: bool) -> Result<Store> {
+    async fn open_inner(
+        path: &Path,
+        migrations: &'static [&'static str],
+        mvcc: bool,
+    ) -> Result<Store> {
         let name = path
             .to_str()
             .ok_or_else(|| Error::Invalid(format!("{} is not valid UTF-8", path.display())))?;
@@ -103,13 +112,14 @@ impl Store {
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
         let store = Store {
             path: path.to_path_buf(),
+            migrations,
             db,
             conn,
         };
         if mvcc {
             // Refuse a database too new for this build before changing it.
             store
-                .check_version(MIGRATIONS.len() as i64)
+                .check_version(migrations.len() as i64)
                 .await
                 .map_err(|e| store.busy(e))?;
             store.use_mvcc().await.map_err(|e| store.busy(e))?;
@@ -182,7 +192,7 @@ impl Store {
     /// version and applies the rest, so connections opening a new database
     /// at the same time migrate it once.
     async fn migrate(&self) -> Result<()> {
-        let known = MIGRATIONS.len() as i64;
+        let known = self.migrations.len() as i64;
         if self.check_version(known).await? == known {
             return Ok(());
         }
@@ -195,7 +205,7 @@ impl Store {
                 )
                 .await?;
             let found = self.check_version(known).await?;
-            for (version, sql) in (1..).zip(MIGRATIONS).skip(found as usize) {
+            for (version, sql) in (1..).zip(self.migrations).skip(found as usize) {
                 self.conn.execute_batch(*sql).await?;
                 self.conn
                     .execute(
@@ -266,6 +276,7 @@ impl Store {
         conn.execute("BEGIN", ()).await?;
         Ok(Store {
             path: self.path.clone(),
+            migrations: self.migrations,
             db: self.db.clone(),
             conn,
         })

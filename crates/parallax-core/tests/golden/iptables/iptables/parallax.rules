@@ -16,11 +16,11 @@
 -A PARALLAX_INPUT -i tailscale0 -m conntrack --ctstate INVALID -m comment --comment "invalid state" -j DROP
 -A PARALLAX_INPUT -m conntrack --ctdir REPLY -m comment --comment "replies" -j ACCEPT
 -A PARALLAX_INPUT -m conntrack --ctstate RELATED -m comment --comment "related (ICMP errors)" -j ACCEPT
--A PARALLAX_INPUT -p udp --dport 51820 -m comment --comment "wireguard listen port" -j ACCEPT
 -A PARALLAX_INPUT -i wg0 -d 10.8.0.1/32 -p udp --dport 53 -m comment --comment "dns shim" -j ACCEPT
 -A PARALLAX_INPUT -i tailscale0 -d 10.8.0.1/32 -p udp --dport 53 -m comment --comment "dns shim" -j ACCEPT
 -A PARALLAX_INPUT -i wg0 -d 10.8.0.1/32 -p tcp --dport 53 -m comment --comment "dns shim" -j ACCEPT
 -A PARALLAX_INPUT -i tailscale0 -d 10.8.0.1/32 -p tcp --dport 53 -m comment --comment "dns shim" -j ACCEPT
+-A PARALLAX_INPUT -p udp --dport 51820 -m comment --comment "wireguard listen port" -j ACCEPT
 -A PARALLAX_INPUT -i wg0 -p icmp --icmp-type echo-request -m comment --comment "ping the gateway" -j ACCEPT
 -A PARALLAX_INPUT -i tailscale0 -p icmp --icmp-type echo-request -m comment --comment "ping the gateway" -j ACCEPT
 -A PARALLAX_INPUT -i wg0 -m set --match-set wg_7a42f16eb5942bbd src -d 10.8.0.1/32 -p tcp --dport 8443 -m comment --comment "family/wireguard: https proxy" -j ACCEPT

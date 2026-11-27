@@ -130,23 +130,33 @@ pub fn build(model: &Model<'_>) -> ProxyRoutes {
 }
 
 /// The routes with every granted proxied hostname, also those whose service
-/// is named by a DNS name that hasn't resolved (no upstream yet), for
-/// checking certificates: whether one is there mustn't depend on DNS, or a
-/// name resolving later could start failing every apply.
+/// is named by a DNS name that hasn't resolved (no upstream yet) and those
+/// no granted peer has an address for yet (a Tailscale node not seen yet),
+/// for checking certificates: whether one is there mustn't depend on DNS or
+/// Headscale, or an answer arriving later could start failing every apply.
 pub fn certificate_check(model: &Model<'_>) -> ProxyRoutes {
     let mut routes = build(model);
-    let granted = |name: &str| {
-        model.tiers().iter().any(|t| {
-            t.rules
-                .iter()
-                .any(|r| matches!(r, Rule::Service { name: n } if n == name))
-        })
-    };
     for svc in model.config().services.iter().filter(|s| s.is_proxied()) {
-        if !model.addresses(&svc.host).is_empty() || !granted(&svc.name) {
+        let rule = Rule::Service {
+            name: svc.name.clone(),
+        };
+        // As `build` decides, members aside: some tier with the grant that
+        // doesn't reach it directly (unresolved: can't tell, so any tier).
+        let addresses = model.addresses(&svc.host);
+        let through_proxy = model.tiers().iter().any(|t| {
+            t.has(&rule)
+                && (addresses.is_empty()
+                    || addresses
+                        .iter()
+                        .any(|ip| !model.reaches_directly(t, *ip, Proto::Tcp, HTTPS)))
+        });
+        if !through_proxy {
             continue;
         }
         for hostname in &svc.hostnames {
+            if routes.sites.iter().any(|s| s.hostname == *hostname) {
+                continue;
+            }
             routes.sites.push(ProxySite {
                 hostname: hostname.clone(),
                 service: svc.name.clone(),
@@ -252,6 +262,28 @@ mod tests {
             certificate_check(&model).sites.is_empty(),
             "not granted: no certificate needed"
         );
+    }
+
+    #[test]
+    fn certificates_are_checked_before_any_member_has_an_address() {
+        let mut cfg = proxied();
+        // family's only peer is on Tailscale, and Headscale hasn't answered.
+        let peer = cfg
+            .peers
+            .iter_mut()
+            .find(|p| p.grants == ["family"])
+            .unwrap();
+        peer.transport = crate::model::TransportKind::Tailscale;
+        peer.wireguard = None;
+        peer.tailscale = Some(crate::model::TailscalePeer {
+            node_id: Some(1),
+            address: None,
+        });
+        let model = Model::resolve(&cfg, today()).unwrap();
+        assert!(build(&model).site("immich.mydomain.com").is_none());
+        assert!(certificate_check(&model)
+            .site("immich.mydomain.com")
+            .is_some());
     }
 
     #[test]

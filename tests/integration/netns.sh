@@ -4,6 +4,9 @@
 # binary (PARALLAX=...). KEEP_LOG=<file> keeps a copy of the daemon's log.
 # NETNS_PREFIX=<prefix> names the namespaces (default: one per run, so several
 # runs can share a machine). Interfaces live inside them and keep their names.
+# NETNS_DAEMON=unit runs the daemon (and a doctor) as an unprivileged user under
+# packaging/systemd/parallax.service's sandbox and capabilities, as a native
+# install does; needs systemd. The default, root, is how the Docker image runs it.
 #
 # Topology (every namespace is fresh; names below are without the prefix):
 #   home    192.168.1.5   "nginx" (TLS, picks the site by Host: immich and a sibling
@@ -42,8 +45,11 @@
 # table, and keeps the home's public IP across the restart, (r) a peer with two grants
 # reaches both and nothing more, a grant for everyone reaches every peer, and changing
 # grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
-# change access when they return, and a refused one changes nothing. Every change
-# goes through the daemon and takes effect without SIGHUP.
+# change access when they return, and a refused one changes nothing, (t) activity
+# logging records logged peers' connections, bytes and blocked attempts and nobody
+# else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
+# node's address from Headscale. Every change goes through the daemon and takes
+# effect without SIGHUP.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -60,11 +66,26 @@ for ns in $NAMESPACES; do
     ip netns list | grep -q "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
 done
 
-WORK=$(mktemp -d /tmp/parallax-it.XXXXXX)
+MODE="${NETNS_DAEMON:-root}"
+case $MODE in
+    root) ;;
+    unit) command -v systemd-run >/dev/null && command -v runuser >/dev/null && [ -d /run/systemd/system ] \
+              || { echo "NETNS_DAEMON=unit needs systemd and runuser"; exit 2; } ;;
+    *) echo "NETNS_DAEMON is root or unit"; exit 2 ;;
+esac
+UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.service"
+
+# The unit's private /tmp would hide one under /tmp.
+WORK=$(mktemp -d "$([ "$MODE" = unit ] && echo /run || echo /tmp)/parallax-it.XXXXXX")
 PIDS=()
+UNITS=()
 CREATED=() # only these are cleaned up: a run that lost a race for a name leaves the winner's alone
 cleanup() {
+    # A second signal (Ctrl-C twice, `timeout` signalling the process group, CI
+    # cancelling) would end bash mid-cleanup and leave the namespaces behind.
+    trap '' INT TERM HUP
     set +e
+    for u in "${UNITS[@]:-}"; do [ -n "$u" ] && systemctl stop "$u" 2>/dev/null; done
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
     # $! above is the backgrounded `inns` subshell, not the server it starts: kill
     # whatever still runs in each namespace, or they outlive the test and keep the
@@ -244,6 +265,8 @@ passphrase_file = "$WORK/backup.passphrase"
 [server.proxy]
 certificates = "$WORK/certs"
 upstream_ca = "$CA"
+[server.logs]
+path = "$WORK/logs.db"
 [[network]]
 name = "home"
 interface = "eth0"
@@ -292,16 +315,87 @@ fi
 grep -q "^FAIL  user namespace" "$WORK/doctor-userns" || fail "doctor did not name the user namespace"
 pass "doctor passes on the gateway and refuses a user namespace"
 
+# As a native install runs it: `nobody` (the test's stand-in for the `parallax`
+# user) in the gateway namespace, with the unit's sandbox and capabilities. Only
+# what names the unit's own install (its user, paths, commands) is left out; the
+# test brings its own.
+if [ "$MODE" = unit ]; then
+    SANDBOX=()
+    while IFS= read -r line; do
+        case ${line%%=*} in
+            User | Group | Exec* | Restart* | StateDirectory* | RuntimeDirectory* | ReadWritePaths) ;;
+            *) SANDBOX+=(-p "$line") ;;
+        esac
+    done < <(sed -n '/^\[Service\]/,/^\[/p' "$UNIT_FILE" | grep -E '^[A-Za-z]+=')
+    printf '%s\n' "${SANDBOX[@]}" | grep -q '^AmbientCapabilities=CAP_NET_ADMIN' \
+        || fail "could not read the sandbox from $UNIT_FILE"
+    AS_UNIT=(systemd-run --quiet --collect -p User=nobody -p "NetworkNamespacePath=/run/netns/${PREFIX}gw"
+        -p "ReadWritePaths=$WORK" "${SANDBOX[@]}")
+    # A first start from nothing: the unit's own ExecStartPre lines, in order,
+    # pointed at a fresh directory.
+    for d in first bad none; do mkdir "$WORK/$d"; done
+    sed "s|^private_key_file = .*|private_key_file = \"$WORK/first/wg-server.key\"|" "$WORK/parallax.toml" \
+        > "$WORK/first/parallax.toml"
+    printf '[server\n' > "$WORK/bad/parallax.toml"
+    chown -R nobody "$WORK"
+    starts=0
+    first_start() { # directory
+        local line
+        while IFS= read -r line; do
+            line=${line#ExecStartPre=}
+            line=${line//\/usr\/bin\/parallax/"$WORK/parallax --db $1/parallax.db --socket $1/parallax.sock"}
+            line=${line//\/etc\/parallax\/parallax.toml/"$1/parallax.toml"}
+            starts=$((starts + 1))
+            "${AS_UNIT[@]}" --unit="${PREFIX}first-$starts" -p Type=exec --wait --pipe /bin/sh -c "$line" || return 1
+        done < <(grep '^ExecStartPre=' "$UNIT_FILE")
+    }
+    first_start "$WORK/first" > "$WORK/first.out" 2>&1 \
+        || { cat "$WORK/first.out"; fail "the unit's first start (import, doctor, keygen) fails as the service"; }
+    grep -q "^imported" "$WORK/first.out" || { cat "$WORK/first.out"; fail "the first start did not import the TOML"; }
+    [ "$(stat -c '%U %a' "$WORK/first/wg-server.key")" = "nobody 600" ] \
+        || fail "the first start's server key is not the service's own, 0600"
+    if first_start "$WORK/bad" > "$WORK/bad.out" 2>&1; then fail "a broken TOML did not stop the first start"; fi
+    grep -q "^imported" "$WORK/bad.out" && fail "a broken TOML was imported"
+    if first_start "$WORK/none" > "$WORK/none.out" 2>&1; then fail "a start with no TOML and no database passed"; fi
+    grep -q "^FAIL  configuration" "$WORK/none.out" \
+        || { cat "$WORK/none.out"; fail "with no TOML, doctor did not say there's no configuration"; }
+    pass "the unit's first start: imports, checks and makes the key as the service; a broken TOML stops it"
+    "${AS_UNIT[@]}" --unit="${PREFIX}doctor" -p Type=exec --wait --pipe \
+        "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" doctor > "$WORK/doctor-unit" 2>&1 \
+        || { cat "$WORK/doctor-unit"; fail "doctor fails as the native service"; }
+    grep -q "^ok    CAP_NET_ADMIN: held, and ambient" "$WORK/doctor-unit" \
+        || { cat "$WORK/doctor-unit"; fail "doctor did not see CAP_NET_ADMIN as ambient"; }
+    pass "doctor passes as the native service: unprivileged, sandboxed, two ambient capabilities"
+fi
+
 # The daemon applies, then serves DNS and the proxy on the tunnel address. Drift
 # checks are hourly here, so the tests below can change live rules on purpose;
 # (n) restarts it with a short interval.
 start_daemon() { # reconcile interval in seconds
-    inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/daemon.pid" \
-        $P daemon -o "$WORK/out" --reconcile-every "$1" >> "$WORK/daemon.log" 2>&1 &
-    PIDS+=($!)
+    local unit="${PREFIX}daemon-${#UNITS[@]}"
+    if [ "$MODE" = unit ]; then
+        UNITS+=("$unit")
+        "${AS_UNIT[@]}" --unit="$unit" -p "StandardOutput=append:$WORK/daemon.log" \
+            -p "StandardError=append:$WORK/daemon.log" \
+            "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" \
+            daemon -o "$WORK/out" --reconcile-every "$1"
+    else
+        inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/daemon.pid" \
+            $P daemon -o "$WORK/out" --reconcile-every "$1" >> "$WORK/daemon.log" 2>&1 &
+        PIDS+=($!)
+    fi
     for _ in $(seq 100); do
-        $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep -q . \
-            && inns gw ss -Hltn 'sport = :8443' | grep -q . && return 0
+        if $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep -q . \
+            && inns gw ss -Hltn 'sport = :8443' | grep -q .; then
+            if [ "$MODE" = unit ]; then
+                # 0 would mean it already exited, and `kill 0` hits this whole test.
+                local pid
+                pid=$(systemctl show -p MainPID --value "$unit")
+                [ "${pid:-0}" -gt 0 ] || fail "the daemon's unit $unit has no main process"
+                echo "$pid" > "$WORK/daemon.pid"
+            fi
+            return 0
+        fi
         sleep 0.1
     done
     fail "parallax daemon did not start"
@@ -692,7 +786,22 @@ kill -0 "$DAEMON" 2>/dev/null && fail "(n) the daemon did not stop on SIGTERM"
 inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) the table outlived the daemon"
 inns gw ip link show wg0 >/dev/null 2>&1 && fail "(n) wg0 outlived the daemon"
 [ -e "$SOCK" ] && fail "(n) the socket outlived the daemon"
-$P validate >/dev/null || fail "(n) without a daemon the CLI opens the database itself"
+if [ "$MODE" = unit ]; then
+    # Root opening the service's database would leave files the service can't open.
+    if $P validate > "$WORK/root.err" 2>&1; then fail "(n) root opened the service's database directly"; fi
+    grep -q "belongs to user 'nobody', and no daemon answers" "$WORK/root.err" \
+        || { cat "$WORK/root.err"; fail "(n) root's refusal doesn't say whose database it is"; }
+    if inns gw timeout 20 $P daemon -o "$WORK/out" > "$WORK/root-daemon.err" 2>&1; then
+        fail "(n) root ran a daemon on the service's database"
+    fi
+    grep -q "a daemon run as root would leave files that user can't open" "$WORK/root-daemon.err" \
+        || { cat "$WORK/root-daemon.err"; fail "(n) root's daemon didn't say why it refused"; }
+    inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) root's refused daemon applied anyway"
+    runuser -u nobody -- "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" validate >/dev/null \
+        || fail "(n) without a daemon the service's user opens the database itself"
+else
+    $P validate >/dev/null || fail "(n) without a daemon the CLI opens the database itself"
+fi
 start_daemon 1
 # wg0 is new: the clients' sessions are gone until they handshake again (up to ~15 s).
 for _ in $(seq 10); do [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] && break; done
@@ -819,5 +928,164 @@ grep -q '^guest  grants=family  .*address=10.8.0.3 ' <<<"$($P peer show guest)" 
 [ "$($P export guest --platform mobile 2>/dev/null | grep -v '^#')" = "$GUEST_CONF" ] \
     || fail "(s) guest's client config changed with its grants"
 pass "(s) grant and peer grants commands change access on return; refused ones change nothing"
+
+# (t) activity logging: off, the firewall has no logging rules; levels set by grant
+# and by peer record what each level covers (guest at `blocked`: its blocked
+# attempts, not its connections; laptop at `detailed`: connections and their bytes),
+# with both destinations, and nothing of anyone else; off again, the rules go.
+inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
+    && fail "(t) logging rules with nobody logged"
+# Byte counts are a host setting; a short TIME_WAIT ends closed TCP flows at once.
+inns gw sysctl -qw net.netfilter.nf_conntrack_acct=1
+inns gw sysctl -qw net.netfilter.nf_conntrack_tcp_timeout_time_wait=1
+feed_up() { # which feed's start to wait for in the daemon's log
+    for _ in $(seq 50); do grep -q "activity logging: reading $1" "$WORK/daemon.log" && return 0; sleep 0.1; done
+    fail "(t) the collector didn't start reading $1"
+}
+# `blocked` alone first: only the blocked attempts feed runs, so the guest's
+# allowed connection is never even marked.
+g log level blocked --grant family
+feed_up "blocked attempts"
+grep -q 'activity logging: reading connections' "$WORK/daemon.log" \
+    && fail "(t) connections are read with only blocked attempts logged"
+[ "$(curl_as $GUEST http://198.18.1.1:9090/)" = gw-self ] || fail "(t) guest -> its gateway service"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) guest reached 8080"
+g log level detailed --peer laptop
+feed_up connections
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(t) laptop -> 8080"
+[ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) friend reached 8080"
+# A flow's end is reported when connection tracking's periodic sweep removes it,
+# some seconds after TIME_WAIT (about 11 s on a 7.2 kernel); wait for it.
+for _ in $(seq 60); do
+    $P log show --peer laptop --kind closed | grep -q . && break
+    sleep 1
+done
+LOGS=$($P log show --limit 1000)
+echo "$LOGS" | grep -q '  guest  blocked  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's blocked attempt, with both destinations"; }
+echo "$LOGS" | grep -q '  guest  \(opened\|closed\)  ' \
+    && { echo "$LOGS"; fail "(t) guest's connections recorded at blocked"; }
+echo "$LOGS" | grep -q '  laptop  opened  tcp 198.18.1.5:8080 (192.168.1.5, home)' \
+    || { echo "$LOGS"; fail "(t) laptop's connection"; }
+echo "$LOGS" | grep -q '  laptop  closed  tcp 198.18.1.5:8080 (192.168.1.5, home)  [0-9.]* [KMG]*i*B out, [0-9.]* [KMG]*i*B in' \
+    || { echo "$LOGS"; fail "(t) laptop's bytes when the flow ended"; }
+echo "$LOGS" | grep -q '  friend  ' && { echo "$LOGS"; fail "(t) friend is logged at off"; }
+[ "$($P log show --peer guest --kind blocked | wc -l)" -ge 1 ] || fail "(t) log show --peer --kind"
+g log level inherit --grant family
+g log level inherit --peer laptop
+inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
+    && fail "(t) logging rules left after everyone went back to off"
+# The records stay readable with logging off.
+[ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
+pass "(t) each level records what it covers (blocked attempts; connections and bytes) with both destinations; nobody else's; off removes the rules"
+
+# (u) Tailscale peers follow Headscale: a real Headscale and a node logged in to it
+# (userspace tailscaled) in the gateway's namespace. The daemon puts the node's
+# address in its peer's tier set within a poll, keeps it while Headscale is down,
+# and drops it once the node is deleted. Needs HEADSCALE, TAILSCALED and TAILSCALE
+# (tests/integration/headscale-binaries.sh builds them); skipped without.
+if [ -n "${HEADSCALE:-}" ] && [ -n "${TAILSCALED:-}" ] && [ -n "${TAILSCALE:-}" ]; then
+    HS="$WORK/hs"
+    mkdir -p "$HS/ts"
+    # No internet here: one offline DERP region, so Headscale starts.
+    cat > "$HS/derp.yaml" <<YAML
+regions:
+  900:
+    regionid: 900
+    regioncode: test
+    regionname: Offline test region
+    nodes:
+      - name: 900a
+        regionid: 900
+        hostname: 127.0.0.1
+YAML
+    cat > "$HS/config.yaml" <<YAML
+server_url: http://127.0.0.1:18080
+listen_addr: 127.0.0.1:18080
+metrics_listen_addr: ""
+unix_socket: $HS/headscale.sock
+noise:
+  private_key_path: $HS/noise.key
+database:
+  sqlite:
+    path: $HS/db.sqlite
+derp:
+  urls: []
+  paths: [$HS/derp.yaml]
+log:
+  level: warn
+YAML
+    start_headscale() {
+        # Its own pid, not the backgrounded subshell's, so (u) can stop it.
+        inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$HS/headscale.pid" \
+            "$HEADSCALE" serve -c "$HS/config.yaml" >> "$HS/headscale.log" 2>&1 &
+        PIDS+=($!)
+        for _ in $(seq 100); do
+            inns gw curl -sf -m 1 http://127.0.0.1:18080/version >/dev/null && return 0
+            sleep 0.1
+        done
+        cat "$HS/headscale.log"; fail "(u) Headscale did not start"
+    }
+    start_headscale
+    HS_KEY=$(inns gw "$HEADSCALE" -c "$HS/config.yaml" apikeys create 2>/dev/null | tail -n1)
+    hs_api() { # method, path, [JSON body]
+        inns gw curl -sf -m 5 -X "$1" -H "Authorization: Bearer $HS_KEY" \
+            -H 'Content-Type: application/json' ${3:+-d "$3"} "http://127.0.0.1:18080$2"
+    }
+    HS_USER=$(hs_api POST /api/v1/user '{"name":"family"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["user"]["id"])')
+    AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"2099-01-01T00:00:00Z\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
+    inns gw "$TAILSCALED" --tun=userspace-networking --state=mem: --socket="$HS/ts/sock" \
+        --statedir="$HS/ts" --port=0 >> "$HS/tailscaled.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 50); do [ -S "$HS/ts/sock" ] && break; sleep 0.1; done
+    inns gw timeout 30 "$TAILSCALE" --socket="$HS/ts/sock" up --login-server=http://127.0.0.1:18080 \
+        --authkey="$AUTH" --hostname=tablet >/dev/null 2>&1 || { tail -20 "$HS/tailscaled.log"; fail "(u) the node did not log in"; }
+    read -r NODE NODE_IP < <(hs_api GET /api/v1/node | python3 -c '
+import json, sys
+n = json.load(sys.stdin)["nodes"][0]
+print(n["id"], next(a for a in n["ipAddresses"] if "." in a))')
+    install -m 0600 /dev/null "$WORK/headscale-api.key"
+    echo "$HS_KEY" > "$WORK/headscale-api.key"
+    [ "$MODE" = unit ] && chown nobody "$WORK/headscale-api.key"
+    $P config export > "$WORK/current.toml"
+    python3 - "$WORK/current.toml" "$WORK/tailscale.toml" "$WORK/headscale-api.key" "$NODE" <<'PY'
+import re, sys
+src, dst, key, node = sys.argv[1:]
+s = open(src).read()
+s = re.sub(r'(?m)^server_url = ".*"$', 'server_url = "http://127.0.0.1:18080"', s, count=1)
+s = re.sub(r'(?m)^api_key_file = ".*"$', f'api_key_file = "{key}"', s, count=1)
+s += f'\n[[peer]]\nname = "tablet"\ngrants = ["family"]\ntransport = "tailscale"\n[peer.tailscale]\nnode_id = {node}\n'
+open(dst, "w").write(s)
+PY
+    grep -q '^server_url = "http://127.0.0.1:18080"$' "$WORK/tailscale.toml" || fail "(u) could not point the configuration at Headscale"
+    # Not grep -q: it stops reading at the match, and with pipefail nft's SIGPIPE
+    # would fail the pipeline exactly when the address is there.
+    in_set() { inns gw nft list table inet parallax | grep "elements = {[^}]*\b$NODE_IP\b" >/dev/null; }
+    wait_set() { # want: in | out
+        for _ in $(seq 30); do
+            if in_set; then [ "$1" = in ] && return 0; else [ "$1" = out ] && return 0; fi
+            sleep 0.5
+        done
+        return 1
+    }
+    apply "$WORK/tailscale.toml"
+    wait_set in || { inns gw nft list table inet parallax | grep -A5 'set ts_'; fail "(u) the node's address $NODE_IP never reached the firewall"; }
+    inns gw $P headscale status | grep "^node $NODE tablet: user family, $NODE_IP, online; peer tablet$" >/dev/null \
+        || { inns gw $P headscale status; fail "(u) headscale status did not show the node as tablet"; }
+    $P status | grep "^Headscale node $NODE: $NODE_IP$" >/dev/null || { $P status; fail "(u) the daemon's status lacks the node"; }
+    HS_PID=$(cat "$HS/headscale.pid")
+    kill "$HS_PID"
+    for _ in $(seq 50); do kill -0 "$HS_PID" 2>/dev/null || break; sleep 0.1; done
+    sleep 12
+    in_set || fail "(u) the node lost its access while Headscale was down"
+    grep -q "keeping the addresses it gave last" "$WORK/daemon.log" || fail "(u) Headscale being down was not logged"
+    start_headscale
+    hs_api DELETE "/api/v1/node/$NODE" >/dev/null || fail "(u) could not delete the node"
+    wait_set out || fail "(u) a deleted node kept its peer's access"
+    pass "(u) a Tailscale peer gets its node's address from Headscale, keeps it while Headscale is down, loses it with the node"
+else
+    echo "SKIP: (u) Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
+fi
 
 echo "ALL PASS"

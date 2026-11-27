@@ -15,6 +15,7 @@ crates/parallax-core/           pure library, no I/O of its own
                                 template-era TOML
   src/tier.rs                   peers with the same grants form a tier
   src/grants.rs                 changing grants and who has them (CLI, later GUI)
+  src/headscale.rs              Headscale's users and nodes, read through its API (ADR 0014)
   src/secret.rs                 PublicKey / PrivateKey / PresharedKey / Secret (Debug-redacted)
   src/date.rs                   dependency-free civil date for peer expiry
   src/netmap.rs                 Mapping: 1:1 prefix translation (+ property test)
@@ -41,8 +42,12 @@ crates/parallax-cli/            `parallax` binary (daemon, status, validate, pla
                                 src/daemon.rs and src/protocol.rs: the daemon and
                                 its socket protocol
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)
+packaging/                      the native install (ADR 0013, docs/native.md): the
+                                systemd unit, sysusers.d, tmpfiles.d, modules-load.d,
+                                sysctl.d, nfpm.yaml (the .deb and Arch package)
 example/parallax.toml           fully commented canonical scenario
-tests/integration/netns.sh      Linux network-namespace integration test (CI)
+tests/integration/netns.sh      Linux network-namespace integration test (CI), with
+                                the daemon as root or as the native unit
 docs/adr/                       decisions
 ```
 
@@ -64,6 +69,7 @@ pub struct ServerConfig {
                                       // subnet_router_node, dns (tailnet-wide)
     pub dns: DnsServer,               // listen (default: WG gateway addr), port, public_resolver
     pub firewall: FirewallServer,     // backend (nftables | iptables-nft), docker_coexistence
+    pub logs: LogsServer,             // level, path, keep, max_size (docs/logging.md)
     pub wan_interface: Option<String>,
 }
 
@@ -86,6 +92,7 @@ pub enum Host { Ip(Ipv4Addr), Name(String) }   // TOML: a string either way
 pub struct Grant {
     pub name: String,
     pub everyone: bool,                 // every peer has it, unattached
+    pub log: Option<LogLevel>,          // sets its peers' log level (docs/logging.md)
     pub rules: Vec<Rule>,
 }
 
@@ -97,6 +104,7 @@ pub enum AllowedIpsStrategy { MappedSubnets, GrantsOnly, FullTunnel }
 pub struct Peer {
     pub name: String,
     pub grants: Vec<String>,             // besides every `everyone` grant
+    pub log: Option<LogLevel>,           // its own log level, over its grants'
     pub transport: TransportKind,        // WireGuard | Tailscale (a device fact)
     pub enabled: bool,
     pub expires: Option<Date>,
@@ -119,6 +127,24 @@ grants changes neither the address nor its client config (except
 `server.wireguard.peer_defaults` when it's added. Files written with
 `[[template]]` still import (`model/legacy.rs`), each template becoming a
 grant of its name.
+
+Activity logging (`logging.rs`, docs/logging.md) is per peer, not per tier:
+a peer's own `log` wins, then the most detailed `log` among its grants, then
+`server.logs.level`. The firewall keeps two address sets, `log_flows` and
+`log_denied`, marks the new flows of the first (connection mark bit
+`0x20000000`) and hands the blocked attempts of the second to nflog group
+20568, rate-limited, before each drop they can reach (a tier's default deny,
+the unknown-source drop, the gateway host's). With nobody logged none of it
+is generated: the canonical goldens have no logging rule or set.
+
+The daemon's collector (`daemon/collector.rs`, ADR 0012) reads connection
+tracking's events and that nflog group from netlink sockets, only while some
+peer needs them. `netlink.rs` parses the bytes into events,
+`logging::attribute` turns each into a record (peer and grant names as they
+are now, the destination as addressed and as real), and each feed commits
+its batches to `logs.db` (`parallax_store::logs`) with `BEGIN CONCURRENT`.
+The daemon purges by age and size every 10 minutes and answers `parallax log
+show` from the same database.
 
 Ports are lists, written the way ufw writes them: `445/tcp`, `137-138/udp`,
 or a bare `25565` for TCP and UDP. A service is a named host and its ports
@@ -176,10 +202,10 @@ pub fn all() -> Vec<Box<dyn Transport>>   // always [WireGuard, Tailscale]
 The shared generators (`firewall`, `dns`, `proxy`, `nginx`) iterate `transport::all()`
 and only use the methods above `provision`. That is why the M1 nftables table
 already has its final shape: NETMAP matches `{ "wg0", "tailscale0" }`, every
-tier has a member set per transport (`wg_<key>`, and `ts_<key>`, empty
-until M2 syncs it; the key is a hash of the tier's grants, so a set name
-never changes meaning between applies), and both transports end with a
-catch-all deny.
+tier has a member set per transport (`wg_<key>`, and `ts_<key>`, the
+addresses Headscale gave the tier's Tailscale peers' nodes, ADR 0014; the key
+is a hash of the tier's grants, so a set name never changes meaning between
+applies), and both transports end with a catch-all deny.
 `TailscaleTransport` implements those today and returns `NotImplemented` for
 provision/export.
 
@@ -207,8 +233,8 @@ measures this). So each tier's FORWARD rules live in their own chain
 several grants, which the rules' comments name), and FORWARD picks the
 chain with one verdict-map lookup on the peer's source address:
 `iifname "wg0" ip saddr vmap { 10.8.1.1 : jump tier_0, 10.8.2.1 : jump tier_1, ... }`.
-Tailscale tiers are sets of node addresses that M2 keeps in sync without a
-new ruleset, so they get one `jump` rule per tier. INPUT and the proxy
+Tailscale tiers are sets of node addresses, so they get one `jump` rule per
+tier. INPUT and the proxy
 redirect match a tier's member set, one rule per tier. The `iptables-nft`
 backend has no verdict maps: it jumps to numbered chains (`PARALLAX_T<n>`)
 with one rule per peer address.
@@ -406,6 +432,10 @@ clients/<peer>/<platform>.conf     only for peers that retain their private key 
 
 `iptables-nft` backend writes `iptables/parallax.rules` (iptables-restore
 format, PARALLAX_* chains) and `iptables/docker-user.rules` instead.
+Its sets live in the host's one ipset namespace, so apply removes only
+stale sets named as Parallax names them (`wg_` or `ts_` and a 16-digit hex
+tier key, `log_flows`, `log_denied`) and leaves every other set alone. Builds before named grants made
+empty `ts_<template>` sets; those stay until removed with `ipset destroy`.
 
 ## Apply order and idempotency
 
@@ -424,8 +454,10 @@ memory and keeps the gateway applied: at startup, after every saved change,
 on SIGHUP, when the UTC date changes, and when the live table or WireGuard
 interface differs from the listing taken after the last apply (checked every
 60 s). A failed apply is retried every tick. It serves DNS and the proxy,
-runs automatic backups, and listens on `/run/parallax/parallax.sock` for the
-CLI: one JSON request and one JSON reply per connection, `protocol: 2`. Saves
+runs automatic backups and the activity collector, and listens on
+`/run/parallax/parallax.sock` for the CLI: one JSON request and one JSON
+reply per connection, with a `protocol` number both sides must match
+(`PROTOCOL` in `protocol.rs`). Saves
 carry the revision they were based on; an older one is refused and the CLI
 retries against the latest. With no daemon answering, the CLI opens the
 database itself. SIGTERM deletes the table and the interface.
@@ -447,3 +479,14 @@ name whose lookup fails or is refused grants nothing until it resolves
 again, and answers aren't stored. A save that adds a name looks
 it up first and is refused if it doesn't resolve to addresses inside the
 configured networks.
+
+When a Tailscale peer names a Headscale node (`peer.tailscale.node_id`), the
+daemon asks Headscale's admin API for its nodes (ADR 0014): before the
+first apply, every 10 seconds and when a saved change alters where Headscale
+is. The addresses are an input to generation (`Model::with_tailnet`), and a
+change applies again. Such a peer has only its node's address: none before
+Headscale first answers or once the node is gone. When Headscale stops
+answering, the last answer stays. The
+logic is `parallax_core::headscale`, behind the `HeadscaleApi` trait in
+`io.rs`; the real client is `parallax-cli`'s `headscale.rs`, and Headscale
+itself is built from a pinned commit (`docker/headscale.Dockerfile`).

@@ -1,0 +1,78 @@
+# The .deb and the Arch package, from one config (nfpm, run by CI:
+# .github/workflows/ci.yml). From the repository root:
+#   ARCH=amd64 VERSION=0.1.0 BINARY=path/to/parallax nfpm package -f packaging/nfpm.yaml -p deb
+# ARCH is amd64 or arm64; nfpm names it per format (x86_64, aarch64 on Arch).
+# BINARY is the static musl build. docs/native.md covers what gets installed.
+name: parallax
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: "1"
+section: net
+priority: optional
+maintainer: Parallax maintainers <https://github.com/ninbura/Parallax/issues>
+description: |
+  WireGuard gateway with subnet remapping, DNS rewriting and named grants.
+  Runs as the unprivileged `parallax` user with CAP_NET_ADMIN and
+  CAP_NET_BIND_SERVICE under a sandboxed systemd unit.
+homepage: https://github.com/ninbura/Parallax
+license: MIT OR Apache-2.0
+
+# What the daemon runs (`nft`, `wg`, `ip`); systemd for the unit, sysusers
+# and tmpfiles. iptables and ipset only for `backend = "iptables-nft"`.
+depends:
+  - systemd
+  - nftables
+  - wireguard-tools
+  - iproute2
+suggests:
+  - iptables
+  - ipset
+
+contents:
+  - src: ${BINARY}
+    expand: true
+    dst: /usr/bin/parallax
+    file_info:
+      mode: 0755
+  - src: packaging/systemd/parallax.service
+    dst: /usr/lib/systemd/system/parallax.service
+    file_info:
+      mode: 0644
+  - src: packaging/sysusers.d/parallax.conf
+    dst: /usr/lib/sysusers.d/parallax.conf
+    file_info:
+      mode: 0644
+  - src: packaging/tmpfiles.d/parallax.conf
+    dst: /usr/lib/tmpfiles.d/parallax.conf
+    file_info:
+      mode: 0644
+  - src: packaging/modules-load.d/parallax.conf
+    dst: /usr/lib/modules-load.d/parallax.conf
+    file_info:
+      mode: 0644
+  - src: packaging/sysctl.d/90-parallax.conf
+    dst: /usr/lib/sysctl.d/90-parallax.conf
+    file_info:
+      mode: 0644
+  - src: example/parallax.toml
+    dst: /usr/share/doc/parallax/parallax.toml.example
+    file_info:
+      mode: 0644
+
+archlinux:
+  packager: Parallax maintainers <https://github.com/ninbura/Parallax/issues>
+
+# Arch's systemd pacman hooks create the user and /etc/parallax, set the
+# sysctl, load the module and reload systemd, so Arch's scripts only print
+# the next step and stop the service on removal. dpkg has no such hooks, so
+# the .deb's scripts do all of it.
+scripts:
+  postinstall: packaging/scripts/arch-post-install.sh
+  preremove: packaging/scripts/arch-pre-remove.sh
+overrides:
+  deb:
+    scripts:
+      postinstall: packaging/scripts/deb-postinst.sh
+      preremove: packaging/scripts/deb-prerm.sh
+      postremove: packaging/scripts/deb-postrm.sh

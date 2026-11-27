@@ -3,7 +3,8 @@
 //! that speaks another version is refused, naming both.
 //!
 //! Secrets cross the socket (private keys in the configuration, a backup
-//! passphrase). It is root-only (0600 in a 0700 directory), the types keep
+//! passphrase). It is owner-only (0600 in a 0700 directory: the daemon's user,
+//! root in Docker or `parallax` natively; root reaches it either way), the types keep
 //! their redacted `Debug`, and nothing logs a message.
 
 use std::io::BufRead;
@@ -11,16 +12,21 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+use parallax_core::headscale::Tailnet;
+use parallax_core::logging::Record;
 use parallax_core::names::Resolved;
 use parallax_core::secret::Secret;
 use parallax_core::Config;
+use parallax_store::logs::Query;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The version this build speaks. 2: replies carry the home's public IP.
 /// 3: and what hosts named by DNS name resolved to. 4: services and host
-/// grants carry port lists.
-pub const PROTOCOL: u64 = 4;
+/// grants carry port lists. 5: the configuration carries log levels.
+/// 6: activity records (`logs`). 7: replies carry the addresses Headscale
+/// gave its nodes.
+pub const PROTOCOL: u64 = 7;
 /// The largest message either side accepts, newline included.
 pub const MAX_MESSAGE: usize = 16 << 20;
 
@@ -50,6 +56,8 @@ pub enum Request {
         revision: u64,
         contents_sha256: String,
     },
+    /// Activity records (`parallax log show`).
+    Logs { query: Query },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,14 +72,21 @@ pub enum Reply {
         public_ip: Option<Ipv4Addr>,
         /// What each host named by DNS name last resolved to.
         names: Resolved,
+        /// The addresses Headscale last gave its nodes; `None` before it
+        /// first answered.
+        #[serde(with = "node_list")]
+        tailnet: Option<Tailnet>,
     },
     Configuration {
         configuration: Box<Config>,
         revision: u64,
         /// What generation also needs: the home's public IP as a lookup
-        /// last found it, and what named hosts resolved to.
+        /// last found it, what named hosts resolved to, and the addresses
+        /// Headscale gave its nodes.
         public_ip: Option<Ipv4Addr>,
         names: Resolved,
+        #[serde(with = "node_list")]
+        tailnet: Option<Tailnet>,
     },
     /// A change was saved (or nothing was asked to change), then applied.
     /// `error` says why the apply failed; the change stays saved either way.
@@ -84,8 +99,33 @@ pub enum Reply {
     Conflict { revision: u64 },
     /// Output of a request that changes no configuration.
     Done { lines: Vec<String> },
+    /// Activity records, oldest first, each with its id.
+    Logs { records: Vec<(i64, Record)> },
     /// The request was refused; nothing changed.
     Error { message: String },
+}
+
+/// Node ids to addresses, as a list of pairs: a map's number keys become
+/// strings in JSON, which a tagged reply can't turn back into numbers.
+mod node_list {
+    use std::net::Ipv4Addr;
+
+    use parallax_core::headscale::Tailnet;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(tailnet: &Option<Tailnet>, s: S) -> Result<S::Ok, S::Error> {
+        tailnet
+            .as_ref()
+            .map(|t| t.iter().map(|(id, a)| (*id, *a)).collect::<Vec<_>>())
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Tailnet>, D::Error> {
+        Ok(
+            Option::<Vec<(u64, Ipv4Addr)>>::deserialize(d)?
+                .map(|pairs| pairs.into_iter().collect()),
+        )
+    }
 }
 
 /// One message as a line: the JSON object with `protocol` added.
@@ -196,7 +236,12 @@ mod tests {
 
     #[test]
     fn a_configuration_survives_the_socket() {
-        let config = canonical_config();
+        let mut config = canonical_config();
+        // Every kind of log level: the socket reads peers through the same
+        // form as TOML.
+        config.server.logs.level = parallax_core::model::LogLevel::Connections;
+        config.grants[1].log = Some(parallax_core::model::LogLevel::Blocked);
+        config.peers[0].log = Some(parallax_core::model::LogLevel::Off);
         let Request::Save {
             configuration,
             revision,
@@ -214,16 +259,19 @@ mod tests {
             vec![Ipv4Addr::new(192, 168, 1, 9)],
         )]
         .into();
+        let nodes: Tailnet = [(1, Ipv4Addr::new(100, 64, 0, 1))].into();
         let Reply::Configuration {
             configuration,
             public_ip,
             names,
+            tailnet,
             ..
         } = round_trip(&Reply::Configuration {
             configuration: Box::new(config.clone()),
             revision: 1,
             public_ip: Some(Ipv4Addr::new(1, 2, 3, 4)),
             names: found.clone(),
+            tailnet: Some(nodes.clone()),
         })
         else {
             panic!("not a configuration");
@@ -231,6 +279,7 @@ mod tests {
         assert_eq!(*configuration, config);
         assert_eq!(public_ip, Some(Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(names, found);
+        assert_eq!(tailnet, Some(nodes));
     }
 
     #[test]
@@ -239,7 +288,7 @@ mod tests {
         let text = String::from_utf8(line).unwrap();
         assert_eq!(
             text,
-            "{\"if_due\":true,\"protocol\":4,\"request\":\"backup_create\"}\n"
+            format!("{{\"if_due\":true,\"protocol\":{PROTOCOL},\"request\":\"backup_create\"}}\n")
         );
         let Request::BackupRestore { passphrase, .. } = round_trip(&Request::BackupRestore {
             path: "/b.tar".into(),
@@ -269,15 +318,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("protocol 4") && e.contains("other side 1"),
+            e.contains(&format!("protocol {PROTOCOL}")) && e.contains("other side 1"),
             "{e}"
         );
         let e = decode::<Request>(b"{\"request\":\"status\"}").unwrap_err();
         assert!(e.to_string().contains("no protocol"), "{e}");
-        let e = decode::<Request>(
-            b"{\"protocol\":4,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
-        )
-        .unwrap_err();
+        let line = format!(
+            "{{\"protocol\":{PROTOCOL},\"request\":\"backup_create\",\"if_due\":true,\"x\":1}}"
+        );
+        let e = decode::<Request>(line.as_bytes()).unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
     }
 

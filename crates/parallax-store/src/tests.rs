@@ -66,6 +66,12 @@ pub(crate) fn everything_config() -> Config {
         // Not in declaration order: the order is the try order.
         encrypted_dns: vec![EncryptedDns::Cloudflare, EncryptedDns::Quad9],
     };
+    c.server.logs = LogsServer {
+        level: LogLevel::Connections,
+        path: "/mnt/ssd/parallax-logs.db".into(),
+        keep: "7d".parse().unwrap(),
+        max_size: "256MiB".parse().unwrap(),
+    };
     c.networks.push(Network {
         name: "lab".into(),
         interface: "eth1".into(),
@@ -114,6 +120,7 @@ pub(crate) fn everything_config() -> Config {
     c.grants.push(Grant {
         name: "public".into(),
         everyone: true,
+        log: Some(LogLevel::Blocked),
         rules: Vec::new(),
     });
     let wg = c.peers[0].wireguard.as_mut().unwrap();
@@ -126,6 +133,7 @@ pub(crate) fn everything_config() -> Config {
     c.peers.push(Peer {
         name: "tv".into(),
         grants: vec!["family".into()],
+        log: Some(LogLevel::Off),
         transport: TransportKind::Tailscale,
         enabled: false,
         expires: Some(today()),
@@ -135,6 +143,7 @@ pub(crate) fn everything_config() -> Config {
     c.peers.push(Peer {
         name: "tablet".into(),
         grants: Vec::new(),
+        log: None,
         transport: TransportKind::Tailscale,
         enabled: true,
         expires: None,
@@ -729,6 +738,7 @@ async fn templates_become_grants_with_the_same_access() {
     expected.peers.push(Peer {
         name: "tv".into(),
         grants: vec!["personal".into()],
+        log: None,
         transport: TransportKind::Tailscale,
         enabled: true,
         expires: None,
@@ -742,6 +752,7 @@ async fn templates_become_grants_with_the_same_access() {
     expected.grants.push(Grant {
         name: "spare".into(),
         everyone: false,
+        log: None,
         rules: vec![
             Rule::Host {
                 host: Ipv4Addr::new(192, 168, 1, 9).into(),

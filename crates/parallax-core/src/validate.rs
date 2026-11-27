@@ -10,6 +10,7 @@ use std::net::Ipv4Addr;
 use ipnet::Ipv4Net;
 
 use crate::date::Date;
+use crate::headscale::Tailnet;
 use crate::model::*;
 use crate::names::{self, in_zone, Resolved};
 use crate::netmap::Mapping;
@@ -18,13 +19,15 @@ use crate::{Error, Result, TAILSCALE_CGNAT};
 
 /// A validated configuration plus what generation needs from outside it:
 /// the evaluation date (for peer expiry), the home's public IP (for the
-/// guest hairpin drop) and what hosts named by DNS name resolved to.
+/// guest hairpin drop), what hosts named by DNS name resolved to, and the
+/// addresses Headscale gave Tailscale nodes.
 #[derive(Debug, Clone)]
 pub struct Model<'a> {
     config: &'a Config,
     today: Date,
     public_ip: Option<Ipv4Addr>,
     names: Resolved,
+    tailnet: Option<Tailnet>,
     tiers: Vec<Tier<'a>>,
     warnings: Vec<String>,
 }
@@ -221,6 +224,7 @@ impl<'a> Model<'a> {
                 today,
                 public_ip: None,
                 names: Resolved::new(),
+                tailnet: None,
                 tiers: tier::tiers(config),
                 warnings,
             })
@@ -254,6 +258,19 @@ impl<'a> Model<'a> {
 
     pub fn names(&self) -> &Resolved {
         &self.names
+    }
+
+    /// The addresses Headscale gave its nodes ([`crate::headscale`]). A
+    /// Tailscale peer that names a node has that node's address, and none
+    /// while Headscale hasn't answered (`None`) or doesn't know the node.
+    /// One that names no node keeps its configured address.
+    pub fn with_tailnet(mut self, tailnet: Option<Tailnet>) -> Self {
+        self.tailnet = tailnet;
+        self
+    }
+
+    pub fn tailnet(&self) -> Option<&Tailnet> {
+        self.tailnet.as_ref()
     }
 
     /// Hosts named by DNS name that grant nothing right now, and why.
@@ -701,6 +718,20 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         }
     }
 
+    let logs = &server.logs;
+    if !logs.path.is_absolute() || logs.path.file_name().is_none() {
+        errors.push(format!(
+            "server.logs.path '{}' must be an absolute path to a file",
+            logs.path.display()
+        ));
+    }
+    if logs.max_size.as_bytes() < 1024 * 1024 {
+        errors.push(format!(
+            "server.logs.max_size {} is too small to hold any records; use at least 1MiB",
+            logs.max_size
+        ));
+    }
+
     let public_ip = &server.public_ip;
     if let Some(address) = public_ip.address {
         if !crate::public_ip::is_public(address) {
@@ -929,6 +960,13 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         if !valid_ident(&g.name) {
             errors.push(format!("{ctx}: name must be a plain identifier"));
         }
+        // nginx snippets: a grant's is parallax-<grant>.conf, a service's
+        // parallax-service-<service>.conf, so these would collide.
+        if g.name.starts_with("service-") {
+            errors.push(format!(
+                "{ctx}: names starting with 'service-' are taken by services' nginx snippets (parallax-service-<service>.conf); pick another"
+            ));
+        }
         if !seen_grants.insert(&g.name) {
             errors.push(format!("{ctx}: duplicate name"));
         }
@@ -1012,6 +1050,7 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
     let mut split_dns: Vec<&str> = Vec::new();
     let mut addresses: BTreeMap<Ipv4Addr, &str> = BTreeMap::new();
     let mut pubkeys: BTreeMap<String, &str> = BTreeMap::new();
+    let mut nodes: BTreeMap<u64, &str> = BTreeMap::new();
     for p in &config.peers {
         let ctx = format!("peer '{}'", p.name);
         if !valid_ident(&p.name) {
@@ -1115,10 +1154,24 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                         "{ctx}: transport is tailscale but a [peer.wireguard] block is present"
                     ));
                 }
+                // One device, one set of grants: the node's address can't
+                // be in two tiers.
+                if let Some(id) = p.tailscale.as_ref().and_then(|t| t.node_id) {
+                    if let Some(other) = nodes.insert(id, &p.name) {
+                        errors.push(format!(
+                            "{ctx}: Headscale node {id} is already peer '{other}'"
+                        ));
+                    }
+                }
                 if let Some(addr) = p.tailscale.as_ref().and_then(|t| t.address) {
                     if !TAILSCALE_CGNAT.contains(&addr) {
                         errors.push(format!(
                             "{ctx}: tailscale address {addr} is outside {TAILSCALE_CGNAT}"
+                        ));
+                    }
+                    if let Some(other) = addresses.insert(addr, &p.name) {
+                        errors.push(format!(
+                            "{ctx}: address {addr} is already used by peer '{other}'"
                         ));
                     }
                 }
@@ -1150,6 +1203,28 @@ mod tests {
         let cfg = canonical_config();
         let (errors, _) = check(&cfg);
         assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn a_node_is_one_peer() {
+        let e = errors_of(|c| {
+            for name in ["tablet", "tv"] {
+                let mut p = c.peers[0].clone();
+                p.name = name.into();
+                p.transport = TransportKind::Tailscale;
+                p.wireguard = None;
+                p.tailscale = Some(TailscalePeer {
+                    node_id: Some(3),
+                    address: None,
+                });
+                c.peers.push(p);
+            }
+        });
+        assert!(
+            e.iter()
+                .any(|e| e.ends_with("'tv': Headscale node 3 is already peer 'tablet'")),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -1195,6 +1270,18 @@ mod tests {
         );
         let e = errors_of(|c| c.server.backup.passphrase_file = "pass".into());
         assert!(has(&e, "server.backup.passphrase_file pass"), "{e:?}");
+        for bad in ["", "logs.db", "/"] {
+            let e = errors_of(|c| c.server.logs.path = bad.into());
+            assert!(
+                has(
+                    &e,
+                    &format!("server.logs.path '{bad}' must be an absolute path")
+                ),
+                "{e:?}"
+            );
+        }
+        let e = errors_of(|c| c.server.logs.max_size = "512KiB".parse().unwrap());
+        assert!(has(&e, "server.logs.max_size 512KiB is too small"), "{e:?}");
     }
 
     #[test]
@@ -1276,6 +1363,15 @@ mod tests {
         );
         let e = errors_of(|c| c.grants[1].name = "personal".into());
         assert!(has(&e, "grant 'personal': duplicate name"), "{e:?}");
+        // Issue #32: it would share service immich's nginx snippet.
+        let e = errors_of(|c| c.grants[1].name = "service-immich".into());
+        assert!(
+            has(
+                &e,
+                "grant 'service-immich': names starting with 'service-' are taken"
+            ),
+            "{e:?}"
+        );
         let e = errors_of(|c| {
             c.grants[0].rules = vec![Rule::Host {
                 host: "10.99.0.1".parse().unwrap(),
@@ -1291,6 +1387,7 @@ mod tests {
         cfg.grants.push(Grant {
             name: "public".into(),
             everyone: true,
+            log: None,
             rules: vec![Rule::PublicDns],
         });
         let (errors, warnings) = check(&cfg);

@@ -194,15 +194,24 @@ fn apply_firewall(
                 sys.runner
                     .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
             }
-            // Sets of tiers that no longer exist: no rule uses them since the
-            // restore. Prefixed as the transports name them (and as builds
-            // before grants did: `ts_<template>`).
+            // Sets of tiers that no longer exist, and the logging sets once
+            // nobody is logged: no rule uses them since the restore. The rules are in by now, so a failure here is only a
+            // leftover set: say so and carry on to the hooks.
             let live = sys.runner.run("ipset", &["list", "-n"], None)?;
-            for name in live.stdout.lines().map(str::trim).filter(|n| {
-                (n.starts_with("wg_") || n.starts_with("ts_"))
-                    && !rs.sets.iter().any(|s| s.name == *n)
-            }) {
-                sys.runner.run("ipset", &["destroy", name], None)?;
+            if !live.ok() {
+                log.push(format!(
+                    "firewall: couldn't list ipsets, stale sets stay: {}",
+                    live.stderr.trim()
+                ));
+            }
+            for name in stale_sets(&live.stdout, &rs.sets) {
+                let destroy = sys.runner.run("ipset", &["destroy", name], None)?;
+                if !destroy.ok() {
+                    log.push(format!(
+                        "firewall: stale set {name} stays: {}",
+                        destroy.stderr.trim()
+                    ));
+                }
             }
             for (table, builtin, own) in CHAINS {
                 let present = sys
@@ -254,19 +263,73 @@ fn apply_firewall(
     Ok(())
 }
 
+/// Sets in an `ipset list -n` listing that Parallax made and the new ruleset
+/// no longer has: a transport's prefix and a tier key, as
+/// [`Transport::set_name`] names them, and the two logging sets. Anything
+/// else listed is someone else's. That includes the `ts_<template>` sets of builds before grants:
+/// they were always empty (no Tailscale peers before M2), and a name built
+/// from a grant could be an operator's own set.
+///
+/// [`Transport::set_name`]: crate::transport::Transport::set_name
+fn stale_sets<'a>(
+    listing: &'a str,
+    keep: &[crate::generate::firewall::AddressSet],
+) -> Vec<&'a str> {
+    let prefixes: Vec<&str> = crate::transport::all()
+        .iter()
+        .map(|t| t.set_prefix())
+        .collect();
+    let tier_key =
+        |key: &str| key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let logging = [
+        crate::generate::firewall::LOG_FLOWS_SET,
+        crate::generate::firewall::LOG_DENIED_SET,
+    ];
+    let ours = |name: &str| {
+        logging.contains(&name)
+            || prefixes.iter().any(|p| {
+                name.strip_prefix(p)
+                    .and_then(|rest| rest.strip_prefix('_'))
+                    .is_some_and(tier_key)
+            })
+    };
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|n| ours(n) && !keep.iter().any(|s| s.name == *n))
+        .collect()
+}
+
 /// Before the firewall changes: take a live WireGuard peer off the
 /// interface when it holds an address the new configuration gives another
 /// key. An address says nothing about access, so the new firewall may give
 /// it someone else's grants; the old key must not hold it meanwhile, nor if
 /// a later step fails. Every other difference is left to `wg syncconf`, so
 /// unchanged peers keep their sessions. No interface yet: nothing to do.
+/// An interface whose peers can't be read stops the apply here, before the
+/// firewall changes: carrying on would skip the hand-over.
 fn drop_moved_peers(model: &Model<'_>, sys: System<'_>, log: &mut Vec<String>) -> Result<()> {
     let iface = model.server().wireguard.interface.as_str();
     let live = sys
         .runner
         .run("wg", &["show", iface, "allowed-ips"], None)?;
     if !live.ok() {
-        return Ok(());
+        let link = sys
+            .runner
+            .run("ip", &["link", "show", "dev", iface], None)?;
+        // Only `ip` saying so means there's no interface. Any other failure
+        // (no netlink permission, say) can't tell, so it stops too.
+        if !link.ok() && link.stderr.contains("does not exist") {
+            return Ok(());
+        }
+        let probe = match link.ok() {
+            true => String::new(),
+            false => format!("; `ip link show dev {iface}`: {}", link.stderr.trim()),
+        };
+        return Err(Error::Refused(format!(
+            "can't read which addresses the peers on {iface} hold, so the firewall stays as it is: `wg show {iface} allowed-ips`: {}{probe}",
+            live.stderr.trim()
+        )));
     }
     let owners: BTreeMap<Ipv4Addr, String> = model
         .peers_on(crate::model::TransportKind::WireGuard)
@@ -320,4 +383,186 @@ pub fn apply(
         log.extend(transport.apply(model, &bundle.artifacts, sys)?);
     }
     Ok(ApplyReport { log })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test")]
+
+    use super::*;
+    use crate::generate::firewall::AddressSet;
+    use crate::io::memory::{MemoryFs, RecordingRunner};
+    use crate::io::Output;
+
+    fn failed(stderr: &str) -> Output {
+        Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// Apply the canonical scenario with `wg show` failing and `ip link
+    /// show` answering `link`.
+    fn apply_with_unreadable_wg0(link: Option<Output>) -> (Result<ApplyReport>, Vec<String>) {
+        let cfg = crate::testing::canonical_config();
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "wg",
+            &["show", "wg0", "allowed-ips"],
+            failed("Unable to access interface: Operation not permitted"),
+        );
+        // The hand-over asks first, then the WireGuard transport.
+        if let Some(link) = link {
+            runner.respond_to("ip", &["link", "show", "dev", "wg0"], link.clone());
+            runner.respond_to("ip", &["link", "show", "dev", "wg0"], link);
+        }
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        let result = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys);
+        (result, runner.command_lines())
+    }
+
+    /// Who holds which address can't be read, but the interface is there,
+    /// or `ip` can't tell: stop before the firewall changes instead of
+    /// skipping the hand-over.
+    #[test]
+    fn an_unreadable_interface_stops_before_the_firewall() {
+        let no_netlink = failed("Cannot open netlink socket: Operation not permitted");
+        for link in [None, Some(no_netlink)] {
+            let (result, lines) = apply_with_unreadable_wg0(link);
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("peers on wg0") && err.contains("Operation not permitted"),
+                "{err}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|l| l.starts_with("nft -f") || l.starts_with("wg set")),
+                "{lines:#?}"
+            );
+        }
+    }
+
+    /// No interface yet (first apply): nothing to hand over, and the apply
+    /// goes on to create it.
+    #[test]
+    fn a_missing_interface_is_created() {
+        let (result, lines) =
+            apply_with_unreadable_wg0(Some(failed("Device \"wg0\" does not exist.")));
+        result.unwrap();
+        let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
+        assert!(
+            pos("nft -f").unwrap() < pos("ip link add wg0").unwrap(),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.ends_with(" remove")), "{lines:#?}");
+    }
+
+    /// Only sets named as Parallax names them go: a transport's prefix and
+    /// 16 lowercase hex digits. An operator's `wg_external_allow`, and
+    /// `ts_family` even with a grant `family`, stay.
+    #[test]
+    fn cleanup_destroys_only_parallaxs_own_sets() {
+        let set = |name: &str| AddressSet {
+            name: name.into(),
+            elements: Vec::new(),
+            comment: String::new(),
+        };
+        let keep = [set("wg_0123456789abcdef"), set("ts_0123456789abcdef")];
+        let listing = "wg_0123456789abcdef\nts_0123456789abcdef\n\
+                       wg_fedcba9876543210\nts_00000000000000ff\n  wg_00000000000000aa  \n\
+                       wg_external_allow\nts_family\nts_home_lab\nts_other\n\
+                       wg_0123456789ABCDEF\nwg_0123456789abcde\nwg_0123456789abcdef0\n\
+                       wg_0123456789abcdeg\nwg0123456789abcdef\nxx_0123456789abcdef\n\
+                       not_public\nlan_real\nparallax-swap\nlog_flows\nlog_denied_x\n\n";
+        assert_eq!(
+            stale_sets(listing, &keep),
+            [
+                "wg_fedcba9876543210",
+                "ts_00000000000000ff",
+                "wg_00000000000000aa",
+                "log_flows"
+            ]
+        );
+    }
+
+    /// Through a whole iptables-nft apply: once the rules are restored, a
+    /// stale set of Parallax's goes, the new ruleset's sets and the
+    /// operator's own stay, and a set that won't go is reported, not fatal.
+    #[test]
+    fn an_iptables_apply_keeps_the_operators_sets() {
+        let mut cfg = crate::testing::canonical_config();
+        cfg.server.firewall.backend = crate::FirewallBackend::IptablesNft;
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let current: Vec<String> = crate::generate::firewall::build(&model)
+            .unwrap()
+            .sets
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(!current.is_empty());
+        let runner = RecordingRunner::new();
+        let listing = format!(
+            "{}\nnot_public\nwg_fedcba9876543210\nts_00000000000000ff\nwg_external_allow\nts_family\n",
+            current.join("\n")
+        );
+        runner.respond_to(
+            "ipset",
+            &["list", "-n"],
+            Output {
+                status: 0,
+                stdout: listing,
+                stderr: String::new(),
+            },
+        );
+        runner.respond_to(
+            "ipset",
+            &["destroy", "ts_00000000000000ff"],
+            failed("ipset v7.22: Set cannot be destroyed: it is in use by a kernel component"),
+        );
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        let report = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+        let lines = runner.command_lines();
+        let destroyed: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("ipset destroy "))
+            .filter(|n| *n != "parallax-swap")
+            .collect();
+        assert_eq!(
+            destroyed,
+            ["wg_fedcba9876543210", "ts_00000000000000ff"],
+            "{lines:#?}"
+        );
+        let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();
+        assert!(
+            pos("iptables-restore") < pos("ipset destroy wg_fedcba9876543210"),
+            "{lines:#?}"
+        );
+        assert!(
+            report
+                .log
+                .iter()
+                .any(|l| l.contains("ts_00000000000000ff stays") && l.contains("in use")),
+            "{:#?}",
+            report.log
+        );
+    }
 }

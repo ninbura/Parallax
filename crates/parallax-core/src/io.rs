@@ -87,6 +87,20 @@ pub trait Resolver {
     fn lookup_ipv4(&self, name: &str, via: Nameserver) -> Result<Vec<Ipv4Addr>>;
 }
 
+/// A reply from Headscale's API, whatever its status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpReply {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Headscale's HTTP API ([`crate::headscale`] reads the replies). An error
+/// means no reply at all: unreachable, timed out, no API key to send.
+pub trait HeadscaleApi {
+    /// `GET path` (`/api/v1/node`) with the API key.
+    fn get(&self, path: &str) -> Result<HttpReply>;
+}
+
 /// Everything `apply` needs, bundled.
 #[derive(Clone, Copy)]
 pub struct System<'a> {
@@ -254,6 +268,40 @@ pub mod memory {
         }
     }
 
+    /// Answers from a table of paths; anything else is unreachable.
+    /// Records every path asked for.
+    #[derive(Debug, Default)]
+    pub struct FakeHeadscale {
+        replies: BTreeMap<String, HttpReply>,
+        pub asked: RefCell<Vec<String>>,
+    }
+
+    impl FakeHeadscale {
+        pub fn new() -> Self {
+            Self::default()
+        }
+        pub fn reply(mut self, path: &str, status: u16, body: &str) -> Self {
+            self.replies.insert(
+                path.to_string(),
+                HttpReply {
+                    status,
+                    body: body.to_string(),
+                },
+            );
+            self
+        }
+    }
+
+    impl HeadscaleApi for FakeHeadscale {
+        fn get(&self, path: &str) -> Result<HttpReply> {
+            self.asked.borrow_mut().push(path.to_string());
+            self.replies
+                .get(path)
+                .cloned()
+                .ok_or_else(|| Error::Headscale(format!("GET {path}: connection refused")))
+        }
+    }
+
     /// Deterministic keys: every keypair derives from a counter.
     #[derive(Debug, Default)]
     pub struct SeededKeys {
@@ -315,8 +363,18 @@ pub mod real {
             tmp_name.push(".tmp");
             let tmp = dir.join(tmp_name);
             let mode = if secret { 0o600 } else { 0o644 };
+            // A fresh file, never one already there: on a native install
+            // root writes keys into the service's own directory, and a
+            // symlink or hard link the service left at this name must not
+            // send the write elsewhere. A leftover from a crash goes first.
+            match std::fs::remove_file(&tmp) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(Error::io(ctx(), e));
+                }
+                _ => {}
+            }
             let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -460,6 +518,29 @@ pub mod real {
                 .run("sh", &["-c", "echo refused >&2; exit 3"], Some(&input))
                 .unwrap();
             assert_eq!((out.status, out.stderr.trim()), (3, "refused"));
+        }
+
+        #[test]
+        fn a_write_never_follows_a_link_left_at_its_temporary_name() {
+            let dir = std::env::temp_dir().join(format!("parallax-io-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let victim = dir.join("victim");
+            std::fs::write(&victim, "untouched").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.join(".key.tmp")).unwrap();
+
+            RealFs.write(&dir.join("key"), "secret\n", true).unwrap();
+
+            let victim_after = std::fs::read_to_string(&victim).unwrap();
+            let key = std::fs::read_to_string(dir.join("key")).unwrap();
+            let key_is_link = std::fs::symlink_metadata(dir.join("key"))
+                .unwrap()
+                .file_type()
+                .is_symlink();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_eq!(
+                (victim_after.as_str(), key.as_str(), key_is_link),
+                ("untouched", "secret\n", false)
+            );
         }
     }
 }

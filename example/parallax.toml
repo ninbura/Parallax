@@ -90,6 +90,21 @@ passphrase_file = "/etc/parallax/backup.passphrase"
 # over DNS over HTTPS, in order ("quad9", "cloudflare"); off when empty.
 encrypted_dns = []
 
+[server.logs]
+# Per-peer activity logging (docs/logging.md), like log verbosity: "off",
+# "blocked" (attempts the firewall stopped), "connections" (also one record
+# per new connection) or "detailed" (also the bytes each way when it ends).
+# This is the default for everyone; `log = "..."` on a grant or a peer
+# overrides it. A peer's own level wins, then the most detailed of its
+# grants'.
+level = "off"
+# Kept apart from the configuration, so it can live on another disk.
+path = "/var/lib/parallax/logs.db"
+# Records are deleted once they're older than `keep` or the records take
+# up more than `max_size`, whichever comes first.
+keep = "30d"
+max_size = "1GiB"
+
 # A physical network the gateway reaches. `mapped_to` is the collision-free
 # prefix clients see; host bits are preserved (192.168.1.5 -> 198.18.1.5).
 # 198.18.0.0/15 is reserved for benchmarking (RFC 2544), so no home or office
@@ -210,9 +225,11 @@ persistent_keepalive = 25
 # Routes and routing domains only for these networks (default: all of them).
 # visible_networks = ["home"]
 
-# M2 will add Tailscale peers like this one; the engine accepts them today so
-# the model is final, but does nothing with them until Headscale is wired in.
+# A Tailscale peer names its Headscale node (`parallax headscale status` lists
+# them); its access follows the address Headscale gives that node.
 # [[peer]]
 # name = "apple-tv"
 # grants = ["personal"]
 # transport = "tailscale"
+# [peer.tailscale]
+# node_id = 3

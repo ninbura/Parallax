@@ -33,6 +33,11 @@
 //!   Public-only tiers also exclude the home's own public IP, which the
 //!   router would hairpin back into the home ([`crate::public_ip`]).
 //! - Tunnel peers are IPv4-only: IPv6 from a tunnel interface is dropped.
+//! - Activity logging ([`crate::logging`]): new flows of logged peers get
+//!   [`FLOW_MARK`] in their connection mark, so the collector keeps only
+//!   theirs; their blocked attempts go to nflog group [`LOG_GROUP`],
+//!   rate-limited, just before the drop. With nobody logged there are no
+//!   such rules or sets at all.
 
 use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -40,7 +45,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use ipnet::Ipv4Net;
 
 use super::{Artifact, ArtifactKind};
-use crate::model::{FirewallBackend, PortRange, Proto};
+use crate::model::{FirewallBackend, LogLevel, PortRange, Proto};
 use crate::tier::Tier;
 use crate::transport;
 use crate::validate::{Model, ReachKind};
@@ -73,6 +78,8 @@ pub enum Ct {
     /// The first packet of a flow related to a tracked one (ICMP errors).
     Related,
     Invalid,
+    /// The first packet of a new flow.
+    New,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +106,14 @@ pub enum Action {
         to: Ipv4Net,
     },
     Masquerade,
+    /// Set [`FLOW_MARK`] in the flow's connection mark, keeping its other
+    /// bits, and continue: the collector logs marked flows only.
+    MarkFlow,
+    /// Hand the packet to the collector (nflog group [`LOG_GROUP`], at most
+    /// [`LOG_RATE`] a second) and continue. `prefix` says which drop follows.
+    Log {
+        prefix: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +276,21 @@ pub struct Ruleset {
 pub const TABLE: &str = "parallax";
 pub const LAN_SET: &str = "lan_real";
 pub const NOT_PUBLIC_SET: &str = "not_public";
+/// Peers whose connections are logged.
+pub const LOG_FLOWS_SET: &str = "log_flows";
+/// Peers whose blocked attempts are logged.
+pub const LOG_DENIED_SET: &str = "log_denied";
+/// The connection-mark bit of a logged flow. A high bit, clear of the low
+/// bits and the 0xff0000 range other tools (Tailscale, Kubernetes) use.
+pub const FLOW_MARK: u32 = 0x2000_0000;
+/// The nflog group blocked attempts go to.
+pub const LOG_GROUP: u16 = 20568;
+/// The most blocked attempts handed over per second (burst twice that), so
+/// a peer scanning ports can't flood the collector.
+pub const LOG_RATE: u32 = 20;
+/// nflog prefixes: what the collector reads to tell drops apart.
+pub const DENIED_FORWARD: &str = "parallax denied";
+pub const DENIED_GATEWAY: &str = "parallax denied gateway";
 
 const fn net(a: u8, b: u8, c: u8, d: u8, len: u8) -> Ipv4Net {
     Ipv4Net::new_assert(Ipv4Addr::new(a, b, c, d), len)
@@ -430,6 +460,38 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         });
     }
 
+    // Activity logging: only when some peer is logged.
+    let log_flows = crate::logging::addresses(model, LogLevel::Connections);
+    let log_denied = crate::logging::addresses(model, LogLevel::Blocked);
+    let mark_flows = |chain: Chain| {
+        Rule::new(chain, Action::MarkFlow, "logged peers: mark new flows")
+            .iifs(&ingress)
+            .src(Match::Set(LOG_FLOWS_SET.into()))
+            .ct(Ct::New)
+    };
+    let log_denied_rule = |chain: Chain, prefix: &'static str| {
+        Rule::new(
+            chain,
+            Action::Log { prefix },
+            "logged peers: blocked attempts",
+        )
+        .src(Match::Set(LOG_DENIED_SET.into()))
+    };
+    if !log_flows.is_empty() {
+        rs.sets.push(AddressSet {
+            name: LOG_FLOWS_SET.into(),
+            elements: log_flows.clone(),
+            comment: "peers whose connections are logged".into(),
+        });
+    }
+    if !log_denied.is_empty() {
+        rs.sets.push(AddressSet {
+            name: LOG_DENIED_SET.into(),
+            elements: log_denied.clone(),
+            comment: "peers whose blocked attempts are logged".into(),
+        });
+    }
+
     // Input: the WireGuard port from anywhere; from tunnels only the shim,
     // ping, granted services on the gateway host and the proxy.
     rs.rules.push(
@@ -446,10 +508,6 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         .push(Rule::new(Chain::Input, Action::Accept, "replies").ct(Ct::Reply));
     rs.rules
         .push(Rule::new(Chain::Input, Action::Accept, "related (ICMP errors)").ct(Ct::Related));
-    rs.rules.push(
-        Rule::new(Chain::Input, Action::Accept, "wireguard listen port")
-            .l4(Some((Proto::Udp, server.wireguard.listen_port))),
-    );
     for proto in [Proto::Udp, Proto::Tcp] {
         rs.rules.push(
             Rule::new(Chain::Input, Action::Accept, "dns shim")
@@ -458,6 +516,15 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                 .l4(Some((proto, server.dns.port))),
         );
     }
+    // After the shim: DNS queries are logged only by their own opt-in.
+    // Before everything else a tunnel peer can reach on the host.
+    if !log_flows.is_empty() {
+        rs.rules.push(mark_flows(Chain::Input));
+    }
+    rs.rules.push(
+        Rule::new(Chain::Input, Action::Accept, "wireguard listen port")
+            .l4(Some((Proto::Udp, server.wireguard.listen_port))),
+    );
     let mut ping = Rule::new(Chain::Input, Action::Accept, "ping the gateway").iifs(&ingress);
     ping.icmp_echo = true;
     rs.rules.push(ping);
@@ -515,6 +582,10 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
             );
         }
     }
+    if !log_denied.is_empty() {
+        rs.rules
+            .push(log_denied_rule(Chain::Input, DENIED_GATEWAY).iifs(&ingress));
+    }
     rs.rules.push(
         Rule::new(
             Chain::Input,
@@ -536,6 +607,9 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
         .push(Rule::new(Chain::Forward, Action::Accept, "replies").ct(Ct::Reply));
     rs.rules
         .push(Rule::new(Chain::Forward, Action::Accept, "related (ICMP errors)").ct(Ct::Related));
+    if !log_flows.is_empty() {
+        rs.rules.push(mark_flows(Chain::Forward));
+    }
 
     // Each tier's rules live in its own chain, entered by source address,
     // so a packet is checked against its own rules only, not walked past
@@ -611,6 +685,10 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                 }
             }
         }
+        if !log_denied.is_empty() {
+            rs.rules
+                .push(log_denied_rule(Chain::Tier(i), DENIED_FORWARD));
+        }
         rs.rules.push(Rule::new(
             Chain::Tier(i),
             Action::Drop,
@@ -647,6 +725,11 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                 .iif(&iif),
             );
         }
+    }
+    // Peers without grants have no tier: their attempts end here.
+    if !log_denied.is_empty() {
+        rs.rules
+            .push(log_denied_rule(Chain::Forward, DENIED_FORWARD).iifs(&ingress));
     }
     for tr in &transports {
         rs.rules.push(
@@ -909,6 +992,7 @@ pub mod nft {
             Some(Ct::Reply) => parts.push("ct direction reply".into()),
             Some(Ct::Related) => parts.push("ct state related".into()),
             Some(Ct::Invalid) => parts.push("ct state invalid".into()),
+            Some(Ct::New) => parts.push("ct state new".into()),
             None => {}
         }
         if !r.iif.is_empty() {
@@ -967,6 +1051,12 @@ pub mod nft {
                 format!("snat ip prefix to ip saddr map {{ {from} : {to} }}")
             }
             Action::Masquerade => "masquerade".into(),
+            Action::MarkFlow => format!("ct mark set ct mark or {FLOW_MARK:#010x}"),
+            Action::Log { prefix } => format!(
+                "limit rate {LOG_RATE}/second burst {} packets log prefix {} group {LOG_GROUP}",
+                2 * LOG_RATE,
+                quote(prefix)
+            ),
         });
         if !r.comment.is_empty() {
             parts.push(format!("comment {}", quote(&r.comment)));
@@ -1151,6 +1241,7 @@ pub mod iptables {
                             Some(Ct::Invalid) => {
                                 parts.push("-m conntrack --ctstate INVALID".into())
                             }
+                            Some(Ct::New) => parts.push("-m conntrack --ctstate NEW".into()),
                             None => {}
                         }
                         if r.icmp_echo {
@@ -1191,6 +1282,14 @@ pub mod iptables {
                                 format!("-j NETMAP --to {to}")
                             }
                             Action::Masquerade => "-j MASQUERADE".into(),
+                            Action::MarkFlow => {
+                                format!("-j CONNMARK --or-mark {FLOW_MARK:#010x}")
+                            }
+                            Action::Log { prefix } => format!(
+                                "-m limit --limit {LOG_RATE}/second --limit-burst {} -j NFLOG --nflog-group {LOG_GROUP} --nflog-prefix {}",
+                                2 * LOG_RATE,
+                                quote(prefix)
+                            ),
                         });
                         out.push(parts.join(" "));
                     }
