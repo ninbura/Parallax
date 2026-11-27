@@ -1216,6 +1216,13 @@ mod tests {
             net_raw(ROOT_STATUS),
             Some(Outcome::Ok("held, for `iptables-restore`".into()))
         );
+
+        // Root without it: a container with `cap_drop: [NET_RAW]`, say.
+        let dropped = ROOT_STATUS.replace("000001ffffffffff", "000001ffffffdfff");
+        let Some(Outcome::Fail(f)) = net_raw(&dropped) else {
+            panic!("expected a failure");
+        };
+        assert!(f.contains("`cap_add: [NET_RAW]`"), "{f}");
     }
 
     #[test]

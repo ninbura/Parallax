@@ -225,7 +225,8 @@ fn apply_firewall(
                 })?;
             let listing = sys
                 .runner
-                .run_checked("iptables", &["-t", "filter", "-S"], None)?;
+                .run_checked("iptables", &["-t", "filter", "-S"], None)
+                .map_err(net_raw_hint)?;
             // Hooks first, then the hold comes off: until both tables are
             // attached nothing new starts. `nat` first: a filter jump goes in
             // above the hold, so once it's there both tables must be. Every
@@ -509,7 +510,8 @@ pub fn apply(
 pub const HOLD_COMMENT: &str = "parallax-hold";
 
 /// `iptables-restore` looks up each `--match-set` ipset through a raw socket,
-/// so without CAP_NET_RAW it fails with only iptables' own words. The shipped
+/// and `iptables -S` does to print one, so without CAP_NET_RAW they fail with
+/// only iptables' own words. The shipped
 /// unit leaves the capability out (it's only for this backend); say how to
 /// add it. `doctor` catches this at start, but the backend can change later.
 fn net_raw_hint(e: Error) -> Error {
@@ -896,6 +898,23 @@ mod tests {
                 .any(|l| l.starts_with("iptables-restore --noflush")),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn the_net_raw_hint_is_only_for_the_ipset_socket() {
+        let command = |stderr: &str| Error::Command {
+            command: "iptables-restore --test".into(),
+            status: 2,
+            stderr: stderr.into(),
+        };
+        let other = "iptables-restore: line 12 failed";
+        assert_eq!(
+            net_raw_hint(command(other)).to_string(),
+            command(other).to_string()
+        );
+        assert!(net_raw_hint(command("Can't open socket to ipset.\n"))
+            .to_string()
+            .contains("needs CAP_NET_RAW"));
     }
 
     /// Through a whole iptables-nft apply: once the rules are restored, a

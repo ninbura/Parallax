@@ -63,7 +63,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RemoveIPC=yes
-# Netlink drives wg0, nftables and routes; no raw or packet sockets.
+# Netlink drives wg0, nftables and routes; no packet sockets. Raw IPv4
+# sockets need CAP_NET_RAW, which only the iptables-nft drop-in adds.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
