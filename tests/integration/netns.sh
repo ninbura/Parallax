@@ -1219,15 +1219,16 @@ PY
         inns gw tailscale --socket="$TS_SOCK" set --operator=nobody || fail "(w) could not make the service the router's operator"
     fi
 
-    PHONE_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"2099-01-01T00:00:00Z\"}" \
+    # Short-lived, and on stdin, as Parallax passes its own.
+    PHONE_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
     mkdir -p "$HS/phone"
     inns tsc "$TAILSCALED" --tun=tailscale0 --state=mem: --socket="$HS/phone/sock" --statedir="$HS/phone" \
         --port=0 >> "$HS/phone.log" 2>&1 &
     PIDS+=($!)
     for _ in $(seq 50); do [ -S "$HS/phone/sock" ] && break; sleep 0.1; done
-    inns tsc timeout 30 "$TAILSCALE" --socket="$HS/phone/sock" up --login-server=http://203.0.114.1:18080 \
-        --authkey="$PHONE_AUTH" --hostname=phone --accept-routes >/dev/null 2>&1 \
+    printf '%s' "$PHONE_AUTH" | inns tsc timeout 30 "$TAILSCALE" --socket="$HS/phone/sock" up \
+        --login-server=http://203.0.114.1:18080 --auth-key=file:/dev/stdin --hostname=phone --accept-routes >/dev/null 2>&1 \
         || { tail -20 "$HS/phone.log"; fail "(w) the phone did not log in"; }
     read -r PHONE PHONE_IP < <(hs_api GET /api/v1/node | python3 -c '
 import json, sys

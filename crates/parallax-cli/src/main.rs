@@ -1159,11 +1159,14 @@ pub(crate) fn find_tailnet(config: &Config) -> Result<Option<Tailnet>, String> {
 }
 
 /// Look at the subnet router and make it what `config` says. Returns what
-/// was done, and what's still wrong or left to the operator.
+/// was done, and what's still wrong or left to the operator. With no peer
+/// on Tailscale, only Parallax's own router follows the routes, and
+/// nothing is reported: the machine may have no Tailscale at all.
 pub(crate) fn sync_router(
     config: &Config,
     socket: &str,
 ) -> Result<(Vec<String>, Option<String>), String> {
+    let needed = parallax_core::subnet_router::needed(config);
     let model = parallax_core::Model::resolve(config, today()).map_err(|e| e.to_string())?;
     let api = headscale::Api::new(&config.server, owner::ConfigFiles::default());
     let operator = owner::tailscale_operator();
@@ -1172,8 +1175,15 @@ pub(crate) fn sync_router(
         operator: operator.as_deref(),
         runner: &RealRunner,
     };
-    let (router, done) =
-        parallax_core::subnet_router::sync(&model, &ts, &api).map_err(|e| e.to_string())?;
+    let synced = parallax_core::subnet_router::sync(&model, &ts, &api, needed);
+    let (router, done) = match synced {
+        Ok(synced) => synced,
+        Err(_) if !needed => return Ok((Vec::new(), None)),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !needed {
+        return Ok((done, None));
+    }
     // Right after a login or a change, the next look says how it went.
     let note = if done.is_empty() {
         parallax_core::subnet_router::describe(&model, &router).err()

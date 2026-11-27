@@ -25,7 +25,8 @@
 //! `tailscaled` at `--tailscale-socket`) logged in and routing what the
 //! configuration says: every 30 seconds and after each saved change
 //! ([`parallax_core::subnet_router`]). The machine's own Tailscale is left
-//! alone; what its operator has to run is logged.
+//! alone; what its operator has to run is logged. Parallax's own router
+//! follows route changes even with no peer on Tailscale, but isn't logged in.
 //!
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
@@ -158,11 +159,15 @@ type Views = watch::Receiver<Option<View>>;
 
 pub fn run(opts: Options) -> anyhow::Result<()> {
     not_root_in_anothers_place(&opts)?;
-    tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("starting the async runtime")?
-        .block_on(serve(opts))
+        .context("starting the async runtime")?;
+    let result = rt.block_on(serve(opts));
+    // A lookup still blocking a thread (a wedged `tailscale`, a slow
+    // Headscale) mustn't keep the process from exiting.
+    rt.shutdown_timeout(Duration::from_secs(5));
+    result
 }
 
 /// Before anything: a daemon run as root where another user's files are
@@ -770,7 +775,7 @@ async fn keep_router(mut views: Views, socket: String) {
             }
         }
         soon = false;
-        let Some(config) = config(&views).filter(|c| subnet_router::needed(c)) else {
+        let Some(config) = config(&views) else {
             continue;
         };
         let socket = socket.clone();
