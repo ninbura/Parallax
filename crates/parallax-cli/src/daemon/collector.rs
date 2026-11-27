@@ -464,44 +464,86 @@ struct Sink {
     runtime: tokio::runtime::Handle,
 }
 
+/// A sink's records on their way to the database. While none is open,
+/// only the newest [`BATCH`] are kept, the rest counted and reported once
+/// a flush (#66), not once an event.
+#[derive(Default)]
+struct Pending {
+    records: Vec<logging::Record>,
+    /// The last flush found no database to write to.
+    none_open: bool,
+    /// Dropped since they were last reported.
+    dropped: u64,
+}
+
+impl Pending {
+    fn push(&mut self, record: logging::Record) {
+        self.records.push(record);
+        // Trimmed in bulk, so a dropped record costs no shuffle of its own.
+        if self.none_open && self.records.len() >= 2 * BATCH {
+            self.keep_newest();
+        }
+    }
+
+    /// Enough for a flush before the timer: not while there's nowhere to
+    /// write, or every event past a batch's worth would flush.
+    fn full(&self) -> bool {
+        !self.none_open && self.records.len() >= BATCH
+    }
+
+    fn keep_newest(&mut self) {
+        let excess = self.records.len().saturating_sub(BATCH);
+        self.records.drain(..excess);
+        self.dropped += excess as u64;
+    }
+
+    /// No database took them: keep the newest, and how many were dropped
+    /// since the last time this said so.
+    fn unwritten(&mut self) -> u64 {
+        self.none_open = true;
+        self.keep_newest();
+        std::mem::take(&mut self.dropped)
+    }
+}
+
 impl Sink {
     fn run(self) {
-        let mut batch = Vec::new();
+        let mut pending = Pending::default();
         let mut flushed = Instant::now();
         let mut writer: Option<(Arc<Logs>, Writer)> = None;
         loop {
             match self.events.recv_timeout(READ_TIMEOUT) {
-                Ok(event) => self.attribute(event, &mut batch),
+                Ok(event) => self.attribute(event, &mut pending),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
-            if batch.len() >= BATCH || flushed.elapsed() >= FLUSH_EVERY {
-                self.flush(&mut batch, &mut writer);
+            if pending.full() || flushed.elapsed() >= FLUSH_EVERY {
+                self.flush(&mut pending, &mut writer);
                 flushed = Instant::now();
             }
         }
         // What was handed over before the stop.
         while let Ok(event) = self.events.try_recv() {
-            self.attribute(event, &mut batch);
+            self.attribute(event, &mut pending);
         }
-        self.flush(&mut batch, &mut writer);
+        self.flush(&mut pending, &mut writer);
     }
 
-    fn attribute(&self, event: Event, batch: &mut Vec<logging::Record>) {
+    fn attribute(&self, event: Event, pending: &mut Pending) {
         let config = self.views.borrow().as_ref().map(|v| Arc::clone(&v.config));
         if let Some(record) = config.and_then(|c| logging::attribute(&c, &event, now_ms())) {
-            batch.push(record);
+            pending.push(record);
         }
     }
 
-    /// Write `batch` to the open database. Records accepted before the
-    /// supervisor moved to a new path go to the old one, and the old one is
-    /// let go after, so its file is never held past the next flush. With
-    /// none open at all yet, keep a batch's worth and drop the rest.
-    fn flush(&self, batch: &mut Vec<logging::Record>, writer: &mut Option<(Arc<Logs>, Writer)>) {
+    /// Write what's pending to the open database. Records accepted before
+    /// the supervisor moved to a new path go to the old one, and the old one
+    /// is let go after, so its file is never held past the next flush. With
+    /// none open at all, keep a batch's worth (the newest) and drop the rest.
+    fn flush(&self, pending: &mut Pending, writer: &mut Option<(Arc<Logs>, Writer)>) {
         let dropped = self.tap.take_dropped();
         if dropped > 0 {
             warn(format!(
@@ -510,7 +552,7 @@ impl Sink {
             ));
         }
         let current = self.slot.read().ok().and_then(|s| s.clone());
-        if !batch.is_empty() {
+        if !pending.records.is_empty() {
             if let (None, Some(logs)) = (writer.as_ref(), &current) {
                 match logs.writer() {
                     Ok(w) => *writer = Some((Arc::clone(logs), w)),
@@ -519,24 +561,25 @@ impl Sink {
             }
             match writer.as_ref() {
                 Some((_, w)) => {
-                    if let Err(e) = self.runtime.block_on(w.write(batch)) {
+                    if let Err(e) = self.runtime.block_on(w.write(&pending.records)) {
                         warn(format!(
                             "activity logging: writing {} records of {} failed: {e}",
-                            batch.len(),
+                            pending.records.len(),
                             self.name
                         ));
                     }
-                    batch.clear();
+                    pending.records.clear();
+                    pending.none_open = false;
                 }
-                None if batch.len() > BATCH => {
-                    warn(format!(
-                        "activity logging: {} records of {} dropped: no database open",
-                        batch.len() - BATCH,
-                        self.name
-                    ));
-                    batch.truncate(BATCH);
+                None => {
+                    let dropped = pending.unwritten();
+                    if dropped > 0 {
+                        warn(format!(
+                            "activity logging: {dropped} records of {} dropped: no database open",
+                            self.name
+                        ));
+                    }
                 }
-                None => {}
             }
         }
         let stale = writer
@@ -632,4 +675,82 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(n: u64) -> logging::Record {
+        logging::Record {
+            time: n,
+            kind: logging::RecordKind::Query,
+            peer: "guest".into(),
+            grants: String::new(),
+            source: std::net::Ipv4Addr::new(10, 8, 0, 2),
+            destination: std::net::Ipv4Addr::new(10, 8, 0, 1),
+            real_destination: None,
+            network: None,
+            protocol: "udp".into(),
+            port: Some(53),
+            flow: None,
+            bytes_out: None,
+            bytes_in: None,
+            hostname: Some("immich.example.test.".into()),
+            method: None,
+            status: None,
+            query_type: Some("A".into()),
+            outcome: Some("answered".into()),
+        }
+    }
+
+    /// No database: the newest batch's worth stays, the rest is counted
+    /// once per flush, and a full batch doesn't flush on every event (#66).
+    #[test]
+    fn with_no_database_the_newest_stay_and_drops_are_counted_once() {
+        let mut pending = Pending::default();
+        (0..BATCH as u64).for_each(|n| pending.push(record(n)));
+        assert!(pending.full());
+        // The flush finds no database.
+        assert_eq!(pending.unwritten(), 0);
+        // Past a batch's worth: no flush on each event any more.
+        (BATCH as u64..BATCH as u64 + 5).for_each(|n| pending.push(record(n)));
+        assert!(!pending.full());
+        // The next (timed) flush finds none either: five dropped, said once.
+        assert_eq!(pending.unwritten(), 5);
+        assert_eq!(pending.unwritten(), 0);
+        assert_eq!(pending.records.len(), BATCH);
+        assert_eq!(pending.records[0].time, 5, "the oldest go, the newest stay");
+        assert_eq!(pending.records[BATCH - 1].time, BATCH as u64 + 4);
+    }
+
+    /// Memory stays bounded between flushes, however many arrive.
+    #[test]
+    fn with_no_database_pending_records_stay_bounded() {
+        let mut pending = Pending {
+            none_open: true,
+            ..Pending::default()
+        };
+        (0..10 * BATCH as u64).for_each(|n| pending.push(record(n)));
+        assert!(pending.records.len() < 2 * BATCH);
+        let dropped = pending.unwritten();
+        assert_eq!(pending.records.len(), BATCH);
+        assert_eq!(dropped, 9 * BATCH as u64);
+        assert_eq!(pending.records[0].time, 9 * BATCH as u64);
+    }
+
+    /// Once a database takes them, a full batch flushes early again.
+    #[test]
+    fn a_database_again_flushes_a_full_batch() {
+        let mut pending = Pending {
+            none_open: true,
+            ..Pending::default()
+        };
+        (0..BATCH as u64).for_each(|n| pending.push(record(n)));
+        assert!(!pending.full());
+        pending.records.clear();
+        pending.none_open = false;
+        (0..BATCH as u64).for_each(|n| pending.push(record(n)));
+        assert!(pending.full());
+    }
 }
