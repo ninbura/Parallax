@@ -1,0 +1,66 @@
+# Parallax's own Tailscale client: the subnet router that carries Tailscale
+# peers into the mapped networks. Enable it only on a machine that isn't on
+# Tailscale already; if it is, leave this off and Parallax uses that client
+# (docs/native.md). parallax.service logs it in and keeps its settings.
+# tests/integration/netns.sh runs its tailscaled with this file's [Service]
+# hardening (NETNS_DAEMON=unit), so keep the sandboxing lines here.
+[Unit]
+Description=Tailscale client for Parallax (the subnet router)
+Documentation=https://github.com/ninbura/Parallax/blob/main/docs/native.md
+Wants=network-pre.target
+After=network-pre.target NetworkManager.service systemd-resolved.service
+Before=parallax.service
+# One tailscaled per machine: they'd share tailscale0, its port and its
+# routing table.
+Conflicts=tailscaled.service
+
+[Service]
+Type=notify
+# The socket is Tailscale's usual one, so `tailscale status` just works.
+ExecStartPre=/usr/sbin/tailscaled --cleanup
+ExecStart=/usr/sbin/tailscaled --state=/var/lib/parallax-tailscale/tailscaled.state --statedir=/var/lib/parallax-tailscale --socket=/run/tailscale/tailscaled.sock --tun=tailscale0 --port=41641
+# The `parallax` user may manage it: the daemon logs it in and changes its
+# routes. Kept by every `tailscale up` the daemon runs.
+ExecStartPost=/usr/bin/tailscale --socket=/run/tailscale/tailscaled.sock set --operator=parallax
+ExecStopPost=/usr/sbin/tailscaled --cleanup
+Restart=on-failure
+RestartSec=5
+
+StateDirectory=parallax-tailscale
+StateDirectoryMode=0700
+RuntimeDirectory=tailscale
+RuntimeDirectoryMode=0755
+UMask=0077
+
+# Root, but only for what a router needs: the tun device, routes and rules
+# (CAP_NET_ADMIN), and raw sockets for path discovery (CAP_NET_RAW). Its own
+# filtering is off (Parallax's firewall is the gate), so no iptables.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,12 @@
 //! re-applies when one changes ([`parallax_core::headscale`]). When
 //! Headscale doesn't answer, the last answer stays in effect.
 //!
+//! While a peer is on Tailscale, it keeps the subnet router (the
+//! `tailscaled` at `--tailscale-socket`) logged in and routing what the
+//! configuration says: every 30 seconds and after each saved change
+//! ([`parallax_core::subnet_router`]). The machine's own Tailscale is left
+//! alone; what its operator has to run is logged.
+//!
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
 //! arrive during an apply queue up, and a batch of them shares one apply.
@@ -46,6 +52,7 @@ use parallax_core::names::{self, Refreshed, Resolved};
 use parallax_core::public_ip::{self, Found};
 use parallax_core::reconcile::{self, Reconciler};
 use parallax_core::secret::Secret;
+use parallax_core::subnet_router;
 use parallax_core::Config;
 use parallax_store::{backup, Store, TempDir};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -65,6 +72,8 @@ pub struct Options {
     pub db: PathBuf,
     pub socket: PathBuf,
     pub out: PathBuf,
+    /// The subnet router's `tailscaled`.
+    pub tailscale_socket: String,
     /// Between checks for drift and a new day.
     pub reconcile_every: Duration,
 }
@@ -78,6 +87,11 @@ const PUBLIC_IP_EVERY: Duration = Duration::from_secs(300);
 const NAMES_EVERY: Duration = Duration::from_secs(300);
 /// How often Headscale is asked for its nodes.
 const TAILNET_EVERY: Duration = Duration::from_secs(headscale::POLL_SECONDS);
+/// How often the subnet router is looked at.
+const ROUTER_EVERY: Duration = Duration::from_secs(subnet_router::POLL_SECONDS);
+/// How soon it's looked at again after a change, so a router that just
+/// logged in gets its routes approved without waiting a whole poll.
+const ROUTER_SOON: Duration = Duration::from_secs(2);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -239,6 +253,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let refresher = tokio::spawn(refresh_public_ip(tx.clone(), views.clone()));
     let names = tokio::spawn(refresh_names(tx.clone(), views.clone()));
     let tailnet = tokio::spawn(refresh_tailnet(tx.clone(), views.clone()));
+    let router = tokio::spawn(keep_router(views.clone(), opts.tailscale_socket.clone()));
     let logs = collector::Slot::default();
     let collecting = tokio::spawn(collector::supervise(views.clone(), Arc::clone(&logs)));
     let server = tokio::spawn(accept(listener, tx.clone(), views, database, logs));
@@ -270,6 +285,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     refresher.abort();
     names.abort();
     tailnet.abort();
+    router.abort();
     // Only our own: another daemon may have bound the path since.
     if file_id(&opts.socket) == Some(socket_id) {
         if let Err(e) = std::fs::remove_file(&opts.socket) {
@@ -718,6 +734,63 @@ async fn refresh_tailnet(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
             if tx.send(Msg::Tailnet(asked, found)).is_err() {
                 return;
             }
+        }
+    }
+}
+
+/// Keep the subnet router as the configuration says, every
+/// [`ROUTER_EVERY`] and when the configuration changes. Logs what it did,
+/// and each problem (or what the operator still has to do) once.
+async fn keep_router(mut views: Views, socket: String) {
+    let mut every = tokio::time::interval(ROUTER_EVERY);
+    every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let config = |views: &Views| views.borrow().as_ref().map(|v| Arc::clone(&v.config));
+    let mut last = config(&views);
+    let mut said: Option<String> = None;
+    let mut soon = false;
+    loop {
+        if soon {
+            tokio::time::sleep(ROUTER_SOON).await;
+        } else {
+            tokio::select! {
+                _ = every.tick() => {}
+                changed = views.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    // Every apply publishes; only a new configuration counts.
+                    let now = config(&views);
+                    if now == last {
+                        continue;
+                    }
+                    last = now;
+                }
+            }
+        }
+        soon = false;
+        let Some(config) = config(&views).filter(|c| subnet_router::needed(c)) else {
+            continue;
+        };
+        let socket = socket.clone();
+        let Ok(looked) =
+            tokio::task::spawn_blocking(move || crate::sync_router(&config, &socket)).await
+        else {
+            continue;
+        };
+        let note = match looked {
+            Ok((done, note)) => {
+                done.iter().for_each(log);
+                soon = !done.is_empty();
+                note
+            }
+            Err(e) => Some(e),
+        };
+        if note != said {
+            match &note {
+                Some(note) => warn(format!("subnet router: {note}")),
+                None => log("subnet router: in place"),
+            }
+            said = note;
         }
     }
 }

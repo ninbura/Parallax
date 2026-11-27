@@ -118,6 +118,15 @@ struct Cli {
         env = "PARALLAX_SOCKET"
     )]
     socket: PathBuf,
+    /// The socket of the `tailscaled` that is the Tailscale subnet router:
+    /// Parallax's own, or this machine's own Tailscale.
+    #[arg(
+        long,
+        global = true,
+        default_value = "/var/run/tailscale/tailscaled.sock",
+        env = "PARALLAX_TAILSCALE_SOCKET"
+    )]
+    tailscale_socket: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -707,6 +716,7 @@ const SAVE_ATTEMPTS: usize = 10;
 pub(crate) struct Ctx {
     db: PathBuf,
     socket: PathBuf,
+    tailscale_socket: String,
     /// Set once a daemon running as another user answered, when this is root.
     daemon_user: std::cell::Cell<Option<owner::User>>,
 }
@@ -1035,6 +1045,31 @@ pub(crate) fn find_tailnet(config: &Config) -> Result<Option<Tailnet>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Look at the subnet router and make it what `config` says. Returns what
+/// was done, and what's still wrong or left to the operator.
+pub(crate) fn sync_router(
+    config: &Config,
+    socket: &str,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let model = parallax_core::Model::resolve(config, today()).map_err(|e| e.to_string())?;
+    let api = headscale::Api::new(&config.server, owner::ConfigFiles::default());
+    let operator = owner::tailscale_operator();
+    let ts = parallax_core::subnet_router::Tailscaled {
+        socket,
+        operator: operator.as_deref(),
+        runner: &RealRunner,
+    };
+    let (router, done) =
+        parallax_core::subnet_router::sync(&model, &ts, &api).map_err(|e| e.to_string())?;
+    // Right after a login or a change, the next look says how it went.
+    let note = if done.is_empty() {
+        parallax_core::subnet_router::describe(&model, &router).err()
+    } else {
+        None
+    };
+    Ok((done, note))
+}
+
 /// Why Headscale's nodes are unknown, and what that means.
 pub(crate) fn tailnet_unknown(problem: &str) -> String {
     format!("{problem}; Tailscale peers that name a node get no access until it answers")
@@ -1144,6 +1179,7 @@ fn run() -> anyhow::Result<()> {
     let ctx = Ctx {
         db: cli.db,
         socket: cli.socket,
+        tailscale_socket: cli.tailscale_socket,
         daemon_user: std::cell::Cell::new(None),
     };
     let db = ctx.db();
@@ -1261,6 +1297,7 @@ fn run() -> anyhow::Result<()> {
         } => daemon::run(daemon::Options {
             db: ctx.db,
             socket: ctx.socket,
+            tailscale_socket: ctx.tailscale_socket,
             out: out.out,
             reconcile_every: Duration::from_secs(reconcile_every.max(1)),
         })?,
@@ -1346,6 +1383,16 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
         checks.push(parallax_core::doctor::public_ip_check(config, known));
         let api = headscale::Api::new(&config.server, files);
         checks.push(parallax_core::headscale::check(config, &api));
+        // An invalid configuration is reported above; nothing to route then.
+        if let Ok(model) = parallax_core::Model::resolve(config, today()) {
+            let operator = owner::tailscale_operator();
+            let ts = parallax_core::subnet_router::Tailscaled {
+                socket: &ctx.tailscale_socket,
+                operator: operator.as_deref(),
+                runner: &runner,
+            };
+            checks.push(parallax_core::subnet_router::check(&model, &ts, &api));
+        }
     }
     let mut failed = 0;
     for check in &checks {

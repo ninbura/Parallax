@@ -87,6 +87,16 @@ fn user_name(uid: u32) -> Option<String> {
     passwd_entry(uid)?.into_iter().next()
 }
 
+/// Who this process runs as when it isn't root: a `tailscaled` it logs in
+/// keeps it as the operator, so it can manage the client afterwards.
+pub(crate) fn tailscale_operator() -> Option<String> {
+    let uid = rustix::process::geteuid();
+    if uid.is_root() {
+        return None;
+    }
+    user_name(uid.as_raw())
+}
+
 /// The primary group `/etc/passwd` gives `uid`.
 fn primary_gid(uid: u32) -> Option<u32> {
     passwd_entry(uid)?.get(3)?.parse().ok()

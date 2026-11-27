@@ -19,9 +19,10 @@ systemctl restart systemd-sysctl.service systemd-modules-load.service ||
 if [ -n "$2" ]; then
     # An upgrade ($2 is the old version): a running service gets the new
     # binary. deb-systemd-invoke honours a local policy-rc.d.
-    deb-systemd-invoke try-restart parallax.service ||
+    deb-systemd-invoke try-restart parallax-tailscaled.service parallax.service ||
         echo "parallax: warning: restarting the service failed; see journalctl -u parallax" >&2
 else
     # A first install leaves it stopped and disabled; it needs a configuration.
     echo "parallax: put your configuration in /etc/parallax/parallax.toml, then: sudo systemctl enable --now parallax (docs/native.md)"
+    echo "parallax: for Tailscale peers, install tailscale and: sudo systemctl enable --now parallax-tailscaled (not if this machine already runs Tailscale; docs/native.md)"
 fi
