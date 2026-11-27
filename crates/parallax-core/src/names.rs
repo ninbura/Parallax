@@ -26,7 +26,10 @@
 //!   whose resolvers changed, must resolve, and a change mustn't leave a
 //!   known address outside every network or off the home's public IP.
 //!   Problems that were already there don't block unrelated changes, so a
-//!   resolver being down never stops removing a peer or a grant.
+//!   resolver being down never stops removing a peer or a grant. They're
+//!   told apart by what they're about (a name, or what a rule opens), not
+//!   their message, and a rule is refused only if its grant didn't have it
+//!   or the change moved its name's answer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -200,68 +203,197 @@ pub fn refresh(config: &Config, public_ip: Option<Ipv4Addr>, resolver: &dyn Reso
 /// public IP changed since), and grants the home's public IP doesn't take
 /// ([`public_ip_refusal`]). Each problem names what stays in effect.
 pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolved) -> Vec<String> {
-    let mut out: Vec<String> = used(config)
+    problems_about(config, public_ip, resolved)
         .into_iter()
-        .filter_map(|name| match resolved.get(name) {
-            None => Some(format!(
-                "{name} didn't resolve; grants on it give nothing until it does"
-            )),
-            Some(addresses) => refused(config, public_ip, name, addresses)
-                .map(|why| format!("{why}; grants on it give nothing")),
+        .map(|(_, problem)| problem)
+        .collect()
+}
+
+/// What a problem is about, so [`check_save`] tells an old one from a new
+/// one by what it is, not by its message: renaming a grant or a service,
+/// writing ports in another order, or a new public IP changes the message.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum About<'a> {
+    /// The name didn't resolve, or its answer isn't allowed.
+    Name(&'a str),
+    /// A grant's rule that gives nothing on the home's public IP, by what
+    /// it opens.
+    Opening(&'a str, Opening<'a>),
+}
+
+/// What a rule opens at a named host: the ports (`None`: every port) as
+/// sorted, merged ranges per protocol, and whether the HTTPS proxy checks
+/// the name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Opening<'a> {
+    name: &'a str,
+    ports: Option<Vec<(&'static str, u16, u16)>>,
+    proxied: bool,
+}
+
+/// A rule on a named host: how messages name it, the host, its ports
+/// (`None`: every port) and whether the proxy checks the name.
+struct Opens<'a> {
+    what: String,
+    name: &'a str,
+    ports: Option<Vec<PortRange>>,
+    proxied: bool,
+}
+
+impl<'a> Opens<'a> {
+    fn of(config: &'a Config, rule: &'a Rule) -> Option<Opens<'a>> {
+        let (what, host, ports, proxied) = match rule {
+            Rule::Host { host, ports } if ports.is_empty() => {
+                (format!("host {host}"), host, None, false)
+            }
+            Rule::Host { host, ports } => (
+                format!(
+                    "host {host} {}",
+                    ports
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                host,
+                Some(ranges(ports)),
+                false,
+            ),
+            Rule::Service { name } => {
+                let s = config.service(name)?;
+                (
+                    format!("service '{name}'"),
+                    &s.host,
+                    Some(ranges(&s.ports)),
+                    s.is_proxied(),
+                )
+            }
+            _ => return None,
+        };
+        Some(Opens {
+            what,
+            name: host.name()?,
+            ports,
+            proxied,
+        })
+    }
+
+    fn key(&self) -> Opening<'a> {
+        Opening {
+            name: self.name,
+            ports: self.ports.as_ref().map(|ports| {
+                let mut sorted: Vec<_> = ports
+                    .iter()
+                    .map(|r| (r.proto.as_str(), r.first, r.last))
+                    .collect();
+                sorted.sort_unstable();
+                // `442-443/tcp` and `442/tcp, 443/tcp` open the same.
+                let mut key: Vec<(&'static str, u16, u16)> = Vec::new();
+                for (proto, first, last) in sorted {
+                    match key.last_mut() {
+                        Some(prev)
+                            if prev.0 == proto && u32::from(first) <= u32::from(prev.2) + 1 =>
+                        {
+                            prev.2 = prev.2.max(last);
+                        }
+                        _ => key.push((proto, first, last)),
+                    }
+                }
+                key
+            }),
+            proxied: self.proxied,
+        }
+    }
+}
+
+/// What each grant's rules open at named hosts, by grant name.
+type Openings<'a> = BTreeMap<&'a str, BTreeSet<Opening<'a>>>;
+
+/// Only grants someone holds: a rule in a grant nobody had yet (created,
+/// then attached) is new to whoever gets it.
+fn openings(config: &Config) -> Openings<'_> {
+    let held: BTreeSet<&str> = tier::tiers(config)
+        .iter()
+        .flat_map(|t| t.grants.iter().map(|g| g.name.as_str()))
+        .collect();
+    config
+        .grants
+        .iter()
+        .filter(|g| held.contains(g.name.as_str()))
+        .map(|g| {
+            let opens = g
+                .rules
+                .iter()
+                .filter_map(|rule| Opens::of(config, rule))
+                .map(|o| o.key())
+                .collect();
+            (g.name.as_str(), opens)
+        })
+        .collect()
+}
+
+/// Whether `map` has `opening` for `grant` of the new configuration: under
+/// its own name in `opened` (the old configuration), or for a grant new
+/// by name, under any old grant that's gone from `kept` (a rename).
+fn held<'a>(
+    map: &Openings<'a>,
+    opened: &Openings<'a>,
+    kept: &BTreeSet<&'a str>,
+    grant: &'a str,
+    opening: &Opening<'a>,
+) -> bool {
+    let has = |g: &str| map.get(g).is_some_and(|set| set.contains(opening));
+    if opened.contains_key(grant) {
+        return has(grant);
+    }
+    opened.keys().filter(|g| !kept.contains(*g)).any(|g| has(g))
+}
+
+/// [`problems`], each with what it's about.
+fn problems_about<'a>(
+    config: &'a Config,
+    public_ip: Option<Ipv4Addr>,
+    resolved: &Resolved,
+) -> Vec<(About<'a>, String)> {
+    let mut out: Vec<(About<'a>, String)> = used(config)
+        .into_iter()
+        .filter_map(|name| {
+            match resolved.get(name) {
+                None => Some(format!(
+                    "{name} didn't resolve; grants on it give nothing until it does"
+                )),
+                Some(addresses) => refused(config, public_ip, name, addresses)
+                    .map(|why| format!("{why}; grants on it give nothing")),
+            }
+            .map(|problem| (About::Name(name), problem))
         })
         .collect();
     let Some(home) = public_ip else {
         return out;
     };
-    // Named by the grant that holds the rule, not the tier: a change to a
-    // peer's other grants changes its tier, and mustn't make an old problem
-    // look new to `check_save`.
     for t in tier::tiers(config) {
         for (grant, rule) in t
             .grants
             .iter()
             .flat_map(|g| g.rules.iter().map(move |r| (g, r)))
         {
-            let (what, host, ports, proxied) = match rule {
-                Rule::Host { host, ports } if ports.is_empty() => {
-                    (format!("host {host}"), host, None, false)
-                }
-                Rule::Host { host, ports } => (
-                    format!(
-                        "host {host} {}",
-                        ports
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    host,
-                    Some(ranges(ports)),
-                    false,
-                ),
-                Rule::Service { name } => match config.service(name) {
-                    Some(s) => (
-                        format!("service '{name}'"),
-                        &s.host,
-                        Some(ranges(&s.ports)),
-                        s.is_proxied(),
-                    ),
-                    None => continue,
-                },
-                _ => continue,
+            let Some(opens) = Opens::of(config, rule) else {
+                continue;
             };
-            let Some(name) = host.name() else { continue };
+            let name = opens.name;
             let at_home = resolved.get(name).is_some_and(|a| a.contains(&home));
-            if let Some(why) = public_ip_refusal(&t, ports.as_deref(), proxied).filter(|_| at_home)
-            {
-                let problem = format!(
-                    "grant '{}': rule {what}: {name} is the home's public IP {home}, and {why}; it gives nothing there",
-                    grant.name
-                );
-                // Every tier holding the grant would say it again.
-                if !out.contains(&problem) {
-                    out.push(problem);
-                }
+            let Some(why) =
+                public_ip_refusal(&t, opens.ports.as_deref(), opens.proxied).filter(|_| at_home)
+            else {
+                continue;
+            };
+            let problem = format!(
+                "grant '{}': rule {}: {name} is the home's public IP {home}, and {why}; it gives nothing there",
+                grant.name, opens.what
+            );
+            // Every tier holding the grant would say it again.
+            if !out.iter().any(|(_, p)| *p == problem) {
+                out.push((About::Opening(grant.name.as_str(), opens.key()), problem));
             }
         }
     }
@@ -320,24 +452,64 @@ pub fn check_save(
             Ok(addresses) => {
                 resolved.insert(name.to_string(), addresses);
             }
-            // A name kept from `old`, or one `old` never found either (a
-            // resolver change mustn't need every broken name fixed first):
-            // whether this change made it worse is for the comparison of
-            // problems below, not the lookup.
-            Err(_)
-                if !fresh.contains(name) || (had.contains(name) && !known.contains_key(name)) => {}
+            // A name kept from `old`: whether this change made it worse is
+            // for the comparison of problems below, not the lookup.
+            Err(_) if !fresh.contains(name) => {}
+            // New resolvers that can't answer for a name nothing knows an
+            // answer for. If `old`'s resolvers can't either, it's an old
+            // problem (a resolver change mustn't need every broken name
+            // fixed first); if they can, this change breaks it. Nothing
+            // known may also mean nothing has asked yet (just started, a
+            // restore), so `old`'s are asked rather than assumed broken.
+            Err(why) if had.contains(name) && !known.contains_key(name) => {
+                let answers_before =
+                    old.is_some_and(|old| lookup(old, old_public_ip, resolver, name).is_ok());
+                if answers_before {
+                    failed.push(why);
+                }
+            }
             Err(why) => failed.push(why),
         }
     }
     if !failed.is_empty() {
         return Err(failed);
     }
-    let before: BTreeSet<String> = old
-        .map(|old| problems(old, old_public_ip, known).into_iter().collect())
+    // A name that was broken stays an old problem. A grant's rule that gives
+    // nothing on the home's public IP is old if the grant had the rule
+    // before (or, for a grant new by name, one that's gone did: a rename)
+    // and either it gave nothing before too, or this change didn't move the
+    // name's answer. So taking access away (a grant from a peer that reached
+    // everything), a rename or a new public IP is never refused for what it
+    // reveals, while a rule added to a grant, or a resolver change that
+    // moves a working rule's name onto the public IP, is.
+    let before = old
+        .map(|old| problems_about(old, old_public_ip, known))
         .unwrap_or_default();
-    let added: Vec<String> = problems(new, public_ip, &resolved)
+    let mut broken: BTreeSet<&str> = BTreeSet::new();
+    let mut gave_nothing: Openings<'_> = BTreeMap::new();
+    for (about, _) in before {
+        match about {
+            About::Name(name) => {
+                broken.insert(name);
+            }
+            About::Opening(grant, opening) => {
+                gave_nothing.entry(grant).or_default().insert(opening);
+            }
+        }
+    }
+    let opened = old.map(openings).unwrap_or_default();
+    let kept_grants: BTreeSet<&str> = new.grants.iter().map(|g| g.name.as_str()).collect();
+    let added: Vec<String> = problems_about(new, public_ip, &resolved)
         .into_iter()
-        .filter(|p| !before.contains(p))
+        .filter(|(about, _)| match about {
+            About::Name(name) => !broken.contains(name),
+            About::Opening(grant, opening) => {
+                let same_answer = resolved.get(opening.name) == known.get(opening.name);
+                let held = |map: &Openings<'_>| held(map, &opened, &kept_grants, grant, opening);
+                !(held(&opened) && (same_answer || held(&gave_nothing)))
+            }
+        })
+        .map(|(_, problem)| problem)
         .collect();
     if !added.is_empty() {
         return Err(added);
@@ -799,5 +971,227 @@ mod tests {
         lab.upstream_dns = vec![Ipv4Addr::new(192, 168, 1, 53)];
         new.networks.push(lab);
         assert_eq!(asked_on_save(Some(&old), &new), BTreeSet::from([NAS]));
+    }
+
+    /// `named()` with `family` granted every port of NAS, which is on the
+    /// home's public IP: a problem already.
+    fn every_port_at_home() -> (Config, Resolved) {
+        let mut old = named();
+        old.grants[1].rules.push(Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: Vec::new(),
+        });
+        (old, [(NAS.to_string(), vec![HOME])].into())
+    }
+
+    #[test]
+    fn renaming_a_grant_keeps_its_old_problem_old() {
+        let (old, known) = every_port_at_home();
+        let mut new = old.clone();
+        new.grants[1].name = "relatives".into();
+        for g in new.peers.iter_mut().flat_map(|p| &mut p.grants) {
+            if g == "family" {
+                *g = "relatives".into();
+            }
+        }
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_ok());
+    }
+
+    #[test]
+    fn a_new_public_ip_keeps_an_old_problem_old() {
+        let (old, _) = every_port_at_home();
+        let at = Ipv4Addr::new(5, 6, 7, 8);
+        let known: Resolved = [(NAS.to_string(), vec![at])].into();
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &old, Some(at), &r, &known).is_ok());
+    }
+
+    #[test]
+    fn reordering_ports_keeps_an_old_problem_old() {
+        let mut old = named();
+        let web = |order: [u16; 2]| Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: order.map(|p| PortSpec::one(Proto::Tcp, p)).to_vec(),
+        };
+        old.grants[1].rules.push(web([80, 443]));
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert_eq!(problems(&old, Some(HOME), &known).len(), 1);
+        let mut new = old.clone();
+        *new.grants[1].rules.last_mut().unwrap() = web([443, 80]);
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_ok());
+        // Another port is another rule: refused.
+        *new.grants[1].rules.last_mut().unwrap() = web([443, 8443]);
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_err());
+    }
+
+    #[test]
+    fn taking_access_away_is_never_refused_for_what_it_reveals() {
+        // Everyone reaches everything, so `web`'s raw web port on the home's
+        // public IP is no problem for anyone yet.
+        let mut old = named();
+        old.grants[0].rules = vec![Rule::AllNetworks, Rule::Internet];
+        for p in &mut old.peers {
+            p.grants = vec!["personal".into()];
+        }
+        let mut web = old.grants[1].clone();
+        web.name = "web".into();
+        web.everyone = true;
+        web.rules = vec![Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+        }];
+        old.grants.push(web);
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert!(problems(&old, Some(HOME), &known).is_empty());
+        let r = FakeResolver::new();
+        let save = |new: &Config| check_save(Some(&old), Some(HOME), new, Some(HOME), &r, &known);
+        // Revoking `personal` from a peer, or `internet` from `personal`.
+        let mut new = old.clone();
+        new.peers[0].grants.clear();
+        assert!(save(&new).is_ok(), "{:?}", save(&new));
+        let mut new = old.clone();
+        new.grants[0].rules.pop();
+        assert!(save(&new).is_ok(), "{:?}", save(&new));
+        // A rule nobody had before is still refused.
+        let mut new = old.clone();
+        new.peers[0].grants.clear();
+        new.grants[2].rules.push(Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 80)],
+        });
+        assert!(save(&new).is_err());
+    }
+
+    #[test]
+    fn with_nothing_known_yet_a_resolver_change_must_still_answer() {
+        // Just started or restored: nothing asked yet, but the old resolver
+        // answers and the new one doesn't.
+        let old = named();
+        let mut new = old.clone();
+        new.networks[0].upstream_dns = vec![Ipv4Addr::new(192, 168, 1, 53)];
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
+        let err = check_save(Some(&old), None, &new, None, &r, &Resolved::new()).unwrap_err();
+        assert!(
+            err[0].starts_with("can't look up nas.mydomain.com"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn moving_a_rule_into_a_grant_it_fails_in_is_refused() {
+        // `personal` reaches everything, so its raw web rule there works.
+        let mut old = named();
+        old.grants[0].rules = vec![
+            Rule::AllNetworks,
+            Rule::Internet,
+            Rule::Host {
+                host: Host::Name(NAS.into()),
+                ports: vec![PortSpec::one(Proto::Tcp, 443)],
+            },
+        ];
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert!(problems(&old, Some(HOME), &known).is_empty());
+        let mut new = old.clone();
+        let rule = new.grants[0].rules.pop().unwrap();
+        new.grants[1].rules.push(rule);
+        let r = FakeResolver::new();
+        let err = check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).unwrap_err();
+        assert!(
+            err[0].starts_with("grant 'family': rule host nas.mydomain.com 443/tcp"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_resolver_change_that_moves_a_working_rule_onto_the_public_ip_is_refused() {
+        // Raw web on the LAN is fine; on the home's public IP it isn't.
+        let mut old = named();
+        old.grants[1].rules.push(Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+        });
+        let known: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
+        let mut new = old.clone();
+        let other = Ipv4Addr::new(192, 168, 1, 53);
+        new.networks[0].upstream_dns = vec![other];
+        let r = FakeResolver::new().answer(NAS, Nameserver::Plain(other), &[HOME]);
+        let err = check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).unwrap_err();
+        assert!(
+            err[0].contains("rule host nas.mydomain.com 443/tcp"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_range_and_its_ports_open_the_same() {
+        let mut old = named();
+        let rule = |ports: &[&str]| Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: ports.iter().map(|p| p.parse().unwrap()).collect(),
+        };
+        old.grants[1].rules.push(rule(&["442-443/tcp"]));
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert_eq!(problems(&old, Some(HOME), &known).len(), 1);
+        let mut new = old.clone();
+        *new.grants[1].rules.last_mut().unwrap() = rule(&["442/tcp", "443/tcp"]);
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_ok());
+    }
+
+    #[test]
+    fn attaching_a_grant_nobody_held_is_judged_like_a_new_rule() {
+        // `web` was created with a raw web rule on the public IP, then attached.
+        let mut old = named();
+        let mut web = old.grants[1].clone();
+        web.name = "web".into();
+        web.rules = vec![Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+        }];
+        old.grants.push(web);
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert!(problems(&old, Some(HOME), &known).is_empty());
+        let mut new = old.clone();
+        new.peers[2].grants.push("web".into());
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_err());
+        // A guest added while `web` is for everyone isn't (#85).
+        old.grants[2].everyone = true;
+        old.grants[0].rules = vec![Rule::AllNetworks, Rule::Internet];
+        for p in &mut old.peers {
+            p.grants = vec!["personal".into()];
+        }
+        let mut new = old.clone();
+        let mut guest = new.peers[2].clone();
+        guest.name = "guest".into();
+        guest.grants.clear();
+        new.peers.push(guest);
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_ok());
+    }
+
+    #[test]
+    fn renaming_a_service_or_spelling_its_protocols_out_keeps_its_problem_old() {
+        // immich is a service on NAS's port 443, unproxied, at the home's public IP.
+        let mut old = named();
+        old.services[0].host = Host::Name(NAS.into());
+        old.services[0].hostnames.clear();
+        old.services[0].ports = vec!["443".parse().unwrap()];
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        let found = problems(&old, Some(HOME), &known);
+        assert!(
+            found.iter().any(|p| p.contains("service 'immich'")),
+            "{found:?}"
+        );
+        let r = FakeResolver::new();
+        let mut new = old.clone();
+        new.services[0].name = "photos".into();
+        new.grants[1].rules = vec![Rule::Service {
+            name: "photos".into(),
+        }];
+        new.services[0].ports = vec!["443/tcp".parse().unwrap(), "443/udp".parse().unwrap()];
+        let saved = check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known);
+        assert!(saved.is_ok(), "{saved:?}");
     }
 }

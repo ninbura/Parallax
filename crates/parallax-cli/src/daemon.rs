@@ -4,7 +4,8 @@
 //! the configuration in memory, and applies it: at startup, after every
 //! saved change, on SIGHUP, when the UTC date changes, and when the live
 //! firewall or WireGuard interface drifts. The DNS server and the HTTPS
-//! proxy run as tasks and re-read their routes after each apply. The CLI
+//! proxy run as tasks: the DNS server re-reads its routes after each apply,
+//! and the proxy gets its routes from the engine around each one. The CLI
 //! talks to it over a Unix socket ([`crate::protocol`]).
 //!
 //! When guests have `internet`, it looks up the home's public IP
@@ -45,6 +46,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use parallax_core::generate;
+use parallax_core::generate::proxy::ProxyRoutes;
 use parallax_core::headscale::{self, Tailnet};
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::System;
@@ -152,8 +154,8 @@ enum Msg {
     Hangup,
     Tick,
     BackupTick,
-    /// The DNS server and the proxy are up: notify these after each apply.
-    Serving(Vec<Arc<Notify>>),
+    /// The DNS server and the proxy are up.
+    Serving(Reloaders),
     /// A lookup of the home's public IP finished, for these inputs.
     PublicIp(Inputs, Result<Found, Vec<String>>),
     /// The named hosts were looked up, for these inputs.
@@ -242,16 +244,16 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
             let _ = done_tx.send(());
         })
         .context("starting the engine thread")?;
-    match ready_rx.await {
-        Ok(Ok(())) => {}
+    let routes = match ready_rx.await {
+        Ok(Ok(routes)) => routes,
         Ok(Err(e)) => return Err(e),
         Err(_) => bail!("the engine stopped during startup"),
-    }
+    };
 
     let mut engine_alive = true;
     let taps = collector::Taps::new();
     let started = async {
-        let servers = start_servers(&opts.out, &taps).await?;
+        let servers = start_servers(&opts.out, routes, &taps).await?;
         let listener = bind_socket(&opts.socket)?;
         anyhow::Ok((servers, listener))
     }
@@ -340,13 +342,24 @@ fn stopped(what: &str, r: Result<anyhow::Result<()>, tokio::task::JoinError>) ->
 type Servers = (
     JoinHandle<anyhow::Result<()>>,
     JoinHandle<anyhow::Result<()>>,
-    Vec<Arc<Notify>>,
+    Reloaders,
 );
 
-/// Start the DNS server and the HTTPS proxy on the routes the first apply
-/// wrote. Both listen on the gateway address, which the WireGuard interface
-/// carries since that apply.
-async fn start_servers(out: &Path, taps: &collector::Taps) -> anyhow::Result<Servers> {
+/// How the engine hands the running DNS server and HTTPS proxy new routes.
+struct Reloaders {
+    /// Has the DNS server re-read the routes file.
+    dns: Arc<Notify>,
+    proxy: parallax_proxy::Reload,
+}
+
+/// Start the DNS server on the routes the first apply wrote, and the HTTPS
+/// proxy on the `routes` it made. Both listen on the gateway address, which
+/// the WireGuard interface carries since that apply.
+async fn start_servers(
+    out: &Path,
+    routes: ProxyRoutes,
+    taps: &collector::Taps,
+) -> anyhow::Result<Servers> {
     let dns = parallax_dns::Dns::load(&out.join(generate::dns::PATH), 53)?.tap(taps.dns.clone());
     let listen = dns.listen();
     let udp = UdpSocket::bind(listen)
@@ -355,13 +368,15 @@ async fn start_servers(out: &Path, taps: &collector::Taps) -> anyhow::Result<Ser
     let tcp = TcpListener::bind(listen)
         .await
         .with_context(|| format!("the DNS server can't listen on tcp {listen}"))?;
-    let proxy =
-        parallax_proxy::Proxy::load(&out.join(generate::proxy::PATH))?.tap(taps.proxy.clone());
+    let proxy = parallax_proxy::Proxy::new(routes)?.tap(taps.proxy.clone());
     let listen = proxy.listen();
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("the HTTPS proxy can't listen on {listen}"))?;
-    let reloaders = vec![dns.reload_trigger(), proxy.reload_trigger()];
+    let reloaders = Reloaders {
+        dns: dns.reload_trigger(),
+        proxy: proxy.reloader(),
+    };
     let dns = tokio::spawn(async move { Ok(dns.run(udp, tcp).await?) });
     let proxy = tokio::spawn(async move { Ok(proxy.run(listener).await?) });
     Ok((dns, proxy, reloaders))
@@ -844,7 +859,7 @@ fn engine_thread(
     out: PathBuf,
     publish: watch::Sender<Option<View>>,
     mut rx: mpsc::UnboundedReceiver<Msg>,
-    ready: oneshot::Sender<anyhow::Result<()>>,
+    ready: oneshot::Sender<anyhow::Result<ProxyRoutes>>,
 ) {
     let (jobs, queue) = std::sync::mpsc::channel::<BackupJob>();
     let writer = match std::thread::Builder::new()
@@ -885,7 +900,11 @@ fn engine_thread(
         let _ = ready.send(Err(e));
         return;
     }
-    let _ = ready.send(Ok(()));
+    let routes = engine
+        .proxy_routes
+        .clone()
+        .ok_or_else(|| anyhow!("the first apply made no proxy routes"));
+    let _ = ready.send(routes);
     while let Some(first) = rx.blocking_recv() {
         let mut batch = vec![first];
         while let Ok(msg) = rx.try_recv() {
@@ -936,7 +955,12 @@ struct Engine {
     applied: Option<ServerConfig>,
     /// The backup thread's queue.
     backups: std::sync::mpsc::Sender<BackupJob>,
-    reloaders: Vec<Arc<Notify>>,
+    /// The DNS server and the proxy, once they run.
+    servers: Option<Reloaders>,
+    /// The routes the proxy serves, or will next: they're taken in the
+    /// order sent. Only what a good apply made, or what that and every
+    /// apply since, failed ones too, all grant (issue #71).
+    proxy_routes: Option<ProxyRoutes>,
     /// Why the last public IP lookup failed, so the same failure is
     /// logged once, not every 5 minutes.
     public_ip_problems: Option<Vec<String>>,
@@ -950,6 +974,45 @@ struct Engine {
     name_problems: Vec<String>,
     /// Why Headscale didn't answer last time, logged once.
     tailnet_problem: Option<String>,
+}
+
+/// How long the proxy may take to serve the routes an apply needs first
+/// (its own wait for open connections is shorter).
+const PROXY_TAKES: Duration = Duration::from_secs(10);
+
+/// Before the apply writes or changes anything: one that fails partway can
+/// leave the old firewall, the new one or (iptables) a mix, so the proxy
+/// first serves only what both its routes `served` and the `new` ones grant
+/// (issue #71). Waits until it does; if it doesn't in time, nothing has
+/// changed and the apply stops.
+fn narrow_proxy(
+    rt: &tokio::runtime::Runtime,
+    proxy: Option<&parallax_proxy::Reload>,
+    served: &mut Option<ProxyRoutes>,
+    new: &ProxyRoutes,
+) -> anyhow::Result<()> {
+    // No proxy runs before the first apply has worked.
+    let (Some(proxy), Some(before)) = (proxy, served.as_ref()) else {
+        return Ok(());
+    };
+    let both = generate::proxy::overlap(before, new);
+    if both == *before {
+        return Ok(());
+    }
+    let taken = proxy.send(both.clone());
+    // Inside the runtime: a timer needs its clock.
+    match rt.block_on(async { tokio::time::timeout(PROXY_TAKES, taken).await }) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => bail!(
+            "the HTTPS proxy couldn't take its routes for the change (stopped, or open connections didn't move on); nothing was changed"
+        ),
+        Err(_) => bail!(
+            "the HTTPS proxy didn't take its routes for the change within {} s; nothing was changed",
+            PROXY_TAKES.as_secs()
+        ),
+    }
+    *served = Some(both);
+    Ok(())
 }
 
 impl Engine {
@@ -993,7 +1056,8 @@ impl Engine {
             out,
             reconciler: Reconciler::new(),
             applied: None,
-            reloaders: Vec::new(),
+            servers: None,
+            proxy_routes: None,
             backups,
             public_ip_problems: None,
             public_ip_saved: true,
@@ -1077,7 +1141,7 @@ impl Engine {
                 }
                 Msg::Tick => tick = true,
                 Msg::BackupTick => backup_due = true,
-                Msg::Serving(reloaders) => self.reloaders = reloaders,
+                Msg::Serving(reloaders) => self.servers = Some(reloaders),
                 // A save changed the inputs, or looked itself, while this
                 // lookup ran: the lookup for the new ones is already on its way.
                 Msg::PublicIp(asked, _) if asked != lookup_inputs(&self.view) => {}
@@ -1138,7 +1202,21 @@ impl Engine {
     fn apply(&mut self, why: &str) -> (Vec<String>, Option<String>) {
         log(format!("applying ({why})"));
         let today = crate::today();
-        match crate::apply_config(&self.view.config, &self.out, today, &self.view.learned()) {
+        let mut made = None;
+        let (servers, served, rt) = (&self.servers, &mut self.proxy_routes, &self.rt);
+        let applied = crate::apply_config(
+            &self.view.config,
+            &self.out,
+            today,
+            &self.view.learned(),
+            |model| {
+                let new = generate::proxy::build(model);
+                narrow_proxy(rt, servers.as_ref().map(|s| &s.proxy), served, &new)?;
+                made = Some(new);
+                Ok(())
+            },
+        );
+        match applied {
             Ok((warnings, applied)) => {
                 let lines: Vec<String> = warnings
                     .into_iter()
@@ -1150,8 +1228,16 @@ impl Engine {
                 self.reconciler
                     .applied(today, reconcile::live_state(server, sys()));
                 self.applied = Some(server.clone());
-                for reload in &self.reloaders {
-                    reload.notify_one();
+                if let Some(servers) = &self.servers {
+                    servers.dns.notify_one();
+                    if let Some(routes) = &made {
+                        // Not waited for: the next apply's narrowing is
+                        // taken after these.
+                        drop(servers.proxy.send(routes.clone()));
+                    }
+                }
+                if made.is_some() {
+                    self.proxy_routes = made;
                 }
                 self.set_apply_error(None);
                 (lines, None)
@@ -1363,8 +1449,10 @@ impl Engine {
             Some(Ok(found)) => Some(found.address),
             _ => self.view.public_ip,
         };
-        // Blocks this thread for those names' lookups only (a few seconds
-        // at most): known names aren't asked again.
+        // Blocks this thread for those names' lookups only, up to a few
+        // seconds per resolver asked (a name the new resolvers can't answer
+        // and nothing knows is asked through the old ones too): known names
+        // aren't asked again.
         let resolved = names::check_save(
             Some(&self.view.config),
             old_ip,
@@ -1476,11 +1564,13 @@ impl Engine {
             // The rows just copied in: what the database now holds.
             anyhow::Ok((lines, restored))
         })?;
-        // What the restored configuration doesn't use goes; the lookups for
-        // what it adds follow.
+        // What the restored configuration doesn't use, or asks other
+        // resolvers for, goes; the lookups for those follow.
         let used = names::used(&config);
+        let elsewhere = names::asked_on_save(Some(before.as_ref()), &config);
         let mut resolved = self.view.names.clone();
-        resolved.retain(|name, _| used.contains(name.as_str()));
+        resolved
+            .retain(|name, _| used.contains(name.as_str()) && !elsewhere.contains(name.as_str()));
         self.replace(config);
         self.set_names_from_save(resolved, false);
         self.publish();
@@ -1526,5 +1616,102 @@ impl Engine {
         for line in reconcile::teardown(server, sys()) {
             log(line);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test")]
+
+    use super::*;
+    use parallax_core::generate::proxy::ProxySite;
+
+    /// `immich.mydomain.com` for `allowed`, or no site for none; neither
+    /// needs a CA bundle loaded.
+    fn routes(allowed: &[&str]) -> ProxyRoutes {
+        ProxyRoutes {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            certificates: "/nonexistent/certs".into(),
+            upstream_ca: "/nonexistent/ca.pem".into(),
+            sites: (!allowed.is_empty())
+                .then(|| ProxySite {
+                    hostname: "immich.mydomain.com".into(),
+                    service: "immich".into(),
+                    upstream: "192.168.1.5:443".parse().unwrap(),
+                    allowed: allowed.iter().map(|a| a.parse().unwrap()).collect(),
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn engine_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    /// A proxy that has stopped: anything sent to it fails.
+    fn stopped() -> parallax_proxy::Reload {
+        let proxy = parallax_proxy::Proxy::new(routes(&[])).unwrap();
+        let reload = proxy.reloader();
+        drop(proxy);
+        reload
+    }
+
+    /// #71: a change that takes `immich` away has the running proxy drop it
+    /// before anything live changes.
+    #[test]
+    fn the_proxy_takes_the_overlap_before_the_apply_goes_on() {
+        let proxy_rt = tokio::runtime::Runtime::new().unwrap();
+        // Sites would need a CA bundle; the engine's side is what's tested.
+        let proxy = parallax_proxy::Proxy::new(routes(&[])).unwrap();
+        let reload = proxy.reloader();
+        let listener = proxy_rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        proxy_rt.spawn(proxy.run(listener));
+        let mut served = Some(routes(&["10.8.2.1/32"]));
+        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap();
+        assert_eq!(served, Some(routes(&[])));
+    }
+
+    /// Nothing to take away: the proxy isn't asked, so a stopped one
+    /// doesn't stop the apply.
+    #[test]
+    fn an_unchanged_proxy_is_not_asked() {
+        let mut served = Some(routes(&["10.8.2.1/32"]));
+        let wider = routes(&["10.8.2.1/32", "10.8.3.0/24"]);
+        narrow_proxy(&engine_rt(), Some(&stopped()), &mut served, &wider).unwrap();
+        assert_eq!(served, Some(routes(&["10.8.2.1/32"])));
+    }
+
+    /// A proxy that can't take the overlap stops the apply before anything
+    /// changes, and what it serves is still what it was.
+    #[test]
+    fn a_stopped_proxy_stops_the_apply() {
+        let mut served = Some(routes(&["10.8.2.1/32"]));
+        let err = narrow_proxy(&engine_rt(), Some(&stopped()), &mut served, &routes(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the HTTPS proxy couldn't take"), "{err}");
+        assert_eq!(served, Some(routes(&["10.8.2.1/32"])));
+    }
+
+    /// The proxy task ended (the daemon aborts it on shutdown): its reloader
+    /// went with it, so nothing is confirmed.
+    #[test]
+    fn a_proxy_task_that_ended_confirms_nothing() {
+        let proxy_rt = tokio::runtime::Runtime::new().unwrap();
+        let proxy = parallax_proxy::Proxy::new(routes(&[])).unwrap();
+        let reload = proxy.reloader();
+        let listener = proxy_rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let task = proxy_rt.spawn(proxy.run(listener));
+        // Running: it confirms.
+        let mut served = Some(routes(&["10.8.2.1/32"]));
+        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap();
+        task.abort();
+        let _ = proxy_rt.block_on(task);
+        let mut served = Some(routes(&["10.8.2.1/32"]));
+        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap_err();
     }
 }

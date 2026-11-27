@@ -1242,11 +1242,14 @@ pub(crate) fn preview(config: &Config, today: Date, learned: &Learned) -> anyhow
 
 /// Generate, write and reconcile the live gateway with what the gateway
 /// learned. Returns the warnings and the apply log.
+/// `before_live` runs before anything is written or changed; its error
+/// stops the apply there.
 pub(crate) fn apply_config(
     config: &Config,
     out: &Path,
     today: Date,
     learned: &Learned,
+    before_live: impl FnOnce(&Model<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let model = model_for(config, today, learned)?;
     let mut bundle = generate::generate_all(&model, &RealFs)?;
@@ -1259,6 +1262,7 @@ pub(crate) fn apply_config(
         fs: &RealFs,
         runner: &runner,
     };
+    before_live(&model)?;
     let report = parallax_core::apply::apply(&model, &bundle, out, sys)?;
     Ok((warnings, report.log))
 }
@@ -1415,7 +1419,9 @@ fn run() -> anyhow::Result<()> {
                         names: found.resolved,
                         tailnet,
                     };
-                    let (warnings, log) = apply_config(&config, &out.out, today(), &learned)?;
+                    // No daemon, so no proxy is running to hand routes to.
+                    let (warnings, log) =
+                        apply_config(&config, &out.out, today(), &learned, |_| Ok(()))?;
                     notes.extend(warnings);
                     anyhow::Ok((notes, log))
                 })?;

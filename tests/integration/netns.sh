@@ -518,7 +518,8 @@ start_daemon 3600
 GW_PUB=$($P config export | sed -n 's/^public_key = "\(.*\)"/\1/p' | head -n1)
 
 # Through the daemon: an import applies on save, `apply` re-applies. No SIGHUP;
-# the DNS server and the proxy re-read their routes right after the apply.
+# the DNS server re-reads its routes right after the apply, and the proxy gets
+# its routes from the daemon around it.
 apply() { # [TOML file to import]
     if [ -n "${1:-}" ]; then
         $P config import "$1" >/dev/null 2>&1 || fail "import of $1 through the daemon failed"

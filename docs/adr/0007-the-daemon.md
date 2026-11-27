@@ -18,10 +18,15 @@ socket.
   already answers on, and a daemon removes only the socket it bound.
 - **Everything runs inside it.** The DNS server and the HTTPS proxy are tasks
   in its runtime, not separate processes; `parallax dns` and `parallax
-  proxy` are gone. They still read the routes files `apply` writes, and the
-  daemon tells them to re-read after each successful apply (no SIGHUP).
-  Generated files are written aside and renamed into place, so a reload
-  never reads half a file while the next apply writes. A failed reload still refuses everything until one works. If either task
+  proxy` are gone. The DNS server still reads the routes file `apply`
+  writes, and the daemon tells it to re-read after each successful apply
+  (no SIGHUP). Generated files are written aside and renamed into place, so
+  a reload never reads half a file while the next apply writes.
+  *Amended (issue #71):* the daemon hands the proxy its routes itself, with
+  no file. Before an apply changes anything live, the proxy gets only what
+  the old and the new routes both grant, and the daemon waits until it
+  serves them. It gets the new routes in full once the apply has worked. A
+  failed reload still refuses everything until one works. If either task
   stops, the daemon exits non-zero and Docker's restart policy takes over.
   Automatic backups (`backup create --if-due` every 10 minutes) run inside
   it too, on its open database.

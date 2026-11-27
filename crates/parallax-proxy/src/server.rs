@@ -2,16 +2,15 @@
 //! is sent, check the caller's tunnel address, then serve HTTP/1.1 or HTTP/2
 //! and forward each checked request to the site's upstream over TLS.
 //!
-//! The routes live in a `watch` channel. A reload sends a new state; every
-//! request looks its site up in the current one, and open connections and
-//! WebSocket relays re-check theirs on every change, so revoking a grant
-//! cuts off connections that were already open.
+//! The routes live in a `watch` channel. New routes ([`Reload`]) become a
+//! new state; every request looks its site up in the current one, and open
+//! connections and WebSocket relays re-check theirs on every change, so
+//! revoking a grant cuts off connections that were already open.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +36,7 @@ use rustls::server::Acceptor;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
 
@@ -56,6 +55,9 @@ const MAX_STREAMS: u32 = 100;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the certificate folder is checked for renewals.
 const CERT_REFRESH: Duration = Duration::from_secs(60);
+/// How long open connections may take to check new routes before a reload
+/// goes unconfirmed (the daemon then stops the apply).
+const DRAIN: Duration = Duration::from_secs(5);
 /// Open connections one tunnel address may hold. Browsers open about six per
 /// site over HTTP/1.1 and one over HTTP/2; this bounds what one peer can
 /// take from everyone else.
@@ -118,23 +120,45 @@ impl State {
 
 type Shared = watch::Receiver<Arc<State>>;
 
+/// Routes on their way to the proxy, and who to tell once they're in force.
+type Handover = (ProxyRoutes, oneshot::Sender<()>);
+
+/// Hands a proxy new routes ([`Proxy::reloader`]).
+#[derive(Debug, Clone)]
+pub struct Reload(mpsc::UnboundedSender<Handover>);
+
+impl Reload {
+    /// Have the proxy serve `routes`. The receiver gets `()` once it does,
+    /// or refuses everything because they didn't load, and every open
+    /// connection has checked them. It gets an error if the proxy has
+    /// stopped, or connections didn't all check them in time. Routes are
+    /// taken in the order sent.
+    pub fn send(&self, routes: ProxyRoutes) -> oneshot::Receiver<()> {
+        let (done, taken) = oneshot::channel();
+        // A stopped proxy drops `done`, which the receiver reports.
+        let _ = self.0.send((routes, done));
+        taken
+    }
+}
+
 /// A loaded proxy, ready to run on a listener.
 pub struct Proxy {
-    routes_path: PathBuf,
     state: Arc<State>,
     refresh: Duration,
-    reload: Arc<Notify>,
+    reload: Reload,
+    reloads: mpsc::UnboundedReceiver<Handover>,
     tap: Option<Tap>,
 }
 
 impl Proxy {
-    /// Read the routes file, the CA bundle and the certificates.
-    pub fn load(routes_path: &Path) -> Result<Proxy> {
+    /// Load `routes`: the CA bundle and the certificates they name.
+    pub fn new(routes: ProxyRoutes) -> Result<Proxy> {
+        let (reload, reloads) = mpsc::unbounded_channel();
         Ok(Proxy {
-            routes_path: routes_path.to_path_buf(),
-            state: Arc::new(load_state(routes_path)?),
+            state: Arc::new(load_state(routes)?),
             refresh: CERT_REFRESH,
-            reload: Arc::new(Notify::new()),
+            reload: Reload(reload),
+            reloads,
             tap: None,
         })
     }
@@ -157,9 +181,9 @@ impl Proxy {
         self
     }
 
-    /// Notifying this re-reads the routes (the daemon does after each apply).
-    pub fn reload_trigger(&self) -> Arc<Notify> {
-        Arc::clone(&self.reload)
+    /// What hands this proxy new routes (the daemon does around each apply).
+    pub fn reloader(&self) -> Reload {
+        self.reload.clone()
     }
 
     /// Serve on `listener` until the task is dropped.
@@ -172,10 +196,17 @@ impl Proxy {
             self.state.sites.len()
         ));
         let (tx, rx) = watch::channel(self.state);
-        tokio::spawn(reloader(self.routes_path, tx, self.refresh, self.reload));
+        // Part of this future, not a task of its own: once it's dropped, no
+        // routes are confirmed.
+        let reloading = reloader(tx, self.refresh, self.reloads);
+        tokio::pin!(reloading);
         let counts: Arc<Mutex<HashMap<Ipv4Addr, usize>>> = Arc::default();
         loop {
-            match listener.accept().await {
+            let accepted = tokio::select! {
+                () = &mut reloading => return Ok(()),
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
                 Ok((stream, peer)) => {
                     let Some(client) = ipv4(peer.ip()) else {
                         continue;
@@ -246,10 +277,7 @@ impl Drop for Slot {
     }
 }
 
-fn load_state(routes_path: &Path) -> Result<State> {
-    let text = std::fs::read_to_string(routes_path)
-        .map_err(|e| Error::io(format!("reading {}", routes_path.display()), e))?;
-    let routes = ProxyRoutes::from_toml(&text)?;
+fn load_state(routes: ProxyRoutes) -> Result<State> {
     let (tls, certs_fingerprint) = server_configs(&routes);
     let mut sites = HashMap::new();
     // With no sites there is nothing to verify, and no CA bundle is needed.
@@ -321,28 +349,77 @@ fn server_configs(routes: &ProxyRoutes) -> (HashMap<String, Option<Arc<ServerCon
     (out, fingerprint)
 }
 
+/// Runs as long as the proxy does.
 async fn reloader(
-    routes_path: PathBuf,
     tx: watch::Sender<Arc<State>>,
     refresh: Duration,
-    trigger: Arc<Notify>,
+    mut reloads: mpsc::UnboundedReceiver<Handover>,
 ) {
     let mut tick = tokio::time::interval(refresh);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
+    // Every state replaced that an open connection may still answer to, by
+    // reloads and certificate renewals alike.
+    let mut replaced: Vec<Arc<State>> = Vec::new();
+    let mut open = true;
     loop {
         tokio::select! {
-            () = trigger.notified() => reload(&routes_path, &tx),
-            _ = tick.tick() => refresh_certificates(&tx),
+            handover = reloads.recv(), if open => {
+                // Nobody can send routes any more: the last ones stay, and
+                // certificates are still renewed.
+                let Some((routes, done)) = handover else {
+                    open = false;
+                    continue;
+                };
+                replaced.push(reload(routes, &tx));
+                // Not confirmed until then: the daemon changes the firewall
+                // next. Dropping `done` tells it so. Nobody waiting: the next
+                // confirmation waits for these too.
+                if !done.is_closed() && drained(&mut replaced).await {
+                    let _ = done.send(());
+                }
+            }
+            _ = tick.tick() => {
+                let before = Arc::clone(&tx.borrow());
+                refresh_certificates(&tx);
+                if !Arc::ptr_eq(&before, &tx.borrow()) {
+                    replaced.push(before);
+                }
+            }
         }
+        replaced.retain(|s| Arc::strong_count(s) > 1);
     }
 }
 
-/// Re-read the routes. On failure, refuse everything until a reload works:
-/// the old routes may grant what the new configuration takes away.
-fn reload(routes_path: &Path, tx: &watch::Sender<Arc<State>>) {
+/// Wait until no open connection answers to any state in `replaced` any
+/// more: each has checked the current routes, or closed. False if some
+/// still do after [`DRAIN`].
+async fn drained(replaced: &mut Vec<Arc<State>>) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        // Ours is the last reference once every connection has moved on.
+        replaced.retain(|s| Arc::strong_count(s) > 1);
+        if replaced.is_empty() {
+            return true;
+        }
+        if start.elapsed() > DRAIN {
+            let held: usize = replaced.iter().map(|s| Arc::strong_count(s) - 1).sum();
+            log(format!(
+                "{held} connection(s) still on older routes after {} s",
+                DRAIN.as_secs()
+            ));
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Serve `routes`. When they don't load, refuse everything until some do:
+/// the old routes may grant what the new configuration takes away. Returns
+/// the routes they replaced.
+fn reload(routes: ProxyRoutes, tx: &watch::Sender<Arc<State>>) -> Arc<State> {
     let old = Arc::clone(&tx.borrow());
-    match load_state(routes_path) {
+    match load_state(routes) {
         Ok(state) => {
             if state.routes.listen != old.routes.listen {
                 log(format!(
@@ -364,6 +441,7 @@ fn reload(routes_path: &Path, tx: &watch::Sender<Arc<State>>) {
             }));
         }
     }
+    old
 }
 
 /// Pick up renewed certificates. A renewal caught halfway (certbot swaps the
@@ -417,23 +495,44 @@ fn refresh_certificates(tx: &watch::Sender<Arc<State>>) {
     }));
 }
 
-/// Drive `work` until it ends or `client` loses `hostname` in a reload.
-async fn while_authorized<F: Future>(work: F, mut state: Shared, hostname: &str, client: Ipv4Addr) {
+/// Drive `work` until it ends (its output) or `client` loses `hostname` in
+/// a reload, or, for work with `upstream`, the hostname moves elsewhere
+/// (`None`). Checked against
+/// the current routes first, and again on every change before `work` goes
+/// on. The routes last checked are held meanwhile: a reload is confirmed
+/// only once no connection holds the ones it replaced ([`drained`]).
+async fn while_authorized<F: Future>(
+    work: F,
+    mut state: Shared,
+    hostname: &str,
+    client: Ipv4Addr,
+    upstream: Option<SocketAddrV4>,
+) -> Option<F::Output> {
     tokio::pin!(work);
+    let mut checked: Option<Arc<State>> = None;
     loop {
+        let now = Arc::clone(&state.borrow_and_update());
+        if !checked.as_ref().is_some_and(|c| Arc::ptr_eq(c, &now)) {
+            let still = now
+                .authorized(hostname, client)
+                .is_some_and(|site| upstream.is_none_or(|u| site.route.upstream == u));
+            if !still {
+                log(format!(
+                    "{client}: {hostname}: access revoked or moved, closing"
+                ));
+                return None;
+            }
+            checked = Some(now);
+        }
         tokio::select! {
-            _ = &mut work => return,
+            biased;
             changed = state.changed() => {
                 if changed.is_err() {
                     // The reloader is gone; the last state stays in force.
-                    work.await;
-                    return;
-                }
-                if state.borrow_and_update().authorized(hostname, client).is_none() {
-                    log(format!("{client}: {hostname}: access revoked, closing"));
-                    return;
+                    return Some(work.await);
                 }
             }
+            done = &mut work => return Some(done),
         }
     }
 }
@@ -547,14 +646,14 @@ async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot,
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
             .max_concurrent_streams(MAX_STREAMS)
             .serve_connection(io, service);
-        while_authorized(conn, state, &hostname, client).await;
+        let _ = while_authorized(conn, state, &hostname, client, None).await;
     } else {
         let conn = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(HEADER_TIMEOUT)
             .serve_connection(io, service)
             .with_upgrades();
-        while_authorized(conn, state, &hostname, client).await;
+        let _ = while_authorized(conn, state, &hostname, client, None).await;
     }
 }
 
@@ -796,7 +895,24 @@ async fn forward(
         Ok(up) => up,
         Err(r) => return Ok(refuse(exchange, r.status(), r.message())),
     };
-    let mut resp = match site.upstream.request(up).await {
+    // Guarded too: an HTTP/2 stream runs as a task of its own, and must not
+    // reach the upstream once a reload has taken the hostname away.
+    let sent = while_authorized(
+        site.upstream.request(up),
+        state.clone(),
+        &hostname,
+        client,
+        Some(site.route.upstream),
+    )
+    .await;
+    let Some(sent) = sent else {
+        return Ok(refuse(
+            exchange,
+            StatusCode::FORBIDDEN,
+            "access was revoked",
+        ));
+    };
+    let mut resp = match sent {
         Ok(resp) => resp,
         Err(e) => {
             log(format!(
@@ -828,6 +944,7 @@ async fn forward(
     };
     let upgrade = resp.headers().get(UPGRADE).cloned();
     http::strip_hop_by_hop(resp.headers_mut(), upgrade);
+    let relayed_to = site.route.upstream;
     let upstream = hyper::upgrade::on(&mut resp);
     // A WebSocket's record goes when it closes, with what it carried.
     if let Some(e) = exchange.as_mut().and_then(Exchange::event) {
@@ -851,7 +968,7 @@ async fn forward(
                     None => tokio::io::copy_bidirectional(&mut down, &mut up).await,
                 };
             };
-            while_authorized(relay, state, &hostname, client).await;
+            let _ = while_authorized(relay, state, &hostname, client, Some(relayed_to)).await;
         }
         drop(exchange);
     });
