@@ -309,10 +309,17 @@ impl<'a> Opens<'a> {
 /// What each grant's rules open at named hosts, by grant name.
 type Openings<'a> = BTreeMap<&'a str, BTreeSet<Opening<'a>>>;
 
+/// Only grants someone holds: a rule in a grant nobody had yet (created,
+/// then attached) is new to whoever gets it.
 fn openings(config: &Config) -> Openings<'_> {
+    let held: BTreeSet<&str> = tier::tiers(config)
+        .iter()
+        .flat_map(|t| t.grants.iter().map(|g| g.name.as_str()))
+        .collect();
     config
         .grants
         .iter()
+        .filter(|g| held.contains(g.name.as_str()))
         .map(|g| {
             let opens = g
                 .rules
@@ -1131,5 +1138,60 @@ mod tests {
         *new.grants[1].rules.last_mut().unwrap() = rule(&["442/tcp", "443/tcp"]);
         let r = FakeResolver::new();
         assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_ok());
+    }
+
+    #[test]
+    fn attaching_a_grant_nobody_held_is_judged_like_a_new_rule() {
+        // `web` was created with a raw web rule on the public IP, then attached.
+        let mut old = named();
+        let mut web = old.grants[1].clone();
+        web.name = "web".into();
+        web.rules = vec![Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+        }];
+        old.grants.push(web);
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert!(problems(&old, Some(HOME), &known).is_empty());
+        let mut new = old.clone();
+        new.peers[2].grants.push("web".into());
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_err());
+        // A guest added while `web` is for everyone isn't (#85).
+        old.grants[2].everyone = true;
+        old.grants[0].rules = vec![Rule::AllNetworks, Rule::Internet];
+        for p in &mut old.peers {
+            p.grants = vec!["personal".into()];
+        }
+        let mut new = old.clone();
+        let mut guest = new.peers[2].clone();
+        guest.name = "guest".into();
+        guest.grants.clear();
+        new.peers.push(guest);
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_ok());
+    }
+
+    #[test]
+    fn renaming_a_service_or_spelling_its_protocols_out_keeps_its_problem_old() {
+        // immich is a service on NAS's port 443, unproxied, at the home's public IP.
+        let mut old = named();
+        old.services[0].host = Host::Name(NAS.into());
+        old.services[0].hostnames.clear();
+        old.services[0].ports = vec!["443".parse().unwrap()];
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        let found = problems(&old, Some(HOME), &known);
+        assert!(
+            found.iter().any(|p| p.contains("service 'immich'")),
+            "{found:?}"
+        );
+        let r = FakeResolver::new();
+        let mut new = old.clone();
+        new.services[0].name = "photos".into();
+        new.grants[1].rules = vec![Rule::Service {
+            name: "photos".into(),
+        }];
+        new.services[0].ports = vec!["443/tcp".parse().unwrap(), "443/udp".parse().unwrap()];
+        let saved = check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known);
+        assert!(saved.is_ok(), "{saved:?}");
     }
 }
