@@ -225,9 +225,11 @@ persistent_keepalive = 25
 # Routes and routing domains only for these networks (default: all of them).
 # visible_networks = ["home"]
 
-# M2 will add Tailscale peers like this one; the engine accepts them today so
-# the model is final, but does nothing with them until Headscale is wired in.
+# A Tailscale peer names its Headscale node (`parallax headscale status` lists
+# them); its access follows the address Headscale gives that node.
 # [[peer]]
 # name = "apple-tv"
 # grants = ["personal"]
 # transport = "tailscale"
+# [peer.tailscale]
+# node_id = 3

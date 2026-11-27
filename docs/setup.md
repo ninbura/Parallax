@@ -296,7 +296,7 @@ up again); see Editing the configuration.
 
 On every start the entrypoint then runs `parallax doctor`. On the first start
 it generates `wg-server.key` (mode 0600) in `docker/config/` and records its
-public key in the configuration. Then it starts `tailscaled` (idle until M2)
+public key in the configuration. Then it starts `tailscaled` (idle until step 13)
 and hands over to `parallax daemon`, which applies the firewall, brings up
 `wg0`, starts the DNS server and the HTTPS proxy, and keeps it all applied.
 If DNS or the proxy stops, the container stops and Docker's restart policy
@@ -338,6 +338,63 @@ only the public key unless you pass `--keep-private-key`. The gateway accepts
 the device as soon as the command returns. `export <peer>
 --platform <linux|macos|windows|mobile>` re-renders a config later (with a
 placeholder for the key if it was not retained).
+
+## Headscale
+
+Tailscale devices log in to Headscale. `docker compose up -d` builds it from
+a pinned commit of its main branch the first time
+(`docker/headscale.Dockerfile`): `tailscale cert` and HTTPS `tailscale serve`
+aren't in a release yet (ADR 0014). Its configuration is
+`docker/headscale/config.yaml`; set `server_url` and `dns.base_domain` there,
+and check a change before restarting it:
+
+```sh
+sudo docker compose run --rm headscale check config -f /etc/headscale/config.yaml
+```
+
+Parallax reads Headscale's nodes through its API at
+`server.headscale.server_url`, with an admin API key. Create one and put it
+where `server.headscale.api_key_file` says (`/etc/parallax/headscale-api.key`,
+which is `docker/config/` on the host):
+
+```sh
+sudo docker compose exec headscale headscale apikeys create --expiration 365d \
+    | sudo sh -c 'umask 077; cat > config/headscale-api.key'
+```
+
+A key expires (90 days without `--expiration`); Parallax then keeps the
+addresses Headscale gave last, logs the refusal, and `parallax doctor` warns
+until there's a new key in the file. No restart is needed. Don't restart
+meanwhile: the addresses aren't stored, and peers that name a node get no
+access until Headscale answers again.
+
+A Tailscale peer names its Headscale node by id, which `parallax headscale
+status` lists:
+
+```toml
+[[peer]]
+name = "apple-tv"
+grants = ["personal"]
+transport = "tailscale"
+[peer.tailscale]
+node_id = 3
+```
+
+Its access follows the address Headscale gives that node: the daemon asks
+every 10 seconds and applies again when an address changes. Each node can be
+only one peer. `parallax
+headscale status` shows each node and its peer, and `parallax status` the
+addresses in effect.
+
+### Certificates for Tailscale devices
+
+For `tailscale cert` and HTTPS `tailscale serve`, `dns.base_domain` must be a
+public domain you control (not `server_url`'s), and Headscale answers the
+ACME DNS-01 challenge through your DNS provider. Uncomment the `challenge`
+block in `config.yaml`, put the provider's token in the file it names (mode
+0600), and set `dns.certificates.enabled: true`. Headscale checks the
+challenge record through public resolvers on port 53; on a network that
+blocks outbound DNS, list your router under `dns.challenge.resolvers`.
 
 ## Editing the configuration
 

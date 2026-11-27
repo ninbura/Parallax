@@ -47,7 +47,9 @@
 # grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
 # change access when they return, and a refused one changes nothing, (t) activity
 # logging records logged peers' connections, bytes and blocked attempts and nobody
-# else's. Every change goes through the daemon and takes effect without SIGHUP.
+# else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
+# node's address from Headscale. Every change goes through the daemon and takes
+# effect without SIGHUP.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -976,5 +978,114 @@ inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
 # The records stay readable with logging off.
 [ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
 pass "(t) each level records what it covers (blocked attempts; connections and bytes) with both destinations; nobody else's; off removes the rules"
+
+# (u) Tailscale peers follow Headscale: a real Headscale and a node logged in to it
+# (userspace tailscaled) in the gateway's namespace. The daemon puts the node's
+# address in its peer's tier set within a poll, keeps it while Headscale is down,
+# and drops it once the node is deleted. Needs HEADSCALE, TAILSCALED and TAILSCALE
+# (tests/integration/headscale-binaries.sh builds them); skipped without.
+if [ -n "${HEADSCALE:-}" ] && [ -n "${TAILSCALED:-}" ] && [ -n "${TAILSCALE:-}" ]; then
+    HS="$WORK/hs"
+    mkdir -p "$HS/ts"
+    # No internet here: one offline DERP region, so Headscale starts.
+    cat > "$HS/derp.yaml" <<YAML
+regions:
+  900:
+    regionid: 900
+    regioncode: test
+    regionname: Offline test region
+    nodes:
+      - name: 900a
+        regionid: 900
+        hostname: 127.0.0.1
+YAML
+    cat > "$HS/config.yaml" <<YAML
+server_url: http://127.0.0.1:18080
+listen_addr: 127.0.0.1:18080
+metrics_listen_addr: ""
+unix_socket: $HS/headscale.sock
+noise:
+  private_key_path: $HS/noise.key
+database:
+  sqlite:
+    path: $HS/db.sqlite
+derp:
+  urls: []
+  paths: [$HS/derp.yaml]
+log:
+  level: warn
+YAML
+    start_headscale() {
+        # Its own pid, not the backgrounded subshell's, so (u) can stop it.
+        inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$HS/headscale.pid" \
+            "$HEADSCALE" serve -c "$HS/config.yaml" >> "$HS/headscale.log" 2>&1 &
+        PIDS+=($!)
+        for _ in $(seq 100); do
+            inns gw curl -sf -m 1 http://127.0.0.1:18080/version >/dev/null && return 0
+            sleep 0.1
+        done
+        cat "$HS/headscale.log"; fail "(u) Headscale did not start"
+    }
+    start_headscale
+    HS_KEY=$(inns gw "$HEADSCALE" -c "$HS/config.yaml" apikeys create 2>/dev/null | tail -n1)
+    hs_api() { # method, path, [JSON body]
+        inns gw curl -sf -m 5 -X "$1" -H "Authorization: Bearer $HS_KEY" \
+            -H 'Content-Type: application/json' ${3:+-d "$3"} "http://127.0.0.1:18080$2"
+    }
+    HS_USER=$(hs_api POST /api/v1/user '{"name":"family"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["user"]["id"])')
+    AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"2099-01-01T00:00:00Z\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
+    inns gw "$TAILSCALED" --tun=userspace-networking --state=mem: --socket="$HS/ts/sock" \
+        --statedir="$HS/ts" --port=0 >> "$HS/tailscaled.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 50); do [ -S "$HS/ts/sock" ] && break; sleep 0.1; done
+    inns gw timeout 30 "$TAILSCALE" --socket="$HS/ts/sock" up --login-server=http://127.0.0.1:18080 \
+        --authkey="$AUTH" --hostname=tablet >/dev/null 2>&1 || { tail -20 "$HS/tailscaled.log"; fail "(u) the node did not log in"; }
+    read -r NODE NODE_IP < <(hs_api GET /api/v1/node | python3 -c '
+import json, sys
+n = json.load(sys.stdin)["nodes"][0]
+print(n["id"], next(a for a in n["ipAddresses"] if "." in a))')
+    install -m 0600 /dev/null "$WORK/headscale-api.key"
+    echo "$HS_KEY" > "$WORK/headscale-api.key"
+    [ "$MODE" = unit ] && chown nobody "$WORK/headscale-api.key"
+    $P config export > "$WORK/current.toml"
+    python3 - "$WORK/current.toml" "$WORK/tailscale.toml" "$WORK/headscale-api.key" "$NODE" <<'PY'
+import re, sys
+src, dst, key, node = sys.argv[1:]
+s = open(src).read()
+s = re.sub(r'(?m)^server_url = ".*"$', 'server_url = "http://127.0.0.1:18080"', s, count=1)
+s = re.sub(r'(?m)^api_key_file = ".*"$', f'api_key_file = "{key}"', s, count=1)
+s += f'\n[[peer]]\nname = "tablet"\ngrants = ["family"]\ntransport = "tailscale"\n[peer.tailscale]\nnode_id = {node}\n'
+open(dst, "w").write(s)
+PY
+    grep -q '^server_url = "http://127.0.0.1:18080"$' "$WORK/tailscale.toml" || fail "(u) could not point the configuration at Headscale"
+    # Not grep -q: it stops reading at the match, and with pipefail nft's SIGPIPE
+    # would fail the pipeline exactly when the address is there.
+    in_set() { inns gw nft list table inet parallax | grep "elements = {[^}]*\b$NODE_IP\b" >/dev/null; }
+    wait_set() { # want: in | out
+        for _ in $(seq 30); do
+            if in_set; then [ "$1" = in ] && return 0; else [ "$1" = out ] && return 0; fi
+            sleep 0.5
+        done
+        return 1
+    }
+    apply "$WORK/tailscale.toml"
+    wait_set in || { inns gw nft list table inet parallax | grep -A5 'set ts_'; fail "(u) the node's address $NODE_IP never reached the firewall"; }
+    inns gw $P headscale status | grep "^node $NODE tablet: user family, $NODE_IP, online; peer tablet$" >/dev/null \
+        || { inns gw $P headscale status; fail "(u) headscale status did not show the node as tablet"; }
+    $P status | grep "^Headscale node $NODE: $NODE_IP$" >/dev/null || { $P status; fail "(u) the daemon's status lacks the node"; }
+    HS_PID=$(cat "$HS/headscale.pid")
+    kill "$HS_PID"
+    for _ in $(seq 50); do kill -0 "$HS_PID" 2>/dev/null || break; sleep 0.1; done
+    sleep 12
+    in_set || fail "(u) the node lost its access while Headscale was down"
+    grep -q "keeping the addresses it gave last" "$WORK/daemon.log" || fail "(u) Headscale being down was not logged"
+    start_headscale
+    hs_api DELETE "/api/v1/node/$NODE" >/dev/null || fail "(u) could not delete the node"
+    wait_set out || fail "(u) a deleted node kept its peer's access"
+    pass "(u) a Tailscale peer gets its node's address from Headscale, keeps it while Headscale is down, loses it with the node"
+else
+    echo "SKIP: (u) Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
+fi
 
 echo "ALL PASS"

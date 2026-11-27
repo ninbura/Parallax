@@ -16,6 +16,11 @@
 //! it up before saving, and refuses the change if it doesn't resolve
 //! ([`parallax_core::names`]).
 //!
+//! When a Tailscale peer names a Headscale node, it asks Headscale for its
+//! nodes' addresses before the first apply and every 10 seconds, and
+//! re-applies when one changes ([`parallax_core::headscale`]). When
+//! Headscale doesn't answer, the last answer stays in effect.
+//!
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
 //! arrive during an apply queue up, and a batch of them shares one apply.
@@ -33,6 +38,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use parallax_core::generate;
+use parallax_core::headscale::{self, Tailnet};
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::System;
 use parallax_core::model::{Network, PublicIpServer, ServerConfig};
@@ -70,6 +76,8 @@ const BACKUP_EVERY: Duration = Duration::from_secs(600);
 const PUBLIC_IP_EVERY: Duration = Duration::from_secs(300);
 /// How often hosts named by DNS name are looked up.
 const NAMES_EVERY: Duration = Duration::from_secs(300);
+/// How often Headscale is asked for its nodes.
+const TAILNET_EVERY: Duration = Duration::from_secs(headscale::POLL_SECONDS);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -101,6 +109,8 @@ struct View {
     public_ip: Option<Ipv4Addr>,
     /// What each host named by DNS name last resolved to.
     names: Resolved,
+    /// The addresses Headscale last gave its nodes; `None` until it answers.
+    tailnet: Option<Tailnet>,
 }
 
 impl View {
@@ -108,6 +118,7 @@ impl View {
         crate::Learned {
             public_ip: self.public_ip,
             names: self.names.clone(),
+            tailnet: self.tailnet.clone(),
         }
     }
 }
@@ -124,6 +135,8 @@ enum Msg {
     PublicIp(Inputs, Result<Found, Vec<String>>),
     /// The named hosts were looked up, for these inputs.
     Names(NameInputs, Refreshed),
+    /// Headscale was asked for its nodes, for these inputs.
+    Tailnet(TailnetInputs, Result<Option<Tailnet>, String>),
     Shutdown,
 }
 
@@ -188,6 +201,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let _ = tx.send(Msg::Serving(reloaders));
     let refresher = tokio::spawn(refresh_public_ip(tx.clone(), views.clone()));
     let names = tokio::spawn(refresh_names(tx.clone(), views.clone()));
+    let tailnet = tokio::spawn(refresh_tailnet(tx.clone(), views.clone()));
     let logs = collector::Slot::default();
     let collecting = tokio::spawn(collector::supervise(views.clone(), Arc::clone(&logs)));
     let server = tokio::spawn(accept(listener, tx.clone(), views, database, logs));
@@ -218,6 +232,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     timers.abort();
     refresher.abort();
     names.abort();
+    tailnet.abort();
     // Only our own: another daemon may have bound the path since.
     if file_id(&opts.socket) == Some(socket_id) {
         if let Err(e) = std::fs::remove_file(&opts.socket) {
@@ -451,12 +466,14 @@ async fn dispatch(
             apply_error: view.apply_error,
             public_ip: public_ip::effective(&view.config.server, view.public_ip),
             names: view.names,
+            tailnet: view.tailnet,
         },
         Request::Load => Reply::Configuration {
             configuration: Box::new((*view.config).clone()),
             revision: view.revision,
             public_ip: view.public_ip,
             names: view.names,
+            tailnet: view.tailnet,
         },
         Request::Logs { query } => {
             let open = logs.read().ok().and_then(|l| l.clone());
@@ -618,6 +635,56 @@ async fn refresh_names(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
     }
 }
 
+/// What asking Headscale depends on: whether any peer needs it, and where
+/// it is and how to reach it.
+type TailnetInputs = (bool, String, PathBuf, PathBuf);
+
+fn tailnet_inputs(config: &Config) -> TailnetInputs {
+    (
+        headscale::needed(config),
+        config.server.headscale.server_url.clone(),
+        config.server.headscale.api_key_file.clone(),
+        config.server.proxy.upstream_ca.clone(),
+    )
+}
+
+/// Ask Headscale every [`TAILNET_EVERY`] (startup asked before the first
+/// apply), and when a change alters what asking depends on. Blocks for up
+/// to seconds, so it runs here.
+async fn refresh_tailnet(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
+    let mut every = tokio::time::interval(TAILNET_EVERY);
+    every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let inputs = |views: &Views| views.borrow().as_ref().map(|v| tailnet_inputs(&v.config));
+    let mut last = inputs(&views);
+    loop {
+        tokio::select! {
+            _ = every.tick() => {}
+            changed = views.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let now = inputs(&views);
+                if now == last {
+                    continue;
+                }
+                last = now;
+            }
+        }
+        let config = views.borrow().as_ref().map(|v| Arc::clone(&v.config));
+        let Some(config) = config.filter(|c| headscale::needed(c)) else {
+            continue;
+        };
+        let asked = tailnet_inputs(&config);
+        last = Some(asked.clone());
+        let found = tokio::task::spawn_blocking(move || crate::find_tailnet(&config)).await;
+        if let Ok(found) = found {
+            if tx.send(Msg::Tailnet(asked, found)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 fn engine_thread(
     db: &Path,
     out: PathBuf,
@@ -647,6 +714,10 @@ fn engine_thread(
         let found = crate::find_public_ip(&engine.view.config.server);
         engine.note_public_ip(found);
     }
+    // Before the first apply: a peer that names a node has no address
+    // until Headscale answers, so a restart mustn't wait a poll for it.
+    let found = crate::find_tailnet(&engine.view.config);
+    engine.note_tailnet(found);
     // A failed first apply leaves the host as it is (nothing here was set
     // up yet, as far as this process knows); Docker restarts and tries again.
     if let Err(e) = engine.first_apply() {
@@ -713,6 +784,8 @@ struct Engine {
     public_ip_saved: bool,
     /// Why the last name lookups failed, logged once.
     name_problems: Vec<String>,
+    /// Why Headscale didn't answer last time, logged once.
+    tailnet_problem: Option<String>,
 }
 
 impl Engine {
@@ -755,6 +828,8 @@ impl Engine {
                 // Looked up right after the first apply: an answer from
                 // before a restart may be stale.
                 names: Resolved::new(),
+                // Asked before the first apply.
+                tailnet: None,
             },
             publish,
             out,
@@ -765,6 +840,7 @@ impl Engine {
             public_ip_problems: None,
             public_ip_saved: true,
             name_problems: Vec::new(),
+            tailnet_problem: None,
         };
         engine.publish();
         Ok(engine)
@@ -861,6 +937,13 @@ impl Engine {
                 Msg::Names(_, found) => {
                     if self.note_names(found) {
                         why.get_or_insert("a named host's address changed");
+                    }
+                }
+                // Where Headscale is changed while it was asked.
+                Msg::Tailnet(asked, _) if asked != tailnet_inputs(&self.view.config) => {}
+                Msg::Tailnet(_, found) => {
+                    if self.note_tailnet(found) {
+                        why.get_or_insert("Headscale gave a Tailscale node another address");
                     }
                 }
                 Msg::Shutdown => {}
@@ -997,6 +1080,52 @@ impl Engine {
         true
     }
 
+    /// Take Headscale's answer: new addresses are published; a failure is
+    /// logged once and the last answer stays. Returns whether the addresses
+    /// changed.
+    fn note_tailnet(&mut self, found: Result<Option<Tailnet>, String>) -> bool {
+        let found = match found {
+            Ok(found) => found,
+            Err(problem) => {
+                if self.tailnet_problem.as_ref() != Some(&problem) {
+                    let keeping = match self.view.tailnet {
+                        Some(_) => "keeping the addresses it gave last",
+                        None => "Tailscale peers that name a node get no access until it answers",
+                    };
+                    warn(format!("warning: {problem}; {keeping}"));
+                    self.tailnet_problem = Some(problem);
+                }
+                return false;
+            }
+        };
+        if self.tailnet_problem.take().is_some() {
+            log("Headscale answers again");
+        }
+        if found == self.view.tailnet {
+            return false;
+        }
+        if let Some(after) = &found {
+            headscale::changes(self.view.tailnet.as_ref(), after)
+                .iter()
+                .for_each(log);
+        }
+        self.view.tailnet = found;
+        self.publish();
+        true
+    }
+
+    /// What Headscale said, if `config` names the same Headscale (node ids
+    /// mean nothing on another one) and still asks it (an answer nobody
+    /// refreshes would come back stale with the next node peer).
+    fn tailnet_for(&self, config: &Config) -> Option<Tailnet> {
+        let same =
+            config.server.headscale.server_url == self.view.config.server.headscale.server_url;
+        self.view
+            .tailnet
+            .clone()
+            .filter(|_| same && headscale::needed(config))
+    }
+
     fn set_apply_error(&mut self, error: Option<String>) {
         if self.view.apply_error != error {
             self.view.apply_error = error;
@@ -1004,8 +1133,10 @@ impl Engine {
         }
     }
 
-    /// The configuration changed: remember and publish it.
+    /// The configuration changed: remember and publish it. Addresses from
+    /// another Headscale than the new one's are forgotten.
     fn replace(&mut self, config: Config) {
+        self.view.tailnet = self.tailnet_for(&config);
         self.view.config = Arc::new(config);
         self.view.revision = self.view.revision.wrapping_add(1);
         self.publish();
@@ -1046,6 +1177,7 @@ impl Engine {
         let learned = crate::Learned {
             public_ip: self.view.public_ip,
             names: resolved,
+            tailnet: self.tailnet_for(&config),
         };
         crate::preview(&config, crate::today(), &learned).map_err(refuse)?;
         self.rt

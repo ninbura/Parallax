@@ -1,20 +1,26 @@
-# Minimal Headscale configuration for Parallax. Adjust server_url to the
-# HTTPS endpoint your reverse proxy exposes. Parallax (M2) manages users,
-# preauth keys, the ACL policy, DNS config and route approval through the API.
+# Headscale configuration for Parallax, for the Headscale that
+# docker/headscale.Dockerfile builds. Every option has a default; this file
+# sets only what Parallax relies on. Check a change with
+# `docker compose run --rm headscale check config -f /etc/headscale/config.yaml`,
+# and list every option with `headscale generate config`.
+#
+# Adjust server_url to the HTTPS endpoint your reverse proxy exposes. Parallax
+# reads Headscale's nodes through its API at the same URL (ADR 0014); later
+# steps manage users, pre-auth keys, the policy, DNS and route approval there.
 server_url: https://headscale.mydomain.com
 listen_addr: 0.0.0.0:8080
 metrics_listen_addr: 0.0.0.0:9090
-grpc_listen_addr: 0.0.0.0:50443
-grpc_allow_insecure: false
+disable_check_updates: true
 noise:
   private_key_path: /var/lib/headscale/noise_private.key
 prefixes:
+  # Parallax takes Tailscale traffic only from 100.64.0.0/10.
   v4: 100.64.0.0/10
   v6: fd7a:115c:a1e0::/48
   allocation: sequential
 derp:
   server:
-    # derp = "embedded" in parallax.toml
+    # derp = "embedded" in Parallax's configuration
     enabled: true
     region_id: 999
     region_code: "parallax"
@@ -26,8 +32,9 @@ derp:
     - https://controlplane.tailscale.com/derpmap/default
   auto_update_enabled: true
   update_frequency: 24h
-disable_check_updates: true
-ephemeral_node_inactivity_timeout: 30m
+node:
+  ephemeral:
+    inactivity_timeout: 30m
 database:
   type: sqlite
   sqlite:
@@ -35,15 +42,28 @@ database:
 log:
   format: text
   level: info
-# Parallax generates and pushes the policy; keep this in database mode.
+# Parallax will generate and push the policy (step 12); keep it in the database.
 policy:
   mode: database
 dns:
   magic_dns: true
+  # A public domain you control, so nodes can get certificates for their
+  # MagicDNS names (below). Not the domain of server_url or below it.
   base_domain: ts.mydomain.com
   nameservers:
     global: []
-    # M2 fills split nameservers per Network.domains -> the shim address.
+    # Parallax will fill split nameservers per network domain -> its DNS server.
     split: {}
+  # `tailscale cert` and HTTPS `tailscale serve`: nodes get Let's Encrypt
+  # certificates for their MagicDNS names, and Headscale answers the DNS-01
+  # challenge through your DNS provider. Off until a provider is set.
+  certificates:
+    enabled: false
+  # challenge:
+  #   provider:
+  #     name: cloudflare
+  #     # A token allowed to edit DNS records of base_domain's zone, kept in a
+  #     # file next to this one (mode 0600).
+  #     api_token: "file:/etc/headscale/cloudflare-api-token"
 unix_socket: /var/run/headscale/headscale.sock
 unix_socket_permission: "0770"

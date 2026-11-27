@@ -10,6 +10,7 @@ use std::net::Ipv4Addr;
 use ipnet::Ipv4Net;
 
 use crate::date::Date;
+use crate::headscale::Tailnet;
 use crate::model::*;
 use crate::names::{self, in_zone, Resolved};
 use crate::netmap::Mapping;
@@ -18,13 +19,15 @@ use crate::{Error, Result, TAILSCALE_CGNAT};
 
 /// A validated configuration plus what generation needs from outside it:
 /// the evaluation date (for peer expiry), the home's public IP (for the
-/// guest hairpin drop) and what hosts named by DNS name resolved to.
+/// guest hairpin drop), what hosts named by DNS name resolved to, and the
+/// addresses Headscale gave Tailscale nodes.
 #[derive(Debug, Clone)]
 pub struct Model<'a> {
     config: &'a Config,
     today: Date,
     public_ip: Option<Ipv4Addr>,
     names: Resolved,
+    tailnet: Option<Tailnet>,
     tiers: Vec<Tier<'a>>,
     warnings: Vec<String>,
 }
@@ -221,6 +224,7 @@ impl<'a> Model<'a> {
                 today,
                 public_ip: None,
                 names: Resolved::new(),
+                tailnet: None,
                 tiers: tier::tiers(config),
                 warnings,
             })
@@ -254,6 +258,19 @@ impl<'a> Model<'a> {
 
     pub fn names(&self) -> &Resolved {
         &self.names
+    }
+
+    /// The addresses Headscale gave its nodes ([`crate::headscale`]). A
+    /// Tailscale peer that names a node has that node's address, and none
+    /// while Headscale hasn't answered (`None`) or doesn't know the node.
+    /// One that names no node keeps its configured address.
+    pub fn with_tailnet(mut self, tailnet: Option<Tailnet>) -> Self {
+        self.tailnet = tailnet;
+        self
+    }
+
+    pub fn tailnet(&self) -> Option<&Tailnet> {
+        self.tailnet.as_ref()
     }
 
     /// Hosts named by DNS name that grant nothing right now, and why.
@@ -1033,6 +1050,7 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
     let mut split_dns: Vec<&str> = Vec::new();
     let mut addresses: BTreeMap<Ipv4Addr, &str> = BTreeMap::new();
     let mut pubkeys: BTreeMap<String, &str> = BTreeMap::new();
+    let mut nodes: BTreeMap<u64, &str> = BTreeMap::new();
     for p in &config.peers {
         let ctx = format!("peer '{}'", p.name);
         if !valid_ident(&p.name) {
@@ -1136,10 +1154,24 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                         "{ctx}: transport is tailscale but a [peer.wireguard] block is present"
                     ));
                 }
+                // One device, one set of grants: the node's address can't
+                // be in two tiers.
+                if let Some(id) = p.tailscale.as_ref().and_then(|t| t.node_id) {
+                    if let Some(other) = nodes.insert(id, &p.name) {
+                        errors.push(format!(
+                            "{ctx}: Headscale node {id} is already peer '{other}'"
+                        ));
+                    }
+                }
                 if let Some(addr) = p.tailscale.as_ref().and_then(|t| t.address) {
                     if !TAILSCALE_CGNAT.contains(&addr) {
                         errors.push(format!(
                             "{ctx}: tailscale address {addr} is outside {TAILSCALE_CGNAT}"
+                        ));
+                    }
+                    if let Some(other) = addresses.insert(addr, &p.name) {
+                        errors.push(format!(
+                            "{ctx}: address {addr} is already used by peer '{other}'"
                         ));
                     }
                 }
@@ -1171,6 +1203,28 @@ mod tests {
         let cfg = canonical_config();
         let (errors, _) = check(&cfg);
         assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn a_node_is_one_peer() {
+        let e = errors_of(|c| {
+            for name in ["tablet", "tv"] {
+                let mut p = c.peers[0].clone();
+                p.name = name.into();
+                p.transport = TransportKind::Tailscale;
+                p.wireguard = None;
+                p.tailscale = Some(TailscalePeer {
+                    node_id: Some(3),
+                    address: None,
+                });
+                c.peers.push(p);
+            }
+        });
+        assert!(
+            e.iter()
+                .any(|e| e.ends_with("'tv': Headscale node 3 is already peer 'tablet'")),
+            "{e:?}"
+        );
     }
 
     #[test]

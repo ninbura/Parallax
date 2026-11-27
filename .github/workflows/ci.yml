@@ -31,8 +31,14 @@ jobs:
       - run: rustup install # the version in rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y nftables wireguard-tools dnsmasq-base dnsutils curl openssl iputils-ping
+      # (t): the Headscale docker/headscale.Dockerfile pins, and a Tailscale client.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - run: ./tests/integration/headscale-binaries.sh "$RUNNER_TEMP/headscale" >> "$GITHUB_ENV"
       - run: cargo build -p parallax-cli
-      - run: sudo env PATH="$PATH" NETNS_DAEMON=${{ matrix.daemon }} ./tests/integration/netns.sh
+      - run: sudo env PATH="$PATH" NETNS_DAEMON=${{ matrix.daemon }} HEADSCALE="$HEADSCALE" TAILSCALED="$TAILSCALED" TAILSCALE="$TAILSCALE" ./tests/integration/netns.sh
       - if: matrix.daemon == 'unit'
         run: systemd-analyze security --offline=true --threshold=20 packaging/systemd/parallax.service
 
@@ -43,6 +49,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -f docker/Dockerfile -t parallax:ci .
       - run: docker run --rm --entrypoint parallax parallax:ci --version
+      # The Headscale image, and the configuration we ship, which it must accept.
+      - run: docker build -f docker/headscale.Dockerfile -t parallax-headscale:ci docker
+      - run: docker run --rm -v "$PWD/docker/headscale:/etc/headscale:ro" parallax-headscale:ci check config -f /etc/headscale/config.yaml
       - run: sudo modprobe wireguard
       - run: sudo sysctl -w net.ipv4.ip_forward=1
       # The example config names eth0; give the runner one if it has none.

@@ -38,7 +38,12 @@ services:
       - headscale
 
   headscale:
-    image: headscale/headscale:0.26
+    # Built from a pinned commit of Headscale's main branch, for `tailscale
+    # cert` and HTTPS `tailscale serve` (headscale.Dockerfile, ADR 0014).
+    build:
+      context: .
+      dockerfile: headscale.Dockerfile
+    image: parallax-headscale:local
     container_name: headscale
     restart: unless-stopped
     command: serve

@@ -217,8 +217,11 @@ Headscale is the control plane only. Tailscale traffic doesn't pass through
 it, except relayed packets when its embedded DERP relay is on. It can run
 anywhere Parallax can reach `server_url`: in rootless Docker (the
 `headscale` service in `docker/compose.yml` works as it is: `docker compose
-up -d headscale`), its own package, or another machine. Rootless Docker isn't supported for Parallax
-itself (setup.md explains why), but it is for Headscale.
+up -d headscale` builds it from the commit Parallax is tested with, ADR
+0014), its own package, or another machine. Rootless Docker isn't supported for Parallax
+itself (setup.md explains why), but it is for Headscale. Parallax reads its
+nodes with the API key in `/etc/parallax/headscale-api.key` (mode 0600,
+owned by `parallax`); see setup.md, Headscale.
 
 ## What the service may do
 
