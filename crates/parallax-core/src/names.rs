@@ -984,6 +984,75 @@ mod tests {
         (old, [(NAS.to_string(), vec![HOME])].into())
     }
 
+    // Lane C's repros of the #93 post-merge findings.
+    #[test]
+    fn lc_one_gone_grant_doesnt_make_two_new_ones_old() {
+        let (old, known) = every_port_at_home();
+        let mut new = old.clone();
+        new.grants[1].name = "relatives".into();
+        let mut clone = new.grants[1].clone();
+        clone.name = "guest-web".into();
+        new.grants.push(clone);
+        for p in &mut new.peers {
+            for g in &mut p.grants {
+                if g == "family" {
+                    *g = "relatives".into();
+                }
+            }
+        }
+        // laptop: guest-web in place of personal.
+        new.peers[1].grants = vec!["guest-web".into()];
+        let r = FakeResolver::new();
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &known).is_err());
+    }
+
+    #[test]
+    fn lc_a_cold_cache_and_a_resolver_change_with_the_same_answer_is_fine() {
+        let (old, _) = every_port_at_home();
+        let mut new = old.clone();
+        let other = Ipv4Addr::new(192, 168, 1, 53);
+        new.networks[0].upstream_dns = vec![other];
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[HOME]).answer(
+            NAS,
+            Nameserver::Plain(other),
+            &[HOME],
+        );
+        let empty = Resolved::new();
+        assert!(check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &empty).is_ok());
+    }
+
+    #[test]
+    fn lc_a_cold_cache_doesnt_let_a_proxied_service_go_raw() {
+        let mut old = canonical_config();
+        old.services[0].host = Host::Name(NAS.into());
+        old.services[0].hostnames = vec!["immich.mydomain.com".into()];
+        let mut new = old.clone();
+        new.services[0].hostnames = Vec::new();
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[HOME]);
+        let cached: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        let cold = check_save(
+            Some(&old),
+            Some(HOME),
+            &new,
+            Some(HOME),
+            &r,
+            &Resolved::new(),
+        );
+        let warm = check_save(Some(&old), Some(HOME), &new, Some(HOME), &r, &cached);
+        assert_eq!(cold.is_err(), warm.is_err(), "cold {cold:?}, warm {warm:?}");
+    }
+
+    #[test]
+    fn lc_a_zone_moved_with_the_same_resolvers_is_asked_again() {
+        let old = named();
+        let mut new = old.clone();
+        let mut lab = new.networks[0].clone();
+        lab.name = "lab".into();
+        lab.domains = vec![NAS.into()];
+        new.networks.push(lab);
+        assert_eq!(asked_on_save(Some(&old), &new), BTreeSet::from([NAS]));
+    }
+
     #[test]
     fn renaming_a_grant_keeps_its_old_problem_old() {
         let (old, known) = every_port_at_home();
