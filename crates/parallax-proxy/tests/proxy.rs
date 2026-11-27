@@ -670,7 +670,11 @@ async fn logging_keeps_a_reply_s_length() {
 async fn a_long_method_is_recorded_cut_short() {
     let (tap, events) = tap_for(parallax_core::model::LogLevel::Blocked);
     let env = Env::start_tapped(Some(tap)).await;
-    let method = hyper::Method::from_bytes(&vec![b'A'; 300_000]).unwrap();
+    // The first 32 characters are kept, and only those.
+    let kept = "PROPFIND-0123456789abcdefghijklm";
+    assert_eq!(kept.len(), 32);
+    let long = format!("{kept}{}", "z".repeat(300_000));
+    let method = hyper::Method::from_bytes(long.as_bytes()).unwrap();
     let req = Request::builder()
         .method(method)
         .uri("/")
@@ -680,5 +684,5 @@ async fn a_long_method_is_recorded_cut_short() {
     assert_eq!(env.h1(IMMICH, req).await.0, StatusCode::MISDIRECTED_REQUEST);
     let got = requests(&events);
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].method.as_deref(), Some("A".repeat(32).as_str()));
+    assert_eq!(got[0].method.as_deref(), Some(kept));
 }
