@@ -41,8 +41,8 @@
 # the home's public IP, and a lookup answered with a private address is refused,
 # (p) hosts granted by DNS name are looked up on save and bad ones refused, (q) names
 # on the home's public IP reach one port forward each, or HTTPS through the proxy,
-# (n) the daemon tears down on SIGTERM, re-applies on SIGHUP and repairs a deleted
-# table, and keeps the home's public IP across the restart, (r) a peer with two grants
+# (n) the daemon tears down on SIGTERM and after a failed first apply, re-applies on
+# SIGHUP and repairs a deleted table, and keeps the home's public IP across the restart, (r) a peer with two grants
 # reaches both and nothing more, a grant for everyone reaches every peer, and changing
 # grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
 # change access when they return, and a refused one changes nothing, (t) activity
@@ -809,6 +809,34 @@ if [ "$MODE" = unit ]; then
 else
     $P validate >/dev/null || fail "(n) without a daemon the CLI opens the database itself"
 fi
+# A first apply that fails partway takes down what it set up (#53): another
+# socket holds WireGuard's port, so wg0 can't come up once the table and wg0 are in.
+# Not through `inns`: $! must be python itself, or killing it leaves the port held.
+ip netns exec "${PREFIX}gw" python3 -c 'import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 51820)); time.sleep(60)' &
+HOLDER=$!
+PIDS+=($HOLDER)
+for _ in $(seq 50); do inns gw ss -Hlun 'sport = :51820' | grep -q . && break; sleep 0.1; done
+inns gw ss -Hlun 'sport = :51820' | grep -q . || fail "(n) could not hold WireGuard's port"
+if [ "$MODE" = unit ]; then
+    UNITS+=("${PREFIX}held")
+    held=(timeout 30 "${AS_UNIT[@]}" --unit="${PREFIX}held" --wait --pipe "$WORK/parallax"
+        --db "$WORK/parallax.db" --socket "$SOCK" daemon -o "$WORK/out")
+else
+    held=(inns gw timeout 30 $P daemon -o "$WORK/out")
+fi
+status=0
+"${held[@]}" > "$WORK/held.log" 2>&1 || status=$?
+# 124: still running when `timeout` stopped it, so it started.
+case $status in 0|124) cat "$WORK/held.log"; fail "(n) the daemon started with WireGuard's port taken" ;; esac
+kill "$HOLDER" 2>/dev/null || true
+wait "$HOLDER" 2>/dev/null || true
+inns gw ss -Hlun 'sport = :51820' | grep -q . && fail "(n) WireGuard's port is still held"
+grep -q "the first apply failed" "$WORK/held.log" || { cat "$WORK/held.log"; fail "(n) the held port didn't fail the first apply"; }
+inns gw nft list table inet parallax >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left the table"; }
+inns gw ip link show wg0 >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left wg0"; }
+grep -q "removed table inet parallax" "$WORK/held.log" && grep -q "removed interface wg0" "$WORK/held.log" \
+    || { cat "$WORK/held.log"; fail "(n) a failed first apply didn't log what it took down"; }
 start_daemon 1
 # wg0 is new: the clients' sessions are gone until they handshake again (up to ~15 s).
 for _ in $(seq 10); do [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] && break; done
@@ -828,7 +856,7 @@ inns gw nft list table inet parallax >/dev/null 2>&1 || fail "(n) the deleted ta
 grep -q 'applying (the live' "$WORK/daemon.log" || fail "(n) the repair was not logged as drift"
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(n) guest grants after the repair"
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after the repair"
-pass "(n) SIGTERM tears down; SIGHUP re-applies; a deleted table comes back on its own"
+pass "(n) SIGTERM tears down; a failed first apply takes down what it set up; SIGHUP re-applies; a deleted table comes back on its own"
 
 # (q) names on the home's public IP are port forwards: friend (full tunnel, internet,
 # which drops the public IP) reaches the one port it's granted there, and HTTPS by name

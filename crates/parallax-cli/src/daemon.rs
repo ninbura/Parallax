@@ -757,9 +757,15 @@ fn engine_thread(
     // until Headscale answers, so a restart mustn't wait a poll for it.
     let found = crate::find_tailnet(&engine.view.config);
     engine.note_tailnet(found);
-    // A failed first apply leaves the host as it is (nothing here was set
-    // up yet, as far as this process knows); Docker restarts and tries again.
+    // A failed first apply takes down what it set up before failing: the
+    // process exits, and nothing else would ever remove a table and an
+    // interface left behind (#53). What was there before it started stays,
+    // whoever set it up. Docker or systemd starts it again.
+    let before = reconcile::parts_present(&engine.view.config.server, sys());
     if let Err(e) = engine.first_apply() {
+        for line in reconcile::teardown_added(&engine.view.config.server, before, sys()) {
+            log(line);
+        }
         let _ = ready.send(Err(e));
         return;
     }
