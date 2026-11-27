@@ -124,6 +124,9 @@ struct View {
     apply_error: Option<String>,
     /// The home's public IP as last found.
     public_ip: Option<Ipv4Addr>,
+    /// Bumped when a save looks the public IP up itself: lookups that
+    /// started before then are older than its answer.
+    public_ip_set: u64,
     /// What each host named by DNS name last resolved to.
     names: Resolved,
     /// Bumped when a save or a restore sets `names` itself: lookups that
@@ -589,11 +592,10 @@ async fn timers(tx: mpsc::UnboundedSender<Msg>, every: Duration) {
     }
 }
 
-/// What a public IP lookup depends on: a change to any of it looks again,
-/// and a result for other inputs than the current ones is stale.
-type Inputs = (bool, String, Ipv4Addr, PublicIpServer, PathBuf);
+/// Where the home's public IP comes from: a change to any of it looks again.
+type Source = (bool, String, Ipv4Addr, PublicIpServer, PathBuf);
 
-fn lookup_inputs(config: &Config) -> Inputs {
+fn public_ip_source(config: &Config) -> Source {
     (
         public_ip::needed(config),
         config.server.wireguard.endpoint.clone(),
@@ -603,6 +605,16 @@ fn lookup_inputs(config: &Config) -> Inputs {
     )
 }
 
+/// What a public IP lookup depends on: where it comes from, and the last
+/// save that looked it up itself (its answer is newer than a lookup that
+/// started before it). A result for other inputs than the current ones is
+/// stale.
+type Inputs = (Source, u64);
+
+fn lookup_inputs(view: &View) -> Inputs {
+    (public_ip_source(&view.config), view.public_ip_set)
+}
+
 /// Look up the home's public IP every [`PUBLIC_IP_EVERY`], and when a saved
 /// change alters what the lookup depends on. Startup has just looked. The
 /// lookup blocks for seconds, so it runs here, never on the engine thread.
@@ -610,7 +622,7 @@ async fn refresh_public_ip(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
     let mut every = tokio::time::interval(PUBLIC_IP_EVERY);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     every.tick().await;
-    let inputs = |views: &Views| views.borrow().as_ref().map(|v| lookup_inputs(&v.config));
+    let inputs = |views: &Views| views.borrow().as_ref().map(lookup_inputs);
     let mut last = inputs(&views);
     loop {
         tokio::select! {
@@ -626,11 +638,12 @@ async fn refresh_public_ip(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
                 last = now;
             }
         }
-        let config = views.borrow().as_ref().map(|v| Arc::clone(&v.config));
-        let Some(config) = config.filter(|c| public_ip::needed(c)) else {
+        let view = views.borrow().clone();
+        let Some(view) = view.filter(|v| public_ip::needed(&v.config)) else {
             continue;
         };
-        let asked = lookup_inputs(&config);
+        let asked = lookup_inputs(&view);
+        let config = view.config;
         // A tick that won the race with a change has looked at it already.
         last = Some(asked.clone());
         let found =
@@ -964,6 +977,7 @@ impl Engine {
                 revision: rand::random::<u64>() >> 1,
                 apply_error: None,
                 public_ip,
+                public_ip_set: 0,
                 // Looked up right after the first apply: an answer from
                 // before a restart may be stale.
                 names: Resolved::new(),
@@ -1059,9 +1073,9 @@ impl Engine {
                 Msg::Tick => tick = true,
                 Msg::BackupTick => backup_due = true,
                 Msg::Serving(reloaders) => self.reloaders = reloaders,
-                // A save changed the inputs while this lookup ran: the
-                // lookup for the new ones is already on its way.
-                Msg::PublicIp(asked, _) if asked != lookup_inputs(&self.view.config) => {}
+                // A save changed the inputs, or looked itself, while this
+                // lookup ran: the lookup for the new ones is already on its way.
+                Msg::PublicIp(asked, _) if asked != lookup_inputs(&self.view) => {}
                 Msg::PublicIp(_, found) => {
                     let server = &self.view.config.server;
                     let before = public_ip::effective(server, self.view.public_ip);
@@ -1150,6 +1164,14 @@ impl Engine {
     /// Take a lookup's result: a new address is published and remembered
     /// in the database; a failure is logged once.
     fn note_public_ip(&mut self, found: Result<Found, Vec<String>>) {
+        if self.record_public_ip(found) {
+            self.publish();
+        }
+    }
+
+    /// [`Engine::note_public_ip`] without publishing. Returns whether the
+    /// address changed.
+    fn record_public_ip(&mut self, found: Result<Found, Vec<String>>) -> bool {
         match found {
             Ok(found) => {
                 self.public_ip_problems = None;
@@ -1160,7 +1182,6 @@ impl Engine {
                         found.address, found.source
                     ));
                     self.view.public_ip = Some(found.address);
-                    self.publish();
                 }
                 if changed || !self.public_ip_saved {
                     let saved = self.rt.block_on(self.store.set_public_ip(found.address));
@@ -1172,6 +1193,7 @@ impl Engine {
                     }
                     self.public_ip_saved = saved.is_ok();
                 }
+                changed
             }
             Err(problems) => {
                 if self.public_ip_problems.as_ref() != Some(&problems) {
@@ -1181,6 +1203,7 @@ impl Engine {
                     ));
                     self.public_ip_problems = Some(problems);
                 }
+                false
             }
         }
     }
@@ -1199,16 +1222,27 @@ impl Engine {
     }
 
     /// What a save or a restore found the names resolve to: newer than any
-    /// lookup still running, so those are dropped when they finish.
-    fn set_names_from_save(&mut self, resolved: Resolved) {
-        if resolved != self.view.names {
+    /// lookup still running, so those are dropped when they finish. `asked`:
+    /// it looked names up, so even an unchanged answer is newer.
+    /// Doesn't publish: its caller does, once, with the rest of the change.
+    fn set_names_from_save(&mut self, resolved: Resolved, asked: bool) {
+        if asked || resolved != self.view.names {
             self.view.names_set = self.view.names_set.wrapping_add(1);
         }
-        self.set_names(resolved);
+        self.record_names(resolved);
     }
 
     /// Publish what the names resolve to now. Returns whether it changed.
     fn set_names(&mut self, resolved: Resolved) -> bool {
+        let changed = self.record_names(resolved);
+        if changed {
+            self.publish();
+        }
+        changed
+    }
+
+    /// [`Engine::set_names`] without publishing.
+    fn record_names(&mut self, resolved: Resolved) -> bool {
         if resolved == self.view.names {
             return false;
         }
@@ -1226,7 +1260,6 @@ impl Engine {
             log(format!("{name} no longer grants anything"));
         }
         self.view.names = resolved;
-        self.publish();
         true
     }
 
@@ -1283,13 +1316,12 @@ impl Engine {
         }
     }
 
-    /// The configuration changed: remember and publish it. Addresses from
-    /// another Headscale than the new one's are forgotten.
+    /// The configuration changed: remember it, for the caller to publish.
+    /// Addresses from another Headscale than the new one's are forgotten.
     fn replace(&mut self, config: Config) {
         self.view.tailnet = self.tailnet_for(&config);
         self.view.config = Arc::new(config);
         self.view.revision = self.view.revision.wrapping_add(1);
-        self.publish();
     }
 
     /// Validate, look up names it adds, generate and check certificates;
@@ -1306,14 +1338,16 @@ impl Engine {
         };
         crate::check(&config).map_err(refuse)?;
         let old_ip = public_ip::effective(&self.view.config.server, self.view.public_ip);
-        // A name may point at the home's public IP. Nothing looked for it
-        // while nothing needed it, so look before telling where a name
-        // points (a few seconds at most, and only then). What it finds came
-        // from this change's endpoint: it's kept only if the change is.
-        let asked = names::asked_on_save(Some(&self.view.config), &config);
-        let found = (!asked.is_empty()
-            && public_ip::effective(&config.server, self.view.public_ip).is_none())
-        .then(|| crate::find_public_ip(&config.server));
+        // A name may point at the home's public IP. Look before telling
+        // where a name points when nothing looked for it (nothing needed it)
+        // or the address known came from other settings than this change's
+        // (another endpoint): a few seconds at most, and only then. What it
+        // finds is kept only if the change is.
+        let asked = !names::asked_on_save(Some(&self.view.config), &config).is_empty();
+        let unknown = public_ip::effective(&config.server, self.view.public_ip).is_none();
+        let elsewhere = public_ip_source(&self.view.config) != public_ip_source(&config);
+        let found = ((unknown && asked) || (elsewhere && !names::used(&config).is_empty()))
+            .then(|| crate::find_public_ip(&config.server));
         let known_ip = match &found {
             Some(Ok(found)) => Some(found.address),
             _ => self.view.public_ip,
@@ -1328,7 +1362,13 @@ impl Engine {
             &crate::lookup(&config.server),
             &self.view.names,
         )
-        .map_err(|problems| refuse(anyhow!("{}", problems.join("; "))))?;
+        .map_err(|mut problems| {
+            // Why a name at the home's public IP may have been refused.
+            if let Some(Err(why)) = &found {
+                problems.push(crate::public_ip_lookup_failed(why, self.view.public_ip));
+            }
+            refuse(anyhow!("{}", problems.join("; ")))
+        })?;
         let learned = crate::Learned {
             public_ip: known_ip,
             names: resolved,
@@ -1339,10 +1379,14 @@ impl Engine {
             .block_on(self.store.save(&config))
             .map_err(|e| refuse(e.into()))?;
         if let Some(found) = found {
-            self.note_public_ip(found);
+            if found.is_ok() {
+                self.view.public_ip_set = self.view.public_ip_set.wrapping_add(1);
+            }
+            self.record_public_ip(found);
         }
         self.replace(config);
-        self.set_names_from_save(learned.names);
+        self.set_names_from_save(learned.names, asked);
+        self.publish();
         log(format!(
             "saved a change (configuration revision {})",
             self.view.revision
@@ -1427,7 +1471,8 @@ impl Engine {
         let mut resolved = self.view.names.clone();
         resolved.retain(|name, _| used.contains(name.as_str()));
         self.replace(config);
-        self.set_names_from_save(resolved);
+        self.set_names_from_save(resolved, false);
+        self.publish();
         Ok(lines)
     }
 

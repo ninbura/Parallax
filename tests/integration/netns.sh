@@ -794,7 +794,10 @@ sed 's/^endpoint = .*/endpoint = "home.example.org:51820"/' "$(named nosuch.mydo
 grep -q '^endpoint = "home.example.org:51820"$' "$WORK/refused-ip.toml" || fail "(o) no endpoint to change"
 $P config import "$WORK/refused-ip.toml" > "$WORK/refused-ip.err" 2>&1 \
     && fail "(o) a save granting nosuch.mydomain.com was accepted"
-grep -q "home public IP" <<<"$($P status)" && fail "(o) a refused save recorded the public IP its endpoint gives"
+grep -q "nosuch.mydomain.com" "$WORK/refused-ip.err" \
+    || { cat "$WORK/refused-ip.err"; fail "(o) the save was refused for another reason"; }
+STATUS=$($P status) || fail "(o) status failed"
+grep -q "home public IP" <<<"$STATUS" && fail "(o) a refused save recorded the public IP its endpoint gives"
 $P config export > "$WORK/public-ip.toml"
 sed -i 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' "$WORK/public-ip.toml"
 apply "$WORK/public-ip.toml"
