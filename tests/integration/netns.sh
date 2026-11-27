@@ -130,6 +130,15 @@ inns gw nft add chain ip filter FORWARD '{ type filter hook forward priority 0; 
 inns gw nft add chain ip filter DOCKER-USER
 inns gw nft add rule ip filter FORWARD jump DOCKER-USER
 inns gw nft add rule ip filter DOCKER-USER return
+# Docker's chain as it was, without Parallax's accepts: listed, its own return
+# and FORWARD's jump kept, nothing commented "parallax" left.
+docker_user_is_dockers() {
+    local listing
+    listing=$(inns gw nft list chain ip filter DOCKER-USER) || return 1
+    grep -q 'return' <<< "$listing" || return 1
+    inns gw nft list chain ip filter FORWARD | grep -q 'jump DOCKER-USER' || return 1
+    ! grep -q 'comment "parallax"' <<< "$listing"
+}
 inns home ip addr add 192.168.1.5/24 dev lan0; inns home ip link set lan0 up
 inns home ip route add 10.8.0.0/16 via 192.168.1.1      # the static route the docs demand
 inns home ip route add 100.64.0.0/10 via 192.168.1.1
@@ -802,8 +811,7 @@ for _ in $(seq 50); do kill -0 "$DAEMON" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$DAEMON" 2>/dev/null && fail "(n) the daemon did not stop on SIGTERM"
 inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) the table outlived the daemon"
 inns gw ip link show wg0 >/dev/null 2>&1 && fail "(n) wg0 outlived the daemon"
-inns gw nft list chain ip filter DOCKER-USER | grep -q 'comment "parallax"' \
-    && fail "(n) Parallax's DOCKER-USER rules outlived the daemon"
+docker_user_is_dockers || fail "(n) DOCKER-USER isn't Docker's own after the daemon stopped"
 [ -e "$SOCK" ] && fail "(n) the socket outlived the daemon"
 if [ "$MODE" = unit ]; then
     # Root opening the service's database would leave files the service can't open.
@@ -847,8 +855,7 @@ inns gw ss -Hlun 'sport = :51820' | grep -q . && fail "(n) WireGuard's port is s
 grep -q "the first apply failed" "$WORK/held.log" || { cat "$WORK/held.log"; fail "(n) the held port didn't fail the first apply"; }
 inns gw nft list table inet parallax >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left the table"; }
 inns gw ip link show wg0 >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left wg0"; }
-inns gw nft list chain ip filter DOCKER-USER | grep -q 'comment "parallax"' \
-    && { cat "$WORK/held.log"; fail "(n) a failed first apply left its DOCKER-USER rules"; }
+docker_user_is_dockers || { cat "$WORK/held.log"; fail "(n) DOCKER-USER isn't Docker's own after a failed first apply"; }
 grep -q "removed table inet parallax" "$WORK/held.log" && grep -q "removed interface wg0" "$WORK/held.log" \
     || { cat "$WORK/held.log"; fail "(n) a failed first apply didn't log what it took down"; }
 start_daemon 1

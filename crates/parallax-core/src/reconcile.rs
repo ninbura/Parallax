@@ -7,6 +7,7 @@
 //! expiry is in UTC days), or when the live state no longer matches the
 //! listing: someone deleted the table or the interface, or changed a rule.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::date::Date;
@@ -138,14 +139,14 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
 /// interface they name.
 const PARTS: usize = 4;
 
-/// Which of the parts [`teardown`] removes are on the host, each
-/// `Some(true)` there, `Some(false)` confirmed gone, `None` couldn't tell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Parts([Option<bool>; PARTS]);
+/// What of each part [`teardown`] removes is on the host, as the commands
+/// that would remove it (empty: it's gone), or `None`: couldn't tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parts([Option<BTreeSet<Command>>; PARTS]);
 
-/// Which of the parts `apply` sets up for `server` are on the host now.
+/// What of the parts `apply` sets up for `server` is on the host now.
 pub fn parts_present(server: &ServerConfig, sys: System<'_>) -> Parts {
-    Parts(found(server, sys).map(|(_, f)| f.ok().map(|c| !c.is_empty())))
+    Parts(found(server, sys).map(|(_, f)| f.ok().map(|c| c.into_iter().collect())))
 }
 
 /// Take down everything `apply` set up for `server`: Parallax's firewall
@@ -157,14 +158,19 @@ pub fn teardown(server: &ServerConfig, sys: System<'_>) -> Vec<String> {
     remove(found(server, sys), [true; PARTS], sys)
 }
 
-/// After a failed apply: take down what it added, the parts confirmed on
-/// the host now that `before` (taken just before it) confirmed weren't.
-/// What was there already stays, whoever set it up, and so does a part
-/// either check couldn't tell about. Log lines as for [`teardown`].
+/// After a failed apply: take down what it added, what's on the host now
+/// that `before` (taken just before it) didn't have: a chain, a set or a
+/// rule at a time. What was there already stays, whoever set it up, and so
+/// does all of a part either check couldn't tell about. Log lines as for
+/// [`teardown`].
 pub fn teardown_added(server: &ServerConfig, before: Parts, sys: System<'_>) -> Vec<String> {
-    let now = found(server, sys);
-    let added = before.0.map(|b| b == Some(false));
-    remove(now, added, sys)
+    let mut now = found(server, sys);
+    for ((_, commands), before) in now.iter_mut().zip(&before.0) {
+        if let (Ok(commands), Some(before)) = (commands, before) {
+            commands.retain(|c| !before.contains(c));
+        }
+    }
+    remove(now, before.0.map(|b| b.is_some()), sys)
 }
 
 /// A command: the program and its arguments.
@@ -244,8 +250,9 @@ fn nft_table(sys: System<'_>) -> Result<Vec<Command>, String> {
         .unwrap_or_default())
 }
 
-/// The jumps from the built-in chains first, then every `PARALLAX_*` chain
-/// flushed, then deleted: a chain something still jumps to can't go.
+/// The jumps from the built-in chains first, then Parallax's chains
+/// flushed, then deleted: a chain something still jumps to can't go. Only
+/// the names the generator gives: an operator's `PARALLAX_MINE` stays.
 fn iptables_chains(sys: System<'_>) -> Result<Vec<Command>, String> {
     use crate::generate::firewall::iptables::CHAINS;
     let (mut jumps, mut flushes, mut deletes) = (Vec::new(), Vec::new(), Vec::new());
@@ -262,10 +269,16 @@ fn iptables_chains(sys: System<'_>) -> Result<Vec<Command>, String> {
                     ));
                 }
             }
-            if let Some(chain) = line
-                .strip_prefix("-N ")
-                .filter(|c| c.starts_with("PARALLAX_"))
-            {
+            let ours = |chain: &str| {
+                CHAINS
+                    .iter()
+                    .any(|(t, _, own)| *t == table && *own == chain)
+                    || (table == "filter"
+                        && chain.strip_prefix("PARALLAX_T").is_some_and(|n| {
+                            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                        }))
+            };
+            if let Some(chain) = line.strip_prefix("-N ").filter(|c| ours(c)) {
                 flushes.push(command("iptables", &["-t", table, "-F", chain]));
                 deletes.push(command("iptables", &["-t", table, "-X", chain]));
             }
@@ -294,8 +307,10 @@ fn nft_docker_user(sys: System<'_>) -> Result<Vec<Command>, String> {
     .unwrap_or_default();
     Ok(listing
         .lines()
-        .filter(|l| l.contains("comment \"parallax\""))
-        .filter_map(|l| l.rsplit_once("# handle ").map(|(_, h)| h.trim()))
+        .filter_map(|l| l.rsplit_once(" # handle "))
+        // Exactly apply's comment, last on the rule as nft lists it.
+        .filter(|(rule, _)| rule.ends_with(" comment \"parallax\""))
+        .map(|(_, handle)| handle.trim())
         .map(|handle| {
             let mut args = vec!["delete", "rule"];
             args.extend(chain);
@@ -313,13 +328,11 @@ fn iptables_docker_user(sys: System<'_>) -> Result<Vec<Command>, String> {
         IPTABLES_GONE,
     )?
     .unwrap_or_default();
-    Ok(listing
-        .lines()
-        .filter(|l| l.contains("--comment parallax") || l.contains("--comment \"parallax\""))
-        .filter_map(|l| l.strip_prefix("-A "))
+    Ok(crate::apply::docker_user_rules(&listing)
+        .into_iter()
         .map(|rule| {
             let mut args = vec!["-t", "filter", "-D"];
-            args.extend(rule.split(' '));
+            args.extend(rule.iter().map(String::as_str));
             command("iptables", &args)
         })
         .collect())
@@ -653,8 +666,8 @@ mod tests {
     }
 
     /// iptables-nft: the jumps, then Parallax's chains (flushed, then
-    /// deleted), its sets and DOCKER-USER accepts. An operator's chain,
-    /// jump, set and DOCKER-USER rule stay.
+    /// deleted), its sets and DOCKER-USER accepts. An operator's chains
+    /// (`PARALLAX_MINE` too), jump, sets and DOCKER-USER rules stay.
     #[test]
     fn iptables_teardown_removes_only_parallaxs_own() {
         let mut config = canonical_config();
@@ -662,6 +675,7 @@ mod tests {
         let runner = RecordingRunner::new();
         let filter = "-P INPUT ACCEPT
 -N MINE
+-N PARALLAX_MINE
 -N PARALLAX_INPUT
 -N PARALLAX_FORWARD
 -N PARALLAX_T0
@@ -678,7 +692,8 @@ wg_external_allow
 not_public";
         let docker = "-N DOCKER-USER
 -A DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT
--A DOCKER-USER -s 10.0.0.0/8 -j DROP
+-A DOCKER-USER -o wg0 -m comment --comment \"\\\"parallax\\\"\" -j ACCEPT
+-A DOCKER-USER -s 10.0.0.0/8 -m comment --comment parallax-backup -j DROP
 -A DOCKER-USER -j RETURN";
         let ipt = "iptables";
         reply(
@@ -718,6 +733,8 @@ not_public";
                 "ipset destroy not_public_fedcba9876543210",
                 "ipset destroy parallax-swap",
                 "iptables -t filter -D DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT",
+                // One a build before this one inserted, the quotes kept.
+                "iptables -t filter -D DOCKER-USER -o wg0 -m comment --comment \"parallax\" -j ACCEPT",
                 "ip link del dev wg0",
             ]
         );
@@ -813,7 +830,7 @@ not_public";
         // nftables has no ipsets to look for; nothing else can be told.
         assert_eq!(
             parts_present(&config.server, sys),
-            Parts([None, Some(false), None, None])
+            Parts([None, Some(BTreeSet::new()), None, None])
         );
         let log = teardown(&config.server, sys);
         assert_eq!(log.len(), 3, "{log:?}");
@@ -821,5 +838,53 @@ not_public";
             log.iter().all(|l| l.starts_with("could not check ")),
             "{log:?}"
         );
+    }
+
+    /// A failed apply on iptables-nft next to a stale set from before: the
+    /// sets it made go, the stale one stays.
+    #[test]
+    fn a_failed_apply_removes_its_own_sets_and_keeps_older_ones() {
+        let mut config = canonical_config();
+        config.server.firewall.backend = FirewallBackend::IptablesNft;
+        let runner = RecordingRunner::new();
+        let host = |sets: &'static str| {
+            reply(
+                &runner,
+                "iptables",
+                &["-t", "filter", "-S"],
+                There(""),
+                IPTABLES_GONE,
+            );
+            reply(
+                &runner,
+                "iptables",
+                &["-t", "nat", "-S"],
+                There(""),
+                IPTABLES_GONE,
+            );
+            reply(&runner, "ipset", &["list", "-n"], There(sets), "");
+            let docker_args = ["-t", "filter", "-S", "DOCKER-USER"];
+            reply(&runner, "iptables", &docker_args, Gone, IPTABLES_GONE);
+            reply(
+                &runner,
+                "ip",
+                &["link", "show", "dev", "wg0"],
+                Gone,
+                IP_GONE,
+            );
+        };
+        host("wg_0123456789abcdef");
+        let before = parts_present(&config.server, on(&MemoryFs::new(), &runner));
+        // The restore failed after the sets were filled.
+        host("wg_0123456789abcdef\nwg_fedcba9876543210\nparallax-swap");
+        let log = teardown_added(&config.server, before, on(&MemoryFs::new(), &runner));
+        assert_eq!(
+            removals(&runner),
+            [
+                "ipset destroy wg_fedcba9876543210",
+                "ipset destroy parallax-swap"
+            ]
+        );
+        assert_eq!(log, ["removed Parallax's ipsets"]);
     }
 }

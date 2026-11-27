@@ -241,16 +241,14 @@ fn apply_firewall(
                     let listing =
                         sys.runner
                             .run("iptables", &["-t", "filter", "-S", "DOCKER-USER"], None)?;
-                    for line in listing.stdout.lines().filter(|l| {
-                        l.contains("--comment parallax") || l.contains("--comment \"parallax\"")
-                    }) {
-                        let args: Vec<&str> = line.trim_start_matches("-A ").split(' ').collect();
+                    for rule in docker_user_rules(&listing.stdout) {
                         let mut del = vec!["-t", "filter", "-D"];
-                        del.extend(args);
+                        del.extend(rule.iter().map(String::as_str));
                         sys.runner.run("iptables", &del, None)?;
                     }
                     for line in docker.contents.lines().filter(|l| l.starts_with("-I")) {
-                        let args: Vec<&str> = line.split(' ').collect();
+                        let words = iptables_words(line);
+                        let args: Vec<&str> = words.iter().map(String::as_str).collect();
                         sys.runner.run_checked("iptables", &args, None)?;
                     }
                     log.push("firewall: DOCKER-USER rules refreshed".into());
@@ -261,6 +259,56 @@ fn apply_firewall(
         }
     }
     Ok(())
+}
+
+/// The words of an iptables rule as `iptables -S` lists it, or as the
+/// generator writes it: split on spaces, a double-quoted word kept whole and
+/// unquoted, `\"` and `\\` inside it unescaped. The generator's rules are
+/// run as arguments, not through a shell, so their quotes must go.
+pub(crate) fn iptables_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let (mut quoted, mut escaped, mut started) = (false, false, false);
+    for c in line.chars() {
+        match c {
+            _ if escaped => {
+                word.push(c);
+                escaped = false;
+            }
+            '\\' if quoted => escaped = true,
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            ' ' if !quoted => {
+                if started || !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                started = false;
+            }
+            _ => word.push(c),
+        }
+    }
+    if started || !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// Parallax's rules in an `iptables -S DOCKER-USER` listing, each as the
+/// words after `-A`: those commented exactly `parallax`, and `"parallax"`
+/// with the quotes, as builds before this one inserted them.
+pub(crate) fn docker_user_rules(listing: &str) -> Vec<Vec<String>> {
+    listing
+        .lines()
+        .map(iptables_words)
+        .filter(|w| w.first().is_some_and(|a| a == "-A"))
+        .filter(|w| {
+            w.windows(2)
+                .any(|p| p[0] == "--comment" && (p[1] == "parallax" || p[1] == "\"parallax\""))
+        })
+        .map(|w| w[1..].to_vec())
+        .collect()
 }
 
 /// The scratch set each set is filled in before it's swapped in. A failed
@@ -487,6 +535,51 @@ mod tests {
     /// shared set's base and 16 lowercase hex digits, or a logging set's
     /// plain name. An operator's `wg_external_allow`, `ts_family` even with
     /// a grant `family`, and a plain `not_public` or `lan_real`, stay.
+    /// The generator's quotes go, as a shell would take them; a listing's
+    /// escaped quotes stay part of the word.
+    #[test]
+    fn iptables_words_are_split_as_iptables_lists_them() {
+        assert_eq!(
+            iptables_words(r#"-I DOCKER-USER -i wg0 -m comment --comment "parallax" -j ACCEPT"#),
+            [
+                "-I",
+                "DOCKER-USER",
+                "-i",
+                "wg0",
+                "-m",
+                "comment",
+                "--comment",
+                "parallax",
+                "-j",
+                "ACCEPT"
+            ]
+        );
+        assert_eq!(
+            iptables_words(r#"-A X -m comment --comment "\"parallax\"" -j ACCEPT"#)[5],
+            "\"parallax\""
+        );
+        assert_eq!(
+            iptables_words(r#"--comment "two words""#),
+            ["--comment", "two words"]
+        );
+        assert_eq!(iptables_words(r#"--comment """#), ["--comment", ""]);
+    }
+
+    /// Exactly `parallax`, or `"parallax"` from builds that kept the
+    /// quotes; not an operator's `parallax-backup`, nor a rule without one.
+    #[test]
+    fn docker_user_rules_are_parallaxs_own_only() {
+        let listing = r#"-N DOCKER-USER
+-A DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT
+-A DOCKER-USER -o wg0 -m comment --comment "\"parallax\"" -j ACCEPT
+-A DOCKER-USER -s 10.0.0.0/8 -m comment --comment parallax-backup -j DROP
+-A DOCKER-USER -j RETURN"#;
+        let rules = docker_user_rules(listing);
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        assert_eq!(rules[0][..3], ["DOCKER-USER", "-i", "wg0"]);
+        assert_eq!(rules[1][..3], ["DOCKER-USER", "-o", "wg0"]);
+    }
+
     #[test]
     fn cleanup_destroys_only_parallaxs_own_sets() {
         let set = |name: &str| AddressSet {
