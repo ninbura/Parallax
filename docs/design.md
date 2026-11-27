@@ -468,13 +468,15 @@ the gateway, which nginx's `allow <subnet>` lines trust. So apply:
    checks every set exists, so those failures stop before either table
    changes. It doesn't ask the kernel; a rule the kernel refuses still
    fails the real commit.
-2. holds new connections from tunnel peers: a `parallax-hold` rule per
-   tunnel interface at the top of INPUT and FORWARD drops their new flows.
-   Open connections carry on under the NAT they started with.
-3. restores, then lifts the hold. If the restore fails, the hold stays, so
-   no connection starts under a mix: peers can't open new connections
-   until an apply succeeds (the daemon retries every minute and says why).
-   Teardown lifts a hold that's left.
+2. holds new connections: `parallax-hold` rules at the top of INPUT and
+   FORWARD drop new flows from each tunnel interface, and in FORWARD those
+   toward it. Open connections carry on under the NAT they started with. A
+   hold a failed apply left is kept, never lifted for a moment.
+3. restores, hooks the chains into the built-in ones (`nat` first: a filter
+   jump goes in above the hold), then lifts every hold. If the restore
+   fails, the hold stays, so no connection starts under a mix: peers can't
+   open new connections until an apply succeeds (the daemon retries every
+   minute and says why). Teardown lifts a hold last, after the chains.
 
 Open connections still see the mix: filter decides on addresses as they
 are after NAT and on interfaces, never on a virtual address (`internet`
