@@ -4,8 +4,8 @@
 //! the configuration in memory, and applies it: at startup, after every
 //! saved change, on SIGHUP, when the UTC date changes, and when the live
 //! firewall or WireGuard interface drifts. The DNS server and the HTTPS
-//! proxy run as tasks: the DNS server re-reads its routes after each apply,
-//! and the proxy gets its routes from the engine around each one. The CLI
+//! proxy run as tasks, and both get their routes from the engine around
+//! each apply. The CLI
 //! talks to it over a Unix socket ([`crate::protocol`]).
 //!
 //! When guests have `internet`, it looks up the home's public IP
@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use parallax_core::generate;
+use parallax_core::generate::dns::DnsRoutes;
 use parallax_core::generate::proxy::ProxyRoutes;
 use parallax_core::headscale::{self, Tailnet};
 use parallax_core::io::real::{RealFs, RealRunner};
@@ -61,7 +62,7 @@ use parallax_store::{backup, Store, TempDir};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket, UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, oneshot, watch, Notify};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
@@ -124,6 +125,9 @@ struct View {
     config: Arc<Config>,
     revision: u64,
     apply_error: Option<String>,
+    /// The configuration of the last apply that worked: what the activity
+    /// log attributes by, since WireGuard holds its peers.
+    applied: Option<Arc<Config>>,
     /// The home's public IP as last found.
     public_ip: Option<Ipv4Addr>,
     /// Bumped when a save looks the public IP up itself: lookups that
@@ -253,7 +257,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let mut engine_alive = true;
     let taps = collector::Taps::new();
     let started = async {
-        let servers = start_servers(&opts.out, routes, &taps).await?;
+        let servers = start_servers(routes, &taps).await?;
         let listener = bind_socket(&opts.socket)?;
         anyhow::Ok((servers, listener))
     }
@@ -347,20 +351,18 @@ type Servers = (
 
 /// How the engine hands the running DNS server and HTTPS proxy new routes.
 struct Reloaders {
-    /// Has the DNS server re-read the routes file.
-    dns: Arc<Notify>,
+    dns: parallax_dns::Reload,
     proxy: parallax_proxy::Reload,
 }
 
-/// Start the DNS server on the routes the first apply wrote, and the HTTPS
-/// proxy on the `routes` it made. Both listen on the gateway address, which
-/// the WireGuard interface carries since that apply.
+/// Start the HTTPS proxy and the DNS server on the routes the first apply
+/// made. Both listen on the gateway address, which the WireGuard interface
+/// carries since that apply.
 async fn start_servers(
-    out: &Path,
-    routes: ProxyRoutes,
+    (routes, dns_routes): (ProxyRoutes, DnsRoutes),
     taps: &collector::Taps,
 ) -> anyhow::Result<Servers> {
-    let dns = parallax_dns::Dns::load(&out.join(generate::dns::PATH), 53)?.tap(taps.dns.clone());
+    let dns = parallax_dns::Dns::new(dns_routes, 53)?.tap(taps.dns.clone());
     let listen = dns.listen();
     let udp = UdpSocket::bind(listen)
         .await
@@ -374,7 +376,7 @@ async fn start_servers(
         .await
         .with_context(|| format!("the HTTPS proxy can't listen on {listen}"))?;
     let reloaders = Reloaders {
-        dns: dns.reload_trigger(),
+        dns: dns.reloader(),
         proxy: proxy.reloader(),
     };
     let dns = tokio::spawn(async move { Ok(dns.run(udp, tcp).await?) });
@@ -859,7 +861,7 @@ fn engine_thread(
     out: PathBuf,
     publish: watch::Sender<Option<View>>,
     mut rx: mpsc::UnboundedReceiver<Msg>,
-    ready: oneshot::Sender<anyhow::Result<ProxyRoutes>>,
+    ready: oneshot::Sender<anyhow::Result<(ProxyRoutes, DnsRoutes)>>,
 ) {
     let (jobs, queue) = std::sync::mpsc::channel::<BackupJob>();
     let writer = match std::thread::Builder::new()
@@ -903,7 +905,8 @@ fn engine_thread(
     let routes = engine
         .proxy_routes
         .clone()
-        .ok_or_else(|| anyhow!("the first apply made no proxy routes"));
+        .zip(engine.dns_routes.clone())
+        .ok_or_else(|| anyhow!("the first apply made no proxy or DNS routes"));
     let _ = ready.send(routes);
     while let Some(first) = rx.blocking_recv() {
         let mut batch = vec![first];
@@ -961,6 +964,10 @@ struct Engine {
     /// order sent. Only what a good apply made, or what that and every
     /// apply since, failed ones too, all grant (issue #71).
     proxy_routes: Option<ProxyRoutes>,
+    /// The routes the DNS server answers by, or will next, likewise: an
+    /// address that changes hands answers neither owner's names beyond
+    /// what both may see until the apply has worked (issue #37).
+    dns_routes: Option<DnsRoutes>,
     /// Why the last public IP lookup failed, so the same failure is
     /// logged once, not every 5 minutes.
     public_ip_problems: Option<Vec<String>>,
@@ -979,6 +986,44 @@ struct Engine {
 /// How long the proxy may take to serve the routes an apply needs first
 /// (its own wait for open connections is shorter).
 const PROXY_TAKES: Duration = Duration::from_secs(10);
+/// The same for the DNS server (its own wait for queries under the old
+/// routes is shorter).
+const DNS_TAKES: Duration = Duration::from_secs(8);
+
+/// Before the apply writes or changes anything, like [`narrow_proxy`]: the
+/// DNS server answers each member only what both its routes `served` and
+/// the `new` ones let it look up (issue #37), so an address that changes
+/// hands answers neither owner's names beyond that while WireGuard may
+/// still give it to either. Waits until it does; if it doesn't in time,
+/// nothing has changed and the apply stops.
+fn narrow_dns(
+    rt: &tokio::runtime::Runtime,
+    dns: Option<&parallax_dns::Reload>,
+    served: &mut Option<DnsRoutes>,
+    new: &DnsRoutes,
+) -> anyhow::Result<()> {
+    // No DNS server runs before the first apply has worked.
+    let (Some(dns), Some(before)) = (dns, served.as_ref()) else {
+        return Ok(());
+    };
+    let both = parallax_dns::overlap(before, new);
+    if both == *before {
+        return Ok(());
+    }
+    let taken = dns.send(both.clone());
+    match rt.block_on(async { tokio::time::timeout(DNS_TAKES, taken).await }) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => bail!(
+            "the DNS server couldn't take its routes for the change (stopped); the firewall and WireGuard weren't changed"
+        ),
+        Err(_) => bail!(
+            "the DNS server didn't take its routes for the change within {} s; the firewall and WireGuard weren't changed",
+            DNS_TAKES.as_secs()
+        ),
+    }
+    *served = Some(both);
+    Ok(())
+}
 
 /// Before the apply writes or changes anything: one that fails partway can
 /// leave the old firewall, the new one or (iptables) a mix, so the proxy
@@ -1043,6 +1088,7 @@ impl Engine {
                 // Random, so a revision from before a restart never matches.
                 revision: rand::random::<u64>() >> 1,
                 apply_error: None,
+                applied: None,
                 public_ip,
                 public_ip_set: 0,
                 // Looked up right after the first apply: an answer from
@@ -1058,6 +1104,7 @@ impl Engine {
             applied: None,
             servers: None,
             proxy_routes: None,
+            dns_routes: None,
             backups,
             public_ip_problems: None,
             public_ip_saved: true,
@@ -1203,7 +1250,8 @@ impl Engine {
         log(format!("applying ({why})"));
         let today = crate::today();
         let mut made = None;
-        let (servers, served, rt) = (&self.servers, &mut self.proxy_routes, &self.rt);
+        let (servers, rt) = (&self.servers, &self.rt);
+        let (served, dns_served) = (&mut self.proxy_routes, &mut self.dns_routes);
         let applied = crate::apply_config(
             &self.view.config,
             &self.out,
@@ -1211,8 +1259,10 @@ impl Engine {
             &self.view.learned(),
             |model| {
                 let new = generate::proxy::build(model);
+                let new_dns = generate::dns::build(model);
                 narrow_proxy(rt, servers.as_ref().map(|s| &s.proxy), served, &new)?;
-                made = Some(new);
+                narrow_dns(rt, servers.as_ref().map(|s| &s.dns), dns_served, &new_dns)?;
+                made = Some((new, new_dns));
                 Ok(())
             },
         );
@@ -1228,18 +1278,20 @@ impl Engine {
                 self.reconciler
                     .applied(today, reconcile::live_state(server, sys()));
                 self.applied = Some(server.clone());
-                if let Some(servers) = &self.servers {
-                    servers.dns.notify_one();
-                    if let Some(routes) = &made {
-                        // Not waited for: the next apply's narrowing is
-                        // taken after these.
-                        drop(servers.proxy.send(routes.clone()));
-                    }
+                if let (Some(servers), Some((routes, dns))) = (&self.servers, &made) {
+                    // Not waited for: the next apply's narrowing is taken
+                    // after these.
+                    drop(servers.proxy.send(routes.clone()));
+                    drop(servers.dns.send(dns.clone()));
                 }
-                if made.is_some() {
-                    self.proxy_routes = made;
+                if let Some((routes, dns)) = made {
+                    self.proxy_routes = Some(routes);
+                    self.dns_routes = Some(dns);
                 }
-                self.set_apply_error(None);
+                // What the activity log attributes by from now on.
+                self.view.applied = Some(Arc::clone(&self.view.config));
+                self.view.apply_error = None;
+                self.publish();
                 (lines, None)
             }
             Err(e) => {
@@ -1713,5 +1765,119 @@ mod tests {
         let _ = proxy_rt.block_on(task);
         let mut served = Some(routes(&["10.8.2.1/32"]));
         narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap_err();
+    }
+
+    /// Routes where `personal` (10.8.1.1) has the whole zone and public
+    /// names, and `family` (10.8.2.1) only immich, `members` of each.
+    fn dns_routes(personal: &[&str], family: &[&str]) -> DnsRoutes {
+        let tier =
+            |name: &str, members: &[&str], whole: bool| parallax_core::generate::dns::DnsTier {
+                tier: name.into(),
+                members: members.iter().map(|m| m.parse().unwrap()).collect(),
+                zones: if whole {
+                    vec!["mydomain.com".into()]
+                } else {
+                    Vec::new()
+                },
+                names: if whole {
+                    Vec::new()
+                } else {
+                    vec!["immich.mydomain.com".into()]
+                },
+                public: whole,
+            };
+        DnsRoutes {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            public_resolver: "127.0.0.1".parse().unwrap(),
+            unmapped: Vec::new(),
+            zones: vec![parallax_core::generate::dns::DnsZone {
+                name: "mydomain.com".into(),
+                network: "home".into(),
+                upstream: vec!["127.0.0.1".parse().unwrap()],
+            }],
+            mappings: Vec::new(),
+            tiers: vec![
+                tier("personal", personal, true),
+                tier("family", family, false),
+            ],
+        }
+    }
+
+    /// A DNS server running on `rt`, answering by `routes`.
+    fn running_dns(
+        rt: &tokio::runtime::Runtime,
+        routes: DnsRoutes,
+    ) -> (parallax_dns::Reload, tokio::task::JoinHandle<()>) {
+        let dns = parallax_dns::Dns::new(routes, 53).unwrap();
+        let reload = dns.reloader();
+        let (udp, tcp) = rt.block_on(async {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let tcp = TcpListener::bind(udp.local_addr().unwrap()).await.unwrap();
+            (udp, tcp)
+        });
+        let task = rt.spawn(async move {
+            let _ = dns.run(udp, tcp).await;
+        });
+        (reload, task)
+    }
+
+    /// #37: 10.8.1.1 moves from `personal` to `family`. Before anything
+    /// live changes, the DNS server answers it only what both give it.
+    #[test]
+    fn the_dns_server_takes_the_overlap_before_the_apply_goes_on() {
+        let dns_rt = tokio::runtime::Runtime::new().unwrap();
+        let before = dns_routes(&["10.8.1.1/32"], &["10.8.2.1/32"]);
+        let (reload, _task) = running_dns(&dns_rt, before.clone());
+        let after = dns_routes(&[], &["10.8.1.1/32", "10.8.2.1/32"]);
+        let mut served = Some(before);
+        narrow_dns(&engine_rt(), Some(&reload), &mut served, &after).unwrap();
+        let both = served.unwrap();
+        let client = "10.8.1.1".parse().unwrap();
+        assert!(matches!(
+            both.route(client, "immich.mydomain.com"),
+            parallax_core::generate::dns::Route::Home {
+                whole_zone: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            both.route(client, "nas.mydomain.com"),
+            parallax_core::generate::dns::Route::Refused
+        );
+        assert_eq!(
+            both.route(client, "example.org"),
+            parallax_core::generate::dns::Route::Refused
+        );
+    }
+
+    /// Nothing changes for anyone: a stopped DNS server isn't asked.
+    #[test]
+    fn unchanged_dns_routes_are_not_handed_over() {
+        let dns_rt = tokio::runtime::Runtime::new().unwrap();
+        let before = dns_routes(&["10.8.1.1/32"], &["10.8.2.1/32"]);
+        let (reload, task) = running_dns(&dns_rt, before.clone());
+        task.abort();
+        let _ = dns_rt.block_on(task);
+        let mut served = Some(before.clone());
+        narrow_dns(&engine_rt(), Some(&reload), &mut served, &before).unwrap();
+        assert_eq!(served, Some(before));
+    }
+
+    /// A DNS server that stopped (its task ended) confirms nothing: the
+    /// apply stops before anything changes, and the routes stay.
+    #[test]
+    fn a_stopped_dns_server_stops_the_apply() {
+        let dns_rt = tokio::runtime::Runtime::new().unwrap();
+        let before = dns_routes(&["10.8.1.1/32"], &["10.8.2.1/32"]);
+        let (reload, task) = running_dns(&dns_rt, before.clone());
+        task.abort();
+        let _ = dns_rt.block_on(task);
+        let after = dns_routes(&[], &["10.8.1.1/32", "10.8.2.1/32"]);
+        let mut served = Some(before.clone());
+        let err = narrow_dns(&engine_rt(), Some(&reload), &mut served, &after)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the DNS server couldn't take"), "{err}");
+        assert_eq!(served, Some(before));
     }
 }

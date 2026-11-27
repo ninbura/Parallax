@@ -361,8 +361,12 @@ the proxy can't lose to a port Docker publishes on the gateway.
 
 Every tier asks the same address (`server.dns.listen`, by default the
 WireGuard gateway address), and the answer depends on who asks. The DNS
-server (crate `parallax-dns`, built on hickory, a task in the daemon) reads
-`dns/routes.toml`, which `apply` writes, and re-reads it after each apply:
+server (crate `parallax-dns`, built on hickory, a task in the daemon)
+answers by the routes `apply` makes (`dns/routes.toml` is written for
+`plan`), which the daemon hands it like the proxy's: before an apply
+changes anything live, each member gets only what both the current and the
+new routes let it look up (`parallax_dns::overlap`); after the apply has
+worked, the new routes in full.
 
 - **Who asks.** The source address picks the tier: its peers' WireGuard
   addresses, or (M2) its Tailscale nodes. WireGuard ties the source address
@@ -509,9 +513,8 @@ firewall (`nft -c -f` then `nft -f`) → WireGuard (`ip link add` if missing,
 replace, never an insert/delete pair, so re-applying an unchanged bundle is a
 no-op (asserted by `apply_runs_expected_commands_and_is_idempotent`). The DNS
 server and the HTTPS proxy are tasks in the daemon; the daemon starts them
-after the first apply. The DNS server re-reads the routes `apply` wrote
-after each apply that worked. The proxy gets its routes from the daemon,
-before anything live changes and after the apply has worked (above).
+after the first apply. Both get their routes from the daemon, before
+anything live changes and after the apply has worked (above).
 
 ## The daemon
 

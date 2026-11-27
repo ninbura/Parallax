@@ -173,3 +173,9 @@ request down. Connections are recorded once when they start and once
 when they end, not per packet; blocked attempts are per packet, within that
 limit. Packets dropped for being out of a connection's state (stale or
 malformed) aren't blocked attempts and aren't logged.
+
+Records go under the peer the last apply that worked gives the address to,
+since that's who WireGuard lets send from it. While a saved change that
+gives an address to another peer isn't applied yet, or its apply is under
+way, nothing from that address is logged, rather than put under the wrong
+peer.

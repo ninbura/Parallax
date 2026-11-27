@@ -7,8 +7,16 @@
 //! A source runs only while some peer is logged at its level: with nobody
 //! logged the kernel isn't asked for a single event, and the taps want
 //! nobody's.
+//!
+//! It goes by the configuration of the last apply that worked, since that's
+//! who WireGuard gives each address to, and logs an address only where the
+//! saved configuration gives it to the same peer: while a save that moves
+//! an address isn't applied yet, or its apply is under way, nothing from
+//! that address is logged rather than put under the wrong peer (issue #37).
 
+use std::collections::HashMap;
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -16,14 +24,71 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parallax_core::generate::firewall::LOG_GROUP;
-use parallax_core::logging::{self, Event, Tap};
-use parallax_core::model::LogLevel;
+use parallax_core::logging::{self, Event, Logged, Record, Tap};
+use parallax_core::model::{Config, LogLevel, TransportKind};
 use parallax_core::netlink;
+use parallax_core::secret::PublicKey;
 use parallax_store::logs::{Logs, Writer};
 use rustix::net::netlink::{SocketAddrNetlink, NETFILTER};
 use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType};
 
 use super::{log, warn, Views};
+
+/// What the log goes by: the last configuration that applied, and the
+/// saved one. `None` before the first apply has worked.
+fn configs(views: &Views) -> Option<(Arc<Config>, Arc<Config>)> {
+    let view = views.borrow();
+    let view = view.as_ref()?;
+    Some((Arc::clone(view.applied.as_ref()?), Arc::clone(&view.config)))
+}
+
+/// The WireGuard peer `config` gives `address` to: its name and key (a
+/// peer added again under its old name has a new key).
+fn holder(config: &Config, address: Ipv4Addr) -> Option<(&str, &PublicKey)> {
+    config.peers.iter().find_map(|p| {
+        let wg = p.wireguard.as_ref()?;
+        (p.transport == TransportKind::WireGuard && wg.address == Some(address))
+            .then_some((p.name.as_str(), &wg.public_key))
+    })
+}
+
+/// Both configurations give `address` to `peer`, under the same key.
+fn same_holder(applied: &Config, saved: &Config, address: Ipv4Addr, peer: &str) -> bool {
+    let now = holder(applied, address);
+    now.is_some_and(|(name, _)| name == peer) && now == holder(saved, address)
+}
+
+/// `record` if the saved configuration gives its address to the same peer.
+fn agreed(record: Option<Record>, applied: &Config, saved: &Config) -> Option<Record> {
+    record.filter(|r| same_holder(applied, saved, r.source, &r.peer))
+}
+
+/// What a connection tracking or nflog event records. Flows are settled
+/// before the check: one opened under one owner and closed under another
+/// is dropped, even if its opening wasn't logged.
+fn kernel_record(
+    open: &mut logging::OpenFlows,
+    event: &Event,
+    applied: &Config,
+    saved: &Config,
+    time: u64,
+) -> Option<Record> {
+    let record = open.settle(event, logging::attribute(applied, event, time));
+    agreed(record, applied, saved)
+}
+
+/// The clients a tap wants, less those the saved configuration gives to
+/// another peer.
+fn agreed_clients(
+    clients: HashMap<Ipv4Addr, Logged>,
+    applied: &Config,
+    saved: &Config,
+) -> HashMap<Ipv4Addr, Logged> {
+    clients
+        .into_iter()
+        .filter(|(address, logged)| same_holder(applied, saved, *address, &logged.peer))
+        .collect()
+}
 
 /// Records are written at least this often...
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
@@ -213,7 +278,7 @@ pub async fn supervise(mut views: Views, slot: Slot, taps: Taps) {
             }
             _ = check.tick() => {}
         }
-        let Some(config) = views.borrow().as_ref().map(|v| Arc::clone(&v.config)) else {
+        let Some((config, saved)) = configs(&views) else {
             continue;
         };
         for feed in &mut feeds {
@@ -221,8 +286,12 @@ pub async fn supervise(mut views: Views, slot: Slot, taps: Taps) {
         }
         // The proxy's refusals are blocked attempts, so whoever logs at
         // `blocked` or more.
-        proxy.set_clients(logging::level_clients(&config, LogLevel::Blocked));
-        let dns_clients = logging::dns_clients(&config);
+        proxy.set_clients(agreed_clients(
+            logging::level_clients(&config, LogLevel::Blocked),
+            &config,
+            &saved,
+        ));
+        let dns_clients = agreed_clients(logging::dns_clients(&config), &config, &saved);
         let wanted = feeds.iter().any(|f| f.wanted) || !dns_clients.is_empty();
         dns.set_clients(dns_clients);
         // A new place for the records: the old database is let go first, so
@@ -309,10 +378,13 @@ async fn purge_now(views: &Views, slot: &Slot) {
     let Some(logs) = slot.read().ok().and_then(|s| s.clone()) else {
         return;
     };
+    // The open database is the applied configuration's, and so are its
+    // limits: a saved change not applied yet mustn't purge it by its own.
     let Some(limits) = views
         .borrow()
         .as_ref()
-        .map(|v| (v.config.server.logs.keep, v.config.server.logs.max_size))
+        .and_then(|v| v.applied.as_ref())
+        .map(|c| (c.server.logs.keep, c.server.logs.max_size))
     else {
         return;
     };
@@ -378,11 +450,10 @@ impl Source {
                 Ok((n, _)) => {
                     let events = (self.parse)(&buf[..n]);
                     if !events.is_empty() {
-                        let config = self.views.borrow().as_ref().map(|v| Arc::clone(&v.config));
-                        if let Some(config) = config {
+                        if let Some((config, saved)) = configs(&self.views) {
                             let time = now_ms();
                             batch.extend(events.iter().filter_map(|e| {
-                                open.settle(e, logging::attribute(&config, e, time))
+                                kernel_record(&mut open, e, &config, &saved, time)
                             }));
                         }
                     }
@@ -549,8 +620,14 @@ impl Sink {
     }
 
     fn attribute(&self, event: Event, pending: &mut Pending) {
-        let config = self.views.borrow().as_ref().map(|v| Arc::clone(&v.config));
-        if let Some(record) = config.and_then(|c| logging::attribute(&c, &event, now_ms())) {
+        let Some((config, saved)) = configs(&self.views) else {
+            return;
+        };
+        if let Some(record) = agreed(
+            logging::attribute(&config, &event, now_ms()),
+            &config,
+            &saved,
+        ) {
             pending.push(record);
         }
     }
@@ -709,6 +786,78 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #37: 10.8.1.1 is `router`'s in the applied configuration, and the
+    /// saved one gives it to a new peer. Until that's applied, nothing from
+    /// it is logged under either.
+    #[test]
+    fn an_address_changing_hands_logs_nothing_until_applied() {
+        let applied = parallax_core::testing::canonical_config();
+        let router = holder(&applied, "10.8.1.1".parse().unwrap())
+            .unwrap()
+            .0
+            .to_string();
+        let mut saved = applied.clone();
+        saved.peers[0].name = "new-key".into();
+        let mut r = record(1);
+        r.peer = router.clone();
+        r.source = "10.8.1.1".parse().unwrap();
+        assert!(agreed(Some(r.clone()), &applied, &applied).is_some());
+        assert!(agreed(Some(r.clone()), &applied, &saved).is_none());
+        // Added again under its old name: a new key, so not the same peer.
+        let mut rekeyed = applied.clone();
+        let other = applied.peers[1]
+            .wireguard
+            .as_ref()
+            .unwrap()
+            .public_key
+            .clone();
+        rekeyed.peers[0].wireguard.as_mut().unwrap().public_key = other;
+        assert!(agreed(Some(r), &applied, &rekeyed).is_none());
+        let clients: HashMap<Ipv4Addr, Logged> = [(
+            "10.8.1.1".parse().unwrap(),
+            Logged {
+                peer: router,
+                level: LogLevel::Detailed,
+            },
+        )]
+        .into();
+        assert_eq!(agreed_clients(clients.clone(), &applied, &applied), clients);
+        assert!(agreed_clients(clients, &applied, &saved).is_empty());
+    }
+
+    /// A connection `router` opens while its address is changing hands, and
+    /// that closes once the new peer has it, is logged under neither.
+    #[test]
+    fn a_flow_across_a_hand_over_is_logged_under_neither_peer() {
+        let mut applied = parallax_core::testing::canonical_config();
+        applied.peers[0].log = Some(LogLevel::Detailed);
+        let mut saved = applied.clone();
+        saved.peers[0].name = "new-key".into();
+        let other = applied.peers[1]
+            .wireguard
+            .as_ref()
+            .unwrap()
+            .public_key
+            .clone();
+        saved.peers[0].wireguard.as_mut().unwrap().public_key = other;
+        let flow = logging::Flow {
+            id: 42,
+            protocol: 6,
+            src: "10.8.1.1".parse().unwrap(),
+            dst: "198.18.1.5".parse().unwrap(),
+            answered_by: "192.168.1.5".parse().unwrap(),
+            port: Some(443),
+            mark: parallax_core::generate::firewall::FLOW_MARK,
+            bytes: Some((1, 1)),
+        };
+        let mut open = logging::OpenFlows::default();
+        let opened = Event::Opened(flow.clone());
+        assert!(kernel_record(&mut open, &opened, &applied, &saved, 1).is_none());
+        // Applied: both say `new-key` now.
+        let closed = Event::Closed(flow);
+        assert!(kernel_record(&mut open, &closed, &saved, &saved, 2).is_none());
+    }
 
     fn record(n: u64) -> logging::Record {
         logging::Record {

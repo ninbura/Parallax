@@ -9,7 +9,6 @@
 )]
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,11 +16,11 @@ use std::time::{Duration, Instant};
 use hickory_server::proto::op::{Edns, Message, OpCode, Query, ResponseCode};
 use hickory_server::proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_server::proto::rr::{Name, RData, Record, RecordType};
+use parallax_core::generate::dns::DnsRoutes;
 use parallax_core::logging::{Event, QueryOutcome, Tap};
-use parallax_dns::Dns;
+use parallax_dns::{Dns, Reload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Notify;
 
 const UPSTREAM: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 10);
 const PERSONAL: &str = "127.0.0.2";
@@ -214,11 +213,15 @@ public = {family_public}
 struct Running {
     addr: SocketAddr,
     upstream: Upstream,
-    routes_path: PathBuf,
-    reload: Arc<Notify>,
+    reload: Reload,
 }
 
-static NEXT_DIR: AtomicU16 = AtomicU16::new(0);
+impl Running {
+    /// Hand the server `routes` and wait until it answers by them.
+    async fn reload(&self, routes: DnsRoutes) {
+        self.reload.send(routes).await.unwrap();
+    }
+}
 
 async fn start() -> Running {
     start_tapped(None).await
@@ -227,19 +230,11 @@ async fn start() -> Running {
 /// With the server handing queries over to `tap`.
 async fn start_tapped(tap: Option<Tap>) -> Running {
     let upstream = upstream().await;
-    let dir = std::env::temp_dir().join(format!(
-        "parallax-dns-test-{}-{}",
-        std::process::id(),
-        NEXT_DIR.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let routes_path = dir.join("routes.toml");
-    std::fs::write(&routes_path, routes(false)).unwrap();
-    let mut dns = Dns::load(&routes_path, upstream.port).unwrap();
+    let mut dns = Dns::new(parsed(false), upstream.port).unwrap();
     if let Some(tap) = tap {
         dns = dns.tap(tap);
     }
-    let reload = dns.reload_trigger();
+    let reload = dns.reloader();
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = udp.local_addr().unwrap();
     let tcp = TcpListener::bind(addr).await.unwrap();
@@ -247,9 +242,12 @@ async fn start_tapped(tap: Option<Tap>) -> Running {
     Running {
         addr,
         upstream,
-        routes_path,
         reload,
     }
+}
+
+fn parsed(public: bool) -> DnsRoutes {
+    DnsRoutes::from_toml(&routes(public)).unwrap()
 }
 
 fn query(name: &str, qtype: RecordType, edns: bool) -> Vec<u8> {
@@ -483,46 +481,23 @@ async fn upstream_failures_are_servfail() {
     );
 }
 
-/// Ask until the answer has `code`, for up to two seconds (a reload is async).
-async fn eventually(from: &str, server: SocketAddr, name: &str, code: ResponseCode) -> Message {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let m = ask(from, server, name, RecordType::A).await;
-        if m.metadata.response_code == code || Instant::now() > deadline {
-            return m;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn reloads_take_effect_and_a_broken_one_refuses_everything() {
     let s = start().await;
-    std::fs::write(&s.routes_path, routes(true)).unwrap();
-    s.reload.notify_one();
-    let m = eventually(FAMILY, s.addr, "example.org.", ResponseCode::NoError).await;
+    // Confirmed: the next query already gets the new routes.
+    s.reload(parsed(true)).await;
+    let m = ask(FAMILY, s.addr, "example.org.", RecordType::A).await;
     assert_eq!(addresses(&m), ["9.9.9.9"]);
 
-    std::fs::write(&s.routes_path, "listen = ").unwrap();
-    s.reload.notify_one();
-    let m = eventually(
-        PERSONAL,
-        s.addr,
-        "immich.mydomain.com.",
-        ResponseCode::Refused,
-    )
-    .await;
+    // Routes that don't load (a mapping between prefixes of two lengths).
+    let mut broken = parsed(false);
+    broken.mappings[0].virt = "198.18.1.0/26".parse().unwrap();
+    s.reload(broken).await;
+    let m = ask(PERSONAL, s.addr, "immich.mydomain.com.", RecordType::A).await;
     assert_eq!(m.metadata.response_code, ResponseCode::Refused);
 
-    std::fs::write(&s.routes_path, routes(false)).unwrap();
-    s.reload.notify_one();
-    let m = eventually(
-        PERSONAL,
-        s.addr,
-        "immich.mydomain.com.",
-        ResponseCode::NoError,
-    )
-    .await;
+    s.reload(parsed(false)).await;
+    let m = ask(PERSONAL, s.addr, "immich.mydomain.com.", RecordType::A).await;
     assert_eq!(addresses(&m), ["198.18.1.5"]);
 }
 
@@ -576,4 +551,79 @@ async fn a_logged_peer_s_queries_are_handed_over_without_answers() {
         !format!("{got:?}").contains("198.18"),
         "never the answer: {got:?}"
     );
+}
+
+/// A query under way when new routes come answers before they're
+/// confirmed: by then its address may be another peer's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_is_confirmed_once_queries_under_the_old_routes_answered() {
+    let s = start().await;
+    let addr = s.addr;
+    // The upstream never answers this one: it ends at the upstream timeout.
+    let slow =
+        tokio::spawn(async move { ask(PERSONAL, addr, "slow.mydomain.com.", RecordType::A).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    s.reload(parsed(true)).await;
+    assert!(
+        slow.is_finished(),
+        "confirmed while a query under the old routes was still out"
+    );
+}
+
+/// Where `client` may look `name` up: `Home`, `Public` or `Refused`.
+fn route_of(routes: &DnsRoutes, client: &str, name: &str) -> &'static str {
+    match routes.route(client.parse().unwrap(), name) {
+        parallax_core::generate::dns::Route::Home { .. } => "home",
+        parallax_core::generate::dns::Route::Public => "public",
+        parallax_core::generate::dns::Route::Refused => "refused",
+    }
+}
+
+#[test]
+fn while_an_apply_runs_a_member_gets_what_both_routes_give_it() {
+    let before = parsed(false);
+    // Nothing changes: the routes stay as they are.
+    assert_eq!(parallax_dns::overlap(&before, &before), before);
+    // PERSONAL's address moves to someone with only `family`'s names.
+    let mut after = parsed(true);
+    after.tiers[0].members.clear();
+    after.tiers[1]
+        .members
+        .push(format!("{PERSONAL}/32").parse().unwrap());
+    let both = parallax_dns::overlap(&before, &after);
+    assert_eq!(route_of(&both, PERSONAL, "immich.mydomain.com"), "home");
+    // Its old owner's whole zone: not the new owner's. Public names: both.
+    assert_eq!(route_of(&both, PERSONAL, "nas.mydomain.com"), "refused");
+    assert_eq!(route_of(&both, PERSONAL, "example.org"), "public");
+    // FAMILY gains public names in `after`: not before the apply has worked.
+    assert_eq!(route_of(&both, FAMILY, "example.org"), "refused");
+    assert_eq!(route_of(&both, FAMILY, "photos.mydomain.com"), "home");
+    // A zone only `after` has: nobody's yet, and not a public name either.
+    let mut zoned = parsed(true);
+    zoned.zones.push(parallax_core::generate::dns::DnsZone {
+        name: "internal.example".into(),
+        network: "lab".into(),
+        upstream: vec![UPSTREAM],
+    });
+    let both = parallax_dns::overlap(&parsed(true), &zoned);
+    assert_eq!(
+        route_of(&both, PERSONAL, "host.internal.example"),
+        "refused"
+    );
+    assert_eq!(route_of(&both, PERSONAL, "example.org"), "public");
+    // A child zone carved out of a zone a tier has whole: refused meanwhile.
+    let mut child = parsed(false);
+    child.zones.push(parallax_core::generate::dns::DnsZone {
+        name: "lab.mydomain.com".into(),
+        network: "lab".into(),
+        upstream: vec![UPSTREAM],
+    });
+    let both = parallax_dns::overlap(&before, &child);
+    assert_eq!(route_of(&both, PERSONAL, "x.lab.mydomain.com"), "refused");
+    assert_eq!(route_of(&both, PERSONAL, "nas.mydomain.com"), "home");
+    // A member only one side has gets nothing.
+    let mut gone = parsed(false);
+    gone.tiers.remove(1);
+    let both = parallax_dns::overlap(&before, &gone);
+    assert_eq!(route_of(&both, FAMILY, "immich.mydomain.com"), "refused");
 }
