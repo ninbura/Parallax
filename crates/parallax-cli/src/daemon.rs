@@ -1702,6 +1702,9 @@ mod tests {
         let reload = proxy.reloader();
         let listener = proxy_rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let task = proxy_rt.spawn(proxy.run(listener));
+        // Running: it confirms.
+        let mut served = Some(routes(&["10.8.2.1/32"]));
+        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap();
         task.abort();
         let _ = proxy_rt.block_on(task);
         let mut served = Some(routes(&["10.8.2.1/32"]));

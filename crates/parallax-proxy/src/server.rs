@@ -196,11 +196,17 @@ impl Proxy {
             self.state.sites.len()
         ));
         let (tx, rx) = watch::channel(self.state);
-        // Stops with this task, so a stopped proxy confirms no routes.
-        let _reloader = AbortOnDrop(tokio::spawn(reloader(tx, self.refresh, self.reloads)));
+        // Part of this future, not a task of its own: once it's dropped, no
+        // routes are confirmed.
+        let reloading = reloader(tx, self.refresh, self.reloads);
+        tokio::pin!(reloading);
         let counts: Arc<Mutex<HashMap<Ipv4Addr, usize>>> = Arc::default();
         loop {
-            match listener.accept().await {
+            let accepted = tokio::select! {
+                () = &mut reloading => return Ok(()),
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
                 Ok((stream, peer)) => {
                     let Some(client) = ipv4(peer.ip()) else {
                         continue;
@@ -228,15 +234,6 @@ impl Proxy {
                 }
             }
         }
-    }
-}
-
-/// Aborts the task when dropped.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 
@@ -352,6 +349,7 @@ fn server_configs(routes: &ProxyRoutes) -> (HashMap<String, Option<Arc<ServerCon
     (out, fingerprint)
 }
 
+/// Runs as long as the proxy does.
 async fn reloader(
     tx: watch::Sender<Arc<State>>,
     refresh: Duration,
@@ -363,11 +361,16 @@ async fn reloader(
     // Every state replaced that an open connection may still answer to, by
     // reloads and certificate renewals alike.
     let mut replaced: Vec<Arc<State>> = Vec::new();
+    let mut open = true;
     loop {
         tokio::select! {
-            handover = reloads.recv() => {
-                // Nobody can send routes any more: the last ones stay.
-                let Some((routes, done)) = handover else { return };
+            handover = reloads.recv(), if open => {
+                // Nobody can send routes any more: the last ones stay, and
+                // certificates are still renewed.
+                let Some((routes, done)) = handover else {
+                    open = false;
+                    continue;
+                };
                 replaced.push(reload(routes, &tx));
                 // Not confirmed until then: the daemon changes the firewall
                 // next. Dropping `done` tells it so. Nobody waiting: the next
@@ -492,8 +495,9 @@ fn refresh_certificates(tx: &watch::Sender<Arc<State>>) {
     }));
 }
 
-/// Drive `work` until it ends or `client` loses `hostname` in a reload, or,
-/// for a relay to `upstream`, the hostname moves elsewhere. Checked against
+/// Drive `work` until it ends (its output) or `client` loses `hostname` in
+/// a reload, or, for work with `upstream`, the hostname moves elsewhere
+/// (`None`). Checked against
 /// the current routes first, and again on every change before `work` goes
 /// on. The routes last checked are held meanwhile: a reload is confirmed
 /// only once no connection holds the ones it replaced ([`drained`]).
@@ -503,7 +507,7 @@ async fn while_authorized<F: Future>(
     hostname: &str,
     client: Ipv4Addr,
     upstream: Option<SocketAddrV4>,
-) {
+) -> Option<F::Output> {
     tokio::pin!(work);
     let mut checked: Option<Arc<State>> = None;
     loop {
@@ -516,7 +520,7 @@ async fn while_authorized<F: Future>(
                 log(format!(
                     "{client}: {hostname}: access revoked or moved, closing"
                 ));
-                return;
+                return None;
             }
             checked = Some(now);
         }
@@ -525,11 +529,10 @@ async fn while_authorized<F: Future>(
             changed = state.changed() => {
                 if changed.is_err() {
                     // The reloader is gone; the last state stays in force.
-                    work.await;
-                    return;
+                    return Some(work.await);
                 }
             }
-            _ = &mut work => return,
+            done = &mut work => return Some(done),
         }
     }
 }
@@ -643,14 +646,14 @@ async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot,
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
             .max_concurrent_streams(MAX_STREAMS)
             .serve_connection(io, service);
-        while_authorized(conn, state, &hostname, client, None).await;
+        let _ = while_authorized(conn, state, &hostname, client, None).await;
     } else {
         let conn = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(HEADER_TIMEOUT)
             .serve_connection(io, service)
             .with_upgrades();
-        while_authorized(conn, state, &hostname, client, None).await;
+        let _ = while_authorized(conn, state, &hostname, client, None).await;
     }
 }
 
@@ -892,7 +895,24 @@ async fn forward(
         Ok(up) => up,
         Err(r) => return Ok(refuse(exchange, r.status(), r.message())),
     };
-    let mut resp = match site.upstream.request(up).await {
+    // Guarded too: an HTTP/2 stream runs as a task of its own, and must not
+    // reach the upstream once a reload has taken the hostname away.
+    let sent = while_authorized(
+        site.upstream.request(up),
+        state.clone(),
+        &hostname,
+        client,
+        Some(site.route.upstream),
+    )
+    .await;
+    let Some(sent) = sent else {
+        return Ok(refuse(
+            exchange,
+            StatusCode::FORBIDDEN,
+            "access was revoked",
+        ));
+    };
+    let mut resp = match sent {
         Ok(resp) => resp,
         Err(e) => {
             log(format!(
@@ -948,7 +968,7 @@ async fn forward(
                     None => tokio::io::copy_bidirectional(&mut down, &mut up).await,
                 };
             };
-            while_authorized(relay, state, &hostname, client, Some(relayed_to)).await;
+            let _ = while_authorized(relay, state, &hostname, client, Some(relayed_to)).await;
         }
         drop(exchange);
     });
