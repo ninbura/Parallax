@@ -48,8 +48,9 @@ home's DNS stays the only place a machine's address is written down.
   addresses grants all of them; the HTTPS proxy's upstream is the lowest.
 - **When.** The daemon looks every name up right after startup, every 5
   minutes, and when a saved change alters the names or the networks; it
-  re-applies only when an address changed. `parallax apply` without a
-  daemon looks too.
+  re-applies only when an address changed. Answers a save looked up are
+  newer than a lookup that started before it, which is dropped. Without a
+  daemon, `apply`, `plan`, `generate`, `export` and `peer show` look too.
 - **Only the latest answer counts.** A lookup that fails, comes back empty
   or is refused leaves the name granting nothing (no rule; never open)
   until it resolves again, and the daemon logs why once. An earlier answer
