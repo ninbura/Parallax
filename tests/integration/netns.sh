@@ -86,7 +86,14 @@ esac
 UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.service"
 
 # The unit's private /tmp would hide one under /tmp.
-WORK=$(mktemp -d "$([ "$MODE" = unit ] && echo /run || echo /tmp)/parallax-it.XXXXXX")
+WORK_IN=$([ "$MODE" = unit ] && echo /run || echo /tmp)
+# The run copies the binary (and Tailscale's) in, and both are often RAM-backed
+# tmpfs: a full one fails a case halfway with "No space left on device". Say so
+# first. Twice the binary leaves room for databases, logs and Headscale.
+need=$(( $(stat -c %s "$PARALLAX") * 2 / 1024 ))
+free=$(df --output=avail -k "$WORK_IN" | tail -n1)
+[ "$free" -ge "$need" ] || { echo "only $((free / 1024)) MiB free in $WORK_IN; a run needs about $((need / 1024)) MiB"; exit 2; }
+WORK=$(mktemp -d "$WORK_IN/parallax-it.XXXXXX")
 PIDS=()
 UNITS=()
 CREATED=() # only these are cleaned up: a run that lost a race for a name leaves the winner's alone
@@ -1234,19 +1241,26 @@ database:
 derp:
   urls: []
   paths: [$HS/derp.yaml]
+# info: a slow start shows what it was doing (#91).
 log:
-  level: warn
+  level: info
 YAML
     start_headscale() {
         # Its own pid, not the backgrounded subshell's, so (u) can stop it.
         inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$HS/headscale.pid" \
             "$HEADSCALE" serve -c "$HS/config.yaml" >> "$HS/headscale.log" 2>&1 &
         PIDS+=($!)
-        for _ in $(seq 100); do
+        # The backgrounded subshell lives as long as Headscale does.
+        local pid=$! i
+        # A first start makes its database and keys, which can take a while
+        # on a busy CI runner (#91). One that exits says so at once.
+        for i in $(seq 300); do
             inns gw curl -sf -m 1 http://127.0.0.1:18080/version >/dev/null && return 0
+            kill -0 "$pid" 2>/dev/null \
+                || { cat "$HS/headscale.log"; fail "(u) Headscale exited before it answered (after $((i / 10)) s)"; }
             sleep 0.1
         done
-        cat "$HS/headscale.log"; fail "(u) Headscale did not start"
+        cat "$HS/headscale.log"; fail "(u) Headscale is running but didn't answer in 30 s"
     }
     start_headscale
     HS_KEY=$(inns gw "$HEADSCALE" -c "$HS/config.yaml" apikeys create 2>/dev/null | tail -n1)
