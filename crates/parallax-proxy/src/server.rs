@@ -60,6 +60,10 @@ const CERT_REFRESH: Duration = Duration::from_secs(60);
 /// site over HTTP/1.1 and one over HTTP/2; this bounds what one peer can
 /// take from everyone else.
 const MAX_PER_SOURCE: usize = 64;
+/// The longest method a request's record keeps. A client can send an
+/// extension method of any length (hyper reads up to its ~400 KiB buffer),
+/// and one guest's records mustn't grow with it (#65).
+const LOGGED_METHOD: usize = 32;
 
 type Body = BoxBody<Bytes, hyper::Error>;
 type Upstream = Client<HttpsConnector<HttpConnector<FixedResolver>>, Body>;
@@ -588,6 +592,12 @@ struct Exchange {
     back: Arc<AtomicU64>,
 }
 
+/// `method` as a record keeps it: a standard one whole, any other cut to
+/// [`LOGGED_METHOD`] characters.
+fn logged_method(method: &Method) -> String {
+    method.as_str().chars().take(LOGGED_METHOD).collect()
+}
+
 impl Exchange {
     fn new(tap: Tap, logged: Logged, client: Ipv4Addr, hostname: &str, method: &Method) -> Self {
         Exchange {
@@ -598,7 +608,7 @@ impl Exchange {
                 peer: logged.peer,
                 hostname: Some(hostname.to_string()),
                 upstream: None,
-                method: Some(method.to_string()),
+                method: Some(logged_method(method)),
                 status: None,
                 refused: None,
                 bytes: None,
