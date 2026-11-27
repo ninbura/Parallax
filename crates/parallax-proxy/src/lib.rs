@@ -7,10 +7,10 @@
 //! that the caller's tunnel address may use it and that every request names
 //! it, and forwards to the configured upstream over verified TLS.
 //!
-//! It reads only the routes file `apply` generates
-//! ([`parallax_core::generate::proxy`]); the daemon runs it and has it
-//! re-read the routes after each apply ([`Proxy::reload_trigger`]), and the
-//! certificate folder is re-checked every minute so renewals need no restart.
+//! It takes only the routes `apply` generates
+//! ([`parallax_core::generate::proxy`]), from the daemon, which runs it and
+//! hands it new ones around each apply ([`Reload`]). The certificate folder
+//! is re-checked every minute so renewals need no restart.
 
 mod error;
 mod server;
@@ -19,7 +19,7 @@ pub mod certs;
 pub mod http;
 
 pub use error::{Error, Result};
-pub use server::Proxy;
+pub use server::{Proxy, Reload};
 
 use parallax_core::generate::proxy::ProxyRoutes;
 

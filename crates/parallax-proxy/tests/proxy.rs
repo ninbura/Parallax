@@ -23,14 +23,13 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parallax_core::generate::proxy::{ProxyRoutes, ProxySite};
 use parallax_core::logging::{Event, Tap};
-use parallax_proxy::{certs, Proxy};
+use parallax_proxy::{certs, Proxy, Reload};
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -157,7 +156,7 @@ struct Env {
     proxy: SocketAddr,
     roots: RootCertStore,
     routes: ProxyRoutes,
-    reload: Arc<Notify>,
+    reload: Reload,
 }
 
 impl Drop for Env {
@@ -197,15 +196,13 @@ impl Env {
                 site(BAD, "127.0.0.0/8"),
             ],
         };
-        let routes_path = dir.join("routes.toml");
-        std::fs::write(&routes_path, toml::to_string(&routes).unwrap()).unwrap();
-        let mut proxy = Proxy::load(&routes_path)
+        let mut proxy = Proxy::new(routes.clone())
             .unwrap()
             .refresh_every(Duration::from_millis(100));
         if let Some(tap) = tap {
             proxy = proxy.tap(tap);
         }
-        let reload = proxy.reload_trigger();
+        let reload = proxy.reloader();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(proxy.run(listener));
@@ -221,18 +218,16 @@ impl Env {
         }
     }
 
-    /// Write `text` as the routes file and have the proxy re-read it.
-    async fn reload_with(&self, text: &str) {
-        std::fs::write(self.dir.join("routes.toml"), text).unwrap();
-        self.reload.notify_one();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    /// Hand the proxy `routes` and wait until it serves them.
+    async fn reload_with(&self, routes: ProxyRoutes) {
+        self.reload.send(routes).await.unwrap();
     }
 
     /// Reload with IMMICH granted to another tier only.
     async fn revoke_immich(&self) {
         let mut routes = self.routes.clone();
         routes.sites[0].allowed = vec!["10.0.0.0/8".parse().unwrap()];
-        self.reload_with(&toml::to_string(&routes).unwrap()).await;
+        self.reload_with(routes).await;
     }
 
     async fn connect(&self, sni: &str, alpn: &[u8]) -> std::io::Result<TlsStream<TcpStream>> {
@@ -449,14 +444,34 @@ async fn revoking_a_grant_closes_open_connections() {
     assert!(env.connect(IMMICH, b"http/1.1").await.is_err());
 }
 
+/// A hostname moved to another upstream closes the WebSocket relayed to the
+/// old one.
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_a_hostname_closes_relays_to_the_old_upstream() {
+    let env = Env::start().await;
+    let mut ws = websocket(&env).await;
+    let mut moved = env.routes.clone();
+    // Nothing listens there; only the move matters.
+    moved.sites[0].upstream = "127.0.0.1:9".parse().unwrap();
+    env.reload_with(moved).await;
+    let mut buf = [0u8; 4];
+    let _ = ws.write_all(b"ping").await;
+    assert!(
+        !matches!(ws.read(&mut buf).await, Ok(n) if n > 0),
+        "the WebSocket must be closed"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_reload_refuses_everything() {
     let env = Env::start().await;
     assert!(env.connect(IMMICH, b"http/1.1").await.is_ok());
-    env.reload_with("not toml").await;
+    // The CA bundle is gone.
+    let mut broken = env.routes.clone();
+    broken.upstream_ca = env.dir.join("missing.pem");
+    env.reload_with(broken).await;
     assert!(env.connect(IMMICH, b"http/1.1").await.is_err());
-    env.reload_with(&toml::to_string(&env.routes).unwrap())
-        .await;
+    env.reload_with(env.routes.clone()).await;
     assert!(env.connect(IMMICH, b"http/1.1").await.is_ok());
 }
 

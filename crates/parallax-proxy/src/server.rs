@@ -2,16 +2,15 @@
 //! is sent, check the caller's tunnel address, then serve HTTP/1.1 or HTTP/2
 //! and forward each checked request to the site's upstream over TLS.
 //!
-//! The routes live in a `watch` channel. A reload sends a new state; every
-//! request looks its site up in the current one, and open connections and
-//! WebSocket relays re-check theirs on every change, so revoking a grant
-//! cuts off connections that were already open.
+//! The routes live in a `watch` channel. New routes ([`Reload`]) become a
+//! new state; every request looks its site up in the current one, and open
+//! connections and WebSocket relays re-check theirs on every change, so
+//! revoking a grant cuts off connections that were already open.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +36,7 @@ use rustls::server::Acceptor;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
 
@@ -118,23 +117,43 @@ impl State {
 
 type Shared = watch::Receiver<Arc<State>>;
 
+/// Routes on their way to the proxy, and who to tell once they're in force.
+type Handover = (ProxyRoutes, oneshot::Sender<()>);
+
+/// Hands a proxy new routes ([`Proxy::reloader`]).
+#[derive(Debug, Clone)]
+pub struct Reload(mpsc::UnboundedSender<Handover>);
+
+impl Reload {
+    /// Have the proxy serve `routes`. The receiver gets `()` once it does,
+    /// or once it refuses everything because they didn't load; it gets an
+    /// error if the proxy has stopped. Routes are taken in the order sent.
+    pub fn send(&self, routes: ProxyRoutes) -> oneshot::Receiver<()> {
+        let (done, taken) = oneshot::channel();
+        // A stopped proxy drops `done`, which the receiver reports.
+        let _ = self.0.send((routes, done));
+        taken
+    }
+}
+
 /// A loaded proxy, ready to run on a listener.
 pub struct Proxy {
-    routes_path: PathBuf,
     state: Arc<State>,
     refresh: Duration,
-    reload: Arc<Notify>,
+    reload: Reload,
+    reloads: mpsc::UnboundedReceiver<Handover>,
     tap: Option<Tap>,
 }
 
 impl Proxy {
-    /// Read the routes file, the CA bundle and the certificates.
-    pub fn load(routes_path: &Path) -> Result<Proxy> {
+    /// Load `routes`: the CA bundle and the certificates they name.
+    pub fn new(routes: ProxyRoutes) -> Result<Proxy> {
+        let (reload, reloads) = mpsc::unbounded_channel();
         Ok(Proxy {
-            routes_path: routes_path.to_path_buf(),
-            state: Arc::new(load_state(routes_path)?),
+            state: Arc::new(load_state(routes)?),
             refresh: CERT_REFRESH,
-            reload: Arc::new(Notify::new()),
+            reload: Reload(reload),
+            reloads,
             tap: None,
         })
     }
@@ -157,9 +176,9 @@ impl Proxy {
         self
     }
 
-    /// Notifying this re-reads the routes (the daemon does after each apply).
-    pub fn reload_trigger(&self) -> Arc<Notify> {
-        Arc::clone(&self.reload)
+    /// What hands this proxy new routes (the daemon does around each apply).
+    pub fn reloader(&self) -> Reload {
+        self.reload.clone()
     }
 
     /// Serve on `listener` until the task is dropped.
@@ -172,7 +191,7 @@ impl Proxy {
             self.state.sites.len()
         ));
         let (tx, rx) = watch::channel(self.state);
-        tokio::spawn(reloader(self.routes_path, tx, self.refresh, self.reload));
+        tokio::spawn(reloader(tx, self.refresh, self.reloads));
         let counts: Arc<Mutex<HashMap<Ipv4Addr, usize>>> = Arc::default();
         loop {
             match listener.accept().await {
@@ -246,10 +265,7 @@ impl Drop for Slot {
     }
 }
 
-fn load_state(routes_path: &Path) -> Result<State> {
-    let text = std::fs::read_to_string(routes_path)
-        .map_err(|e| Error::io(format!("reading {}", routes_path.display()), e))?;
-    let routes = ProxyRoutes::from_toml(&text)?;
+fn load_state(routes: ProxyRoutes) -> Result<State> {
     let (tls, certs_fingerprint) = server_configs(&routes);
     let mut sites = HashMap::new();
     // With no sites there is nothing to verify, and no CA bundle is needed.
@@ -322,27 +338,31 @@ fn server_configs(routes: &ProxyRoutes) -> (HashMap<String, Option<Arc<ServerCon
 }
 
 async fn reloader(
-    routes_path: PathBuf,
     tx: watch::Sender<Arc<State>>,
     refresh: Duration,
-    trigger: Arc<Notify>,
+    mut reloads: mpsc::UnboundedReceiver<Handover>,
 ) {
     let mut tick = tokio::time::interval(refresh);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
     loop {
         tokio::select! {
-            () = trigger.notified() => reload(&routes_path, &tx),
+            handover = reloads.recv() => {
+                // Nobody can send routes any more: the last ones stay.
+                let Some((routes, done)) = handover else { return };
+                reload(routes, &tx);
+                let _ = done.send(());
+            }
             _ = tick.tick() => refresh_certificates(&tx),
         }
     }
 }
 
-/// Re-read the routes. On failure, refuse everything until a reload works:
+/// Serve `routes`. When they don't load, refuse everything until some do:
 /// the old routes may grant what the new configuration takes away.
-fn reload(routes_path: &Path, tx: &watch::Sender<Arc<State>>) {
+fn reload(routes: ProxyRoutes, tx: &watch::Sender<Arc<State>>) {
     let old = Arc::clone(&tx.borrow());
-    match load_state(routes_path) {
+    match load_state(routes) {
         Ok(state) => {
             if state.routes.listen != old.routes.listen {
                 log(format!(
@@ -417,8 +437,15 @@ fn refresh_certificates(tx: &watch::Sender<Arc<State>>) {
     }));
 }
 
-/// Drive `work` until it ends or `client` loses `hostname` in a reload.
-async fn while_authorized<F: Future>(work: F, mut state: Shared, hostname: &str, client: Ipv4Addr) {
+/// Drive `work` until it ends or `client` loses `hostname` in a reload, or,
+/// for a relay to `upstream`, the hostname moves elsewhere.
+async fn while_authorized<F: Future>(
+    work: F,
+    mut state: Shared,
+    hostname: &str,
+    client: Ipv4Addr,
+    upstream: Option<SocketAddrV4>,
+) {
     tokio::pin!(work);
     loop {
         tokio::select! {
@@ -429,8 +456,12 @@ async fn while_authorized<F: Future>(work: F, mut state: Shared, hostname: &str,
                     work.await;
                     return;
                 }
-                if state.borrow_and_update().authorized(hostname, client).is_none() {
-                    log(format!("{client}: {hostname}: access revoked, closing"));
+                let still = state
+                    .borrow_and_update()
+                    .authorized(hostname, client)
+                    .is_some_and(|site| upstream.is_none_or(|u| site.route.upstream == u));
+                if !still {
+                    log(format!("{client}: {hostname}: access revoked or moved, closing"));
                     return;
                 }
             }
@@ -547,14 +578,14 @@ async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot,
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
             .max_concurrent_streams(MAX_STREAMS)
             .serve_connection(io, service);
-        while_authorized(conn, state, &hostname, client).await;
+        while_authorized(conn, state, &hostname, client, None).await;
     } else {
         let conn = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(HEADER_TIMEOUT)
             .serve_connection(io, service)
             .with_upgrades();
-        while_authorized(conn, state, &hostname, client).await;
+        while_authorized(conn, state, &hostname, client, None).await;
     }
 }
 
@@ -828,6 +859,7 @@ async fn forward(
     };
     let upgrade = resp.headers().get(UPGRADE).cloned();
     http::strip_hop_by_hop(resp.headers_mut(), upgrade);
+    let relayed_to = site.route.upstream;
     let upstream = hyper::upgrade::on(&mut resp);
     // A WebSocket's record goes when it closes, with what it carried.
     if let Some(e) = exchange.as_mut().and_then(Exchange::event) {
@@ -851,7 +883,7 @@ async fn forward(
                     None => tokio::io::copy_bidirectional(&mut down, &mut up).await,
                 };
             };
-            while_authorized(relay, state, &hostname, client).await;
+            while_authorized(relay, state, &hostname, client, Some(relayed_to)).await;
         }
         drop(exchange);
     });
