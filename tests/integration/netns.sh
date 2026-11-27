@@ -123,6 +123,13 @@ inns gw ip route add default via 198.51.100.2
 inns gw ip link add docker0 type bridge
 inns gw ip addr add 172.17.0.1/16 dev docker0; inns gw ip link set docker0 up
 inns gw ip link set vethctr master docker0 up
+# Docker's DOCKER-USER chain, as iptables-nft makes it, with the FORWARD jump
+# Docker adds. The policy accepts: only Parallax's own accepts are checked here.
+inns gw nft add table ip filter
+inns gw nft add chain ip filter FORWARD '{ type filter hook forward priority 0; policy accept; }'
+inns gw nft add chain ip filter DOCKER-USER
+inns gw nft add rule ip filter FORWARD jump DOCKER-USER
+inns gw nft add rule ip filter DOCKER-USER return
 inns home ip addr add 192.168.1.5/24 dev lan0; inns home ip link set lan0 up
 inns home ip route add 10.8.0.0/16 via 192.168.1.1      # the static route the docs demand
 inns home ip route add 100.64.0.0/10 via 192.168.1.1
@@ -258,7 +265,7 @@ private_key_file = "$WORK/wg-server.key"
 [server.dns]
 public_resolver = "9.9.9.9"
 [server.firewall]
-docker_coexistence = false
+docker_coexistence = true
 [server.backup]
 directory = "$WORK/backups"
 passphrase_file = "$WORK/backup.passphrase"
@@ -786,12 +793,17 @@ pass "(o) guests drop the home's public IP: configured, looked up and re-applied
 
 # (n) the daemon's lifecycle: SIGTERM takes the gateway down and removes the socket;
 # a new daemon re-applies on SIGHUP and puts back a table someone deleted.
+# Docker coexistence is on: the accepts are in Docker's chain until the end.
+[ "$(inns gw nft list chain ip filter DOCKER-USER | grep -c 'comment "parallax"')" -ge 2 ] \
+    || fail "(n) Parallax's DOCKER-USER accepts aren't there while it runs"
 DAEMON=$(cat "$WORK/daemon.pid")
 kill -TERM "$DAEMON"
 for _ in $(seq 50); do kill -0 "$DAEMON" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$DAEMON" 2>/dev/null && fail "(n) the daemon did not stop on SIGTERM"
 inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) the table outlived the daemon"
 inns gw ip link show wg0 >/dev/null 2>&1 && fail "(n) wg0 outlived the daemon"
+inns gw nft list chain ip filter DOCKER-USER | grep -q 'comment "parallax"' \
+    && fail "(n) Parallax's DOCKER-USER rules outlived the daemon"
 [ -e "$SOCK" ] && fail "(n) the socket outlived the daemon"
 if [ "$MODE" = unit ]; then
     # Root opening the service's database would leave files the service can't open.
@@ -835,6 +847,8 @@ inns gw ss -Hlun 'sport = :51820' | grep -q . && fail "(n) WireGuard's port is s
 grep -q "the first apply failed" "$WORK/held.log" || { cat "$WORK/held.log"; fail "(n) the held port didn't fail the first apply"; }
 inns gw nft list table inet parallax >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left the table"; }
 inns gw ip link show wg0 >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left wg0"; }
+inns gw nft list chain ip filter DOCKER-USER | grep -q 'comment "parallax"' \
+    && { cat "$WORK/held.log"; fail "(n) a failed first apply left its DOCKER-USER rules"; }
 grep -q "removed table inet parallax" "$WORK/held.log" && grep -q "removed interface wg0" "$WORK/held.log" \
     || { cat "$WORK/held.log"; fail "(n) a failed first apply didn't log what it took down"; }
 start_daemon 1
@@ -856,7 +870,7 @@ inns gw nft list table inet parallax >/dev/null 2>&1 || fail "(n) the deleted ta
 grep -q 'applying (the live' "$WORK/daemon.log" || fail "(n) the repair was not logged as drift"
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(n) guest grants after the repair"
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after the repair"
-pass "(n) SIGTERM tears down; a failed first apply takes down what it set up; SIGHUP re-applies; a deleted table comes back on its own"
+pass "(n) SIGTERM tears down, DOCKER-USER accepts too; a failed first apply takes down what it set up; SIGHUP re-applies; a deleted table comes back on its own"
 
 # (q) names on the home's public IP are port forwards: friend (full tunnel, internet,
 # which drops the public IP) reaches the one port it's granted there, and HTTPS by name

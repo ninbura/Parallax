@@ -148,7 +148,7 @@ fn apply_firewall(
             // Fill a fresh set and swap it in: flushing the live one would
             // briefly leave `! --match-set not_public` matching everything.
             // One short scratch name: ipset names stop at 31 characters.
-            let next = "parallax-swap";
+            let next = SWAP_SET;
             for set in &rs.sets {
                 for name in [set.name.as_str(), next] {
                     sys.runner.run_checked(
@@ -261,6 +261,19 @@ fn apply_firewall(
         }
     }
     Ok(())
+}
+
+/// The scratch set each set is filled in before it's swapped in. A failed
+/// apply can leave it.
+const SWAP_SET: &str = "parallax-swap";
+
+/// Every set in an `ipset list -n` listing that Parallax made, for
+/// teardown: what [`stale_sets`] finds against an empty ruleset, and the
+/// scratch set.
+pub(crate) fn own_sets(listing: &str) -> Vec<&str> {
+    let mut sets = stale_sets(listing, &[]);
+    sets.extend(listing.lines().map(str::trim).filter(|n| *n == SWAP_SET));
+    sets
 }
 
 /// Sets in an `ipset list -n` listing that Parallax made and the new ruleset
