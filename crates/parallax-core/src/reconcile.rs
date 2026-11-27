@@ -146,6 +146,14 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
                                 )
                             },
                         );
+                        // Docker's chain coming (it starts after Parallax)
+                        // or going: it needs Parallax's rules, as with nft.
+                        if server.firewall.docker_coexistence {
+                            let docker = save_table(&out.stdout, "filter")
+                                .lines()
+                                .any(|l| l.starts_with(":DOCKER-USER "));
+                            listing.push_str(&format!("DOCKER-USER there: {docker}\n"));
+                        }
                     }
                 } else {
                     listing.push_str(&out.stdout);
@@ -599,6 +607,34 @@ mod tests {
             )
         };
         assert_eq!(listing("one"), listing("two"));
+    }
+
+    /// Docker starting after Parallax makes its chain without Parallax's
+    /// rules: that's drift, as it is with nftables.
+    #[test]
+    fn docker_user_appearing_counts_as_drift() {
+        let mut config = canonical_config();
+        config.server.firewall.backend = FirewallBackend::IptablesNft;
+        let fs = MemoryFs::new();
+        let listing = |docker: &str| {
+            let runner = RecordingRunner::new();
+            runner.respond(
+                "iptables-save",
+                Output {
+                    status: 0,
+                    stdout: format!("*filter\n:FORWARD ACCEPT [0:0]\n{docker}-A FORWARD -j PARALLAX_FORWARD\nCOMMIT\n"),
+                    stderr: String::new(),
+                },
+            );
+            live_state(
+                &config.server,
+                System {
+                    fs: &fs,
+                    runner: &runner,
+                },
+            )
+        };
+        assert_ne!(listing(""), listing(":DOCKER-USER - [0:0]\n"));
     }
 
     /// Each table's part of `iptables-save` alone: mangle has a FORWARD too.

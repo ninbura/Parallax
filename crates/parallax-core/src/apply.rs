@@ -231,7 +231,13 @@ fn apply_firewall(
                 .runner
                 .run_checked("iptables", &["-t", "filter", "-S"], None)
                 .map_err(still_held)?;
-            attach(docker, &listing.stdout, sys, log).map_err(still_held)?;
+            attach(docker, sys, log).map_err(still_held)?;
+            // Every hold goes, also one for an interface since renamed. The
+            // hooks are above them by now, so one left over holds nothing.
+            for args in held(&listing.stdout) {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                sys.runner.run_checked("iptables", &args, None)?;
+            }
             // Chains of tiers that no longer exist: nothing jumps to them
             // since the restore, so they can go.
             for chain in listing
@@ -274,20 +280,15 @@ fn apply_firewall(
     Ok(())
 }
 
-/// After the restore: hook the PARALLAX_* chains, refill Docker's chain,
-/// and lift the holds. Until both tables are attached nothing new starts.
+/// After the restore, while the holds are up: hook the PARALLAX_* chains
+/// and refill Docker's chain. Until both tables are attached nothing new
+/// starts.
 /// `nat` first: a filter jump goes in above the hold, so once it's there
 /// both tables must be. A jump that's there but below someone else's rules
 /// (Docker's, after it restarts: issue #74) moves to the top. Each change
 /// is one transaction, so no packet finds a jump missing on the way.
-/// `docker` is Docker's chain's rules, when Parallax shares it; `listing` is
-/// `iptables -t filter -S` from after the restore.
-fn attach(
-    docker: Option<&str>,
-    listing: &str,
-    sys: System<'_>,
-    log: &mut Vec<String>,
-) -> Result<()> {
+/// `docker` is Docker's chain's rules, when Parallax shares it.
+fn attach(docker: Option<&str>, sys: System<'_>, log: &mut Vec<String>) -> Result<()> {
     use crate::generate::firewall::iptables::DOCKER_USER;
     let nat = sys
         .runner
@@ -314,13 +315,7 @@ fn attach(
     let filter = sys
         .runner
         .run_checked("iptables", &["-t", "filter", "-S"], None)?;
-    commit("filter", &hook_moves("filter", &filter.stdout, log), sys)?;
-    // Every hold goes, also one for an interface since renamed.
-    for args in held(listing) {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        sys.runner.run_checked("iptables", &args, None)?;
-    }
-    Ok(())
+    commit("filter", &hook_moves("filter", &filter.stdout, log), sys)
 }
 
 /// A failure once the holds are in leaves them: say so.
