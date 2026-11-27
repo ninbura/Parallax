@@ -266,16 +266,19 @@ fn apply_firewall(
 /// Sets in an `ipset list -n` listing that Parallax made and the new ruleset
 /// no longer has: a transport's prefix or a shared set's base name
 /// (`not_public`) and a 16-digit hash, as `generate::firewall` names them,
-/// and the shared sets' plain names from builds before those hashes. Anything
-/// else listed is someone else's. That includes the `ts_<template>` sets of builds before grants:
-/// they were always empty (no Tailscale peers before M2), and a name built
-/// from a grant could be an operator's own set.
+/// and the logging sets' plain names. Anything else listed is someone
+/// else's. That includes the `ts_<template>` sets of builds before grants
+/// (always empty: no Tailscale peers before M2), and the plain `lan_real`
+/// and `not_public` of builds before hashed names: a name built from a grant,
+/// or a word like those, could be an operator's own set.
 fn stale_sets<'a>(
     listing: &'a str,
     keep: &[crate::generate::firewall::AddressSet],
 ) -> Vec<&'a str> {
     use crate::generate::firewall::{LAN_SET, LOG_DENIED_SET, LOG_FLOWS_SET, NOT_PUBLIC_SET};
     let shared = [LAN_SET, NOT_PUBLIC_SET, LOG_FLOWS_SET, LOG_DENIED_SET];
+    // Logging came in shortly before hashed names, under these names.
+    let plain = [LOG_FLOWS_SET, LOG_DENIED_SET];
     let transports = crate::transport::all();
     let bases: Vec<&str> = transports
         .iter()
@@ -285,7 +288,7 @@ fn stale_sets<'a>(
     let hash =
         |key: &str| key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let ours = |name: &str| {
-        shared.contains(&name)
+        plain.contains(&name)
             || bases.iter().any(|p| {
                 name.strip_prefix(p)
                     .and_then(|rest| rest.strip_prefix('_'))
@@ -468,9 +471,9 @@ mod tests {
     }
 
     /// Only sets named as Parallax names them go: a transport's prefix or a
-    /// shared set's base and 16 lowercase hex digits, or a shared set's
-    /// plain name from before those hashes. An operator's
-    /// `wg_external_allow`, and `ts_family` even with a grant `family`, stay.
+    /// shared set's base and 16 lowercase hex digits, or a logging set's
+    /// plain name. An operator's `wg_external_allow`, `ts_family` even with
+    /// a grant `family`, and a plain `not_public` or `lan_real`, stay.
     #[test]
     fn cleanup_destroys_only_parallaxs_own_sets() {
         let set = |name: &str| AddressSet {
@@ -493,8 +496,6 @@ mod tests {
                 "wg_fedcba9876543210",
                 "ts_00000000000000ff",
                 "wg_00000000000000aa",
-                "not_public",
-                "lan_real",
                 "log_flows",
                 "not_public_00000000000000bb",
                 "lan_real_00000000000000cc",
@@ -609,8 +610,7 @@ mod tests {
             .collect();
         assert_eq!(
             destroyed,
-            // The plain not_public of builds before set names were hashed.
-            ["not_public", "wg_fedcba9876543210", "ts_00000000000000ff"],
+            ["wg_fedcba9876543210", "ts_00000000000000ff"],
             "{lines:#?}"
         );
         let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();

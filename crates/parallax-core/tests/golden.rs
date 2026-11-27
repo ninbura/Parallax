@@ -784,7 +784,8 @@ fn iptables_apply_refills_chains_in_one_restore() {
     );
     // A set from before grants (not ours to judge by name), one of a tier
     // that went away, a live one, and not_public as builds before hashed
-    // set names named it, beside its live successor.
+    // set names named it (not ours to judge by name either), beside its
+    // live successor.
     runner.respond_to(
         "ipset",
         &["list", "-n"],
@@ -805,8 +806,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let restore = pos("iptables-restore --noflush").unwrap();
     let gone = |set: &str| pos(&format!("ipset destroy {set}"));
     assert!(gone("wg_0000000000000000").unwrap() > restore);
-    assert!(gone("not_public").unwrap() > restore);
-    assert!(gone("ts_family").is_none());
+    assert!(gone("not_public").is_none() && gone("ts_family").is_none());
     assert!(gone(&live).is_none() && gone(&not_public).is_none());
     // Nothing touches a stale set before the restore: the old rules use it
     // until then, and still do if the restore fails (#35).
