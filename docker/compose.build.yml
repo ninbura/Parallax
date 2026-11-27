@@ -1,0 +1,14 @@
+# Build both images from this checkout instead of pulling the released ones:
+#   docker compose -f compose.yml -f compose.build.yml up -d --build
+services:
+  parallax:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: parallax:local
+
+  headscale:
+    build:
+      context: .
+      dockerfile: headscale.Dockerfile
+    image: parallax-headscale:local

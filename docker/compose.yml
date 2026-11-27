@@ -1,12 +1,14 @@
 # Parallax: both services are required. `parallax` carries every packet
 # (WireGuard, the Tailscale subnet router, NETMAP, the DNS shim) in the host
 # network namespace; `headscale` is the control plane and carries no traffic.
+#
+# The images are the released ones on GHCR (docs/releasing.md). Pin a release
+# with PARALLAX_VERSION in docker/.env (e.g. PARALLAX_VERSION=0.2.0); both
+# images share it. To build both from this checkout instead:
+#   docker compose -f compose.yml -f compose.build.yml up -d --build
 services:
   parallax:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: parallax:local
+    image: ghcr.io/ninbura/parallax:${PARALLAX_VERSION:-latest}
     container_name: parallax
     restart: unless-stopped
     # Host networking: wg0 and tailscale0 live next to the LAN interface, and
@@ -40,10 +42,9 @@ services:
   headscale:
     # Built from a pinned commit of Headscale's main branch, for `tailscale
     # cert` and HTTPS `tailscale serve` (headscale.Dockerfile, ADR 0014).
-    build:
-      context: .
-      dockerfile: headscale.Dockerfile
-    image: parallax-headscale:local
+    # Parallax's Headscale client is written against that commit, so the two
+    # images are released together under one version.
+    image: ghcr.io/ninbura/parallax-headscale:${PARALLAX_VERSION:-latest}
     container_name: headscale
     restart: unless-stopped
     command: serve

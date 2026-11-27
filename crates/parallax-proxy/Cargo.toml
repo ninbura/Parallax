@@ -2,6 +2,7 @@
 name = "parallax-proxy"
 description = "Parallax HTTPS proxy: per-hostname, per-tier access to services that share an address"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

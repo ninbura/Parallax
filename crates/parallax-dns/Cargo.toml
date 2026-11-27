@@ -2,6 +2,7 @@
 name = "parallax-dns"
 description = "Parallax DNS server: per-tier answers, home zones rewritten into mapped space"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

@@ -2,6 +2,7 @@
 name = "parallax-store"
 description = "Parallax database: the configuration in one SQLite-format file"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

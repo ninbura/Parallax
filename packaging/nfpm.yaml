@@ -1,8 +1,10 @@
 # The .deb and the Arch package, from one config (nfpm, run by CI:
 # .github/workflows/ci.yml). From the repository root:
-#   ARCH=amd64 VERSION=0.1.0 BINARY=path/to/parallax nfpm package -f packaging/nfpm.yaml -p deb
+#   ARCH=amd64 VERSION=0.1.0 BINARY=path/to/parallax LICENSES=path/to/THIRD-PARTY-LICENSES \
+#     nfpm package -f packaging/nfpm.yaml -p deb
 # ARCH is amd64 or arm64; nfpm names it per format (x86_64, aarch64 on Arch).
-# BINARY is the static musl build. docs/native.md covers what gets installed.
+# BINARY is the static musl build, LICENSES its crates' licenses (cargo-about,
+# about.toml). docs/native.md covers what gets installed.
 name: parallax
 arch: ${ARCH}
 platform: linux
@@ -57,6 +59,19 @@ contents:
       mode: 0644
   - src: example/parallax.toml
     dst: /usr/share/doc/parallax/parallax.toml.example
+    file_info:
+      mode: 0644
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/parallax/LICENSE-MIT
+    file_info:
+      mode: 0644
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/parallax/LICENSE-APACHE
+    file_info:
+      mode: 0644
+  - src: ${LICENSES}
+    expand: true
+    dst: /usr/share/licenses/parallax/THIRD-PARTY-LICENSES
     file_info:
       mode: 0644
 

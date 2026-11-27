@@ -1,0 +1,17 @@
+Third-party licenses in Parallax
+
+Parallax is built with the Rust crates below. Each license follows the list
+of crates it covers. Parallax's own license is in LICENSE-MIT and
+LICENSE-APACHE.
+{{#each licenses}}
+
+================================================================================
+{{{name}}}
+
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

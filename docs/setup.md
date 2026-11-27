@@ -287,6 +287,13 @@ cd docker && sudo docker compose up -d
 sudo docker compose logs -f parallax
 ```
 
+Compose pulls the released images from GHCR (`ghcr.io/ninbura/parallax` and
+`parallax-headscale`, `latest`). To stay on one release until you choose to
+move, put `PARALLAX_VERSION=<version>` (e.g. `0.2.0`) in `docker/.env`.
+[releasing.md](releasing.md) says how to check an image was built by this
+repository's CI. To build both images from your checkout instead, add
+`-f compose.yml -f compose.build.yml` and `--build` to `docker compose up`.
+
 The configuration lives in a database, `/var/lib/parallax/parallax.db` (mode
 0600, in the `parallax-state` volume). On the first start the entrypoint
 imports `parallax.toml` into it and renames the file to
@@ -341,10 +348,12 @@ placeholder for the key if it was not retained).
 
 ## Headscale
 
-Tailscale devices log in to Headscale. `docker compose up -d` builds it from
-a pinned commit of its main branch the first time
+Tailscale devices log in to Headscale. Its image, `parallax-headscale`, is
+built from a pinned commit of Headscale's main branch
 (`docker/headscale.Dockerfile`): `tailscale cert` and HTTPS `tailscale serve`
-aren't in a release yet (ADR 0014). Its configuration is
+aren't in a Headscale release yet (ADR 0014). It's released together with
+the `parallax` image under the same version, since Parallax's Headscale
+client is written against that commit. Its configuration is
 `docker/headscale/config.yaml`; set `server_url` and `dns.base_domain` there,
 and check a change before restarting it:
 

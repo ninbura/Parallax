@@ -1,0 +1,29 @@
+# cargo-about: the licenses of the crates built into `parallax`, collected
+# into THIRD-PARTY-LICENSES by CI (ci.yml, package job) for the packages,
+# the image and each release. A dependency under a license not listed here
+# fails the build until someone checks it and adds it.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# Parallax's own crates: LICENSE-MIT and LICENSE-APACHE cover them.
+private = { ignore = true }
+
+# Its manifest names no license; its LICENSE file is the Apache-2.0 notice.
+[cfg_block.clarify]
+license = "Apache-2.0"
+[[cfg_block.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+checksum = "408bbc4d10bdf74d8c9b74b64ea4910603257e24133da18edc4d16198e3b4010"
