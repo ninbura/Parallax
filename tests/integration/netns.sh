@@ -1101,7 +1101,7 @@ regions:
 YAML
     cat > "$HS/config.yaml" <<YAML
 server_url: http://127.0.0.1:18080
-# Also on wan1, for the phone in (v).
+# Also on wan1, for the phone in (w).
 listen_addr: 0.0.0.0:18080
 metrics_listen_addr: ""
 unix_socket: $HS/headscale.sock
