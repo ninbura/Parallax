@@ -170,15 +170,77 @@ fn apply_firewall(
                 sys.runner.run_checked("ipset", &["destroy", next], None)?;
             }
             // The restore file declares every PARALLAX_* chain, which creates
-            // it or flushes it in the same transaction as the refill: no
-            // window with empty chains, and a failed restore changes nothing.
+            // it or flushes it in the same transaction as its refill, so no
+            // chain is ever empty. But each table commits at its own COMMIT
+            // (issue #56): for a moment, or for good if `nat` fails, the new
+            // filter runs with the old NAT, and a connection opened then
+            // keeps that NAT for its life. A stale masquerade, say, shows a
+            // newly granted peer to the LAN as the gateway. So first a dry
+            // run, which stops syntax errors and missing sets before either
+            // table changes; then tunnel peers open no new connections until
+            // both tables are in. Open ones carry on under the NAT they
+            // started with. If the restore fails, the hold stays until an
+            // apply succeeds (the daemon retries).
+            sys.runner.run_checked(
+                "iptables-restore",
+                &["--test", "--noflush", &main_str],
+                None,
+            )?;
+            for rule in hold_rules(model.server()) {
+                // A failed apply may have left it: keep that one rather than
+                // lift it for a moment.
+                if !sys
+                    .runner
+                    .run("iptables", &hold_args("-C", &rule), None)?
+                    .ok()
+                {
+                    sys.runner
+                        .run_checked("iptables", &hold_args("-I", &rule), None)?;
+                }
+            }
             sys.runner
-                .run_checked("iptables-restore", &["--noflush", &main_str], None)?;
-            // Chains of tiers that no longer exist: nothing jumps to them
-            // since the restore, so they can go.
+                .run_checked("iptables-restore", &["--noflush", &main_str], None)
+                .map_err(|e| match e {
+                    Error::Command {
+                        command,
+                        status,
+                        stderr,
+                    } => Error::Command {
+                        command,
+                        status,
+                        stderr: format!(
+                            "{}; tunnel peers can't open new connections until an apply succeeds (issue #56)",
+                            stderr.trim_end()
+                        ),
+                    },
+                    e => e,
+                })?;
             let listing = sys
                 .runner
                 .run_checked("iptables", &["-t", "filter", "-S"], None)?;
+            // Hooks first, then the hold comes off: until both tables are
+            // attached nothing new starts. `nat` first: a filter jump goes in
+            // above the hold, so once it's there both tables must be. Every
+            // hold goes, also one for an interface since renamed.
+            for (table, builtin, own) in CHAINS.iter().rev() {
+                let present = sys
+                    .runner
+                    .run("iptables", &["-t", table, "-C", builtin, "-j", own], None)?
+                    .ok();
+                if !present {
+                    sys.runner.run_checked(
+                        "iptables",
+                        &["-t", table, "-I", builtin, "-j", own],
+                        None,
+                    )?;
+                }
+            }
+            for args in held(&listing.stdout) {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                sys.runner.run_checked("iptables", &args, None)?;
+            }
+            // Chains of tiers that no longer exist: nothing jumps to them
+            // since the restore, so they can go.
             for chain in listing
                 .stdout
                 .lines()
@@ -211,19 +273,6 @@ fn apply_firewall(
                         "firewall: stale set {name} stays: {}",
                         destroy.stderr.trim()
                     ));
-                }
-            }
-            for (table, builtin, own) in CHAINS {
-                let present = sys
-                    .runner
-                    .run("iptables", &["-t", table, "-C", builtin, "-j", own], None)?
-                    .ok();
-                if !present {
-                    sys.runner.run_checked(
-                        "iptables",
-                        &["-t", table, "-I", builtin, "-j", own],
-                        None,
-                    )?;
                 }
             }
             log.push("firewall: PARALLAX_* chains restored".into());
@@ -448,6 +497,70 @@ pub fn apply(
     Ok(ApplyReport { log })
 }
 
+/// Comment on the hold rules, one word so `iptables -S` prints it plain.
+pub const HOLD_COMMENT: &str = "parallax-hold";
+
+/// What keeps tunnel peers from opening connections while `iptables-restore`
+/// swaps the rules (issue #56): rules at the top of INPUT and FORWARD that
+/// drop new flows from each tunnel interface, and in FORWARD those toward
+/// it (LAN-initiated, which NETMAP's source map would mislabel). Each is the
+/// rule as `iptables -t filter <-C|-I>` takes it.
+pub fn hold_rules(server: &crate::model::ServerConfig) -> Vec<Vec<String>> {
+    let mut rules = Vec::new();
+    for t in crate::transport::all() {
+        let iface = t.ingress_interface(server);
+        for (chain, dir) in [("INPUT", "-i"), ("FORWARD", "-i"), ("FORWARD", "-o")] {
+            rules.push(
+                [
+                    chain,
+                    dir,
+                    &iface,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "NEW",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    HOLD_COMMENT,
+                    "-j",
+                    "DROP",
+                ]
+                .map(String::from)
+                .to_vec(),
+            );
+        }
+    }
+    rules
+}
+
+/// `iptables` arguments that delete every hold in `listing` (`iptables -t
+/// filter -S`), whatever interface it names.
+pub fn held(listing: &str) -> Vec<Vec<String>> {
+    let marker = format!("--comment {HOLD_COMMENT} ");
+    listing
+        .lines()
+        .filter(|l| l.contains(&marker))
+        .filter_map(|l| l.strip_prefix("-A "))
+        .map(|rule| {
+            ["-t", "filter", "-D"]
+                .into_iter()
+                .map(String::from)
+                .chain(iptables_words(rule))
+                .collect()
+        })
+        .collect()
+}
+
+/// `iptables` arguments to check for (`-C`) or insert (`-I`, at the top)
+/// one of [`hold_rules`].
+pub fn hold_args<'a>(op: &'a str, rule: &'a [String]) -> Vec<&'a str> {
+    ["-t", "filter", op]
+        .into_iter()
+        .chain(rule.iter().map(String::as_str))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test")]
@@ -611,8 +724,10 @@ mod tests {
     }
 
     /// Issue #35: a failed restore leaves the old rules in place, so the
-    /// sets they use must be exactly as they were: none of the old ruleset's
-    /// sets is filled, swapped or destroyed, only new ones made beside them.
+    /// sets they use must be exactly as they were: no set only the old
+    /// ruleset uses is filled, swapped or destroyed, only new ones made
+    /// beside them. Issue #56: a failed dry run stops before the real restore, which can
+    /// commit `filter` without `nat`.
     #[test]
     fn a_failed_iptables_restore_leaves_the_old_sets_alone() {
         let mut cfg = crate::testing::canonical_config();
@@ -632,35 +747,78 @@ mod tests {
             crate::testing::keypair(200).private.expose_base64(),
         );
         let bundle = crate::generate::generate_all(&model, &fs).unwrap();
-        let runner = RecordingRunner::new();
-        runner.respond_to(
-            "ipset",
-            &["list", "-n"],
-            Output {
-                status: 0,
-                stdout: old.join("\n"),
-                stderr: String::new(),
-            },
-        );
-        runner.respond(
-            "iptables-restore",
-            failed("iptables-restore: line 12 failed"),
-        );
-        let sys = System {
-            fs: &fs,
-            runner: &runner,
-        };
-        assert!(apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).is_err());
-        let lines = runner.command_lines();
-        assert!(
-            lines.iter().any(|l| l.starts_with("iptables-restore")),
-            "{lines:#?}"
-        );
-        for name in &old {
-            assert!(
-                !lines.iter().any(|l| l.split(' ').any(|w| w == name)),
-                "{name} was touched: {lines:#?}"
+        // A set both rulesets name means the same in both (its name is a
+        // hash of its members), so refilling it changes nothing. The ones
+        // only the old rules use must stay as they are.
+        let new = crate::generate::firewall::build(&model).unwrap().sets;
+        let retired: Vec<&String> = old
+            .iter()
+            .filter(|o| !new.iter().any(|n| n.name == **o))
+            .collect();
+        assert!(!retired.is_empty());
+        let rules = "/var/lib/parallax/iptables/parallax.rules";
+        let dry_run = ["--test", "--noflush", rules];
+        let restore = ["--noflush", rules];
+        for failing in [&dry_run[..], &restore[..]] {
+            let runner = RecordingRunner::new();
+            runner.respond_to(
+                "ipset",
+                &["list", "-n"],
+                Output {
+                    status: 0,
+                    stdout: old.join("\n"),
+                    stderr: String::new(),
+                },
             );
+            runner.respond_to(
+                "iptables-restore",
+                failing,
+                failed("iptables-restore: line 12 failed"),
+            );
+            // A failed apply left one hold; the others aren't there.
+            let holds = hold_rules(model.server());
+            for rule in &holds[1..] {
+                runner.respond_to("iptables", &hold_args("-C", rule), failed("Bad rule"));
+            }
+            let sys = System {
+                fs: &fs,
+                runner: &runner,
+            };
+            let err = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys)
+                .unwrap_err()
+                .to_string();
+            let lines = runner.command_lines();
+            let ran = |args: &[&str]| {
+                let line = format!("iptables-restore {}", args.join(" "));
+                lines.contains(&line)
+            };
+            assert!(ran(failing), "{lines:#?}");
+            assert_eq!(ran(&restore), failing == restore, "{lines:#?}");
+            // The hold: never placed when the dry run fails. When the
+            // restore fails, placed for both transports (the one already
+            // there kept, never lifted for a moment) and left in, which the
+            // error says.
+            let touched: Vec<&String> = lines.iter().filter(|l| l.contains(HOLD_COMMENT)).collect();
+            if failing == dry_run {
+                assert!(touched.is_empty(), "{lines:#?}");
+            } else {
+                assert_eq!(holds.len(), 6);
+                let placed = touched.iter().filter(|l| l.contains(" -I ")).count();
+                assert_eq!(placed, 5, "{lines:#?}");
+                assert!(!touched.iter().any(|l| l.contains(" -D ")), "{lines:#?}");
+                assert!(
+                    err.contains("tunnel peers can't open new connections until an apply succeeds"),
+                    "{err}"
+                );
+            }
+            for name in &retired {
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|l| l.split(" ").any(|w| w == name.as_str())),
+                    "{name} was touched: {lines:#?}"
+                );
+            }
         }
     }
 

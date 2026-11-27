@@ -70,10 +70,8 @@ impl Tier<'_> {
         )
     }
 
-    /// The grants alone: `grant 'family'`, `grants 'lan', 'photos'`. For
-    /// messages that are compared before and after a change, which adding
-    /// or removing a peer mustn't alter.
-    pub fn grant_context(&self) -> String {
+    /// The grants alone: `grant 'family'`, `grants 'lan', 'photos'`.
+    fn grant_context(&self) -> String {
         format!(
             "{} {}",
             if self.grants.len() == 1 {

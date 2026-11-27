@@ -1305,22 +1305,24 @@ impl Engine {
             message: format!("{e:#}"),
         };
         crate::check(&config).map_err(refuse)?;
+        let old_ip = public_ip::effective(&self.view.config.server, self.view.public_ip);
         // A name may point at the home's public IP. Nothing looked for it
-        // while nothing needed it, so look before telling where a new name
+        // while nothing needed it, so look before telling where a name
         // points (a few seconds at most, and only then). What it finds came
         // from this change's endpoint: it's kept only if the change is.
-        let had = names::used(&self.view.config);
-        let found = (names::used(&config).iter().any(|n| !had.contains(n))
+        let asked = names::asked_on_save(Some(&self.view.config), &config);
+        let found = (!asked.is_empty()
             && public_ip::effective(&config.server, self.view.public_ip).is_none())
         .then(|| crate::find_public_ip(&config.server));
         let known_ip = match &found {
             Some(Ok(found)) => Some(found.address),
             _ => self.view.public_ip,
         };
-        // Blocks this thread for a new name's lookup only (a few seconds at
-        // most): known names aren't asked again.
+        // Blocks this thread for those names' lookups only (a few seconds
+        // at most): known names aren't asked again.
         let resolved = names::check_save(
             Some(&self.view.config),
+            old_ip,
             &config,
             public_ip::effective(&config.server, known_ip),
             &crate::lookup(&config.server),

@@ -637,11 +637,14 @@ mod tests {
         let config = config();
         let model = Model::resolve(&config, today()).unwrap();
         assert_eq!(list(&routes(&model)), "10.8.0.1/32,198.18.1.0/24");
-        // An address inside an advertised network isn't advertised again.
+        // An address inside an advertised network isn't advertised again:
+        // here the gateway's own address on an unmapped home. (A virtual
+        // address can't be a listener, #56.)
         let mut config = config.clone();
-        config.server.dns.listen = Some("198.18.1.53".parse().unwrap());
+        config.networks[0].mapped_to = None;
+        config.server.dns.listen = Some("192.168.1.53".parse().unwrap());
         let model = Model::resolve(&config, today()).unwrap();
-        assert_eq!(list(&routes(&model)), "10.8.0.1/32,198.18.1.0/24");
+        assert_eq!(list(&routes(&model)), "10.8.0.1/32,192.168.1.0/24");
     }
 
     #[test]
