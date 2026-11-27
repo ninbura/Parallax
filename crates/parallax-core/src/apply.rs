@@ -4,7 +4,8 @@
 //! unfiltered), then each transport. Every step is idempotent, so
 //! re-applying an unchanged bundle changes nothing. The DNS server and the
 //! HTTPS proxy read the routes written here; the daemon has them re-read
-//! after each apply.
+//! after each apply, also one that failed. Until every step has worked, the
+//! proxy's routes are only what the old and the new ones both grant.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -12,8 +13,9 @@ use std::path::Path;
 
 use ipnet::Ipv4Net;
 
-use crate::generate::{ArtifactKind, Bundle};
-use crate::io::System;
+use crate::generate::proxy::{self, ProxyRoutes};
+use crate::generate::{Artifact, ArtifactKind, Bundle};
+use crate::io::{FileSystem, System};
 use crate::model::FirewallBackend;
 use crate::validate::Model;
 use crate::{Error, Result};
@@ -556,7 +558,21 @@ pub fn apply(
     if !missing.is_empty() {
         return Err(Error::Invalid(missing));
     }
-    crate::plan::write_bundle(bundle, out_dir, sys.fs)?;
+    // Whichever step fails, the live firewall may be the old one, the new
+    // one or a mix, so until the last step has worked the proxy gets only
+    // what both grant (issue #71).
+    let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next();
+    let interim = match routes {
+        Some(routes) => interim_routes(routes, out_dir, sys.fs)?,
+        None => None,
+    };
+    for a in &bundle.artifacts {
+        let contents = match &interim {
+            Some(text) if a.kind == ArtifactKind::ProxyRoutes => text,
+            _ => &a.contents,
+        };
+        sys.fs.write(&out_dir.join(&a.path), contents, a.secret)?;
+    }
     let mut log = vec![format!(
         "wrote {} artifacts under {}",
         bundle.artifacts.len(),
@@ -567,7 +583,33 @@ pub fn apply(
     for transport in crate::transport::all() {
         log.extend(transport.apply(model, &bundle.artifacts, sys)?);
     }
+    if let (Some(routes), Some(_)) = (routes, interim) {
+        sys.fs
+            .write(&out_dir.join(&routes.path), &routes.contents, routes.secret)?;
+    }
     Ok(ApplyReport { log })
+}
+
+/// The proxy routes to serve while this apply runs, when they aren't the
+/// new ones: the overlap of `new` and the routes file already there, which
+/// is what the proxy serves (the daemon reloads it after every apply). No
+/// file, or one that doesn't parse (an older version's), overlaps nothing.
+fn interim_routes(new: &Artifact, out_dir: &Path, fs: &dyn FileSystem) -> Result<Option<String>> {
+    let new_routes = ProxyRoutes::from_toml(&new.contents)?;
+    let served = fs
+        .read(&out_dir.join(&new.path))?
+        .and_then(|text| ProxyRoutes::from_toml(&text).ok());
+    let both = match served {
+        Some(served) => proxy::overlap(&served, &new_routes),
+        None => ProxyRoutes {
+            sites: Vec::new(),
+            ..new_routes.clone()
+        },
+    };
+    if both == new_routes {
+        return Ok(None);
+    }
+    Ok(Some(proxy::to_text(&both, true)?))
 }
 
 /// Comment on the hold rules, one word so `iptables -S` prints it plain.
@@ -767,6 +809,79 @@ mod tests {
             "{lines:#?}"
         );
         assert!(!lines.iter().any(|l| l.ends_with(" remove")), "{lines:#?}");
+    }
+
+    /// #71: an apply that fails after the firewall step leaves the proxy
+    /// only what the old and the new configuration both grant: not the
+    /// revoked `immich`, not the new `jellyfin`. The next good apply serves
+    /// the new routes in full.
+    #[test]
+    fn a_failed_apply_leaves_the_proxy_what_both_grant() {
+        use crate::model::{Host, PortSpec, Proto, Rule, Service};
+        let mut before = crate::testing::canonical_config();
+        before.services[0].hostnames = vec!["immich.mydomain.com".into()];
+        before.services.push(Service {
+            name: "jellyfin".into(),
+            host: Host::Ip(Ipv4Addr::new(192, 168, 1, 8)),
+            ports: vec![PortSpec::one(Proto::Tcp, 443)],
+            nginx_vhost: true,
+            hostnames: vec!["jellyfin.mydomain.com".into()],
+        });
+        let mut after = before.clone();
+        after.grants[1].rules = vec![
+            Rule::Service {
+                name: "jellyfin".into(),
+            },
+            Rule::Host {
+                host: "192.168.1.10".parse().unwrap(),
+                ports: Vec::new(),
+            },
+        ];
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let out = Path::new("/var/lib/parallax");
+        let routes = out.join(proxy::PATH);
+        let hostnames = || -> Vec<String> {
+            let text = fs.read(&routes).unwrap().unwrap();
+            let r = ProxyRoutes::from_toml(&text).unwrap();
+            r.sites.into_iter().map(|s| s.hostname).collect()
+        };
+        let apply_with = |cfg: &crate::Config, runner: &RecordingRunner| {
+            let model = Model::resolve(cfg, crate::testing::today()).unwrap();
+            let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+            let sys = System { fs: &fs, runner };
+            apply(&model, &bundle, out, sys)
+        };
+        apply_with(&before, &RecordingRunner::new()).unwrap();
+        assert_eq!(hostnames(), ["immich.mydomain.com"]);
+
+        let wg_fails = RecordingRunner::new();
+        for _ in 0..2 {
+            wg_fails.respond_to(
+                "wg",
+                &["syncconf", "wg0", "/dev/stdin"],
+                failed("Unable to modify interface"),
+            );
+        }
+        apply_with(&after, &wg_fails).unwrap_err();
+        assert!(
+            wg_fails
+                .command_lines()
+                .iter()
+                .any(|l| l.starts_with("nft -f")),
+            "the firewall step ran"
+        );
+        assert!(hostnames().is_empty(), "{:?}", fs.read(&routes));
+        // Failing again changes nothing.
+        apply_with(&after, &wg_fails).unwrap_err();
+        assert!(hostnames().is_empty());
+
+        apply_with(&after, &RecordingRunner::new()).unwrap();
+        assert_eq!(hostnames(), ["jellyfin.mydomain.com"]);
+        let text = fs.read(&routes).unwrap().unwrap();
+        assert!(!text.contains("An apply hasn't finished"), "{text}");
     }
 
     /// Only sets named as Parallax names them go: a transport's prefix or a

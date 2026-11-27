@@ -282,7 +282,14 @@ reach the proxy port in INPUT. The firewall works per tier and the proxy per
 hostname: when a tier loses one of several proxied hostnames, its other
 redirects keep the proxy port open to it, and the proxy closes the revoked
 hostname's connections when it reloads. So the daemon has the proxy re-read
-its routes after every apply.
+its routes after every apply, also one that failed.
+
+An apply that fails partway can leave the old firewall live, the new one,
+or (iptables) a mix. So `apply` first writes the proxy routes as only what
+the routes already there and the new ones both grant: the sites both have
+alike, each for the addresses both allow. It writes the new routes in full
+only after the last step has worked. After a failure the proxy keeps
+serving what neither configuration takes away, until an apply succeeds.
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
@@ -323,7 +330,7 @@ are dropped, since after a switch the proxy only relays bytes. HTTP/1 vs
 HTTP/2 comes from ALPN, so the header timeout runs from the first byte, and
 one tunnel address may hold at most 64 connections.
 
-Reloads (after each apply) swap the routes whole. Every request looks its site up in
+Reloads (after each apply, failed or not) swap the routes whole. Every request looks its site up in
 the current routes, and open connections and WebSocket relays are closed
 when a reload takes their hostname away from their address. A reload that
 fails (unreadable routes or CA bundle) refuses everything until one
@@ -499,7 +506,7 @@ replace, never an insert/delete pair, so re-applying an unchanged bundle is a
 no-op (asserted by `apply_runs_expected_commands_and_is_idempotent`). The DNS
 server and the HTTPS proxy are tasks in the daemon that read the routes
 `apply` wrote; the daemon starts them after the first apply and has them
-re-read after each one.
+re-read after each one, failed or not.
 
 ## The daemon
 

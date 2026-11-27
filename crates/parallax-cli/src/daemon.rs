@@ -1138,7 +1138,15 @@ impl Engine {
     fn apply(&mut self, why: &str) -> (Vec<String>, Option<String>) {
         log(format!("applying ({why})"));
         let today = crate::today();
-        match crate::apply_config(&self.view.config, &self.out, today, &self.view.learned()) {
+        let applied =
+            crate::apply_config(&self.view.config, &self.out, today, &self.view.learned());
+        // Also after a failure: the new firewall may be live, and the proxy's
+        // routes are then only what the old and new configurations both
+        // grant (issue #71).
+        for reload in &self.reloaders {
+            reload.notify_one();
+        }
+        match applied {
             Ok((warnings, applied)) => {
                 let lines: Vec<String> = warnings
                     .into_iter()
@@ -1150,9 +1158,6 @@ impl Engine {
                 self.reconciler
                     .applied(today, reconcile::live_state(server, sys()));
                 self.applied = Some(server.clone());
-                for reload in &self.reloaders {
-                    reload.notify_one();
-                }
                 self.set_apply_error(None);
                 (lines, None)
             }

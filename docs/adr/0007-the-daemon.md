@@ -19,7 +19,9 @@ socket.
 - **Everything runs inside it.** The DNS server and the HTTPS proxy are tasks
   in its runtime, not separate processes; `parallax dns` and `parallax
   proxy` are gone. They still read the routes files `apply` writes, and the
-  daemon tells them to re-read after each successful apply (no SIGHUP).
+  daemon tells them to re-read after each apply, also one that failed
+  (no SIGHUP). Until an apply has finished, the proxy's routes are only what
+  the old and the new ones both grant (issue #71).
   Generated files are written aside and renamed into place, so a reload
   never reads half a file while the next apply writes. A failed reload still refuses everything until one works. If either task
   stops, the daemon exits non-zero and Docker's restart policy takes over.
