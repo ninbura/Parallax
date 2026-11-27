@@ -1561,6 +1561,16 @@ fn grant_change<T>(
     report(saved, "run `parallax apply` to put it into effect")
 }
 
+/// A grant named `service-<x>`, from before such names were refused
+/// (issue #32), shared service x's nginx snippet: that file is the
+/// service's, so it must stay.
+fn shared_snippet(grant: &str) -> Option<String> {
+    let service = grant.strip_prefix("service-")?;
+    Some(format!(
+        "note: snippets/parallax-{grant}.conf is service '{service}'s snippet (the grant shared it); keep it"
+    ))
+}
+
 /// `'a', 'b'`, or `none`.
 fn quoted(names: &[String]) -> String {
     if names.is_empty() {
@@ -1624,9 +1634,12 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
             },
             |had| {
                 outln!("removed grant '{name}'")?;
-                eoutln!(
-                    "note: snippets/parallax-{name}.conf stays on disk with its last allow lines; remove any nginx include of it, delete it, and reload nginx"
-                );
+                match shared_snippet(&name) {
+                    Some(note) => eoutln!("{note}"),
+                    None => eoutln!(
+                        "note: snippets/parallax-{name}.conf stays on disk with its last allow lines; remove any nginx include of it, delete it, and reload nginx"
+                    ),
+                }
                 if !had.is_empty() {
                     outln!("taken from {}", quoted(had))?;
                 }
@@ -1638,9 +1651,14 @@ fn grant_command(ctx: &Ctx, command: GrantCommand) -> anyhow::Result<()> {
             |c| Ok(grants::rename(c, &from, &to)?),
             |peers| {
                 outln!("renamed grant '{from}' to '{to}' (peers {})", quoted(peers))?;
-                eoutln!(
-                    "note: its nginx snippet is now snippets/parallax-{to}.conf; parallax-{from}.conf stays on disk with its last allow lines, so point any include at the new one, delete the old, and reload nginx"
-                );
+                match shared_snippet(&from) {
+                    Some(note) => eoutln!(
+                        "{note}; its own snippet is now snippets/parallax-{to}.conf, so point the grant's include there and reload nginx"
+                    ),
+                    None => eoutln!(
+                        "note: its nginx snippet is now snippets/parallax-{to}.conf; parallax-{from}.conf stays on disk with its last allow lines, so point any include at the new one, delete the old, and reload nginx"
+                    ),
+                }
                 Ok(())
             },
         ),
