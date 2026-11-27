@@ -6,7 +6,7 @@ CREATE TABLE records (
     id INTEGER PRIMARY KEY,
     -- Unix milliseconds.
     time INTEGER NOT NULL,
-    -- opened, closed, denied, denied_gateway
+    -- opened, closed, blocked, blocked_gateway
     kind TEXT NOT NULL,
     peer TEXT NOT NULL,
     -- The peer's grants then, comma-separated.

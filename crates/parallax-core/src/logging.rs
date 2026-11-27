@@ -485,6 +485,11 @@ mod tests {
         let r = attribute(&cfg, &closed, 2000).unwrap();
         assert_eq!((r.bytes_out, r.bytes_in), (Some(1200), Some(34_000)));
 
+        // A connection isn't kept below `connections`.
+        let mut quiet = cfg.clone();
+        quiet.server.logs.level = LogLevel::Blocked;
+        assert!(attribute(&quiet, &Event::Opened(flow([10, 8, 2, 1], mark)), 1).is_none());
+
         // Unmarked flows, unknown sources and peers at `off` give nothing.
         assert!(attribute(&cfg, &Event::Opened(flow([10, 8, 2, 1], 0x1)), 1).is_none());
         assert!(attribute(&cfg, &Event::Opened(flow([10, 8, 9, 9], mark)), 1).is_none());
@@ -507,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_packets_give_where_they_were_sent_and_need_the_denied_level() {
+    fn blocked_packets_give_where_they_were_sent_and_need_the_blocked_level() {
         let mut cfg = canonical_config();
         let mut b = Blocked {
             protocol: 17,

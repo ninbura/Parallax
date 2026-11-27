@@ -400,11 +400,11 @@ const FOLLOW_WINDOW_MS: u64 = 10_000;
 fn show_records(ctx: &Ctx, query: Query, follow: bool) -> anyhow::Result<()> {
     let records = read_history(ctx, &query)?;
     for (_, r) in &records {
-        println!("{}", record_line(r));
+        outln!("{}", record_line(r))?;
     }
     if !follow {
         if records.is_empty() {
-            eprintln!("no records (see `parallax log level` and docs/logging.md)");
+            eoutln!("no records (see `parallax log level` and docs/logging.md)");
         }
         return Ok(());
     }
@@ -424,7 +424,7 @@ fn show_records(ctx: &Ctx, query: Query, follow: bool) -> anyhow::Result<()> {
         fresh.sort_by_key(|(id, r)| (r.time, *id));
         for (id, r) in &fresh {
             if shown.insert((*id, r.time)) {
-                println!("{}", record_line(r));
+                outln!("{}", record_line(r))?;
             }
         }
         shown.retain(|(_, time)| *time + 2 * FOLLOW_WINDOW_MS >= since);

@@ -936,12 +936,20 @@ inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
 # Byte counts are a host setting; a short TIME_WAIT ends closed TCP flows at once.
 inns gw sysctl -qw net.netfilter.nf_conntrack_acct=1
 inns gw sysctl -qw net.netfilter.nf_conntrack_tcp_timeout_time_wait=1
+feed_up() { # which feed's start to wait for in the daemon's log
+    for _ in $(seq 50); do grep -q "activity logging: reading $1" "$WORK/daemon.log" && return 0; sleep 0.1; done
+    fail "(t) the collector didn't start reading $1"
+}
+# `blocked` alone first: only the blocked attempts feed runs, so the guest's
+# allowed connection is never even marked.
 g log level blocked --grant family
-g log level detailed --peer laptop
-for _ in $(seq 50); do grep -q 'activity logging: reading connections' "$WORK/daemon.log" && break; sleep 0.1; done
-grep -q 'activity logging: reading blocked attempts' "$WORK/daemon.log" || fail "(t) the collector didn't start"
+feed_up "blocked attempts"
+grep -q 'activity logging: reading connections' "$WORK/daemon.log" \
+    && fail "(t) connections are read with only blocked attempts logged"
 [ "$(curl_as $GUEST http://198.18.1.1:9090/)" = gw-self ] || fail "(t) guest -> its gateway service"
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) guest reached 8080"
+g log level detailed --peer laptop
+feed_up connections
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(t) laptop -> 8080"
 [ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) friend reached 8080"
 # A flow's end is reported when connection tracking's periodic sweep removes it,
