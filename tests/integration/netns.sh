@@ -89,10 +89,10 @@ UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.servi
 WORK_IN=$([ "$MODE" = unit ] && echo /run || echo /tmp)
 # The run copies the binary (and Tailscale's) in, and both are often RAM-backed
 # tmpfs: a full one fails a case halfway with "No space left on device". Say so
-# first. Twice the binary leaves room for databases, logs and Headscale.
-need=$(( $(stat -L -c %s "$PARALLAX") * 2 ))
+# first: the copies, and 256 MiB for databases, logs and Headscale.
+need=$(stat -L -c %s "$PARALLAX")
 for t in "${TAILSCALE:-}" "${TAILSCALED:-}"; do [ -z "$t" ] || need=$((need + $(stat -L -c %s "$t"))); done
-need=$((need / 1024))
+need=$((need / 1024 + 256 * 1024))
 free=$(df --output=avail -k "$WORK_IN" | tail -n1)
 [ "$free" -ge "$need" ] || { echo "only $((free / 1024)) MiB free in $WORK_IN; a run needs about $((need / 1024)) MiB"; exit 2; }
 WORK=$(mktemp -d "$WORK_IN/parallax-it.XXXXXX")
@@ -1260,10 +1260,10 @@ YAML
         while [ $((SECONDS - start)) -lt 30 ]; do
             inns gw curl -sf -m 1 http://127.0.0.1:18080/version >/dev/null && return 0
             kill -0 "$pid" 2>/dev/null \
-                || { cat "$HS/headscale.log"; fail "(u) Headscale exited before it answered (after $((SECONDS - start)) s)"; }
+                || { cat "$HS/headscale.log" 2>/dev/null || true; fail "(u) Headscale exited before it answered (after $((SECONDS - start)) s)"; }
             sleep 0.1
         done
-        cat "$HS/headscale.log"; fail "(u) Headscale is running but didn't answer in 30 s"
+        cat "$HS/headscale.log" 2>/dev/null || true; fail "(u) Headscale is running but didn't answer in 30 s"
     }
     start_headscale
     HS_KEY=$(inns gw "$HEADSCALE" -c "$HS/config.yaml" apikeys create 2>/dev/null | tail -n1)
