@@ -538,6 +538,14 @@ impl Sink {
             self.attribute(event, &mut pending);
         }
         self.flush(&mut pending, &mut writer, true);
+        // Kept for a database that never came: they go with the process.
+        if !pending.records.is_empty() {
+            warn(format!(
+                "activity logging: {} records of {} not written: no database to write to",
+                pending.records.len(),
+                self.name
+            ));
+        }
     }
 
     fn attribute(&self, event: Event, pending: &mut Pending) {
