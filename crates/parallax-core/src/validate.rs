@@ -10,6 +10,7 @@ use std::net::Ipv4Addr;
 use ipnet::Ipv4Net;
 
 use crate::date::Date;
+use crate::headscale::Tailnet;
 use crate::model::*;
 use crate::names::{self, in_zone, Resolved};
 use crate::netmap::Mapping;
@@ -18,13 +19,15 @@ use crate::{Error, Result, TAILSCALE_CGNAT};
 
 /// A validated configuration plus what generation needs from outside it:
 /// the evaluation date (for peer expiry), the home's public IP (for the
-/// guest hairpin drop) and what hosts named by DNS name resolved to.
+/// guest hairpin drop), what hosts named by DNS name resolved to, and the
+/// addresses Headscale gave Tailscale nodes.
 #[derive(Debug, Clone)]
 pub struct Model<'a> {
     config: &'a Config,
     today: Date,
     public_ip: Option<Ipv4Addr>,
     names: Resolved,
+    tailnet: Option<Tailnet>,
     tiers: Vec<Tier<'a>>,
     warnings: Vec<String>,
 }
@@ -221,6 +224,7 @@ impl<'a> Model<'a> {
                 today,
                 public_ip: None,
                 names: Resolved::new(),
+                tailnet: None,
                 tiers: tier::tiers(config),
                 warnings,
             })
@@ -254,6 +258,18 @@ impl<'a> Model<'a> {
 
     pub fn names(&self) -> &Resolved {
         &self.names
+    }
+
+    /// The addresses Headscale gave its nodes ([`crate::headscale`]). Once
+    /// known, a Tailscale peer's address is its node's, and a peer whose
+    /// node isn't there has none; `None` keeps the configured addresses.
+    pub fn with_tailnet(mut self, tailnet: Option<Tailnet>) -> Self {
+        self.tailnet = tailnet;
+        self
+    }
+
+    pub fn tailnet(&self) -> Option<&Tailnet> {
+        self.tailnet.as_ref()
     }
 
     /// Hosts named by DNS name that grant nothing right now, and why.

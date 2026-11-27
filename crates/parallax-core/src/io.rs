@@ -87,6 +87,20 @@ pub trait Resolver {
     fn lookup_ipv4(&self, name: &str, via: Nameserver) -> Result<Vec<Ipv4Addr>>;
 }
 
+/// A reply from Headscale's API, whatever its status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpReply {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Headscale's HTTP API ([`crate::headscale`] reads the replies). An error
+/// means no reply at all: unreachable, timed out, no API key to send.
+pub trait HeadscaleApi {
+    /// `GET path` (`/api/v1/node`) with the API key.
+    fn get(&self, path: &str) -> Result<HttpReply>;
+}
+
 /// Everything `apply` needs, bundled.
 #[derive(Clone, Copy)]
 pub struct System<'a> {
@@ -251,6 +265,40 @@ pub mod memory {
                 .get(&(name.to_string(), via.to_string()))
                 .cloned()
                 .ok_or_else(|| Error::Lookup("no answer within 3 seconds".into()))
+        }
+    }
+
+    /// Answers from a table of paths; anything else is unreachable.
+    /// Records every path asked for.
+    #[derive(Debug, Default)]
+    pub struct FakeHeadscale {
+        replies: BTreeMap<String, HttpReply>,
+        pub asked: RefCell<Vec<String>>,
+    }
+
+    impl FakeHeadscale {
+        pub fn new() -> Self {
+            Self::default()
+        }
+        pub fn reply(mut self, path: &str, status: u16, body: &str) -> Self {
+            self.replies.insert(
+                path.to_string(),
+                HttpReply {
+                    status,
+                    body: body.to_string(),
+                },
+            );
+            self
+        }
+    }
+
+    impl HeadscaleApi for FakeHeadscale {
+        fn get(&self, path: &str) -> Result<HttpReply> {
+            self.asked.borrow_mut().push(path.to_string());
+            self.replies
+                .get(path)
+                .cloned()
+                .ok_or_else(|| Error::Headscale(format!("GET {path}: connection refused")))
         }
     }
 

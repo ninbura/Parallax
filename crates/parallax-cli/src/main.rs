@@ -18,6 +18,7 @@ use parallax_core::date::Date;
 use parallax_core::doctor::Outcome;
 use parallax_core::generate::{self, Export};
 use parallax_core::grants;
+use parallax_core::headscale::Tailnet;
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
 use parallax_core::model::{
@@ -36,6 +37,7 @@ use crate::protocol::{Reply, Request};
 // Declared before the print macros below, so they aren't in scope there: the
 // daemon must outlive whoever reads its log.
 mod daemon;
+mod headscale;
 
 // `print!`, `println!`, `eprint!` and `eprintln!` for the commands, which panic
 // when the reader has gone (`parallax peer show | head -1`, a pager that quits).
@@ -169,6 +171,11 @@ enum Command {
         #[command(subcommand)]
         command: PeerCommand,
     },
+    /// Ask Headscale, the Tailscale control server.
+    Headscale {
+        #[command(subcommand)]
+        command: HeadscaleCommand,
+    },
     /// Render a peer's client config for a platform.
     Export {
         peer: String,
@@ -182,6 +189,12 @@ struct OutArgs {
     /// Output directory for generated artifacts.
     #[arg(short, long, default_value = "/var/lib/parallax", env = "PARALLAX_OUT")]
     out: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum HeadscaleCommand {
+    /// Show Headscale's version, users and nodes, and which peer each node is.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -485,7 +498,16 @@ impl Ctx {
                 revision,
                 public_ip,
                 names,
-            }) => Ok((*configuration, Some(revision), Learned { public_ip, names })),
+                tailnet,
+            }) => Ok((
+                *configuration,
+                Some(revision),
+                Learned {
+                    public_ip,
+                    names,
+                    tailnet,
+                },
+            )),
             Some(other) => Err(unexpected(other)),
             None => {
                 let (config, public_ip) = block_on(async {
@@ -495,6 +517,7 @@ impl Ctx {
                 let learned = Learned {
                     public_ip,
                     names: Resolved::new(),
+                    tailnet: None,
                 };
                 Ok((config, None, learned))
             }
@@ -511,12 +534,17 @@ impl Ctx {
     }
 
     /// The configuration and what the gateway learned: what generation
-    /// needs. Without a daemon, the named hosts are looked up here.
+    /// needs. Without a daemon, the named hosts are looked up and Headscale
+    /// is asked here; a Headscale that doesn't answer is a warning.
     pub(crate) fn load_for_generation(&self) -> anyhow::Result<(Config, Learned)> {
         let (config, revision, mut learned) = self.load_full()?;
         if revision.is_none() {
             let home = public_ip::effective(&config.server, learned.public_ip);
             learned.names = find_names(&config, home).resolved;
+            learned.tailnet = find_tailnet(&config).unwrap_or_else(|problem| {
+                print_warnings(&[tailnet_unknown(&problem)]);
+                None
+            });
         }
         Ok((config, learned))
     }
@@ -646,12 +674,14 @@ pub(crate) fn resolve(config: &Config) -> anyhow::Result<Model<'_>> {
 }
 
 /// What the gateway learned while running that generation needs besides
-/// the configuration: the home's public IP as a lookup last found it, and
-/// what each host named by DNS name resolved to.
+/// the configuration: the home's public IP as a lookup last found it, what
+/// each host named by DNS name resolved to, and the addresses Headscale
+/// gave its nodes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Learned {
     pub(crate) public_ip: Option<Ipv4Addr>,
     pub(crate) names: Resolved,
+    pub(crate) tailnet: Option<Tailnet>,
 }
 
 /// The model generation uses: validated, with what the gateway learned.
@@ -663,7 +693,25 @@ pub(crate) fn model_for<'a>(
     Ok(Model::resolve(config, today)
         .map_err(|e| anyhow!("{e}"))?
         .with_public_ip(public_ip::effective(&config.server, learned.public_ip))
-        .with_names(learned.names.clone()))
+        .with_names(learned.names.clone())
+        .with_tailnet(learned.tailnet.clone()))
+}
+
+/// Ask Headscale for its nodes' addresses when a Tailscale peer names one
+/// ([`parallax_core::headscale`]). `Err` says why it couldn't.
+pub(crate) fn find_tailnet(config: &Config) -> Result<Option<Tailnet>, String> {
+    if !parallax_core::headscale::needed(config) {
+        return Ok(None);
+    }
+    let api = headscale::Api::new(&config.server);
+    parallax_core::headscale::nodes(&config.server.headscale, &api)
+        .map(|nodes| Some(parallax_core::headscale::tailnet(&nodes)))
+        .map_err(|e| e.to_string())
+}
+
+/// Why Headscale's nodes are unknown, and what that means.
+pub(crate) fn tailnet_unknown(problem: &str) -> String {
+    format!("{problem}; Tailscale peers keep their configured addresses")
 }
 
 pub(crate) fn print_warnings(warnings: &[String]) {
@@ -851,9 +899,14 @@ fn run() -> anyhow::Result<()> {
                     let home = public_ip::effective(&config.server, known);
                     let found = find_names(&config, home);
                     notes.extend(found.problems);
+                    let tailnet = find_tailnet(&config).unwrap_or_else(|problem| {
+                        notes.push(tailnet_unknown(&problem));
+                        None
+                    });
                     let learned = Learned {
                         public_ip: known,
                         names: found.resolved,
+                        tailnet,
                     };
                     let (warnings, log) = apply_config(&config, &out.out, today(), &learned)?;
                     notes.extend(warnings);
@@ -880,6 +933,7 @@ fn run() -> anyhow::Result<()> {
                 apply_error,
                 public_ip,
                 names,
+                tailnet,
             }) => {
                 outln!(
                     "daemon at {}: configuration revision {revision}",
@@ -890,6 +944,9 @@ fn run() -> anyhow::Result<()> {
                 }
                 for line in name_lines(&names) {
                     outln!("name {line}")?;
+                }
+                for (id, address) in tailnet.iter().flatten() {
+                    outln!("Headscale node {id}: {address}")?;
                 }
                 match apply_error {
                     None => outln!("last apply: ok")?,
@@ -910,6 +967,15 @@ fn run() -> anyhow::Result<()> {
         Command::Backup { command } => backup::run(&ctx, command)?,
         Command::Grant { command } => grant_command(&ctx, command)?,
         Command::Peer { command } => peer_command(&ctx, command)?,
+        Command::Headscale {
+            command: HeadscaleCommand::Status,
+        } => {
+            let config = ctx.load()?;
+            let api = headscale::Api::new(&config.server);
+            for line in parallax_core::headscale::status(&config, &api)? {
+                outln!("{line}")?;
+            }
+        }
         Command::Export { peer, platform } => {
             let (config, learned) = ctx.load_for_generation()?;
             let model = model_for(&config, today(), &learned)?;
@@ -936,6 +1002,8 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
     if let Ok((config, learned)) = &loaded {
         let known = public_ip::effective(&config.server, learned.public_ip);
         checks.push(parallax_core::doctor::public_ip_check(config, known));
+        let api = headscale::Api::new(&config.server);
+        checks.push(parallax_core::headscale::check(config, &api));
     }
     let mut failed = 0;
     for check in &checks {

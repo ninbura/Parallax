@@ -40,7 +40,13 @@ impl Transport for TailscaleTransport {
     fn tier_members(&self, model: &Model<'_>, tier: &Tier<'_>) -> Vec<Ipv4Net> {
         model
             .members_on(tier, TransportKind::Tailscale)
-            .filter_map(|p| p.tailscale.as_ref().and_then(|t| t.address))
+            .filter_map(|p| {
+                let ts = p.tailscale.as_ref()?;
+                match model.tailnet() {
+                    Some(nodes) => nodes.get(&ts.node_id?).copied(),
+                    None => ts.address,
+                }
+            })
             .map(Ipv4Net::from)
             .collect()
     }
@@ -78,5 +84,81 @@ impl Transport for TailscaleTransport {
         Ok(vec![
             "tailscale: nothing to apply in M1 (Headscale is driven in M2)".into(),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+    use crate::headscale::Tailnet;
+    use crate::model::TailscalePeer;
+    use crate::testing::{canonical_config, today};
+
+    const STORED: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+    const FROM_HEADSCALE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+
+    /// The canonical scenario plus a Tailscale twin of its first peer.
+    fn with_tailscale_peer() -> crate::Config {
+        let mut config = canonical_config();
+        let mut peer = config.peers[0].clone();
+        peer.name = "twin-tablet".into();
+        peer.transport = TransportKind::Tailscale;
+        peer.wireguard = None;
+        peer.tailscale = Some(TailscalePeer {
+            node_id: Some(1),
+            address: Some(STORED),
+        });
+        config.peers.push(peer);
+        config
+    }
+
+    fn members(model: &Model<'_>) -> Vec<Ipv4Net> {
+        let config = model.config();
+        let peer = config.peers.last().unwrap();
+        let tier = model.tier_of(peer).unwrap();
+        TailscaleTransport.tier_members(model, tier)
+    }
+
+    #[test]
+    fn a_peer_is_where_headscale_says_its_node_is() {
+        let config = with_tailscale_peer();
+        let model = Model::resolve(&config, today()).unwrap();
+        assert_eq!(members(&model), vec![Ipv4Net::from(STORED)]);
+
+        let known = Tailnet::from([(1, FROM_HEADSCALE)]);
+        let model = Model::resolve(&config, today())
+            .unwrap()
+            .with_tailnet(Some(known));
+        assert_eq!(members(&model), vec![Ipv4Net::from(FROM_HEADSCALE)]);
+
+        // Headscale doesn't know the node (deleted): no address, no access.
+        let model = Model::resolve(&config, today())
+            .unwrap()
+            .with_tailnet(Some(Tailnet::new()));
+        assert!(members(&model).is_empty());
+    }
+
+    #[test]
+    fn the_firewall_set_follows_headscale() {
+        let config = with_tailscale_peer();
+        let model = Model::resolve(&config, today())
+            .unwrap()
+            .with_tailnet(Some(Tailnet::from([(1, FROM_HEADSCALE)])));
+        let rs = crate::generate::firewall::build(&model).unwrap();
+        let ts: Vec<_> = rs
+            .sets
+            .iter()
+            .filter(|s| s.name.starts_with("ts_"))
+            .collect();
+        assert!(
+            ts.iter()
+                .any(|s| s.elements == vec![Ipv4Net::from(FROM_HEADSCALE)]),
+            "{ts:?}"
+        );
+        assert!(!ts
+            .iter()
+            .any(|s| s.elements.contains(&Ipv4Net::from(STORED))));
     }
 }

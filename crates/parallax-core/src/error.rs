@@ -51,6 +51,10 @@ pub enum Error {
     #[error("{0}")]
     Lookup(String),
 
+    /// Headscale couldn't be asked, or answered with an error.
+    #[error("{0}")]
+    Headscale(String),
+
     /// The operation is defined by the design but not built in this milestone.
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),

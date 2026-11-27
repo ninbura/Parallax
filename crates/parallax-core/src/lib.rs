@@ -19,6 +19,7 @@ pub mod doctor;
 pub mod error;
 pub mod generate;
 pub mod grants;
+pub mod headscale;
 pub mod io;
 pub mod model;
 pub mod names;
