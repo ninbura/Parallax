@@ -45,8 +45,9 @@
 # table, and keeps the home's public IP across the restart, (r) a peer with two grants
 # reaches both and nothing more, a grant for everyone reaches every peer, and changing
 # grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
-# change access when they return, and a refused one changes nothing. Every change
-# goes through the daemon and takes effect without SIGHUP.
+# change access when they return, and a refused one changes nothing, (t) activity
+# logging records logged peers' connections, bytes and blocked attempts and nobody
+# else's. Every change goes through the daemon and takes effect without SIGHUP.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -262,6 +263,8 @@ passphrase_file = "$WORK/backup.passphrase"
 [server.proxy]
 certificates = "$WORK/certs"
 upstream_ca = "$CA"
+[server.logs]
+path = "$WORK/logs.db"
 [[network]]
 name = "home"
 interface = "eth0"
@@ -923,5 +926,55 @@ grep -q '^guest  grants=family  .*address=10.8.0.3 ' <<<"$($P peer show guest)" 
 [ "$($P export guest --platform mobile 2>/dev/null | grep -v '^#')" = "$GUEST_CONF" ] \
     || fail "(s) guest's client config changed with its grants"
 pass "(s) grant and peer grants commands change access on return; refused ones change nothing"
+
+# (t) activity logging: off, the firewall has no logging rules; levels set by grant
+# and by peer record what each level covers (guest at `blocked`: its blocked
+# attempts, not its connections; laptop at `detailed`: connections and their bytes),
+# with both destinations, and nothing of anyone else; off again, the rules go.
+inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
+    && fail "(t) logging rules with nobody logged"
+# Byte counts are a host setting; a short TIME_WAIT ends closed TCP flows at once.
+inns gw sysctl -qw net.netfilter.nf_conntrack_acct=1
+inns gw sysctl -qw net.netfilter.nf_conntrack_tcp_timeout_time_wait=1
+feed_up() { # which feed's start to wait for in the daemon's log
+    for _ in $(seq 50); do grep -q "activity logging: reading $1" "$WORK/daemon.log" && return 0; sleep 0.1; done
+    fail "(t) the collector didn't start reading $1"
+}
+# `blocked` alone first: only the blocked attempts feed runs, so the guest's
+# allowed connection is never even marked.
+g log level blocked --grant family
+feed_up "blocked attempts"
+grep -q 'activity logging: reading connections' "$WORK/daemon.log" \
+    && fail "(t) connections are read with only blocked attempts logged"
+[ "$(curl_as $GUEST http://198.18.1.1:9090/)" = gw-self ] || fail "(t) guest -> its gateway service"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) guest reached 8080"
+g log level detailed --peer laptop
+feed_up connections
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(t) laptop -> 8080"
+[ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) friend reached 8080"
+# A flow's end is reported when connection tracking's periodic sweep removes it,
+# some seconds after TIME_WAIT (about 11 s on a 7.2 kernel); wait for it.
+for _ in $(seq 60); do
+    $P log show --peer laptop --kind closed | grep -q . && break
+    sleep 1
+done
+LOGS=$($P log show --limit 1000)
+echo "$LOGS" | grep -q '  guest  blocked  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's blocked attempt, with both destinations"; }
+echo "$LOGS" | grep -q '  guest  \(opened\|closed\)  ' \
+    && { echo "$LOGS"; fail "(t) guest's connections recorded at blocked"; }
+echo "$LOGS" | grep -q '  laptop  opened  tcp 198.18.1.5:8080 (192.168.1.5, home)' \
+    || { echo "$LOGS"; fail "(t) laptop's connection"; }
+echo "$LOGS" | grep -q '  laptop  closed  tcp 198.18.1.5:8080 (192.168.1.5, home)  [0-9.]* [KMG]*i*B out, [0-9.]* [KMG]*i*B in' \
+    || { echo "$LOGS"; fail "(t) laptop's bytes when the flow ended"; }
+echo "$LOGS" | grep -q '  friend  ' && { echo "$LOGS"; fail "(t) friend is logged at off"; }
+[ "$($P log show --peer guest --kind blocked | wc -l)" -ge 1 ] || fail "(t) log show --peer --kind"
+g log level inherit --grant family
+g log level inherit --peer laptop
+inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
+    && fail "(t) logging rules left after everyone went back to off"
+# The records stay readable with logging off.
+[ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
+pass "(t) each level records what it covers (blocked attempts; connections and bytes) with both destinations; nobody else's; off removes the rules"
 
 echo "ALL PASS"

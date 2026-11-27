@@ -12,16 +12,19 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+use parallax_core::logging::Record;
 use parallax_core::names::Resolved;
 use parallax_core::secret::Secret;
 use parallax_core::Config;
+use parallax_store::logs::Query;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The version this build speaks. 2: replies carry the home's public IP.
 /// 3: and what hosts named by DNS name resolved to. 4: services and host
 /// grants carry port lists. 5: the configuration carries log levels.
-pub const PROTOCOL: u64 = 5;
+/// 6: activity records (`logs`).
+pub const PROTOCOL: u64 = 6;
 /// The largest message either side accepts, newline included.
 pub const MAX_MESSAGE: usize = 16 << 20;
 
@@ -51,6 +54,8 @@ pub enum Request {
         revision: u64,
         contents_sha256: String,
     },
+    /// Activity records (`parallax log show`).
+    Logs { query: Query },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,6 +90,8 @@ pub enum Reply {
     Conflict { revision: u64 },
     /// Output of a request that changes no configuration.
     Done { lines: Vec<String> },
+    /// Activity records, oldest first, each with its id.
+    Logs { records: Vec<(i64, Record)> },
     /// The request was refused; nothing changed.
     Error { message: String },
 }
@@ -245,7 +252,7 @@ mod tests {
         let text = String::from_utf8(line).unwrap();
         assert_eq!(
             text,
-            "{\"if_due\":true,\"protocol\":5,\"request\":\"backup_create\"}\n"
+            "{\"if_due\":true,\"protocol\":6,\"request\":\"backup_create\"}\n"
         );
         let Request::BackupRestore { passphrase, .. } = round_trip(&Request::BackupRestore {
             path: "/b.tar".into(),
@@ -275,13 +282,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("protocol 5") && e.contains("other side 1"),
+            e.contains("protocol 6") && e.contains("other side 1"),
             "{e}"
         );
         let e = decode::<Request>(b"{\"request\":\"status\"}").unwrap_err();
         assert!(e.to_string().contains("no protocol"), "{e}");
         let e = decode::<Request>(
-            b"{\"protocol\":5,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
+            b"{\"protocol\":6,\"request\":\"backup_create\",\"if_due\":true,\"x\":1}",
         )
         .unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");

@@ -21,8 +21,10 @@ use parallax_core::grants;
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
 use parallax_core::logging;
+use parallax_core::logging::{Record, RecordKind};
 use parallax_core::model::{
-    AllowedIpsStrategy, DnsMode, LogLevel, Peer, Platform, Rule, ServerConfig, TransportKind,
+    AllowedIpsStrategy, DnsMode, Interval, LogLevel, Peer, Platform, Rule, ServerConfig,
+    TransportKind,
 };
 use parallax_core::names::{self, Resolved};
 use parallax_core::public_ip;
@@ -30,6 +32,7 @@ use parallax_core::secret::PrivateKey;
 use parallax_core::transport::{self, ProvisionOptions};
 use parallax_core::validate::ReachKind;
 use parallax_core::{Config, Model};
+use parallax_store::logs::{Logs, Query};
 use parallax_store::{Store, TempDir};
 
 use crate::protocol::{Reply, Request};
@@ -362,6 +365,173 @@ enum LogCommand {
         #[arg(long)]
         grant: Option<String>,
     },
+    /// Show activity records, oldest first.
+    Show {
+        /// Only this peer's.
+        #[arg(long)]
+        peer: Option<String>,
+        /// Only these kinds: opened, closed, blocked, blocked_gateway (repeat,
+        /// or separate with commas).
+        #[arg(long, value_delimiter = ',', value_parser = parse_record_kind)]
+        kind: Vec<RecordKind>,
+        /// Only from this long ago: 30m, 6h, 1d.
+        #[arg(long)]
+        since: Option<Interval>,
+        /// At most this many, the newest.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Keep showing new ones as they're recorded.
+        #[arg(long)]
+        follow: bool,
+    },
+}
+
+fn parse_record_kind(s: &str) -> Result<RecordKind, String> {
+    s.parse().map_err(|e: parallax_core::Error| e.to_string())
+}
+
+/// How far back `--follow` reads again each second. Feeds commit
+/// concurrently, so ids don't arrive in order: a cursor on the last id
+/// could skip a batch that commits after a later one. Re-reading a window
+/// and skipping what was shown can't.
+const FOLLOW_WINDOW_MS: u64 = 10_000;
+
+/// Print records as they match; with `follow`, keep showing new ones.
+fn show_records(ctx: &Ctx, query: Query, follow: bool) -> anyhow::Result<()> {
+    let records = read_history(ctx, &query)?;
+    for (_, r) in &records {
+        outln!("{}", record_line(r))?;
+    }
+    if !follow {
+        if records.is_empty() {
+            eoutln!("no records (see `parallax log level` and docs/logging.md)");
+        }
+        return Ok(());
+    }
+    // Shown, by id and time (ids start over in a new database).
+    let mut shown: std::collections::HashSet<(i64, u64)> =
+        records.iter().map(|(id, r)| (*id, r.time)).collect();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let since = now_ms().saturating_sub(FOLLOW_WINDOW_MS);
+        let window = Query {
+            since: Some(since.max(query.since.unwrap_or(0))),
+            before: None,
+            limit: PAGE,
+            ..query.clone()
+        };
+        let mut fresh = read_records(ctx, &window)?;
+        fresh.sort_by_key(|(id, r)| (r.time, *id));
+        for (id, r) in &fresh {
+            if shown.insert((*id, r.time)) {
+                outln!("{}", record_line(r))?;
+            }
+        }
+        shown.retain(|(_, time)| *time + 2 * FOLLOW_WINDOW_MS >= since);
+    }
+}
+
+/// Records per request: each answer stays far below the socket's limit on
+/// a message, however many are asked for.
+const PAGE: u32 = 5000;
+
+/// The newest `query.limit` records, oldest first, read a page at a time
+/// from the newest back.
+fn read_history(ctx: &Ctx, query: &Query) -> anyhow::Result<Vec<(i64, Record)>> {
+    let mut pages: Vec<Vec<(i64, Record)>> = Vec::new();
+    let mut left = query.limit;
+    let mut before = None;
+    while left > 0 {
+        let page = read_records(
+            ctx,
+            &Query {
+                before,
+                limit: left.min(PAGE),
+                ..query.clone()
+            },
+        )?;
+        let Some((oldest, _)) = page.first() else {
+            break;
+        };
+        before = Some(*oldest);
+        left = left.saturating_sub(page.len() as u32);
+        let full = page.len() as u32 == PAGE;
+        pages.push(page);
+        if !full {
+            break;
+        }
+    }
+    Ok(pages.into_iter().rev().flatten().collect())
+}
+
+/// Through the daemon, which holds logs.db; without one, from the file.
+fn read_records(ctx: &Ctx, query: &Query) -> anyhow::Result<Vec<(i64, Record)>> {
+    match ctx.ask(&Request::Logs {
+        query: query.clone(),
+    })? {
+        Some(Reply::Logs { records }) => Ok(records),
+        Some(other) => Err(unexpected(other)),
+        None => {
+            let (config, _, _) = ctx.load_full()?;
+            let path = config.server.logs.path;
+            if !path.exists() {
+                return Ok(Vec::new());
+            }
+            block_on(async { Ok(Logs::open(&path).await?.query(query).await?) })
+        }
+    }
+}
+
+/// `2026-11-26T10:23:22Z  sister-phone  opened  tcp 198.18.1.5:2283 (192.168.1.5, home)  grants family`
+fn record_line(r: &Record) -> String {
+    let secs = r.time / 1000;
+    let date = Date::from_unix_days((secs / 86_400) as i64);
+    let rest = secs % 86_400;
+    let time = format!(
+        "{date}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    );
+    let target = match r.port {
+        Some(p) => format!("{}:{p}", r.destination),
+        None => r.destination.to_string(),
+    };
+    let mut line = format!(
+        "{time}  {}  {}  {} {target}",
+        r.peer,
+        r.kind.as_str(),
+        r.protocol
+    );
+    let real = r.real_destination.map(|a| a.to_string());
+    match (real, &r.network) {
+        (Some(a), Some(n)) => line.push_str(&format!(" ({a}, {n})")),
+        (Some(a), None) => line.push_str(&format!(" ({a})")),
+        (None, Some(n)) => line.push_str(&format!(" ({n})")),
+        (None, None) => {}
+    }
+    if let (Some(out), Some(back)) = (r.bytes_out, r.bytes_in) {
+        line.push_str(&format!("  {} out, {} in", bytes(out), bytes(back)));
+    }
+    if !r.grants.is_empty() {
+        line.push_str(&format!("  grants {}", r.grants));
+    }
+    line
+}
+
+fn bytes(n: u64) -> String {
+    match n {
+        n if n >= 1 << 30 => format!("{:.1} GiB", n as f64 / (1u64 << 30) as f64),
+        n if n >= 1 << 20 => format!("{:.1} MiB", n as f64 / (1u64 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.1} KiB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -390,7 +560,26 @@ impl LevelArg {
 }
 
 fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
-    let LogCommand::Level { level, peer, grant } = command;
+    let (level, peer, grant) = match command {
+        LogCommand::Level { level, peer, grant } => (level, peer, grant),
+        LogCommand::Show {
+            peer,
+            kind,
+            since,
+            limit,
+            follow,
+        } => {
+            let now = now_ms();
+            let query = Query {
+                peer,
+                kinds: kind,
+                since: since.map(|s| now.saturating_sub(s.as_secs().saturating_mul(1000))),
+                before: None,
+                limit,
+            };
+            return show_records(ctx, query, follow);
+        }
+    };
     let target = match (peer, grant) {
         (Some(p), _) => logging::Target::Peer(p),
         (None, Some(g)) => logging::Target::Grant(g),
@@ -691,6 +880,7 @@ pub(crate) fn unexpected(reply: Reply) -> anyhow::Error {
         Reply::Applied { .. } => "applied",
         Reply::Conflict { .. } => "conflict",
         Reply::Done { .. } => "done",
+        Reply::Logs { .. } => "logs",
         Reply::Error { .. } => "error",
     };
     anyhow!("the daemon answered with an unexpected '{kind}' reply")

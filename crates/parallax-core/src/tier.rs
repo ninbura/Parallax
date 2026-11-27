@@ -101,6 +101,15 @@ fn quoted<'a>(names: impl Iterator<Item = &'a str>) -> String {
         .join(", ")
 }
 
+/// Names of the grants `peer` has, its own and every `everyone` grant, in
+/// configuration order.
+pub fn grant_names<'a>(config: &'a Config, peer: &Peer) -> Vec<&'a str> {
+    effective(config, peer)
+        .into_iter()
+        .map(|i| config.grants[i].name.as_str())
+        .collect()
+}
+
 /// Positions in `config.grants` of what `peer` has: its own grants and
 /// every `everyone` grant, sorted, each once. Unknown names are left out
 /// (validation reports them).
