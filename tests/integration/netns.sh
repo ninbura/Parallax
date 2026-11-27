@@ -1006,7 +1006,9 @@ s += f'\n[[peer]]\nname = "tablet"\ngrants = ["family"]\ntransport = "tailscale"
 open(dst, "w").write(s)
 PY
     grep -q '^server_url = "http://127.0.0.1:18080"$' "$WORK/tailscale.toml" || fail "(t) could not point the configuration at Headscale"
-    in_set() { inns gw nft list table inet parallax | grep -q "elements = {[^}]*\b$NODE_IP\b"; }
+    # Not grep -q: it stops reading at the match, and with pipefail nft's SIGPIPE
+    # would fail the pipeline exactly when the address is there.
+    in_set() { inns gw nft list table inet parallax | grep "elements = {[^}]*\b$NODE_IP\b" >/dev/null; }
     wait_set() { # want: in | out
         for _ in $(seq 30); do
             if in_set; then [ "$1" = in ] && return 0; else [ "$1" = out ] && return 0; fi
@@ -1015,10 +1017,10 @@ PY
         return 1
     }
     apply "$WORK/tailscale.toml"
-    wait_set in || { inns gw nft list table inet parallax | grep -A2 'set ts_'; fail "(t) the node's address $NODE_IP never reached the firewall"; }
-    inns gw $P headscale status | grep -q "^node $NODE tablet: user family, $NODE_IP, online; peer tablet$" \
+    wait_set in || { inns gw nft list table inet parallax | grep -A5 'set ts_'; fail "(t) the node's address $NODE_IP never reached the firewall"; }
+    inns gw $P headscale status | grep "^node $NODE tablet: user family, $NODE_IP, online; peer tablet$" >/dev/null \
         || { inns gw $P headscale status; fail "(t) headscale status did not show the node as tablet"; }
-    $P status | grep -q "^Headscale node $NODE: $NODE_IP$" || { $P status; fail "(t) the daemon's status lacks the node"; }
+    $P status | grep "^Headscale node $NODE: $NODE_IP$" >/dev/null || { $P status; fail "(t) the daemon's status lacks the node"; }
     HS_PID=$(cat "$HS/headscale.pid")
     kill "$HS_PID"
     for _ in $(seq 50); do kill -0 "$HS_PID" 2>/dev/null || break; sleep 0.1; done
