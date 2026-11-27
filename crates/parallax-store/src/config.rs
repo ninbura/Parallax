@@ -158,7 +158,7 @@ impl Store {
                     public_ip_address, public_ip_encrypted_dns,
                     wireguard_peer_dns, wireguard_peer_allowed_ips, wireguard_peer_mtu,
                     wireguard_peer_persistent_keepalive, headscale_dns,
-                    logs_level, logs_path, logs_keep, logs_max_size
+                    logs_level, logs_path, logs_keep, logs_max_size, logs_dns
                  FROM server WHERE id = 1",
                 Vec::new(),
             )
@@ -236,6 +236,7 @@ impl Store {
                 path: PathBuf::from(r.get::<String>(35)?),
                 keep: parse(at, "logs keep", &r.get::<String>(36)?)?,
                 max_size: parse(at, "logs max_size", &r.get::<String>(37)?)?,
+                dns: r.get(38)?,
             },
             wan_interface: r.get(20)?,
         }))
@@ -327,6 +328,7 @@ impl Store {
                 ("logs_path", path("server.logs.path", &s.logs.path)?),
                 ("logs_keep", text(s.logs.keep)),
                 ("logs_max_size", text(s.logs.max_size)),
+                ("logs_dns", s.logs.dns.into()),
             ],
         )
         .await?;
@@ -488,7 +490,7 @@ impl Store {
         let mut out = Vec::new();
         let rows = self
             .rows(
-                "SELECT id, name, everyone, log FROM grants ORDER BY position",
+                "SELECT id, name, everyone, log, log_dns FROM grants ORDER BY position",
                 Vec::new(),
             )
             .await?;
@@ -500,6 +502,7 @@ impl Store {
                 rules: self.load_rules(id, &at).await?,
                 everyone: r.get(2)?,
                 log: variant_opt(&at, "log", r.get(3)?)?,
+                log_dns: r.get(4)?,
                 name,
             });
         }
@@ -572,6 +575,7 @@ impl Store {
                         ("position", position.into()),
                         ("everyone", g.everyone.into()),
                         ("log", log_level(g.log)?),
+                        ("log_dns", switch(g.log_dns)),
                     ],
                 )
                 .await?;
@@ -636,7 +640,7 @@ impl Store {
                     wireguard_preshared_key, tailscale, tailscale_node_id, tailscale_address,
                     wireguard_dns, wireguard_allowed_ips, wireguard_mtu,
                     wireguard_persistent_keepalive, wireguard_visible_networks_limited,
-                    log
+                    log, log_dns
                  FROM peers ORDER BY position",
                 Vec::new(),
             )
@@ -716,6 +720,7 @@ impl Store {
                     )
                     .await?,
                 log: variant_opt(&at, "log", r.get(17)?)?,
+                log_dns: r.get(18)?,
                 transport: variant(&at, "transport", &r.get::<String>(2)?)?,
                 enabled: r.get(3)?,
                 expires: parse_opt(&at, "expires", r.get(4)?)?,
@@ -756,6 +761,7 @@ impl Store {
                         ("position", position.into()),
                         ("transport", variant_text(&p.transport)?),
                         ("log", log_level(p.log)?),
+                        ("log_dns", switch(p.log_dns)),
                         ("enabled", p.enabled.into()),
                         ("expires", p.expires.map(|d| d.to_string()).into()),
                         (
@@ -947,6 +953,11 @@ fn variant<T: DeserializeOwned>(at: &str, what: &str, s: &str) -> Result<T> {
 
 fn variant_opt<T: DeserializeOwned>(at: &str, what: &str, s: Option<String>) -> Result<Option<T>> {
     s.map(|s| variant(at, what, &s)).transpose()
+}
+
+/// A grant's or peer's own `log_dns`; NULL when it sets none.
+fn switch(on: Option<bool>) -> Value {
+    on.map_or(Value::Null, Value::from)
 }
 
 /// A grant's or peer's own log level; NULL when it sets none.

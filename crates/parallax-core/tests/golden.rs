@@ -861,6 +861,7 @@ fn config_export_layout_matches_golden() {
         name: "public".into(),
         everyone: true,
         log: None,
+        log_dns: None,
         rules: vec![Rule::PublicDns],
     });
     busy.peers[0].grants.push("family".into());
@@ -936,6 +937,7 @@ fn changing_grants_keeps_the_address_and_the_exported_config() {
         name: "photos".into(),
         everyone: true,
         log: None,
+        log_dns: None,
         rules: vec![Rule::Network {
             name: "home".into(),
         }],
@@ -964,12 +966,14 @@ fn a_peer_reaches_the_union_of_its_grants() {
         name: "files".into(),
         everyone: false,
         log: None,
+        log_dns: None,
         rules: vec![Rule::Service { name: "nas".into() }],
     });
     cfg.grants.push(parallax_core::model::Grant {
         name: "public".into(),
         everyone: true,
         log: None,
+        log_dns: None,
         rules: vec![Rule::PublicDns],
     });
     cfg.peers[2].grants.push("files".into());

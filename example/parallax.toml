@@ -98,6 +98,9 @@ encrypted_dns = []
 # overrides it. A peer's own level wins, then the most detailed of its
 # grants'.
 level = "off"
+# Also record peers' DNS queries (name, type, outcome). No level turns this
+# on; `log_dns = true|false` on a grant or a peer overrides it.
+dns = false
 # Kept apart from the configuration, so it can live on another disk.
 path = "/var/lib/parallax/logs.db"
 # Records are deleted once they're older than `keep` or the records take

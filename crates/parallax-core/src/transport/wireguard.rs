@@ -74,6 +74,7 @@ impl Transport for WireGuardTransport {
             name: name.to_string(),
             grants: grants.to_vec(),
             log: None,
+            log_dns: None,
             transport: TransportKind::WireGuard,
             enabled: true,
             expires: opts.expires,

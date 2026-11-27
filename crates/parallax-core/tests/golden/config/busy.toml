@@ -49,6 +49,7 @@ encrypted_dns = []
 
 [server.logs]
 level = "off"
+dns = false
 path = "/var/lib/parallax/logs.db"
 keep = "30d"
 max_size = "1GiB"

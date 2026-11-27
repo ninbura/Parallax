@@ -40,6 +40,7 @@ pub fn create(config: &mut Config, name: &str, everyone: bool, rules: &[Rule]) -
         name: name.to_string(),
         everyone,
         log: None,
+        log_dns: None,
         rules: Vec::new(),
     };
     for rule in rules {

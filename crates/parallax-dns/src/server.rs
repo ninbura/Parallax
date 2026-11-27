@@ -24,6 +24,7 @@ use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseI
 use hickory_server::zone_handler::MessageResponseBuilder;
 use hickory_server::Server;
 use parallax_core::generate::dns::{DnsRoutes, Route};
+use parallax_core::logging::{Event, Logged, Query, QueryOutcome, Tap};
 use parallax_core::netmap::Mapping;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Notify;
@@ -115,6 +116,7 @@ pub struct Dns {
     upstream_port: u16,
     state: Arc<State>,
     reload: Arc<Notify>,
+    tap: Option<Tap>,
 }
 
 impl Dns {
@@ -126,7 +128,15 @@ impl Dns {
             upstream_port,
             state: Arc::new(load_state(routes_path, upstream_port)?),
             reload: Arc::new(Notify::new()),
+            tap: None,
         })
+    }
+
+    /// Hand the queries of peers whose DNS is logged to `tap`
+    /// (docs/logging.md): name, type and outcome, never the answer.
+    pub fn tap(mut self, tap: Tap) -> Self {
+        self.tap = Some(tap);
+        self
     }
 
     /// The address the routes say to listen on.
@@ -161,6 +171,8 @@ impl Dns {
         let mut server = Server::new(Handler {
             state: shared,
             inflight: Arc::default(),
+            tap: self.tap,
+            server: listening,
         });
         server.register_socket(udp);
         server.register_listener(tcp, TCP_TIMEOUT, TCP_QUEUE);
@@ -256,6 +268,10 @@ enum Kind {
 struct Handler {
     state: Shared,
     inflight: Arc<Mutex<HashMap<Ipv4Addr, usize>>>,
+    /// Where logged peers' queries go, if anywhere.
+    tap: Option<Tap>,
+    /// The address the server answers on, for the records.
+    server: SocketAddrV4,
 }
 
 fn reply(code: ResponseCode) -> (ResponseCode, Vec<Record>) {
@@ -265,6 +281,40 @@ fn reply(code: ResponseCode) -> (ResponseCode, Vec<Record>) {
 impl Handler {
     fn current(&self) -> Option<Arc<State>> {
         self.state.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The peer that asked, if its queries are logged.
+    fn admit(&self, request: &Request) -> Option<Logged> {
+        let tap = self.tap.as_ref()?;
+        let client = ipv4(request.request_info().ok()?.src.ip())?;
+        tap.admit(client)
+    }
+
+    /// Hand the query to the tap for `logged`.
+    fn record(&self, request: &Request, logged: Logged, code: ResponseCode) {
+        let (Some(tap), Ok(info)) = (&self.tap, request.request_info()) else {
+            return;
+        };
+        let Some(client) = ipv4(info.src.ip()) else {
+            return;
+        };
+        let mut name: Name = info.query.name().clone().into();
+        name.set_fqdn(true);
+        let outcome = match code {
+            ResponseCode::NoError => QueryOutcome::Answered,
+            ResponseCode::Refused | ResponseCode::NotImp => QueryOutcome::Refused,
+            ResponseCode::NXDomain => QueryOutcome::NxDomain,
+            _ => QueryOutcome::Failed,
+        };
+        tap.send(Event::Query(Query {
+            client,
+            peer: logged.peer,
+            server: self.server,
+            protocol: if info.protocol.is_datagram() { 17 } else { 6 },
+            name: name.to_ascii(),
+            query_type: info.query.query_type().to_string(),
+            outcome,
+        }));
     }
 
     /// The response code and answer records for `request`.
@@ -354,10 +404,15 @@ impl RequestHandler for Handler {
     ) -> ResponseInfo {
         // Only EDNS version 0 exists; anything newer gets BADVERS so the
         // client can fall back (RFC 6891).
+        // Whether it's wanted is decided as the query comes in.
+        let logged = self.admit(request);
         let (code, answers) = match &request.edns {
             Some(e) if e.version() > 0 => reply(ResponseCode::BADVERS),
             _ => self.answer(request).await,
         };
+        if let Some(logged) = logged {
+            self.record(request, logged, code);
+        }
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
         metadata.response_code = code;

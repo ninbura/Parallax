@@ -24,7 +24,7 @@
 #           10.99.0.5 (a private subnet the router knows but Parallax doesn't, like
 #           another VLAN)
 #   ctr     172.17.0.2, a "container" behind the gateway's Docker bridge
-#   tsc     wan0 203.0.114.2 -> gw wan1 203.0.114.1; a phone on Tailscale, for (v)
+#   tsc     wan0 203.0.114.2 -> gw wan1 203.0.114.1; a phone on Tailscale, for (w)
 #
 # Grants: personal (all_networks + internet, public DNS), family (the proxied
 # Immich, a service on the gateway host, two echo ports), friend (internet only),
@@ -42,14 +42,14 @@
 # the home's public IP, and a lookup answered with a private address is refused,
 # (p) hosts granted by DNS name are looked up on save and bad ones refused, (q) names
 # on the home's public IP reach one port forward each, or HTTPS through the proxy,
-# (n) the daemon tears down on SIGTERM, re-applies on SIGHUP and repairs a deleted
-# table, and keeps the home's public IP across the restart, (r) a peer with two grants
+# (n) the daemon tears down on SIGTERM and after a failed first apply, re-applies on
+# SIGHUP and repairs a deleted table, and keeps the home's public IP across the restart, (r) a peer with two grants
 # reaches both and nothing more, a grant for everyone reaches every peer, and changing
 # grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
 # change access when they return, and a refused one changes nothing, (t) activity
-# logging records logged peers' connections, bytes and blocked attempts and nobody
-# else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
-# node's address from Headscale, (v) the subnet router: the daemon logs Parallax's
+# logging records logged peers' connections, bytes, blocked attempts, proxied
+# requests and (when asked) DNS queries, and nobody else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
+# node's address from Headscale, (w) the subnet router: the daemon logs Parallax's
 # tailscaled in to Headscale, advertises and approves the mapped routes, and a phone
 # on Tailscale reaches what its grant allows, DNS included. Every change goes through
 # the daemon and takes effect without SIGHUP.
@@ -305,7 +305,7 @@ SOCK="$WORK/run/parallax.sock"
 # would /usr/bin/parallax: it starts the CLI again as the service's user for
 # the service's files, and that user can't reach a build under a home.
 cp "$PARALLAX" "$WORK/parallax"
-# The subnet router's socket, (v); the daemon runs `tailscale` from PATH.
+# The subnet router's socket, (w); the daemon runs `tailscale` from PATH.
 TS_SOCK="$WORK/tsr/sock"
 mkdir -p "$WORK/bin" "$WORK/tsr"
 if [ -n "${TAILSCALE:-}" ]; then
@@ -824,6 +824,34 @@ if [ "$MODE" = unit ]; then
 else
     $P validate >/dev/null || fail "(n) without a daemon the CLI opens the database itself"
 fi
+# A first apply that fails partway takes down what it set up (#53): another
+# socket holds WireGuard's port, so wg0 can't come up once the table and wg0 are in.
+# Not through `inns`: $! must be python itself, or killing it leaves the port held.
+ip netns exec "${PREFIX}gw" python3 -c 'import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 51820)); time.sleep(60)' &
+HOLDER=$!
+PIDS+=($HOLDER)
+for _ in $(seq 50); do inns gw ss -Hlun 'sport = :51820' | grep -q . && break; sleep 0.1; done
+inns gw ss -Hlun 'sport = :51820' | grep -q . || fail "(n) could not hold WireGuard's port"
+if [ "$MODE" = unit ]; then
+    UNITS+=("${PREFIX}held")
+    held=(timeout 30 "${AS_UNIT[@]}" --unit="${PREFIX}held" --wait --pipe "$WORK/parallax"
+        --db "$WORK/parallax.db" --socket "$SOCK" daemon -o "$WORK/out")
+else
+    held=(inns gw timeout 30 $P daemon -o "$WORK/out")
+fi
+status=0
+"${held[@]}" > "$WORK/held.log" 2>&1 || status=$?
+# 124: still running when `timeout` stopped it, so it started.
+case $status in 0|124) cat "$WORK/held.log"; fail "(n) the daemon started with WireGuard's port taken" ;; esac
+kill "$HOLDER" 2>/dev/null || true
+wait "$HOLDER" 2>/dev/null || true
+inns gw ss -Hlun 'sport = :51820' | grep -q . && fail "(n) WireGuard's port is still held"
+grep -q "the first apply failed" "$WORK/held.log" || { cat "$WORK/held.log"; fail "(n) the held port didn't fail the first apply"; }
+inns gw nft list table inet parallax >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left the table"; }
+inns gw ip link show wg0 >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left wg0"; }
+grep -q "removed table inet parallax" "$WORK/held.log" && grep -q "removed interface wg0" "$WORK/held.log" \
+    || { cat "$WORK/held.log"; fail "(n) a failed first apply didn't log what it took down"; }
 start_daemon 1
 # wg0 is new: the clients' sessions are gone until they handshake again (up to ~15 s).
 for _ in $(seq 10); do [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] && break; done
@@ -843,7 +871,7 @@ inns gw nft list table inet parallax >/dev/null 2>&1 || fail "(n) the deleted ta
 grep -q 'applying (the live' "$WORK/daemon.log" || fail "(n) the repair was not logged as drift"
 [ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(n) guest grants after the repair"
 [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after the repair"
-pass "(n) SIGTERM tears down; SIGHUP re-applies; a deleted table comes back on its own"
+pass "(n) SIGTERM tears down; a failed first apply takes down what it set up; SIGHUP re-applies; a deleted table comes back on its own"
 
 # (q) names on the home's public IP are port forwards: friend (full tunnel, internet,
 # which drops the public IP) reaches the one port it's granted there, and HTTPS by name
@@ -993,13 +1021,41 @@ echo "$LOGS" | grep -q '  laptop  closed  tcp 198.18.1.5:8080 (192.168.1.5, home
     || { echo "$LOGS"; fail "(t) laptop's bytes when the flow ended"; }
 echo "$LOGS" | grep -q '  friend  ' && { echo "$LOGS"; fail "(t) friend is logged at off"; }
 [ "$($P log show --peer guest --kind blocked | wc -l)" -ge 1 ] || fail "(t) log show --peer --kind"
+# The proxy and DNS: at `connections` one record per proxied request (never its
+# path) and each refusal; DNS queries only once `log dns` turns them on.
+g log level connections --grant family
+ANS=$(inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
+[ "$(curl_as $GUEST --cacert "$CA" --resolve "immich.mydomain.com:443:$ANS" https://immich.mydomain.com/secret-album-42)" = home-immich ] \
+    || fail "(t) guest -> immich through the proxy"
+https_as $GUEST immich.mydomain.com "$ANS" --http1.1 -H 'Host: other.mydomain.com' -o /dev/null >/dev/null || true
+g log dns on --peer guest
+inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com >/dev/null || true
+inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 other.mydomain.com >/dev/null || true
+for _ in $(seq 20); do
+    [ "$($P log show --peer guest --kind query | wc -l)" -ge 2 ] \
+        && [ "$($P log show --peer guest --kind request,refused | wc -l)" -ge 2 ] && break
+    sleep 0.5
+done
+LOGS=$($P log show --peer guest --kind request,refused,query --limit 1000)
+echo "$LOGS" | grep -q '  guest  request  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 200  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's proxied request"; }
+echo "$LOGS" | grep -q '  guest  refused  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 421: this connection serves a different hostname' \
+    || { echo "$LOGS"; fail "(t) guest's misdirected request"; }
+echo "$LOGS" | grep -q 'secret-album-42' && { echo "$LOGS"; fail "(t) a URL path was recorded"; }
+[ "$(echo "$LOGS" | grep -c '  guest  query  ')" -eq 2 ] \
+    || { echo "$LOGS"; fail "(t) only the queries after log dns on"; }
+echo "$LOGS" | grep -q '  guest  query  udp 10.8.0.1:53  immich.mydomain.com. A answered  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's DNS query"; }
+echo "$LOGS" | grep -q '  guest  query  udp 10.8.0.1:53  other.mydomain.com. A refused' \
+    || { echo "$LOGS"; fail "(t) guest's refused DNS query"; }
+g log dns inherit --peer guest
 g log level inherit --grant family
 g log level inherit --peer laptop
 inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
     && fail "(t) logging rules left after everyone went back to off"
 # The records stay readable with logging off.
 [ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
-pass "(t) each level records what it covers (blocked attempts; connections and bytes) with both destinations; nobody else's; off removes the rules"
+pass "(t) each level records what it covers (blocked attempts; connections and bytes; proxied requests and refusals, no paths) with both destinations; DNS queries only when asked; nobody else's; off removes the rules"
 
 # (v) Root writes what the service's configuration names as the service: a
 # configuration naming a file in root's own directory gets no write from root.
@@ -1130,7 +1186,7 @@ PY
     wait_set out || fail "(u) a deleted node kept its peer's access"
     pass "(u) a Tailscale peer gets its node's address from Headscale, keeps it while Headscale is down, loses it with the node"
 
-    # (v) The subnet router. Parallax's own tailscaled (kernel tun, as the image
+    # (w) The subnet router. Parallax's own tailscaled (kernel tun, as the image
     # and parallax-tailscaled.service run it), logged out; the daemon logs it in,
     # advertises the mapped network and the DNS address, and approves them. A
     # phone on Tailscale in its own namespace then reaches what its grant allows,
@@ -1148,7 +1204,7 @@ PY
             esac
         done < <(sed -n '/^\[Service\]/,/^\[/p' "$TSD_UNIT" | grep -E '^[A-Za-z]+=')
         printf '%s\n' "${TSD_SANDBOX[@]}" | grep -q '^CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW$' \
-            || fail "(v) could not read the sandbox from $TSD_UNIT"
+            || fail "(w) could not read the sandbox from $TSD_UNIT"
         UNITS+=("${PREFIX}tailscaled")
         systemd-run --quiet --collect --unit="${PREFIX}tailscaled" -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" \
             -p "ReadWritePaths=$WORK" -p "StandardOutput=append:$HS/router.log" -p "StandardError=append:$HS/router.log" \
@@ -1158,9 +1214,9 @@ PY
         PIDS+=($!)
     fi
     for _ in $(seq 50); do [ -S "$TS_SOCK" ] && break; sleep 0.1; done
-    [ -S "$TS_SOCK" ] || { cat "$HS/router.log"; fail "(v) the router's tailscaled did not start"; }
+    [ -S "$TS_SOCK" ] || { cat "$HS/router.log"; fail "(w) the router's tailscaled did not start"; }
     if [ "$MODE" = unit ]; then
-        inns gw tailscale --socket="$TS_SOCK" set --operator=nobody || fail "(v) could not make the service the router's operator"
+        inns gw tailscale --socket="$TS_SOCK" set --operator=nobody || fail "(w) could not make the service the router's operator"
     fi
 
     PHONE_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"2099-01-01T00:00:00Z\"}" \
@@ -1172,7 +1228,7 @@ PY
     for _ in $(seq 50); do [ -S "$HS/phone/sock" ] && break; sleep 0.1; done
     inns tsc timeout 30 "$TAILSCALE" --socket="$HS/phone/sock" up --login-server=http://203.0.114.1:18080 \
         --authkey="$PHONE_AUTH" --hostname=phone --accept-routes >/dev/null 2>&1 \
-        || { tail -20 "$HS/phone.log"; fail "(v) the phone did not log in"; }
+        || { tail -20 "$HS/phone.log"; fail "(w) the phone did not log in"; }
     read -r PHONE PHONE_IP < <(hs_api GET /api/v1/node | python3 -c '
 import json, sys
 n = next(n for n in json.load(sys.stdin)["nodes"] if n["givenName"] == "phone")
@@ -1193,38 +1249,38 @@ for n in json.load(sys.stdin)["nodes"]:
         sleep 0.5
     done
     [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] \
-        || { hs_api GET /api/v1/node; tail -20 "$HS/router.log"; fail "(v) the router's routes were not advertised and approved"; }
-    grep -q "logged the router in to Headscale" "$WORK/daemon.log" || fail "(v) the router's login was not logged"
+        || { hs_api GET /api/v1/node; tail -20 "$HS/router.log"; fail "(w) the router's routes were not advertised and approved"; }
+    grep -q "logged the router in to Headscale" "$WORK/daemon.log" || fail "(w) the router's login was not logged"
     inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
 import json, sys
 p = json.load(sys.stdin)
 assert p["NetfilterMode"] == 0 and p["NoSNAT"] and not p["CorpDNS"] and not p["RouteAll"], p' \
-        || fail "(v) the router does not have its own filtering, SNAT, DNS and routes off"
+        || fail "(w) the router does not have its own filtering, SNAT, DNS and routes off"
     for _ in $(seq 60); do
         inns tsc ip route show table 52 | grep -q '^198.18.1.0/24 dev tailscale0' && break
         sleep 0.5
     done
     inns tsc ip route show table 52 | grep -q '^198.18.1.0/24 dev tailscale0' \
-        || { inns tsc ip route show table 52; fail "(v) the phone has no route to the mapped network"; }
+        || { inns tsc ip route show table 52; fail "(w) the phone has no route to the mapped network"; }
     phone() { inns tsc curl -s -m 3 "$@" || echo BLOCKED; }
     # The first packets may wait for the path between the two to be found.
     for _ in $(seq 20); do [ "$(phone http://198.18.1.1:9090/)" = gw-self ] && break; done
-    [ "$(phone http://198.18.1.1:9090/)" = gw-self ] || fail "(v) phone -> the granted service on the gateway host"
+    [ "$(phone http://198.18.1.1:9090/)" = gw-self ] || fail "(w) phone -> the granted service on the gateway host"
     for url in http://198.18.1.1:9090/ http://198.18.1.1:9091/ http://198.18.1.1:8080/ http://198.18.1.5:8080/ http://198.18.1.5:7000/ http://9.9.9.9/; do
-        [ "$(phone "$url")" = "$(curl_as $GUEST "$url")" ] || fail "(v) the phone and the guest, same grant, differ on $url"
+        [ "$(phone "$url")" = "$(curl_as $GUEST "$url")" ] || fail "(w) the phone and the guest, same grant, differ on $url"
     done
-    [ "$(phone http://198.18.1.1:9091/)" = BLOCKED ] || fail "(v) the phone reached a port its grant lacks"
+    [ "$(phone http://198.18.1.1:9091/)" = BLOCKED ] || fail "(w) the phone reached a port its grant lacks"
     ANS=$(inns tsc dig +short +time=2 +tries=1 @10.8.0.1 immich.mydomain.com || true)
     [ -n "$ANS" ] && [ "$ANS" = "$(inns client dig +short +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)" ] \
-        || fail "(v) the phone's DNS answer for immich ('$ANS') is not the guest's"
+        || fail "(w) the phone's DNS answer for immich ('$ANS') is not the guest's"
     [ "$(inns tsc curl -s -m 3 --cacert "$CA" --resolve "immich.mydomain.com:443:$ANS" https://immich.mydomain.com/ || echo BLOCKED)" = home-immich ] \
-        || fail "(v) the phone did not reach Immich through the proxy"
+        || fail "(w) the phone did not reach Immich through the proxy"
     [ "$(inns tsc dig +time=2 +tries=1 @10.8.0.1 other.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')" = REFUSED ] \
-        || fail "(v) the phone looked up a name its grant lacks"
+        || fail "(w) the phone looked up a name its grant lacks"
     inns gw $P doctor > "$WORK/doctor-router" 2>&1 || true
     grep -q "^ok    tailscale router: Parallax's router is node" "$WORK/doctor-router" \
-        || { cat "$WORK/doctor-router"; fail "(v) doctor does not see the router in place"; }
-    pass "(v) the daemon logs the subnet router in and approves its routes; a Tailscale phone reaches what its grant allows, DNS and the proxy included"
+        || { cat "$WORK/doctor-router"; fail "(w) doctor does not see the router in place"; }
+    pass "(w) the daemon logs the subnet router in and approves its routes; a Tailscale phone reaches what its grant allows, DNS and the proxy included"
 else
     echo "SKIP: (u) Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
 fi

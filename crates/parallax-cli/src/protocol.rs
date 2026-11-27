@@ -25,8 +25,9 @@ use serde::{Deserialize, Serialize};
 /// 3: and what hosts named by DNS name resolved to. 4: services and host
 /// grants carry port lists. 5: the configuration carries log levels.
 /// 6: activity records (`logs`). 7: replies carry the addresses Headscale
-/// gave its nodes.
-pub const PROTOCOL: u64 = 7;
+/// gave its nodes. 8: DNS logging settings, and records of proxied
+/// requests and DNS queries.
+pub const PROTOCOL: u64 = 8;
 /// The largest message either side accepts, newline included.
 pub const MAX_MESSAGE: usize = 16 << 20;
 
@@ -242,6 +243,9 @@ mod tests {
         config.server.logs.level = parallax_core::model::LogLevel::Connections;
         config.grants[1].log = Some(parallax_core::model::LogLevel::Blocked);
         config.peers[0].log = Some(parallax_core::model::LogLevel::Off);
+        config.server.logs.dns = true;
+        config.grants[1].log_dns = Some(false);
+        config.peers[0].log_dns = Some(true);
         let Request::Save {
             configuration,
             revision,

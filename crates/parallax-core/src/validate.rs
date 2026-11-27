@@ -1388,6 +1388,7 @@ mod tests {
             name: "public".into(),
             everyone: true,
             log: None,
+            log_dns: None,
             rules: vec![Rule::PublicDns],
         });
         let (errors, warnings) = check(&cfg);
