@@ -817,6 +817,33 @@ fn iptables_apply_refills_chains_in_one_restore() {
         .rposition(|l| l.starts_with("ipset swap"))
         .unwrap();
     assert!(last_set < dry_run && dry_run < restore, "{lines:#?}");
+    // Tunnel peers open no new connections while the tables change: the
+    // hold goes in after the dry run (once, replacing any a failed apply
+    // left) and comes out after the restore.
+    for chain in ["INPUT", "FORWARD"] {
+        for iface in ["wg0", "tailscale0"] {
+            let rule = format!(
+                "{chain} -i {iface} -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP"
+            );
+            let at = |op: &str| {
+                let line = format!("iptables -t filter {op} {rule}");
+                lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| **l == line)
+                    .map(|(i, _)| i)
+                    .collect::<Vec<usize>>()
+            };
+            let (inserted, deleted) = (at("-I"), at("-D"));
+            assert_eq!(inserted.len(), 1, "{rule}: {lines:#?}");
+            assert_eq!(deleted.len(), 2, "{rule}: {lines:#?}");
+            assert!(
+                dry_run < deleted[0] && deleted[0] < inserted[0],
+                "{lines:#?}"
+            );
+            assert!(inserted[0] < restore && restore < deleted[1], "{lines:#?}");
+        }
+    }
     let gone = |set: &str| pos(&format!("ipset destroy {set}"));
     assert!(gone("wg_0000000000000000").unwrap() > restore);
     assert!(gone("not_public").is_none() && gone("ts_family").is_none());

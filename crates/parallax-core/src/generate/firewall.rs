@@ -879,30 +879,11 @@ fn check_layers(rs: &Ruleset, cfg: &crate::Config) -> Result<()> {
         .filter_map(|n| n.mapping())
         .map(|m| m.virt())
         .collect();
-    let set = |name: &str| {
-        rs.sets
-            .iter()
-            .find(|s| s.name == name)
-            .map_or(&[][..], |s| s.elements.as_slice())
-    };
-    let virtual_in = |m: &Match| -> Option<Ipv4Net> {
-        let nets: &[Ipv4Net] = match m {
-            Match::Any | Match::NotSet(_) => &[],
-            Match::Cidr(n) => std::slice::from_ref(n),
-            Match::Cidrs(ns) => ns,
-            Match::Set(name) => set(name),
-        };
-        nets.iter().copied().find(|n| {
-            virtual_prefixes
-                .iter()
-                .any(|v| v.contains(n) || n.contains(v))
-        })
-    };
     let bug = |r: &Rule, what: String| {
-        Err(crate::Error::Refused(format!(
+        crate::Error::Refused(format!(
             "firewall rule '{}' {what}, so a failed iptables restore could mix two configurations' access (issue #56). This is a bug in Parallax: please report it",
             r.comment
-        )))
+        ))
     };
     for r in rs.rules.iter().chain(&rs.docker_user) {
         let translates = matches!(
@@ -913,16 +894,50 @@ fn check_layers(rs: &Ruleset, cfg: &crate::Config) -> Result<()> {
                 | Action::Masquerade
         );
         let nat = matches!(r.chain, Chain::Prerouting | Chain::Postrouting);
-        if nat && !translates {
-            return bug(r, "decides access in the nat table".into());
+        if nat != translates {
+            return Err(bug(
+                r,
+                if nat {
+                    "does something other than translate in the nat table".into()
+                } else {
+                    "translates addresses in the filter table".into()
+                },
+            ));
         }
-        if !nat && translates {
-            return bug(r, "translates addresses in the filter table".into());
+        if nat {
+            continue;
         }
-        if !nat {
-            if let Some(v) = virtual_in(&r.src).or_else(|| virtual_in(&r.dst)) {
-                return bug(r, format!("matches the virtual addresses {v}"));
+        // A negated match an untranslated address fails can only deny,
+        // unless failing it skips a drop.
+        let drops = r.action == Action::Drop;
+        let mut nets: Vec<Ipv4Net> = Vec::new();
+        for m in [&r.src, &r.dst] {
+            match m {
+                Match::Any => {}
+                Match::Cidr(n) => nets.push(*n),
+                Match::Cidrs(ns) => nets.extend(ns),
+                Match::Set(name) | Match::NotSet(name) => {
+                    let set = rs.sets.iter().find(|s| s.name == *name).ok_or_else(|| {
+                        bug(
+                            r,
+                            format!("names a set '{name}' the ruleset doesn't define"),
+                        )
+                    })?;
+                    if matches!(m, Match::Set(_)) || drops {
+                        nets.extend(&set.elements);
+                    }
+                }
             }
+        }
+        if let Action::SourceVmap(entries) = &r.action {
+            nets.extend(entries.iter().map(|(n, _)| *n));
+        }
+        if let Some(v) = nets.iter().find(|n| {
+            virtual_prefixes
+                .iter()
+                .any(|v| v.contains(*n) || n.contains(v))
+        }) {
+            return Err(bug(r, format!("matches the virtual addresses {v}")));
         }
     }
     Ok(())
@@ -1560,7 +1575,7 @@ mod tests {
 
         let e = refused(Rule::new(Chain::Prerouting, Action::Drop, "nat drop"));
         assert!(
-            e.contains("'nat drop' decides access in the nat table"),
+            e.contains("'nat drop' does something other than translate in the nat table"),
             "{e}"
         );
         let e = refused(Rule::new(Chain::Forward, Action::Masquerade, "filter nat"));
@@ -1596,12 +1611,38 @@ mod tests {
 
         // A negated match may hold virtual addresses: untranslated, they
         // fail it, which only denies. (`lan_real` in `good` holds one too.)
-        let mut rs = with_set;
+        let mut rs = with_set.clone();
         rs.rules.push(
             Rule::new(Chain::Tier(0), Action::Accept, "not virtual")
                 .dst(Match::NotSet("virtual".into())),
         );
         check_layers(&rs, &cfg).unwrap();
+        // Unless failing it skips a drop.
+        let mut rs = with_set;
+        rs.rules.push(
+            Rule::new(Chain::Tier(0), Action::Drop, "drop unless virtual")
+                .dst(Match::NotSet("virtual".into())),
+        );
+        assert!(check_layers(&rs, &cfg).is_err());
+
+        // A source map is a source match.
+        let e = refused(Rule::new(
+            Chain::Forward,
+            Action::SourceVmap(vec![(virt, 0)]),
+            "by source",
+        ));
+        assert!(
+            e.contains("'by source' matches the virtual addresses"),
+            "{e}"
+        );
+        // A set the ruleset doesn't define is a bug, not an empty set.
+        let e = refused(
+            Rule::new(Chain::Input, Action::Accept, "dangling").src(Match::Set("nowhere".into())),
+        );
+        assert!(
+            e.contains("names a set 'nowhere' the ruleset doesn't define"),
+            "{e}"
+        );
     }
 
     #[test]

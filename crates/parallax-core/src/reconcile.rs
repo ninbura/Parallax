@@ -152,7 +152,7 @@ pub fn teardown(server: &ServerConfig, sys: System<'_>) -> Vec<String> {
         "ip",
         vec!["link", "del", "dev", iface],
     ));
-    steps
+    let mut log: Vec<String> = steps
         .into_iter()
         .map(
             |(what, program, args)| match sys.runner.run_checked(program, &args, None) {
@@ -160,7 +160,22 @@ pub fn teardown(server: &ServerConfig, sys: System<'_>) -> Vec<String> {
                 Err(e) => format!("could not remove {what}: {e}"),
             },
         )
-        .collect()
+        .collect();
+    // A failed apply's hold on new connections (issue #56); usually there's
+    // none, so only a removal is worth a line.
+    if server.firewall.backend == FirewallBackend::IptablesNft {
+        for rule in crate::apply::hold_rules(server) {
+            let args = crate::apply::hold_args("-D", &rule);
+            if sys
+                .runner
+                .run("iptables", &args, None)
+                .is_ok_and(|o| o.ok())
+            {
+                log.push(format!("removed the hold on {} {}", rule[0], rule[2]));
+            }
+        }
+    }
+    log
 }
 
 #[cfg(test)]
@@ -337,5 +352,52 @@ mod tests {
             "{log:?}"
         );
         assert_eq!(log[1], "removed interface wg0");
+    }
+
+    /// Issue #56: on iptables, a hold a failed apply left goes too, and
+    /// only a hold that was there gets a line.
+    #[test]
+    fn teardown_removes_a_left_hold_on_new_connections() {
+        let mut config = canonical_config();
+        config.server.firewall.backend = FirewallBackend::IptablesNft;
+        let fs = MemoryFs::new();
+        let runner = RecordingRunner::new();
+        // The tailscale holds aren't there.
+        for chain in ["INPUT", "FORWARD"] {
+            let rule = crate::apply::hold_rules(&config.server)
+                .into_iter()
+                .find(|r| r[0] == chain && r[2] == "tailscale0")
+                .unwrap();
+            runner.respond_to(
+                "iptables",
+                &crate::apply::hold_args("-D", &rule),
+                Output {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Bad rule".into(),
+                },
+            );
+        }
+        let log = teardown(
+            &config.server,
+            System {
+                fs: &fs,
+                runner: &runner,
+            },
+        );
+        assert_eq!(
+            runner.command_lines().len(),
+            5,
+            "{:?}",
+            runner.command_lines()
+        );
+        assert_eq!(
+            log,
+            [
+                "removed interface wg0",
+                "removed the hold on INPUT wg0",
+                "removed the hold on FORWARD wg0"
+            ]
+        );
     }
 }

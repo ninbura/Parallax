@@ -171,20 +171,49 @@ fn apply_firewall(
             }
             // The restore file declares every PARALLAX_* chain, which creates
             // it or flushes it in the same transaction as its refill, so no
-            // chain is ever empty. But each table commits at its own COMMIT:
-            // if `nat` fails, `filter` is already in (issue #56). The dry run
-            // stops syntax errors and missing sets before either table
-            // changes. A kernel refusing a `nat` rule still leaves new
-            // filter rules with old NAT, which reach no more than the filter
-            // allows (`firewall::check_layers`, docs/design.md); the daemon
-            // retries.
+            // chain is ever empty. But each table commits at its own COMMIT
+            // (issue #56): for a moment, or for good if `nat` fails, the new
+            // filter runs with the old NAT, and a connection opened then
+            // keeps that NAT for its life. A stale masquerade, say, shows a
+            // newly granted peer to the LAN as the gateway. So first a dry
+            // run, which stops syntax errors and missing sets before either
+            // table changes; then tunnel peers open no new connections until
+            // both tables are in. Open ones carry on under the NAT they
+            // started with. If the restore fails, the hold stays until an
+            // apply succeeds (the daemon retries).
             sys.runner.run_checked(
                 "iptables-restore",
                 &["--test", "--noflush", &main_str],
                 None,
             )?;
+            let hold = hold_rules(model.server());
+            for rule in &hold {
+                // At most one of each: a failed apply may have left it.
+                sys.runner.run("iptables", &hold_args("-D", rule), None)?;
+                sys.runner
+                    .run_checked("iptables", &hold_args("-I", rule), None)?;
+            }
             sys.runner
-                .run_checked("iptables-restore", &["--noflush", &main_str], None)?;
+                .run_checked("iptables-restore", &["--noflush", &main_str], None)
+                .map_err(|e| match e {
+                    Error::Command {
+                        command,
+                        status,
+                        stderr,
+                    } => Error::Command {
+                        command,
+                        status,
+                        stderr: format!(
+                            "{}; tunnel peers can't open new connections until an apply succeeds (issue #56)",
+                            stderr.trim_end()
+                        ),
+                    },
+                    e => e,
+                })?;
+            for rule in &hold {
+                sys.runner
+                    .run_checked("iptables", &hold_args("-D", rule), None)?;
+            }
             // Chains of tiers that no longer exist: nothing jumps to them
             // since the restore, so they can go.
             let listing = sys
@@ -398,6 +427,51 @@ pub fn apply(
     Ok(ApplyReport { log })
 }
 
+/// Comment on the hold rules, one word so `iptables -S` prints it plain.
+pub const HOLD_COMMENT: &str = "parallax-hold";
+
+/// What keeps tunnel peers from opening connections while `iptables-restore`
+/// swaps the rules (issue #56): one rule per tunnel interface at the top of
+/// INPUT and FORWARD, dropping their new flows. Each is the rule as
+/// `iptables -t filter <-I|-D>` takes it.
+pub fn hold_rules(server: &crate::model::ServerConfig) -> Vec<Vec<String>> {
+    let mut rules = Vec::new();
+    for t in crate::transport::all() {
+        let iface = t.ingress_interface(server);
+        for chain in ["INPUT", "FORWARD"] {
+            rules.push(
+                [
+                    chain,
+                    "-i",
+                    &iface,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "NEW",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    HOLD_COMMENT,
+                    "-j",
+                    "DROP",
+                ]
+                .map(String::from)
+                .to_vec(),
+            );
+        }
+    }
+    rules
+}
+
+/// `iptables` arguments to insert (`-I`, at the top) or delete (`-D`) one
+/// of [`hold_rules`].
+pub fn hold_args<'a>(op: &'a str, rule: &'a [String]) -> Vec<&'a str> {
+    ["-t", "filter", op]
+        .into_iter()
+        .chain(rule.iter().map(String::as_str))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "test")]
@@ -571,7 +645,9 @@ mod tests {
                 fs: &fs,
                 runner: &runner,
             };
-            assert!(apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).is_err());
+            let err = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys)
+                .unwrap_err()
+                .to_string();
             let lines = runner.command_lines();
             let ran = |args: &[&str]| {
                 let line = format!("iptables-restore {}", args.join(" "));
@@ -579,6 +655,24 @@ mod tests {
             };
             assert!(ran(failing), "{lines:#?}");
             assert_eq!(ran(&restore), failing == restore, "{lines:#?}");
+            // The hold: never placed when the dry run fails; placed for
+            // both transports' INPUT and FORWARD, and left, when the
+            // restore fails, which the error says.
+            let holds: Vec<&String> = lines.iter().filter(|l| l.contains(HOLD_COMMENT)).collect();
+            if failing == dry_run {
+                assert!(holds.is_empty(), "{lines:#?}");
+            } else {
+                let placed = holds.iter().filter(|l| l.contains(" -I ")).count();
+                assert_eq!(placed, 4, "{lines:#?}");
+                assert!(
+                    holds.last().is_some_and(|l| l.contains(" -I ")),
+                    "{lines:#?}"
+                );
+                assert!(
+                    err.contains("tunnel peers can't open new connections until an apply succeeds"),
+                    "{err}"
+                );
+            }
             for name in &retired {
                 assert!(
                     !lines
