@@ -51,6 +51,45 @@ fn check_golden(name: &str, actual: &str) {
     }
 }
 
+/// `text` with each set named for a reader: a tier's set (`wg_<16 hex>`)
+/// by its tier's label (`wg_family`), a shared one (`not_public_<16 hex>`)
+/// by its base name (`not_public`). The hashes follow what each set means
+/// (issue #35), so they change with the scenario and say nothing to a
+/// reader.
+fn tier_names(text: &str) -> String {
+    let mut out = text.to_owned();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(name) = line
+            .trim()
+            .strip_prefix("set ")
+            .and_then(|r| r.strip_suffix(" {"))
+        else {
+            continue;
+        };
+        let Some((base, _hash)) = name.rsplit_once('_') else {
+            continue;
+        };
+        // Only this set's own lines: a shared set may have no comment.
+        let label = lines
+            .by_ref()
+            .take_while(|l| l.trim() != "}")
+            .find_map(|l| {
+                let (_, tier) = l
+                    .trim()
+                    .strip_prefix("comment \"")?
+                    .split_once(" of tier ")?;
+                tier.split([' ', '"']).next()
+            });
+        let readable = match label {
+            Some(label) => format!("{base}_{label}"),
+            None => base.to_owned(),
+        };
+        out = out.replace(name, &readable);
+    }
+    out
+}
+
 fn bundle_for(config: &Config) -> Bundle {
     let model = Model::resolve(config, today()).expect("valid");
     generate::generate_all(&model, &fs_with_server_key()).expect("generate")
@@ -220,34 +259,32 @@ fn proxied_service_gets_no_direct_accept() {
     cfg.networks[0].gateway_address = Some("192.168.1.5".parse().unwrap());
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // Set names follow each scenario's access (issue #35).
+    let fw_text = tier_names(&fw.contents);
     check_golden("variants/proxied-service.nft", &fw.contents);
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     check_golden("variants/proxied-service-routes.toml", &routes.contents);
     assert!(
-        !fw.contents
+        !fw_text
             .lines()
             .any(|l| l.contains("service immich") && l.contains(" accept ")),
         "family must not reach immich directly, not even on the gateway host:\n{}",
-        fw.contents
+        fw_text
     );
-    assert!(fw
-        .contents
-        .contains("drop comment \"family: default deny\""));
+    assert!(fw_text.contains("drop comment \"family: default deny\""));
     // Family's HTTPS to Immich's client address goes to the proxy, before
     // NETMAP would send it to the real host; only family may reach the proxy.
-    let pre: Vec<&str> = fw
-        .contents
+    let pre: Vec<&str> = fw_text
         .lines()
         .skip_while(|l| !l.contains("chain prerouting"))
         .collect();
     assert!(pre[2].contains(
-        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
+        "iifname \"wg0\" ip saddr @wg_family ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
     ), "{pre:#?}");
     assert!(pre.iter().any(|l| l.contains("netmap home")));
-    assert!(!fw.contents.contains("personal/wireguard: https proxy"));
-    assert!(fw.contents.contains(
-        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 10.8.0.1 tcp dport 8443 accept"
-    ));
+    assert!(!fw_text.contains("personal/wireguard: https proxy"));
+    assert!(fw_text
+        .contains("iifname \"wg0\" ip saddr @wg_family ip daddr 10.8.0.1 tcp dport 8443 accept"));
 }
 
 #[test]
@@ -268,11 +305,12 @@ fn no_proxy_redirect_where_a_grant_reaches_the_host_directly() {
 fn tunnel_peers_are_checked_on_every_packet() {
     let bundle = bundle_for(&canonical_config());
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // Set names follow each scenario's access (issue #35).
+    let fw_text = tier_names(&fw.contents);
     // No blanket "established" accept: a removed grant cuts open flows.
-    assert!(!fw.contents.contains("established"), "{}", fw.contents);
+    assert!(!fw_text.contains("established"), "{}", fw_text);
     for chain in ["chain input", "chain forward"] {
-        let body: Vec<&str> = fw
-            .contents
+        let body: Vec<&str> = fw_text
             .lines()
             .skip_while(|l| !l.contains(chain))
             .take_while(|l| !l.trim().starts_with('}'))
@@ -286,14 +324,11 @@ fn tunnel_peers_are_checked_on_every_packet() {
     }
     // A packet sees its own tier's rules only: one lookup by source
     // address picks the chain, however many peers and tiers there are.
-    assert!(fw.contents.contains(
+    assert!(fw_text.contains(
         "iifname \"wg0\" ip saddr vmap { 10.8.1.1 : jump tier_0, 10.8.1.2 : jump tier_0, 10.8.2.1 : jump tier_1 }"
     ));
-    assert!(fw
-        .contents
-        .contains("iifname \"tailscale0\" ip saddr @ts_f62eed6a1a23f069 jump tier_1"));
-    let family: Vec<&str> = fw
-        .contents
+    assert!(fw_text.contains("iifname \"tailscale0\" ip saddr @ts_family jump tier_1"));
+    let family: Vec<&str> = fw_text
         .lines()
         .skip_while(|l| !l.contains("chain tier_1 {"))
         .take_while(|l| !l.trim().starts_with('}'))
@@ -310,9 +345,10 @@ fn gateway_address_turns_grants_into_input_accepts() {
     cfg.networks[0].gateway_address = Some("192.168.1.5".parse().unwrap());
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // Set names follow each scenario's access (issue #35).
+    let fw_text = tier_names(&fw.contents);
     check_golden("variants/gateway-address.nft", &fw.contents);
-    let input: Vec<&str> = fw
-        .contents
+    let input: Vec<&str> = fw_text
         .lines()
         .skip_while(|l| !l.contains("chain input"))
         .take_while(|l| !l.contains("chain forward"))
@@ -320,12 +356,13 @@ fn gateway_address_turns_grants_into_input_accepts() {
     assert!(
         input
             .iter()
-            .any(|l| l.contains("ip saddr @wg_20deb125664a4b6d ip daddr 192.168.1.5 accept")),
+            .any(|l| l.contains("ip saddr @wg_personal ip daddr 192.168.1.5 accept")),
         "{input:#?}"
     );
     assert!(
-        input.iter().any(|l| l
-            .contains("ip saddr @wg_f62eed6a1a23f069 ip daddr 192.168.1.5 tcp dport 443 accept")),
+        input
+            .iter()
+            .any(|l| l.contains("ip saddr @wg_family ip daddr 192.168.1.5 tcp dport 443 accept")),
         "{input:#?}"
     );
     let drop_idx = input
@@ -462,28 +499,26 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     );
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    // Set names follow each scenario's access (issue #35).
+    let fw_text = tier_names(&fw.contents);
     check_golden("variants/home-public-names.nft", &fw.contents);
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     check_golden("variants/home-public-names-routes.toml", &routes.contents);
     // The game port: accepted out the WAN, masqueraded; still in not_public.
-    assert!(fw.contents.contains(
+    assert!(fw_text.contains(
         "oifname \"eth0\" ip daddr 1.2.3.4 udp dport 25565 accept comment \"family: host game.mydomain.com (1.2.3.4) (a port forward on the home's public IP)\""
-    ), "{}", fw.contents);
+    ), "{}", fw_text);
     // HTTPS by name: redirected to the proxy, which connects to the public IP.
-    assert!(fw.contents.contains(
-        "iifname \"wg0\" ip saddr @wg_f62eed6a1a23f069 ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
-    ), "{}", fw.contents);
+    assert!(fw_text.contains(
+        "iifname \"wg0\" ip saddr @wg_family ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
+    ), "{}", fw_text);
     assert!(
         routes.contents.contains("upstream = \"1.2.3.4:443\""),
         "{}",
         routes.contents
     );
     // Nothing else on the public IP: no all-ports accept.
-    assert!(
-        !fw.contents.contains("ip daddr 1.2.3.4 accept"),
-        "{}",
-        fw.contents
-    );
+    assert!(!fw_text.contains("ip daddr 1.2.3.4 accept"), "{}", fw_text);
     // The owner's tier (all_networks + internet) reaches the public IP
     // anyway: granting it the service adds no redirect to the proxy.
     let mut owner = cfg.clone();
@@ -497,11 +532,13 @@ fn names_on_the_home_public_ip_are_port_forwards() {
         .with_names(names.clone());
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    let fw_text = tier_names(&fw.contents);
+    // The owner's set is there by that name, or the check below says nothing.
+    assert!(fw_text.contains("set wg_personal {"), "{fw_text}");
     assert!(
-        !fw.contents
-            .contains("ip saddr @wg_20deb125664a4b6d ip daddr 1.2.3.4 tcp dport 443 dnat"),
+        !fw_text.contains("ip saddr @wg_personal ip daddr 1.2.3.4 tcp dport 443 dnat"),
         "{}",
-        fw.contents
+        fw_text
     );
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     assert!(
@@ -517,17 +554,16 @@ fn names_on_the_home_public_ip_are_port_forwards() {
         .with_names(names);
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+    let fw_text = tier_names(&fw.contents);
     assert!(
-        fw.contents
-            .contains("ip daddr 1.2.3.4 udp dport 25565 accept"),
+        fw_text.contains("ip daddr 1.2.3.4 udp dport 25565 accept"),
         "{}",
-        fw.contents
+        fw_text
     );
     assert!(
-        fw.contents
-            .contains("masquerade comment \"internet egress\""),
+        fw_text.contains("masquerade comment \"internet egress\""),
         "{}",
-        fw.contents
+        fw_text
     );
 }
 
@@ -723,6 +759,18 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let model = Model::resolve(&cfg, today()).unwrap();
     let fs = fs_with_server_key();
     let bundle = generate::generate_all(&model, &fs).unwrap();
+    // Live set names, as the ruleset gives them.
+    let sets = parallax_core::generate::firewall::build(&model)
+        .unwrap()
+        .sets;
+    let named = |base: &str| {
+        sets.iter()
+            .find(|s| s.name.starts_with(base))
+            .unwrap()
+            .name
+            .clone()
+    };
+    let (live, not_public) = (named("wg_"), named("not_public_"));
     let runner = RecordingRunner::new();
     // A tier went away since the last apply: its chain is still there.
     runner.respond_to(
@@ -735,13 +783,15 @@ fn iptables_apply_refills_chains_in_one_restore() {
         },
     );
     // A set from before grants (not ours to judge by name), one of a tier
-    // that went away, and a live one.
+    // that went away, a live one, and not_public as builds before hashed
+    // set names named it (not ours to judge by name either), beside its
+    // live successor.
     runner.respond_to(
         "ipset",
         &["list", "-n"],
         parallax_core::io::Output {
             status: 0,
-            stdout: "ts_family\nwg_0000000000000000\nwg_f62eed6a1a23f069\nnot_public\n".into(),
+            stdout: format!("ts_family\nwg_0000000000000000\n{live}\nnot_public\n{not_public}\n"),
             stderr: String::new(),
         },
     );
@@ -753,11 +803,19 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let lines = runner.command_lines();
     let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
     // Stale sets go after the restore; live ones and others' stay.
-    let gone = |set: &str| pos(&format!("ipset destroy {set}"));
-    assert!(gone("wg_0000000000000000").unwrap() > pos("iptables-restore").unwrap());
-    assert!(gone("ts_family").is_none());
-    assert!(gone("wg_f62eed6a1a23f069").is_none() && gone("not_public").is_none());
     let restore = pos("iptables-restore --noflush").unwrap();
+    let gone = |set: &str| pos(&format!("ipset destroy {set}"));
+    assert!(gone("wg_0000000000000000").unwrap() > restore);
+    assert!(gone("not_public").is_none() && gone("ts_family").is_none());
+    assert!(gone(&live).is_none() && gone(&not_public).is_none());
+    // Nothing touches a stale set before the restore: the old rules use it
+    // until then, and still do if the restore fails (#35).
+    assert!(
+        !lines[..restore]
+            .iter()
+            .any(|l| l.contains("wg_0000000000000000") || l.ends_with(" not_public")),
+        "{lines:#?}"
+    );
     // No flush of live chains before the restore: that left a window with
     // empty chains, and empty ones if the restore failed.
     assert!(
@@ -765,8 +823,10 @@ fn iptables_apply_refills_chains_in_one_restore() {
         "{lines:#?}"
     );
     // Sets are filled aside and swapped in, never flushed while in use.
-    assert!(pos("ipset swap parallax-swap not_public").unwrap() < restore);
-    assert!(!lines.iter().any(|l| l == "ipset flush not_public"));
+    assert!(pos(&format!("ipset swap parallax-swap {not_public}")).unwrap() < restore);
+    assert!(!lines
+        .iter()
+        .any(|l| l.starts_with("ipset flush not_public")));
     // Only the stale tier chain goes.
     assert!(lines
         .iter()

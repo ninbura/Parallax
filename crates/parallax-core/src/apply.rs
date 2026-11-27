@@ -264,33 +264,35 @@ fn apply_firewall(
 }
 
 /// Sets in an `ipset list -n` listing that Parallax made and the new ruleset
-/// no longer has: a transport's prefix and a tier key, as
-/// [`Transport::set_name`] names them, and the two logging sets. Anything
-/// else listed is someone else's. That includes the `ts_<template>` sets of builds before grants:
-/// they were always empty (no Tailscale peers before M2), and a name built
-/// from a grant could be an operator's own set.
-///
-/// [`Transport::set_name`]: crate::transport::Transport::set_name
+/// no longer has: a transport's prefix or a shared set's base name
+/// (`not_public`) and a 16-digit hash, as `generate::firewall` names them,
+/// and the logging sets' plain names. Anything else listed is someone
+/// else's. That includes the `ts_<template>` sets of builds before grants
+/// (always empty: no Tailscale peers before M2), and the plain `lan_real`
+/// and `not_public` of builds before hashed names: a name built from a grant,
+/// or a word like those, could be an operator's own set.
 fn stale_sets<'a>(
     listing: &'a str,
     keep: &[crate::generate::firewall::AddressSet],
 ) -> Vec<&'a str> {
-    let prefixes: Vec<&str> = crate::transport::all()
+    use crate::generate::firewall::{LAN_SET, LOG_DENIED_SET, LOG_FLOWS_SET, NOT_PUBLIC_SET};
+    let shared = [LAN_SET, NOT_PUBLIC_SET, LOG_FLOWS_SET, LOG_DENIED_SET];
+    // Logging came in shortly before hashed names, under these names.
+    let plain = [LOG_FLOWS_SET, LOG_DENIED_SET];
+    let transports = crate::transport::all();
+    let bases: Vec<&str> = transports
         .iter()
         .map(|t| t.set_prefix())
+        .chain(shared)
         .collect();
-    let tier_key =
+    let hash =
         |key: &str| key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    let logging = [
-        crate::generate::firewall::LOG_FLOWS_SET,
-        crate::generate::firewall::LOG_DENIED_SET,
-    ];
     let ours = |name: &str| {
-        logging.contains(&name)
-            || prefixes.iter().any(|p| {
+        plain.contains(&name)
+            || bases.iter().any(|p| {
                 name.strip_prefix(p)
                     .and_then(|rest| rest.strip_prefix('_'))
-                    .is_some_and(tier_key)
+                    .is_some_and(hash)
             })
     };
     listing
@@ -468,9 +470,10 @@ mod tests {
         assert!(!lines.iter().any(|l| l.ends_with(" remove")), "{lines:#?}");
     }
 
-    /// Only sets named as Parallax names them go: a transport's prefix and
-    /// 16 lowercase hex digits. An operator's `wg_external_allow`, and
-    /// `ts_family` even with a grant `family`, stay.
+    /// Only sets named as Parallax names them go: a transport's prefix or a
+    /// shared set's base and 16 lowercase hex digits, or a logging set's
+    /// plain name. An operator's `wg_external_allow`, `ts_family` even with
+    /// a grant `family`, and a plain `not_public` or `lan_real`, stay.
     #[test]
     fn cleanup_destroys_only_parallaxs_own_sets() {
         let set = |name: &str| AddressSet {
@@ -484,16 +487,75 @@ mod tests {
                        wg_external_allow\nts_family\nts_home_lab\nts_other\n\
                        wg_0123456789ABCDEF\nwg_0123456789abcde\nwg_0123456789abcdef0\n\
                        wg_0123456789abcdeg\nwg0123456789abcdef\nxx_0123456789abcdef\n\
-                       not_public\nlan_real\nparallax-swap\nlog_flows\nlog_denied_x\n\n";
+                       not_public\nlan_real\nparallax-swap\nlog_flows\nlog_denied_x\n\
+                       not_public_00000000000000bb\nlan_real_00000000000000cc\n\
+                       log_denied_00000000000000dd\nnot_public_x\nlan_real_0123\n\n";
         assert_eq!(
             stale_sets(listing, &keep),
             [
                 "wg_fedcba9876543210",
                 "ts_00000000000000ff",
                 "wg_00000000000000aa",
-                "log_flows"
+                "log_flows",
+                "not_public_00000000000000bb",
+                "lan_real_00000000000000cc",
+                "log_denied_00000000000000dd"
             ]
         );
+    }
+
+    /// Issue #35: a failed restore leaves the old rules in place, so the
+    /// sets they use must be exactly as they were: none of the old ruleset's
+    /// sets is filled, swapped or destroyed, only new ones made beside them.
+    #[test]
+    fn a_failed_iptables_restore_leaves_the_old_sets_alone() {
+        let mut cfg = crate::testing::canonical_config();
+        cfg.server.firewall.backend = crate::FirewallBackend::IptablesNft;
+        let old_model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let old: Vec<String> = crate::generate::firewall::build(&old_model)
+            .unwrap()
+            .sets
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        // The issue's save: sister-phone moves from family to personal.
+        cfg.peers[2].grants = vec!["personal".into()];
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "ipset",
+            &["list", "-n"],
+            Output {
+                status: 0,
+                stdout: old.join("\n"),
+                stderr: String::new(),
+            },
+        );
+        runner.respond(
+            "iptables-restore",
+            failed("iptables-restore: line 12 failed"),
+        );
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        assert!(apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).is_err());
+        let lines = runner.command_lines();
+        assert!(
+            lines.iter().any(|l| l.starts_with("iptables-restore")),
+            "{lines:#?}"
+        );
+        for name in &old {
+            assert!(
+                !lines.iter().any(|l| l.split(' ').any(|w| w == name)),
+                "{name} was touched: {lines:#?}"
+            );
+        }
     }
 
     /// Through a whole iptables-nft apply: once the rules are restored, a
