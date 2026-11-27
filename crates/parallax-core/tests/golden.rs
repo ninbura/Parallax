@@ -51,9 +51,11 @@ fn check_golden(name: &str, actual: &str) {
     }
 }
 
-/// `text` with each tier set's name (`wg_<16 hex>`, `ts_<16 hex>`) as its
-/// tier's label (`wg_family`): the names hash each tier's access (issue
-/// #35), so they change with the scenario and say nothing to a reader.
+/// `text` with each set named for a reader: a tier's set (`wg_<16 hex>`)
+/// by its tier's label (`wg_family`), a shared one (`not_public_<16 hex>`)
+/// by its base name (`not_public`). The hashes follow what each set means
+/// (issue #35), so they change with the scenario and say nothing to a
+/// reader.
 fn tier_names(text: &str) -> String {
     let mut out = text.to_owned();
     let mut lines = text.lines();
@@ -62,20 +64,28 @@ fn tier_names(text: &str) -> String {
             .trim()
             .strip_prefix("set ")
             .and_then(|r| r.strip_suffix(" {"))
-            .filter(|n| n.starts_with("wg_") || n.starts_with("ts_"))
         else {
             continue;
         };
-        let label = lines.by_ref().find_map(|l| {
-            let (_, tier) = l
-                .trim()
-                .strip_prefix("comment \"")?
-                .split_once(" of tier ")?;
-            tier.split([' ', '"']).next()
-        });
-        if let Some(label) = label {
-            out = out.replace(name, &format!("{}_{label}", &name[..2]));
-        }
+        let Some((base, _hash)) = name.rsplit_once('_') else {
+            continue;
+        };
+        // Only this set's own lines: a shared set may have no comment.
+        let label = lines
+            .by_ref()
+            .take_while(|l| l.trim() != "}")
+            .find_map(|l| {
+                let (_, tier) = l
+                    .trim()
+                    .strip_prefix("comment \"")?
+                    .split_once(" of tier ")?;
+                tier.split([' ', '"']).next()
+            });
+        let readable = match label {
+            Some(label) => format!("{base}_{label}"),
+            None => base.to_owned(),
+        };
+        out = out.replace(name, &readable);
     }
     out
 }
@@ -523,6 +533,8 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     let fw_text = tier_names(&fw.contents);
+    // The owner's set is there by that name, or the check below says nothing.
+    assert!(fw_text.contains("set wg_personal {"), "{fw_text}");
     assert!(
         !fw_text.contains("ip saddr @wg_personal ip daddr 1.2.3.4 tcp dport 443 dnat"),
         "{}",
@@ -747,14 +759,18 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let model = Model::resolve(&cfg, today()).unwrap();
     let fs = fs_with_server_key();
     let bundle = generate::generate_all(&model, &fs).unwrap();
-    // A live tier set's name, as the ruleset gives it.
-    let live = parallax_core::generate::firewall::build(&model)
+    // Live set names, as the ruleset gives them.
+    let sets = parallax_core::generate::firewall::build(&model)
         .unwrap()
-        .sets
-        .into_iter()
-        .find(|s| s.name.starts_with("wg_"))
-        .unwrap()
-        .name;
+        .sets;
+    let named = |base: &str| {
+        sets.iter()
+            .find(|s| s.name.starts_with(base))
+            .unwrap()
+            .name
+            .clone()
+    };
+    let (live, not_public) = (named("wg_"), named("not_public_"));
     let runner = RecordingRunner::new();
     // A tier went away since the last apply: its chain is still there.
     runner.respond_to(
@@ -767,13 +783,14 @@ fn iptables_apply_refills_chains_in_one_restore() {
         },
     );
     // A set from before grants (not ours to judge by name), one of a tier
-    // that went away, and a live one.
+    // that went away, a live one, and not_public as builds before hashed
+    // set names named it, beside its live successor.
     runner.respond_to(
         "ipset",
         &["list", "-n"],
         parallax_core::io::Output {
             status: 0,
-            stdout: format!("ts_family\nwg_0000000000000000\n{live}\nnot_public\n"),
+            stdout: format!("ts_family\nwg_0000000000000000\n{live}\nnot_public\n{not_public}\n"),
             stderr: String::new(),
         },
     );
@@ -785,18 +802,20 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let lines = runner.command_lines();
     let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
     // Stale sets go after the restore; live ones and others' stay.
-    let gone = |set: &str| pos(&format!("ipset destroy {set}"));
-    assert!(gone("wg_0000000000000000").unwrap() > pos("iptables-restore").unwrap());
-    assert!(gone("ts_family").is_none());
-    assert!(gone(&live).is_none() && gone("not_public").is_none());
     let restore = pos("iptables-restore --noflush").unwrap();
-    // A stale set is emptied before the restore: the old rules still use
-    // it, and a peer that moved to an unchanged tier would otherwise have
-    // both tiers' access until the restore, or for good if it failed (#35).
-    let flushed = |set: &str| pos(&format!("ipset flush {set}"));
-    assert!(flushed("wg_0000000000000000").unwrap() < restore);
-    assert!(flushed("ts_family").is_none() && flushed(&live).is_none());
-    assert!(flushed("not_public").is_none());
+    let gone = |set: &str| pos(&format!("ipset destroy {set}"));
+    assert!(gone("wg_0000000000000000").unwrap() > restore);
+    assert!(gone("not_public").unwrap() > restore);
+    assert!(gone("ts_family").is_none());
+    assert!(gone(&live).is_none() && gone(&not_public).is_none());
+    // Nothing touches a stale set before the restore: the old rules use it
+    // until then, and still do if the restore fails (#35).
+    assert!(
+        !lines[..restore]
+            .iter()
+            .any(|l| l.contains("wg_0000000000000000") || l.ends_with(" not_public")),
+        "{lines:#?}"
+    );
     // No flush of live chains before the restore: that left a window with
     // empty chains, and empty ones if the restore failed.
     assert!(
@@ -804,8 +823,10 @@ fn iptables_apply_refills_chains_in_one_restore() {
         "{lines:#?}"
     );
     // Sets are filled aside and swapped in, never flushed while in use.
-    assert!(pos("ipset swap parallax-swap not_public").unwrap() < restore);
-    assert!(!lines.iter().any(|l| l == "ipset flush not_public"));
+    assert!(pos(&format!("ipset swap parallax-swap {not_public}")).unwrap() < restore);
+    assert!(!lines
+        .iter()
+        .any(|l| l.starts_with("ipset flush not_public")));
     // Only the stale tier chain goes.
     assert!(lines
         .iter()

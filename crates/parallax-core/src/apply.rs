@@ -145,12 +145,6 @@ fn apply_firewall(
         FirewallBackend::IptablesNft => {
             use crate::generate::firewall::iptables::CHAINS;
             let rs = crate::generate::firewall::build(model)?;
-            // Sets this ruleset drops: those of tiers that went away or whose
-            // access changed (they get a new name, issue #35), and the
-            // logging sets once nobody is logged. Listed before anything
-            // changes, so a failed listing changes nothing.
-            let listing = sys.runner.run_checked("ipset", &["list", "-n"], None)?;
-            let stale = stale_sets(&listing.stdout, &rs.sets);
             // Fill a fresh set and swap it in: flushing the live one would
             // briefly leave `! --match-set not_public` matching everything.
             // One short scratch name: ipset names stop at 31 characters.
@@ -174,15 +168,6 @@ fn apply_firewall(
                 sys.runner
                     .run_checked("ipset", &["swap", next, &set.name], None)?;
                 sys.runner.run_checked("ipset", &["destroy", next], None)?;
-            }
-            // The old rules still use the stale sets until the restore. A peer
-            // that left a changed tier for an unchanged one is in the new
-            // tier's set already, and would have both tiers' access until
-            // then, or for good if the restore failed. Emptied, the stale
-            // sets give nobody anything; their tiers' peers have only what
-            // their new sets give them, and only once the new rules are in.
-            for name in &stale {
-                sys.runner.run_checked("ipset", &["flush", name], None)?;
             }
             // The restore file declares every PARALLAX_* chain, which creates
             // it or flushes it in the same transaction as the refill: no
@@ -209,10 +194,17 @@ fn apply_firewall(
                 sys.runner
                     .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
             }
-            // No rule uses the stale sets since the restore. The rules are in
-            // by now, so a failure here is only a leftover (empty) set: say so
-            // and carry on to the hooks.
-            for name in stale {
+            // Sets of tiers that no longer exist, and the logging sets once
+            // nobody is logged: no rule uses them since the restore. The rules are in by now, so a failure here is only a
+            // leftover set: say so and carry on to the hooks.
+            let live = sys.runner.run("ipset", &["list", "-n"], None)?;
+            if !live.ok() {
+                log.push(format!(
+                    "firewall: couldn't list ipsets, stale sets stay: {}",
+                    live.stderr.trim()
+                ));
+            }
+            for name in stale_sets(&live.stdout, &rs.sets) {
                 let destroy = sys.runner.run("ipset", &["destroy", name], None)?;
                 if !destroy.ok() {
                     log.push(format!(
@@ -272,33 +264,32 @@ fn apply_firewall(
 }
 
 /// Sets in an `ipset list -n` listing that Parallax made and the new ruleset
-/// no longer has: a transport's prefix and a tier key, as
-/// [`Transport::set_name`] names them, and the two logging sets. Anything
+/// no longer has: a transport's prefix or a shared set's base name
+/// (`not_public`) and a 16-digit hash, as `generate::firewall` names them,
+/// and the shared sets' plain names from builds before those hashes. Anything
 /// else listed is someone else's. That includes the `ts_<template>` sets of builds before grants:
 /// they were always empty (no Tailscale peers before M2), and a name built
 /// from a grant could be an operator's own set.
-///
-/// [`Transport::set_name`]: crate::transport::Transport::set_name
 fn stale_sets<'a>(
     listing: &'a str,
     keep: &[crate::generate::firewall::AddressSet],
 ) -> Vec<&'a str> {
-    let prefixes: Vec<&str> = crate::transport::all()
+    use crate::generate::firewall::{LAN_SET, LOG_DENIED_SET, LOG_FLOWS_SET, NOT_PUBLIC_SET};
+    let shared = [LAN_SET, NOT_PUBLIC_SET, LOG_FLOWS_SET, LOG_DENIED_SET];
+    let transports = crate::transport::all();
+    let bases: Vec<&str> = transports
         .iter()
         .map(|t| t.set_prefix())
+        .chain(shared)
         .collect();
-    let tier_key =
+    let hash =
         |key: &str| key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    let logging = [
-        crate::generate::firewall::LOG_FLOWS_SET,
-        crate::generate::firewall::LOG_DENIED_SET,
-    ];
     let ours = |name: &str| {
-        logging.contains(&name)
-            || prefixes.iter().any(|p| {
+        shared.contains(&name)
+            || bases.iter().any(|p| {
                 name.strip_prefix(p)
                     .and_then(|rest| rest.strip_prefix('_'))
-                    .is_some_and(tier_key)
+                    .is_some_and(hash)
             })
     };
     listing
@@ -476,9 +467,10 @@ mod tests {
         assert!(!lines.iter().any(|l| l.ends_with(" remove")), "{lines:#?}");
     }
 
-    /// Only sets named as Parallax names them go: a transport's prefix and
-    /// 16 lowercase hex digits. An operator's `wg_external_allow`, and
-    /// `ts_family` even with a grant `family`, stay.
+    /// Only sets named as Parallax names them go: a transport's prefix or a
+    /// shared set's base and 16 lowercase hex digits, or a shared set's
+    /// plain name from before those hashes. An operator's
+    /// `wg_external_allow`, and `ts_family` even with a grant `family`, stay.
     #[test]
     fn cleanup_destroys_only_parallaxs_own_sets() {
         let set = |name: &str| AddressSet {
@@ -492,16 +484,77 @@ mod tests {
                        wg_external_allow\nts_family\nts_home_lab\nts_other\n\
                        wg_0123456789ABCDEF\nwg_0123456789abcde\nwg_0123456789abcdef0\n\
                        wg_0123456789abcdeg\nwg0123456789abcdef\nxx_0123456789abcdef\n\
-                       not_public\nlan_real\nparallax-swap\nlog_flows\nlog_denied_x\n\n";
+                       not_public\nlan_real\nparallax-swap\nlog_flows\nlog_denied_x\n\
+                       not_public_00000000000000bb\nlan_real_00000000000000cc\n\
+                       log_denied_00000000000000dd\nnot_public_x\nlan_real_0123\n\n";
         assert_eq!(
             stale_sets(listing, &keep),
             [
                 "wg_fedcba9876543210",
                 "ts_00000000000000ff",
                 "wg_00000000000000aa",
-                "log_flows"
+                "not_public",
+                "lan_real",
+                "log_flows",
+                "not_public_00000000000000bb",
+                "lan_real_00000000000000cc",
+                "log_denied_00000000000000dd"
             ]
         );
+    }
+
+    /// Issue #35: a failed restore leaves the old rules in place, so the
+    /// sets they use must be exactly as they were: none of the old ruleset's
+    /// sets is filled, swapped or destroyed, only new ones made beside them.
+    #[test]
+    fn a_failed_iptables_restore_leaves_the_old_sets_alone() {
+        let mut cfg = crate::testing::canonical_config();
+        cfg.server.firewall.backend = crate::FirewallBackend::IptablesNft;
+        let old_model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let old: Vec<String> = crate::generate::firewall::build(&old_model)
+            .unwrap()
+            .sets
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        // The issue's save: sister-phone moves from family to personal.
+        cfg.peers[2].grants = vec!["personal".into()];
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "ipset",
+            &["list", "-n"],
+            Output {
+                status: 0,
+                stdout: old.join("\n"),
+                stderr: String::new(),
+            },
+        );
+        runner.respond(
+            "iptables-restore",
+            failed("iptables-restore: line 12 failed"),
+        );
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        assert!(apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).is_err());
+        let lines = runner.command_lines();
+        assert!(
+            lines.iter().any(|l| l.starts_with("iptables-restore")),
+            "{lines:#?}"
+        );
+        for name in &old {
+            assert!(
+                !lines.iter().any(|l| l.split(' ').any(|w| w == name)),
+                "{name} was touched: {lines:#?}"
+            );
+        }
     }
 
     /// Through a whole iptables-nft apply: once the rules are restored, a
@@ -556,7 +609,8 @@ mod tests {
             .collect();
         assert_eq!(
             destroyed,
-            ["wg_fedcba9876543210", "ts_00000000000000ff"],
+            // The plain not_public of builds before set names were hashed.
+            ["not_public", "wg_fedcba9876543210", "ts_00000000000000ff"],
             "{lines:#?}"
         );
         let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();

@@ -274,6 +274,8 @@ pub struct Ruleset {
 }
 
 pub const TABLE: &str = "parallax";
+/// Shared sets' base names: each set is named `<base>_<16 hex>`, the hash
+/// of what it means ([`build`]; issue #35).
 pub const LAN_SET: &str = "lan_real";
 pub const NOT_PUBLIC_SET: &str = "not_public";
 /// Peers whose connections are logged.
@@ -835,48 +837,65 @@ pub fn build(model: &Model<'_>) -> Result<Ruleset> {
                 .push(Rule::new(Chain::Forward, Action::Accept, "parallax").oif(iface));
         }
     }
-    name_tier_sets(&mut rs, tiers, &transports);
+    name_sets(&mut rs, tiers, &transports);
     Ok(rs)
 }
 
-/// Name each tier's sets after the access they give, not only the tier's
-/// grants: its label and every rule that uses the set or sits in the
-/// tier's chain. On iptables, apply fills sets before `iptables-restore`
-/// swaps the rules, so a set whose rules changed under the same name would
-/// put its new members under the old rules until the restore, or for good
-/// if it failed (issue #35). With a new name, the new set is filled while
-/// the old rules still use the old one, and the restore moves to it in one
-/// step. An unchanged tier keeps its name, so a peer joining it gets
-/// exactly its rules early. nftables loads sets and rules in one
-/// transaction and is indifferent.
-fn name_tier_sets(
-    rs: &mut Ruleset,
-    tiers: &[Tier<'_>],
-    transports: &[Box<dyn transport::Transport>],
-) {
-    for t in tiers {
-        for tr in transports {
-            let old = tr.set_name(t);
-            let uses = |m: &Match| matches!(m, Match::Set(s) | Match::NotSet(s) if *s == old);
-            let mut access = t.label();
-            for r in rs
-                .rules
+/// Name every set after what it means: its members, and every rule that
+/// uses it or, for a tier's set, sits in the tier's chain (`wg_<16 hex>`,
+/// `not_public_<16 hex>`). On iptables, apply fills sets before
+/// `iptables-restore` swaps the rules. A set whose meaning changed under
+/// its old name would put the old rules to work on its new members or
+/// addresses until the restore, or for good if it failed (issue #35): a
+/// peer moved into a tier would get the tier's old rules, a peer that left
+/// one would get both tiers' access. With these names, a set the old rules
+/// use never changes; apply fills new sets beside them, and the restore
+/// moves every rule to the new ones in one step. Unchanged sets keep their
+/// names. nftables loads sets and rules in one transaction and is
+/// indifferent.
+fn name_sets(rs: &mut Ruleset, tiers: &[Tier<'_>], transports: &[Box<dyn transport::Transport>]) {
+    let tier_sets: Vec<(String, &'static str, usize)> = tiers
+        .iter()
+        .flat_map(|t| {
+            transports
                 .iter()
-                .filter(|r| r.chain == Chain::Tier(t.index) || uses(&r.src) || uses(&r.dst))
-            {
-                access.push('\n');
-                access.push_str(&nft::rule(r));
-            }
-            let new = format!("{}_{}", tr.set_prefix(), crate::tier::fnv64(&access));
-            for set in rs.sets.iter_mut().filter(|s| s.name == old) {
-                set.name.clone_from(&new);
-            }
-            for r in &mut rs.rules {
-                for m in [&mut r.src, &mut r.dst] {
-                    if let Match::Set(s) | Match::NotSet(s) = m {
-                        if *s == old {
-                            s.clone_from(&new);
-                        }
+                .map(move |tr| (tr.set_name(t), tr.set_prefix(), t.index))
+        })
+        .collect();
+    // Shared sets first: tier rules use them, so a tier set's name then
+    // covers what they hold too.
+    let shared: Vec<String> = rs
+        .sets
+        .iter()
+        .map(|s| s.name.clone())
+        .filter(|n| !tier_sets.iter().any(|(t, ..)| t == n))
+        .collect();
+    let order = shared
+        .iter()
+        .map(|n| (n.as_str(), n.as_str(), None))
+        .chain(tier_sets.iter().map(|(n, p, i)| (n.as_str(), *p, Some(*i))));
+    for (old, base, tier) in order {
+        let Some(set) = rs.sets.iter_mut().find(|s| s.name == old) else {
+            continue;
+        };
+        let uses = |m: &Match| matches!(m, Match::Set(s) | Match::NotSet(s) if s == old);
+        let mut meaning = old.to_owned();
+        for e in &set.elements {
+            meaning.push_str(&format!("\n{e}"));
+        }
+        for r in rs.rules.iter().filter(|r| {
+            tier.is_some_and(|i| r.chain == Chain::Tier(i)) || uses(&r.src) || uses(&r.dst)
+        }) {
+            // The chain too: the same rule means something else elsewhere.
+            meaning.push_str(&format!("\n{:?} {}", r.chain, nft::rule(r)));
+        }
+        let new = format!("{base}_{}", crate::tier::fnv64(&meaning));
+        set.name.clone_from(&new);
+        for r in &mut rs.rules {
+            for m in [&mut r.src, &mut r.dst] {
+                if let Match::Set(s) | Match::NotSet(s) = m {
+                    if s == old {
+                        s.clone_from(&new);
                     }
                 }
             }
@@ -1378,21 +1397,23 @@ mod tests {
     }
 
     /// Issue #35: on iptables, sets are filled before the rules change, so a
-    /// tier whose access changes gets a set of another name; one whose
-    /// members change keeps its own.
+    /// set the old rules use must never change: a tier whose members or
+    /// access change gets a set of another name, and so does a shared set
+    /// whose addresses change. The same input gives the same names.
     #[test]
-    fn a_tier_set_is_renamed_when_its_access_changes_not_its_members() {
+    fn a_set_is_renamed_when_what_it_means_changes() {
         use crate::model::Rule as Grant;
         let cfg = crate::testing::canonical_config();
         let personal = tier_set(&cfg, "personal");
+        let family = tier_set(&cfg, "family");
 
         let mut joined = cfg.clone();
         joined.peers[2].grants = vec!["personal".into()];
-        assert_eq!(tier_set(&joined, "personal"), personal, "a member joined");
+        assert_ne!(tier_set(&joined, "personal"), personal, "a member joined");
 
         // The issue's case: personal shrinks to public_dns, and sister-phone
         // moves into it, in one save.
-        let mut shrunk = joined.clone();
+        let mut shrunk = cfg.clone();
         let p = shrunk
             .grants
             .iter()
@@ -1400,10 +1421,10 @@ mod tests {
             .unwrap();
         shrunk.grants[p].rules = vec![Grant::PublicDns];
         assert_ne!(tier_set(&shrunk, "personal"), personal, "its rules changed");
+        assert_eq!(tier_set(&shrunk, "family"), family, "family didn't change");
 
         // What a rule means can change under the same rule: the service's
         // ports.
-        let family = tier_set(&cfg, "family");
         let mut moved = cfg.clone();
         moved.services[0].ports = vec!["2283/tcp".parse().unwrap()];
         assert_ne!(tier_set(&moved, "family"), family, "its service changed");
@@ -1412,6 +1433,27 @@ mod tests {
             family,
             "the same input, the same name"
         );
+
+        // A shared set: the addresses family's internet doesn't reach
+        // include the home's public IP once it's known.
+        let mut online = cfg.clone();
+        online.grants[1].rules.push(Grant::Internet);
+        let shared = |public: Option<std::net::Ipv4Addr>| {
+            let model = Model::resolve(&online, crate::testing::today())
+                .unwrap()
+                .with_public_ip(public);
+            build(&model)
+                .unwrap()
+                .sets
+                .into_iter()
+                .find(|s| s.name.starts_with(NOT_PUBLIC_SET))
+                .unwrap()
+                .name
+        };
+        let before = shared(None);
+        assert!(before.starts_with("not_public_") && before.len() == 27);
+        assert_ne!(shared(Some([1, 2, 3, 4].into())), before, "the home's IP");
+        assert_eq!(shared(None), before);
     }
 
     #[test]

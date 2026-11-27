@@ -41,7 +41,7 @@ pub trait Transport {
     /// The named address set holding `tier`'s members on this transport,
     /// which the firewall matches them by. Named by the tier's grants
     /// ([`Tier::key`]) while the ruleset is built; the firewall then renames
-    /// it after the tier's whole access (issue #35). At most 19 characters
+    /// it after its members and the rules that use it (issue #35). At most 19 characters
     /// either way (ipset's limit is 31).
     fn set_name(&self, tier: &Tier<'_>) -> String {
         format!("{}_{}", self.set_prefix(), tier.key())

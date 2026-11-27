@@ -131,7 +131,7 @@ grant of its name.
 Activity logging (`logging.rs`, docs/logging.md) is per peer, not per tier:
 a peer's own `log` wins, then the most detailed `log` among its grants, then
 `server.logs.level`. The firewall keeps two address sets, `log_flows` and
-`log_denied`, marks the new flows of the first (connection mark bit
+`log_denied` (each name followed by a hash of its members), marks the new flows of the first (connection mark bit
 `0x20000000`) and hands the blocked attempts of the second to nflog group
 20568, rate-limited, before each drop they can reach (a tier's default deny,
 the unknown-source drop, the gateway host's). With nobody logged none of it
@@ -204,8 +204,8 @@ and only use the methods above `provision`. That is why the M1 nftables table
 already has its final shape: NETMAP matches `{ "wg0", "tailscale0" }`, every
 tier has a member set per transport (`wg_<key>`, and `ts_<key>`, the
 addresses Headscale gave the tier's Tailscale peers' nodes, ADR 0014; the key
-is a hash of the tier's label and every rule that uses the set or sits in its
-chain, so a set name never changes meaning between applies), and both
+is a hash of the set's members and every rule that uses it or sits in the
+tier's chain, so a set name never changes meaning between applies), and both
 transports end with a catch-all deny.
 `TailscaleTransport` implements those today and returns `NotImplemented` for
 provision/export.
@@ -434,12 +434,17 @@ clients/<peer>/<platform>.conf     only for peers that retain their private key 
 `iptables-nft` backend writes `iptables/parallax.rules` (iptables-restore
 format, PARALLAX_* chains) and `iptables/docker-user.rules` instead.
 Its sets live in the host's one ipset namespace, so apply removes only
-stale sets named as Parallax names them (`wg_` or `ts_` and a 16-digit hex
-hash, `log_flows`, `log_denied`) and leaves every other set alone. Builds before named grants made
+stale sets named as Parallax names them (`wg_`, `ts_`, `lan_real_`,
+`not_public_`, `log_flows_` or `log_denied_` and a 16-digit hex hash, or
+the shared sets' plain names from earlier builds) and leaves every other
+set alone. Builds before named grants made
 empty `ts_<template>` sets; those stay until removed with `ipset destroy`.
-Apply fills the new sets first, empties the stale ones (the old rules
-still use them, and a peer that moved tiers would otherwise match both),
-then restores the rules in one step and destroys the stale sets.
+Every set is named after what it means: its members and the rules that use
+it. apply fills sets before `iptables-restore` swaps the rules, so a set
+the old rules use must not change: a changed set gets a new name and is
+filled beside the old one, the restore moves every rule to the new sets in
+one step, and the old ones are destroyed after it. A failed restore leaves
+the old rules with exactly the sets they had (issue #35).
 
 ## Apply order and idempotency
 
