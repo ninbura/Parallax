@@ -688,7 +688,8 @@ fn iptables_apply_refills_chains_in_one_restore() {
             stderr: String::new(),
         },
     );
-    // A set from before grants, one of a tier that went away, and a live one.
+    // A set from before grants (not ours to judge by name), one of a tier
+    // that went away, and a live one.
     runner.respond_to(
         "ipset",
         &["list", "-n"],
@@ -705,10 +706,10 @@ fn iptables_apply_refills_chains_in_one_restore() {
     parallax_core::apply::apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
     let lines = runner.command_lines();
     let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
-    // Stale sets go after the restore; live ones stay.
+    // Stale sets go after the restore; live ones and others' stay.
     let gone = |set: &str| pos(&format!("ipset destroy {set}"));
-    assert!(gone("ts_family").unwrap() > pos("iptables-restore").unwrap());
-    assert!(gone("wg_0000000000000000").is_some());
+    assert!(gone("wg_0000000000000000").unwrap() > pos("iptables-restore").unwrap());
+    assert!(gone("ts_family").is_none());
     assert!(gone("wg_f62eed6a1a23f069").is_none() && gone("not_public").is_none());
     let restore = pos("iptables-restore --noflush").unwrap();
     // No flush of live chains before the restore: that left a window with

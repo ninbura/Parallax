@@ -195,16 +195,23 @@ fn apply_firewall(
                     .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
             }
             // Sets of tiers that no longer exist: no rule uses them since the
-            // restore.
+            // restore. The rules are in by now, so a failure here is only a
+            // leftover set: say so and carry on to the hooks.
             let live = sys.runner.run("ipset", &["list", "-n"], None)?;
-            let grants: Vec<&str> = model
-                .config()
-                .grants
-                .iter()
-                .map(|g| g.name.as_str())
-                .collect();
-            for name in stale_sets(&live.stdout, &rs.sets, &grants) {
-                sys.runner.run("ipset", &["destroy", name], None)?;
+            if !live.ok() {
+                log.push(format!(
+                    "firewall: couldn't list ipsets, stale sets stay: {}",
+                    live.stderr.trim()
+                ));
+            }
+            for name in stale_sets(&live.stdout, &rs.sets) {
+                let destroy = sys.runner.run("ipset", &["destroy", name], None)?;
+                if !destroy.ok() {
+                    log.push(format!(
+                        "firewall: stale set {name} stays: {}",
+                        destroy.stderr.trim()
+                    ));
+                }
             }
             for (table, builtin, own) in CHAINS {
                 let present = sys
@@ -258,15 +265,15 @@ fn apply_firewall(
 
 /// Sets in an `ipset list -n` listing that Parallax made and the new ruleset
 /// no longer has: a transport's prefix and a tier key, as
-/// [`Transport::set_name`] names them, or `ts_<template>` from builds before
-/// grants (each template became the grant of its name). Anything else
-/// listed is someone else's.
+/// [`Transport::set_name`] names them. Anything else listed is someone
+/// else's. That includes the `ts_<template>` sets of builds before grants:
+/// they were always empty (no Tailscale peers before M2), and a name built
+/// from a grant could be an operator's own set.
 ///
 /// [`Transport::set_name`]: crate::transport::Transport::set_name
 fn stale_sets<'a>(
     listing: &'a str,
     keep: &[crate::generate::firewall::AddressSet],
-    grants: &[&str],
 ) -> Vec<&'a str> {
     let prefixes: Vec<&str> = crate::transport::all()
         .iter()
@@ -274,17 +281,12 @@ fn stale_sets<'a>(
         .collect();
     let tier_key =
         |key: &str| key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    let legacy: Vec<String> = grants
-        .iter()
-        .map(|g| format!("ts_{}", g.replace('-', "_")))
-        .collect();
     let ours = |name: &str| {
-        legacy.iter().any(|l| l == name)
-            || prefixes.iter().any(|p| {
-                name.strip_prefix(p)
-                    .and_then(|rest| rest.strip_prefix('_'))
-                    .is_some_and(tier_key)
-            })
+        prefixes.iter().any(|p| {
+            name.strip_prefix(p)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .is_some_and(tier_key)
+        })
     };
     listing
         .lines()
@@ -461,31 +463,36 @@ mod tests {
         assert!(!lines.iter().any(|l| l.ends_with(" remove")), "{lines:#?}");
     }
 
-    /// Only sets named as Parallax names them go, now or before grants; an
-    /// operator's own `wg_external_allow` and `ts_other` stay.
+    /// Only sets named as Parallax names them go: a transport's prefix and
+    /// 16 lowercase hex digits. An operator's `wg_external_allow`, and
+    /// `ts_family` even with a grant `family`, stay.
     #[test]
     fn cleanup_destroys_only_parallaxs_own_sets() {
-        let keep = [AddressSet {
-            name: "wg_0123456789abcdef".into(),
+        let set = |name: &str| AddressSet {
+            name: name.into(),
             elements: Vec::new(),
             comment: String::new(),
-        }];
-        let listing = "wg_0123456789abcdef\nwg_fedcba9876543210\nts_00000000000000ff\n\
-                       wg_external_allow\nts_family\nts_home_lab\nts_other\nwg_0123456789ABCDEF\nwg_0123456789abcde\n\
-                       not_public\nparallax-swap\n";
+        };
+        let keep = [set("wg_0123456789abcdef"), set("ts_0123456789abcdef")];
+        let listing = "wg_0123456789abcdef\nts_0123456789abcdef\n\
+                       wg_fedcba9876543210\nts_00000000000000ff\n  wg_00000000000000aa  \n\
+                       wg_external_allow\nts_family\nts_home_lab\nts_other\n\
+                       wg_0123456789ABCDEF\nwg_0123456789abcde\nwg_0123456789abcdef0\n\
+                       wg_0123456789abcdeg\nwg0123456789abcdef\nxx_0123456789abcdef\n\
+                       not_public\nlan_real\nparallax-swap\n\n";
         assert_eq!(
-            stale_sets(listing, &keep, &["family", "home-lab"]),
+            stale_sets(listing, &keep),
             [
                 "wg_fedcba9876543210",
                 "ts_00000000000000ff",
-                "ts_family",
-                "ts_home_lab"
+                "wg_00000000000000aa"
             ]
         );
     }
 
-    /// Through a whole iptables-nft apply: a stale set of Parallax's goes,
-    /// the operator's own `wg_external_allow` stays.
+    /// Through a whole iptables-nft apply: once the rules are restored, a
+    /// stale set of Parallax's goes, the new ruleset's sets and the
+    /// operator's own stay, and a set that won't go is reported, not fatal.
     #[test]
     fn an_iptables_apply_keeps_the_operators_sets() {
         let mut cfg = crate::testing::canonical_config();
@@ -496,31 +503,60 @@ mod tests {
             crate::testing::keypair(200).private.expose_base64(),
         );
         let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let current: Vec<String> = crate::generate::firewall::build(&model)
+            .unwrap()
+            .sets
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(!current.is_empty());
         let runner = RecordingRunner::new();
+        let listing = format!(
+            "{}\nnot_public\nwg_fedcba9876543210\nts_00000000000000ff\nwg_external_allow\nts_family\n",
+            current.join("\n")
+        );
         runner.respond_to(
             "ipset",
             &["list", "-n"],
             Output {
                 status: 0,
-                stdout: "not_public\nwg_fedcba9876543210\nwg_external_allow\n".into(),
+                stdout: listing,
                 stderr: String::new(),
             },
+        );
+        runner.respond_to(
+            "ipset",
+            &["destroy", "ts_00000000000000ff"],
+            failed("ipset v7.22: Set cannot be destroyed: it is in use by a kernel component"),
         );
         let sys = System {
             fs: &fs,
             runner: &runner,
         };
-        apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+        let report = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
         let lines = runner.command_lines();
+        let destroyed: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("ipset destroy "))
+            .filter(|n| *n != "parallax-swap")
+            .collect();
+        assert_eq!(
+            destroyed,
+            ["wg_fedcba9876543210", "ts_00000000000000ff"],
+            "{lines:#?}"
+        );
+        let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();
         assert!(
-            lines
-                .iter()
-                .any(|l| l == "ipset destroy wg_fedcba9876543210"),
+            pos("iptables-restore") < pos("ipset destroy wg_fedcba9876543210"),
             "{lines:#?}"
         );
         assert!(
-            !lines.iter().any(|l| l == "ipset destroy wg_external_allow"),
-            "{lines:#?}"
+            report
+                .log
+                .iter()
+                .any(|l| l.contains("ts_00000000000000ff stays") && l.contains("in use")),
+            "{:#?}",
+            report.log
         );
     }
 }
