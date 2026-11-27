@@ -49,7 +49,7 @@ EDITOR=nvim $parallax config edit -o /tmp/parallax-out
 `apply` needs Linux with `nft`, `wg` and `ip`. Run the gateway in rootful
 Docker (`docker/`, `docs/setup.md`), or natively as an unprivileged systemd
 service from a `.deb`, an Arch package or a static binary (`docs/native.md`). Backups (automatic, encrypted, one-command restore):
-`docs/backup.md`.
+`docs/backup.md`. Per-peer activity logging: `docs/logging.md`.
 
 ## Layout
 

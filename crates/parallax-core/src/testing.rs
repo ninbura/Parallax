@@ -53,6 +53,7 @@ pub fn canonical_config() -> Config {
             proxy: ProxyServer::default(),
             backup: BackupServer::default(),
             public_ip: PublicIpServer::default(),
+            logs: Default::default(),
             wan_interface: None,
         },
         networks: vec![Network {
@@ -76,11 +77,13 @@ pub fn canonical_config() -> Config {
             Grant {
                 name: "personal".into(),
                 everyone: false,
+                log: None,
                 rules: vec![Rule::AllNetworks, Rule::PublicDns],
             },
             Grant {
                 name: "family".into(),
                 everyone: false,
+                log: None,
                 rules: vec![Rule::Service {
                     name: "immich".into(),
                 }],
@@ -90,6 +93,7 @@ pub fn canonical_config() -> Config {
             Peer {
                 name: "router".into(),
                 grants: vec!["personal".into()],
+                log: None,
                 transport: TransportKind::WireGuard,
                 enabled: true,
                 expires: None,
@@ -109,6 +113,7 @@ pub fn canonical_config() -> Config {
             Peer {
                 name: "laptop".into(),
                 grants: vec!["personal".into()],
+                log: None,
                 transport: TransportKind::WireGuard,
                 enabled: true,
                 expires: None,
@@ -128,6 +133,7 @@ pub fn canonical_config() -> Config {
             Peer {
                 name: "sister-phone".into(),
                 grants: vec!["family".into()],
+                log: None,
                 transport: TransportKind::WireGuard,
                 enabled: true,
                 expires: Some(Date::new(2027, 12, 31).unwrap()),

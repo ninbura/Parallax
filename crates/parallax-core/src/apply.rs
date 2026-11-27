@@ -194,8 +194,8 @@ fn apply_firewall(
                 sys.runner
                     .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
             }
-            // Sets of tiers that no longer exist: no rule uses them since the
-            // restore. The rules are in by now, so a failure here is only a
+            // Sets of tiers that no longer exist, and the logging sets once
+            // nobody is logged: no rule uses them since the restore. The rules are in by now, so a failure here is only a
             // leftover set: say so and carry on to the hooks.
             let live = sys.runner.run("ipset", &["list", "-n"], None)?;
             if !live.ok() {
@@ -265,8 +265,8 @@ fn apply_firewall(
 
 /// Sets in an `ipset list -n` listing that Parallax made and the new ruleset
 /// no longer has: a transport's prefix and a tier key, as
-/// [`Transport::set_name`] names them. Anything else listed is someone
-/// else's. That includes the `ts_<template>` sets of builds before grants:
+/// [`Transport::set_name`] names them, and the two logging sets. Anything
+/// else listed is someone else's. That includes the `ts_<template>` sets of builds before grants:
 /// they were always empty (no Tailscale peers before M2), and a name built
 /// from a grant could be an operator's own set.
 ///
@@ -281,12 +281,17 @@ fn stale_sets<'a>(
         .collect();
     let tier_key =
         |key: &str| key.len() == 16 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let logging = [
+        crate::generate::firewall::LOG_FLOWS_SET,
+        crate::generate::firewall::LOG_DENIED_SET,
+    ];
     let ours = |name: &str| {
-        prefixes.iter().any(|p| {
-            name.strip_prefix(p)
-                .and_then(|rest| rest.strip_prefix('_'))
-                .is_some_and(tier_key)
-        })
+        logging.contains(&name)
+            || prefixes.iter().any(|p| {
+                name.strip_prefix(p)
+                    .and_then(|rest| rest.strip_prefix('_'))
+                    .is_some_and(tier_key)
+            })
     };
     listing
         .lines()
@@ -479,13 +484,14 @@ mod tests {
                        wg_external_allow\nts_family\nts_home_lab\nts_other\n\
                        wg_0123456789ABCDEF\nwg_0123456789abcde\nwg_0123456789abcdef0\n\
                        wg_0123456789abcdeg\nwg0123456789abcdef\nxx_0123456789abcdef\n\
-                       not_public\nlan_real\nparallax-swap\n\n";
+                       not_public\nlan_real\nparallax-swap\nlog_flows\nlog_denied_x\n\n";
         assert_eq!(
             stale_sets(listing, &keep),
             [
                 "wg_fedcba9876543210",
                 "ts_00000000000000ff",
-                "wg_00000000000000aa"
+                "wg_00000000000000aa",
+                "log_flows"
             ]
         );
     }

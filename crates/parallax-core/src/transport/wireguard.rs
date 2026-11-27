@@ -73,6 +73,7 @@ impl Transport for WireGuardTransport {
         Ok(Peer {
             name: name.to_string(),
             grants: grants.to_vec(),
+            log: None,
             transport: TransportKind::WireGuard,
             enabled: true,
             expires: opts.expires,
