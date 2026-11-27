@@ -243,6 +243,9 @@ mod tests {
         config.server.logs.level = parallax_core::model::LogLevel::Connections;
         config.grants[1].log = Some(parallax_core::model::LogLevel::Blocked);
         config.peers[0].log = Some(parallax_core::model::LogLevel::Off);
+        config.server.logs.dns = true;
+        config.grants[1].log_dns = Some(false);
+        config.peers[0].log_dns = Some(true);
         let Request::Save {
             configuration,
             revision,

@@ -264,10 +264,16 @@ pub async fn supervise(mut views: Views, slot: Slot, taps: Taps) {
     }
     proxy.set_clients(Default::default());
     dns.set_clients(Default::default());
+    // Every thread told first, so their last reads and writes overlap.
+    stop.store(true, Ordering::Relaxed);
+    for feed in &feeds {
+        if let Some((stop, _)) = &feed.running {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
     for feed in &mut feeds {
         feed.stop().await;
     }
-    stop.store(true, Ordering::Relaxed);
     for thread in tapped {
         let _ = tokio::task::spawn_blocking(move || thread.join()).await;
     }
@@ -491,10 +497,10 @@ impl Sink {
         }
     }
 
-    /// Write `batch` to the open database. While none is open (the
-    /// supervisor lets the old one go before it opens one at a new path),
-    /// the records go to the one they were accepted for; with none at all
-    /// yet, keep a batch's worth and drop the rest.
+    /// Write `batch` to the open database. Records accepted before the
+    /// supervisor moved to a new path go to the old one, and the old one is
+    /// let go after, so its file is never held past the next flush. With
+    /// none open at all yet, keep a batch's worth and drop the rest.
     fn flush(&self, batch: &mut Vec<logging::Record>, writer: &mut Option<(Arc<Logs>, Writer)>) {
         let dropped = self.tap.take_dropped();
         if dropped > 0 {
@@ -503,43 +509,42 @@ impl Sink {
                 self.name
             ));
         }
-        if batch.is_empty() {
-            return;
-        }
         let current = self.slot.read().ok().and_then(|s| s.clone());
-        if let Some(current) = current {
-            if !writer
-                .as_ref()
-                .is_some_and(|(l, _)| Arc::ptr_eq(l, &current))
-            {
-                *writer = match current.writer() {
-                    Ok(w) => Some((Arc::clone(&current), w)),
-                    Err(e) => {
-                        warn(format!("activity logging: writing {}: {e}", self.name));
-                        None
+        if !batch.is_empty() {
+            if let (None, Some(logs)) = (writer.as_ref(), &current) {
+                match logs.writer() {
+                    Ok(w) => *writer = Some((Arc::clone(logs), w)),
+                    Err(e) => warn(format!("activity logging: writing {}: {e}", self.name)),
+                }
+            }
+            match writer.as_ref() {
+                Some((_, w)) => {
+                    if let Err(e) = self.runtime.block_on(w.write(batch)) {
+                        warn(format!(
+                            "activity logging: writing {} records of {} failed: {e}",
+                            batch.len(),
+                            self.name
+                        ));
                     }
-                };
+                    batch.clear();
+                }
+                None if batch.len() > BATCH => {
+                    warn(format!(
+                        "activity logging: {} records of {} dropped: no database open",
+                        batch.len() - BATCH,
+                        self.name
+                    ));
+                    batch.truncate(BATCH);
+                }
+                None => {}
             }
         }
-        let Some((_, w)) = writer else {
-            if batch.len() > BATCH {
-                warn(format!(
-                    "activity logging: {} records of {} dropped: no database open",
-                    batch.len() - BATCH,
-                    self.name
-                ));
-                batch.truncate(BATCH);
-            }
-            return;
-        };
-        if let Err(e) = self.runtime.block_on(w.write(batch)) {
-            warn(format!(
-                "activity logging: writing {} records of {} failed: {e}",
-                batch.len(),
-                self.name
-            ));
+        let stale = writer
+            .as_ref()
+            .is_some_and(|(l, _)| !current.as_ref().is_some_and(|c| Arc::ptr_eq(l, c)));
+        if stale {
+            *writer = None;
         }
-        batch.clear();
     }
 }
 

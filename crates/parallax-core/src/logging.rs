@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, RwLock};
 
@@ -261,8 +261,8 @@ pub struct Query {
     pub client: Ipv4Addr,
     /// The peer the client was when the query came in.
     pub peer: String,
-    /// The DNS server's address.
-    pub server: Ipv4Addr,
+    /// The DNS server's address and port.
+    pub server: SocketAddrV4,
     pub protocol: u8,
     pub name: String,
     /// `A`, `AAAA`, `HTTPS` and so on.
@@ -322,6 +322,9 @@ pub struct Logged {
 pub struct Tap {
     tx: SyncSender<Event>,
     clients: Arc<RwLock<HashMap<Ipv4Addr, Logged>>>,
+    /// Whether `clients` has anyone: with nobody logged, a request or query
+    /// costs one load, not a lock.
+    any: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -332,6 +335,7 @@ impl Tap {
         let tap = Tap {
             tx,
             clients: Arc::default(),
+            any: Arc::default(),
             dropped: Arc::default(),
         };
         (tap, rx)
@@ -339,6 +343,9 @@ impl Tap {
 
     /// The peer `client` is, if what it does is wanted.
     pub fn admit(&self, client: Ipv4Addr) -> Option<Logged> {
+        if !self.any.load(Ordering::Relaxed) {
+            return None;
+        }
         self.clients
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -355,7 +362,9 @@ impl Tap {
 
     /// Whose events are wanted from now on.
     pub fn set_clients(&self, clients: HashMap<Ipv4Addr, Logged>) {
+        let any = !clients.is_empty();
         *self.clients.write().unwrap_or_else(|p| p.into_inner()) = clients;
+        self.any.store(any, Ordering::Relaxed);
     }
 
     /// Events dropped since the last call.
@@ -653,7 +662,13 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
             r
         }
         Event::Query(q) => {
-            let mut r = record(RecordKind::Query, q.server, None, q.protocol, Some(53));
+            let mut r = record(
+                RecordKind::Query,
+                *q.server.ip(),
+                None,
+                q.protocol,
+                Some(q.server.port()),
+            );
             r.network = None;
             r.hostname = Some(q.name.clone());
             r.query_type = Some(q.query_type.clone());
@@ -904,7 +919,7 @@ mod tests {
         Event::Query(Query {
             client: Ipv4Addr::new(10, 8, 2, 1),
             peer: "sister-phone".into(),
-            server: Ipv4Addr::new(10, 8, 0, 1),
+            server: "10.8.0.1:53".parse().unwrap(),
             protocol: 17,
             name: "immich.example.com.".into(),
             query_type: "A".into(),
@@ -1021,6 +1036,9 @@ mod tests {
         cfg.server.logs.level = LogLevel::Connections;
         cfg.grants[1].log = Some(LogLevel::Blocked);
         cfg.peers[0].log = Some(LogLevel::Off);
+        cfg.server.logs.dns = true;
+        cfg.grants[1].log_dns = Some(false);
+        cfg.peers[0].log_dns = Some(true);
         let toml = cfg.to_toml().unwrap();
         assert_eq!(Config::from_toml(&toml).unwrap(), cfg);
     }

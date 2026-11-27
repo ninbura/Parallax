@@ -172,7 +172,7 @@ impl Dns {
             state: shared,
             inflight: Arc::default(),
             tap: self.tap,
-            server: *listening.ip(),
+            server: listening,
         });
         server.register_socket(udp);
         server.register_listener(tcp, TCP_TIMEOUT, TCP_QUEUE);
@@ -271,7 +271,7 @@ struct Handler {
     /// Where logged peers' queries go, if anywhere.
     tap: Option<Tap>,
     /// The address the server answers on, for the records.
-    server: Ipv4Addr,
+    server: SocketAddrV4,
 }
 
 fn reply(code: ResponseCode) -> (ResponseCode, Vec<Record>) {

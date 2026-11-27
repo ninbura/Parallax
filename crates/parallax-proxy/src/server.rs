@@ -180,6 +180,13 @@ impl Proxy {
                         log(format!(
                             "{client}: refused, already {MAX_PER_SOURCE} open connections"
                         ));
+                        refused_connection(
+                            self.tap.as_ref(),
+                            client,
+                            None,
+                            None,
+                            "too many open connections",
+                        );
                         continue;
                     };
                     let tap = self.tap.clone();
@@ -818,18 +825,21 @@ async fn forward(
     }
     tokio::spawn(async move {
         if let (Ok(down), Ok(up)) = tokio::join!(downstream, upstream) {
-            // Counted as read, so the tally survives a relay that ends in an
-            // error (a peer gone, an upstream closing without TLS's goodbye).
-            let (out, back) = match &exchange {
-                Some(x) => (Arc::clone(&x.out), Arc::clone(&x.back)),
-                None => Default::default(),
-            };
+            let (mut down, mut up) = (TokioIo::new(down), TokioIo::new(up));
             let relay = async {
-                let _ = tokio::io::copy_bidirectional(
-                    &mut Counting::new(TokioIo::new(down), out),
-                    &mut Counting::new(TokioIo::new(up), back),
-                )
-                .await;
+                let _ = match &exchange {
+                    // Counted as read, so the tally survives a relay that ends
+                    // in an error (a peer gone, an upstream closing without
+                    // TLS's goodbye).
+                    Some(x) => {
+                        tokio::io::copy_bidirectional(
+                            &mut Counting::new(down, Arc::clone(&x.out)),
+                            &mut Counting::new(up, Arc::clone(&x.back)),
+                        )
+                        .await
+                    }
+                    None => tokio::io::copy_bidirectional(&mut down, &mut up).await,
+                };
             };
             while_authorized(relay, state, &hostname, client).await;
         }

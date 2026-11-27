@@ -989,7 +989,8 @@ g log dns on --peer guest
 inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com >/dev/null || true
 inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 other.mydomain.com >/dev/null || true
 for _ in $(seq 20); do
-    [ "$($P log show --peer guest --kind query | wc -l)" -ge 2 ] && break
+    [ "$($P log show --peer guest --kind query | wc -l)" -ge 2 ] \
+        && [ "$($P log show --peer guest --kind request,refused | wc -l)" -ge 2 ] && break
     sleep 0.5
 done
 LOGS=$($P log show --peer guest --kind request,refused,query --limit 1000)
