@@ -45,9 +45,11 @@
 # table, and keeps the home's public IP across the restart, (r) a peer with two grants
 # reaches both and nothing more, a grant for everyone reaches every peer, and changing
 # grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
-# change access when they return, and a refused one changes nothing, (t) with
-# HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its node's address
-# from Headscale. Every change goes through the daemon and takes effect without SIGHUP.
+# change access when they return, and a refused one changes nothing, (t) activity
+# logging records logged peers' connections, bytes and blocked attempts and nobody
+# else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
+# node's address from Headscale. Every change goes through the daemon and takes
+# effect without SIGHUP.
 set -euo pipefail
 
 PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
@@ -263,6 +265,8 @@ passphrase_file = "$WORK/backup.passphrase"
 [server.proxy]
 certificates = "$WORK/certs"
 upstream_ca = "$CA"
+[server.logs]
+path = "$WORK/logs.db"
 [[network]]
 name = "home"
 interface = "eth0"
@@ -925,8 +929,57 @@ grep -q '^guest  grants=family  .*address=10.8.0.3 ' <<<"$($P peer show guest)" 
     || fail "(s) guest's client config changed with its grants"
 pass "(s) grant and peer grants commands change access on return; refused ones change nothing"
 
+# (t) activity logging: off, the firewall has no logging rules; levels set by grant
+# and by peer record what each level covers (guest at `blocked`: its blocked
+# attempts, not its connections; laptop at `detailed`: connections and their bytes),
+# with both destinations, and nothing of anyone else; off again, the rules go.
+inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
+    && fail "(t) logging rules with nobody logged"
+# Byte counts are a host setting; a short TIME_WAIT ends closed TCP flows at once.
+inns gw sysctl -qw net.netfilter.nf_conntrack_acct=1
+inns gw sysctl -qw net.netfilter.nf_conntrack_tcp_timeout_time_wait=1
+feed_up() { # which feed's start to wait for in the daemon's log
+    for _ in $(seq 50); do grep -q "activity logging: reading $1" "$WORK/daemon.log" && return 0; sleep 0.1; done
+    fail "(t) the collector didn't start reading $1"
+}
+# `blocked` alone first: only the blocked attempts feed runs, so the guest's
+# allowed connection is never even marked.
+g log level blocked --grant family
+feed_up "blocked attempts"
+grep -q 'activity logging: reading connections' "$WORK/daemon.log" \
+    && fail "(t) connections are read with only blocked attempts logged"
+[ "$(curl_as $GUEST http://198.18.1.1:9090/)" = gw-self ] || fail "(t) guest -> its gateway service"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) guest reached 8080"
+g log level detailed --peer laptop
+feed_up connections
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(t) laptop -> 8080"
+[ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) friend reached 8080"
+# A flow's end is reported when connection tracking's periodic sweep removes it,
+# some seconds after TIME_WAIT (about 11 s on a 7.2 kernel); wait for it.
+for _ in $(seq 60); do
+    $P log show --peer laptop --kind closed | grep -q . && break
+    sleep 1
+done
+LOGS=$($P log show --limit 1000)
+echo "$LOGS" | grep -q '  guest  blocked  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's blocked attempt, with both destinations"; }
+echo "$LOGS" | grep -q '  guest  \(opened\|closed\)  ' \
+    && { echo "$LOGS"; fail "(t) guest's connections recorded at blocked"; }
+echo "$LOGS" | grep -q '  laptop  opened  tcp 198.18.1.5:8080 (192.168.1.5, home)' \
+    || { echo "$LOGS"; fail "(t) laptop's connection"; }
+echo "$LOGS" | grep -q '  laptop  closed  tcp 198.18.1.5:8080 (192.168.1.5, home)  [0-9.]* [KMG]*i*B out, [0-9.]* [KMG]*i*B in' \
+    || { echo "$LOGS"; fail "(t) laptop's bytes when the flow ended"; }
+echo "$LOGS" | grep -q '  friend  ' && { echo "$LOGS"; fail "(t) friend is logged at off"; }
+[ "$($P log show --peer guest --kind blocked | wc -l)" -ge 1 ] || fail "(t) log show --peer --kind"
+g log level inherit --grant family
+g log level inherit --peer laptop
+inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
+    && fail "(t) logging rules left after everyone went back to off"
+# The records stay readable with logging off.
+[ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
+pass "(t) each level records what it covers (blocked attempts; connections and bytes) with both destinations; nobody else's; off removes the rules"
 
-# (t) Tailscale peers follow Headscale: a real Headscale and a node logged in to it
+# (u) Tailscale peers follow Headscale: a real Headscale and a node logged in to it
 # (userspace tailscaled) in the gateway's namespace. The daemon puts the node's
 # address in its peer's tier set within a poll, keeps it while Headscale is down,
 # and drops it once the node is deleted. Needs HEADSCALE, TAILSCALED and TAILSCALE
@@ -963,7 +1016,7 @@ log:
   level: warn
 YAML
     start_headscale() {
-        # Its own pid, not the backgrounded subshell's, so (t) can stop it.
+        # Its own pid, not the backgrounded subshell's, so (u) can stop it.
         inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$HS/headscale.pid" \
             "$HEADSCALE" serve -c "$HS/config.yaml" >> "$HS/headscale.log" 2>&1 &
         PIDS+=($!)
@@ -971,7 +1024,7 @@ YAML
             inns gw curl -sf -m 1 http://127.0.0.1:18080/version >/dev/null && return 0
             sleep 0.1
         done
-        cat "$HS/headscale.log"; fail "(t) Headscale did not start"
+        cat "$HS/headscale.log"; fail "(u) Headscale did not start"
     }
     start_headscale
     HS_KEY=$(inns gw "$HEADSCALE" -c "$HS/config.yaml" apikeys create 2>/dev/null | tail -n1)
@@ -987,7 +1040,7 @@ YAML
     PIDS+=($!)
     for _ in $(seq 50); do [ -S "$HS/ts/sock" ] && break; sleep 0.1; done
     inns gw timeout 30 "$TAILSCALE" --socket="$HS/ts/sock" up --login-server=http://127.0.0.1:18080 \
-        --authkey="$AUTH" --hostname=tablet >/dev/null 2>&1 || { tail -20 "$HS/tailscaled.log"; fail "(t) the node did not log in"; }
+        --authkey="$AUTH" --hostname=tablet >/dev/null 2>&1 || { tail -20 "$HS/tailscaled.log"; fail "(u) the node did not log in"; }
     read -r NODE NODE_IP < <(hs_api GET /api/v1/node | python3 -c '
 import json, sys
 n = json.load(sys.stdin)["nodes"][0]
@@ -1005,7 +1058,7 @@ s = re.sub(r'(?m)^api_key_file = ".*"$', f'api_key_file = "{key}"', s, count=1)
 s += f'\n[[peer]]\nname = "tablet"\ngrants = ["family"]\ntransport = "tailscale"\n[peer.tailscale]\nnode_id = {node}\n'
 open(dst, "w").write(s)
 PY
-    grep -q '^server_url = "http://127.0.0.1:18080"$' "$WORK/tailscale.toml" || fail "(t) could not point the configuration at Headscale"
+    grep -q '^server_url = "http://127.0.0.1:18080"$' "$WORK/tailscale.toml" || fail "(u) could not point the configuration at Headscale"
     # Not grep -q: it stops reading at the match, and with pipefail nft's SIGPIPE
     # would fail the pipeline exactly when the address is there.
     in_set() { inns gw nft list table inet parallax | grep "elements = {[^}]*\b$NODE_IP\b" >/dev/null; }
@@ -1017,22 +1070,22 @@ PY
         return 1
     }
     apply "$WORK/tailscale.toml"
-    wait_set in || { inns gw nft list table inet parallax | grep -A5 'set ts_'; fail "(t) the node's address $NODE_IP never reached the firewall"; }
+    wait_set in || { inns gw nft list table inet parallax | grep -A5 'set ts_'; fail "(u) the node's address $NODE_IP never reached the firewall"; }
     inns gw $P headscale status | grep "^node $NODE tablet: user family, $NODE_IP, online; peer tablet$" >/dev/null \
-        || { inns gw $P headscale status; fail "(t) headscale status did not show the node as tablet"; }
-    $P status | grep "^Headscale node $NODE: $NODE_IP$" >/dev/null || { $P status; fail "(t) the daemon's status lacks the node"; }
+        || { inns gw $P headscale status; fail "(u) headscale status did not show the node as tablet"; }
+    $P status | grep "^Headscale node $NODE: $NODE_IP$" >/dev/null || { $P status; fail "(u) the daemon's status lacks the node"; }
     HS_PID=$(cat "$HS/headscale.pid")
     kill "$HS_PID"
     for _ in $(seq 50); do kill -0 "$HS_PID" 2>/dev/null || break; sleep 0.1; done
     sleep 12
-    in_set || fail "(t) the node lost its access while Headscale was down"
-    grep -q "keeping the addresses it gave last" "$WORK/daemon.log" || fail "(t) Headscale being down was not logged"
+    in_set || fail "(u) the node lost its access while Headscale was down"
+    grep -q "keeping the addresses it gave last" "$WORK/daemon.log" || fail "(u) Headscale being down was not logged"
     start_headscale
-    hs_api DELETE "/api/v1/node/$NODE" >/dev/null || fail "(t) could not delete the node"
-    wait_set out || fail "(t) a deleted node kept its peer's access"
-    pass "(t) a Tailscale peer gets its node's address from Headscale, keeps it while Headscale is down, loses it with the node"
+    hs_api DELETE "/api/v1/node/$NODE" >/dev/null || fail "(u) could not delete the node"
+    wait_set out || fail "(u) a deleted node kept its peer's access"
+    pass "(u) a Tailscale peer gets its node's address from Headscale, keeps it while Headscale is down, loses it with the node"
 else
-    echo "SKIP: (t) Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
+    echo "SKIP: (u) Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
 fi
 
 echo "ALL PASS"

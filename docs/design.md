@@ -137,6 +137,15 @@ a peer's own `log` wins, then the most detailed `log` among its grants, then
 the unknown-source drop, the gateway host's). With nobody logged none of it
 is generated: the canonical goldens have no logging rule or set.
 
+The daemon's collector (`daemon/collector.rs`, ADR 0012) reads connection
+tracking's events and that nflog group from netlink sockets, only while some
+peer needs them. `netlink.rs` parses the bytes into events,
+`logging::attribute` turns each into a record (peer and grant names as they
+are now, the destination as addressed and as real), and each feed commits
+its batches to `logs.db` (`parallax_store::logs`) with `BEGIN CONCURRENT`.
+The daemon purges by age and size every 10 minutes and answers `parallax log
+show` from the same database.
+
 Ports are lists, written the way ufw writes them: `445/tcp`, `137-138/udp`,
 or a bare `25565` for TCP and UDP. A service is a named host and its ports
 (SMB is one service with four ports), used by any number of grants. A
@@ -423,6 +432,10 @@ clients/<peer>/<platform>.conf     only for peers that retain their private key 
 
 `iptables-nft` backend writes `iptables/parallax.rules` (iptables-restore
 format, PARALLAX_* chains) and `iptables/docker-user.rules` instead.
+Its sets live in the host's one ipset namespace, so apply removes only
+stale sets named as Parallax names them (`wg_` or `ts_` and a 16-digit hex
+tier key, `log_flows`, `log_denied`) and leaves every other set alone. Builds before named grants made
+empty `ts_<template>` sets; those stay until removed with `ipset destroy`.
 
 ## Apply order and idempotency
 
@@ -441,9 +454,10 @@ memory and keeps the gateway applied: at startup, after every saved change,
 on SIGHUP, when the UTC date changes, and when the live table or WireGuard
 interface differs from the listing taken after the last apply (checked every
 60 s). A failed apply is retried every tick. It serves DNS and the proxy,
-runs automatic backups, and listens on `/run/parallax/parallax.sock` for the
-CLI: one JSON request and one JSON reply per connection, with a `protocol`
-number both sides must match (`PROTOCOL` in `protocol.rs`). Saves
+runs automatic backups and the activity collector, and listens on
+`/run/parallax/parallax.sock` for the CLI: one JSON request and one JSON
+reply per connection, with a `protocol` number both sides must match
+(`PROTOCOL` in `protocol.rs`). Saves
 carry the revision they were based on; an older one is refused and the CLI
 retries against the latest. With no daemon answering, the CLI opens the
 database itself. SIGTERM deletes the table and the interface.

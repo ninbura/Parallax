@@ -13,17 +13,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use parallax_core::headscale::Tailnet;
+use parallax_core::logging::Record;
 use parallax_core::names::Resolved;
 use parallax_core::secret::Secret;
 use parallax_core::Config;
+use parallax_store::logs::Query;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// The version this build speaks. 2: replies carry the home's public IP.
 /// 3: and what hosts named by DNS name resolved to. 4: services and host
 /// grants carry port lists. 5: the configuration carries log levels.
-/// 6: replies carry the addresses Headscale gave its nodes.
-pub const PROTOCOL: u64 = 6;
+/// 6: activity records (`logs`). 7: replies carry the addresses Headscale
+/// gave its nodes.
+pub const PROTOCOL: u64 = 7;
 /// The largest message either side accepts, newline included.
 pub const MAX_MESSAGE: usize = 16 << 20;
 
@@ -53,6 +56,8 @@ pub enum Request {
         revision: u64,
         contents_sha256: String,
     },
+    /// Activity records (`parallax log show`).
+    Logs { query: Query },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,6 +99,8 @@ pub enum Reply {
     Conflict { revision: u64 },
     /// Output of a request that changes no configuration.
     Done { lines: Vec<String> },
+    /// Activity records, oldest first, each with its id.
+    Logs { records: Vec<(i64, Record)> },
     /// The request was refused; nothing changed.
     Error { message: String },
 }

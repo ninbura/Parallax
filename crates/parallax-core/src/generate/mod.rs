@@ -100,5 +100,20 @@ pub fn generate_all(model: &Model<'_>, fs: &dyn FileSystem) -> Result<Bundle> {
     bundle.artifacts.extend(nginx::render(model)?);
     bundle.artifacts.push(proxy::render(model)?);
     bundle.artifacts.sort_by(|a, b| a.path.cmp(&b.path));
+    // Two artifacts at one path: one would silently replace the other.
+    let shared: Vec<String> = bundle
+        .artifacts
+        .windows(2)
+        .filter(|w| w[0].path == w[1].path)
+        .map(|w| {
+            format!(
+                "two generated files would both be {}; rename one of what they're named after",
+                w[0].path.display()
+            )
+        })
+        .collect();
+    if !shared.is_empty() {
+        return Err(crate::Error::Invalid(shared));
+    }
     Ok(bundle)
 }

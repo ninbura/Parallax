@@ -24,6 +24,7 @@ pub mod io;
 pub mod logging;
 pub mod model;
 pub mod names;
+pub mod netlink;
 pub mod netmap;
 pub mod plan;
 pub mod public_ip;

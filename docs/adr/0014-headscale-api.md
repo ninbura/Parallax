@@ -80,8 +80,8 @@ Tailscale's API, with scoped OAuth credentials, but can't create users.
   whether or not its peers have addresses yet, so a node appearing later
   can't start failing applies.
   `parallax status` lists the addresses the daemon follows.
-- The daemon protocol carries the node addresses (protocol 6).
-- The integration test (`netns.sh` (t)) runs a real Headscale from the
+- The daemon protocol carries the node addresses (protocol 7).
+- The integration test (`netns.sh` (u)) runs a real Headscale from the
   pinned commit and a logged-in node. CI builds both
   (`tests/integration/headscale-binaries.sh`), and builds the image and
   checks the shipped configuration with it.

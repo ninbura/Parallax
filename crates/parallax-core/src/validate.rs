@@ -960,6 +960,13 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         if !valid_ident(&g.name) {
             errors.push(format!("{ctx}: name must be a plain identifier"));
         }
+        // nginx snippets: a grant's is parallax-<grant>.conf, a service's
+        // parallax-service-<service>.conf, so these would collide.
+        if g.name.starts_with("service-") {
+            errors.push(format!(
+                "{ctx}: names starting with 'service-' are taken by services' nginx snippets (parallax-service-<service>.conf); pick another"
+            ));
+        }
         if !seen_grants.insert(&g.name) {
             errors.push(format!("{ctx}: duplicate name"));
         }
@@ -1356,6 +1363,15 @@ mod tests {
         );
         let e = errors_of(|c| c.grants[1].name = "personal".into());
         assert!(has(&e, "grant 'personal': duplicate name"), "{e:?}");
+        // Issue #32: it would share service immich's nginx snippet.
+        let e = errors_of(|c| c.grants[1].name = "service-immich".into());
+        assert!(
+            has(
+                &e,
+                "grant 'service-immich': names starting with 'service-' are taken"
+            ),
+            "{e:?}"
+        );
         let e = errors_of(|c| {
             c.grants[0].rules = vec![Rule::Host {
                 host: "10.99.0.1".parse().unwrap(),

@@ -57,6 +57,8 @@ use tokio::time::MissedTickBehavior;
 
 use crate::protocol::{self, Reply, Request};
 
+mod collector;
+
 /// How `parallax daemon` was started.
 #[derive(Debug)]
 pub struct Options {
@@ -200,7 +202,9 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let refresher = tokio::spawn(refresh_public_ip(tx.clone(), views.clone()));
     let names = tokio::spawn(refresh_names(tx.clone(), views.clone()));
     let tailnet = tokio::spawn(refresh_tailnet(tx.clone(), views.clone()));
-    let server = tokio::spawn(accept(listener, tx.clone(), views, database));
+    let logs = collector::Slot::default();
+    let collecting = tokio::spawn(collector::supervise(views.clone(), Arc::clone(&logs)));
+    let server = tokio::spawn(accept(listener, tx.clone(), views, database, logs));
     let timers = tokio::spawn(timers(tx.clone(), opts.reconcile_every));
     log(format!(
         "gateway up; listening for commands on {}. Saved changes apply at once; SIGHUP re-applies",
@@ -239,6 +243,14 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     proxy.abort();
     if engine_alive {
         stop_engine(&tx, &mut done_rx).await;
+    }
+    // With the engine gone its view closes, so the collector stops its
+    // sources and writes what they hold; don't wait long for it.
+    if tokio::time::timeout(Duration::from_secs(5), collecting)
+        .await
+        .is_err()
+    {
+        warn("the activity collector didn't stop in time; its last records may be lost");
     }
     result
 }
@@ -370,6 +382,7 @@ async fn accept(
     tx: mpsc::UnboundedSender<Msg>,
     views: Views,
     database: Arc<PathBuf>,
+    logs: collector::Slot,
 ) {
     loop {
         match listener.accept().await {
@@ -379,6 +392,7 @@ async fn accept(
                     tx.clone(),
                     views.clone(),
                     Arc::clone(&database),
+                    Arc::clone(&logs),
                 ));
             }
             Err(e) => {
@@ -396,6 +410,7 @@ async fn answer(
     tx: mpsc::UnboundedSender<Msg>,
     views: Views,
     database: Arc<PathBuf>,
+    logs: collector::Slot,
 ) {
     let (read, mut write) = stream.into_split();
     let reply = match tokio::time::timeout(REQUEST_TIMEOUT, read_request(read)).await {
@@ -410,7 +425,7 @@ async fn answer(
                 theirs.display()
             ),
         },
-        Ok(Ok((_, request))) => dispatch(request, &tx, &views).await,
+        Ok(Ok((_, request))) => dispatch(request, &tx, &views, &logs).await,
     };
     let line = protocol::encode(&reply).or_else(|e| {
         protocol::encode(&Reply::Error {
@@ -433,7 +448,12 @@ async fn read_request(read: tokio::net::unix::OwnedReadHalf) -> anyhow::Result<(
     protocol::decode_request(&line)
 }
 
-async fn dispatch(request: Request, tx: &mpsc::UnboundedSender<Msg>, views: &Views) -> Reply {
+async fn dispatch(
+    request: Request,
+    tx: &mpsc::UnboundedSender<Msg>,
+    views: &Views,
+    logs: &collector::Slot,
+) -> Reply {
     let view = views.borrow().clone();
     let Some(view) = view else {
         return Reply::Error {
@@ -455,6 +475,20 @@ async fn dispatch(request: Request, tx: &mpsc::UnboundedSender<Msg>, views: &Vie
             names: view.names,
             tailnet: view.tailnet,
         },
+        Request::Logs { query } => {
+            let open = logs.read().ok().and_then(|l| l.clone());
+            match open {
+                Some(logs) => match logs.query(&query).await {
+                    Ok(records) => Reply::Logs { records },
+                    Err(e) => Reply::Error {
+                        message: format!("reading {}: {e}", logs.path().display()),
+                    },
+                },
+                None => Reply::Logs {
+                    records: Vec::new(),
+                },
+            }
+        }
         request => {
             let (reply_tx, reply_rx) = oneshot::channel();
             if tx.send(Msg::Request(request, reply_tx)).is_err() {
@@ -872,10 +906,10 @@ impl Engine {
                         }
                     },
                     Request::BackupCreate { if_due } => self.backup(if_due, Some(reply)),
-                    // Answered from the view by the socket task.
-                    Request::Status | Request::Load => {
+                    // Answered by the socket task, from the view and logs.db.
+                    Request::Status | Request::Load | Request::Logs { .. } => {
                         let _ = reply.send(Reply::Error {
-                            message: "status and load aren't queued".into(),
+                            message: "status, load and logs aren't queued".into(),
                         });
                     }
                 },
