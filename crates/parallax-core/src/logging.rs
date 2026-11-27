@@ -30,7 +30,7 @@ pub fn set_level(config: &mut Config, target: &Target, level: Option<LogLevel>) 
                 return Err(Error::Malformed {
                     what: "log level",
                     detail: "the global level (server.logs.level) has nothing to inherit from; \
-                             set off, connections, bytes or denied"
+                             set off, blocked, connections or detailed"
                         .into(),
                 });
             };
@@ -172,7 +172,7 @@ mod tests {
     fn nobody_is_logged_by_default() {
         let cfg = canonical_config();
         let model = Model::resolve(&cfg, today()).unwrap();
-        assert!(!any(&model, LogLevel::Connections));
-        assert!(addresses(&model, LogLevel::Connections).is_empty());
+        assert!(!any(&model, LogLevel::Blocked));
+        assert!(addresses(&model, LogLevel::Blocked).is_empty());
     }
 }
