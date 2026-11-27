@@ -41,8 +41,12 @@ crates/parallax-cli/            `parallax` binary (daemon, status, validate, pla
                                 src/daemon.rs and src/protocol.rs: the daemon and
                                 its socket protocol
 docker/                         Dockerfile, entrypoint, compose (parallax + headscale)
+packaging/                      the native install (ADR 0013, docs/native.md): the
+                                systemd unit, sysusers.d, tmpfiles.d, modules-load.d,
+                                sysctl.d, nfpm.yaml (the .deb and Arch package)
 example/parallax.toml           fully commented canonical scenario
-tests/integration/netns.sh      Linux network-namespace integration test (CI)
+tests/integration/netns.sh      Linux network-namespace integration test (CI), with
+                                the daemon as root or as the native unit
 docs/adr/                       decisions
 ```
 
@@ -64,6 +68,7 @@ pub struct ServerConfig {
                                       // subnet_router_node, dns (tailnet-wide)
     pub dns: DnsServer,               // listen (default: WG gateway addr), port, public_resolver
     pub firewall: FirewallServer,     // backend (nftables | iptables-nft), docker_coexistence
+    pub logs: LogsServer,             // level, path, keep, max_size (docs/logging.md)
     pub wan_interface: Option<String>,
 }
 
@@ -86,6 +91,7 @@ pub enum Host { Ip(Ipv4Addr), Name(String) }   // TOML: a string either way
 pub struct Grant {
     pub name: String,
     pub everyone: bool,                 // every peer has it, unattached
+    pub log: Option<LogLevel>,          // sets its peers' log level (docs/logging.md)
     pub rules: Vec<Rule>,
 }
 
@@ -97,6 +103,7 @@ pub enum AllowedIpsStrategy { MappedSubnets, GrantsOnly, FullTunnel }
 pub struct Peer {
     pub name: String,
     pub grants: Vec<String>,             // besides every `everyone` grant
+    pub log: Option<LogLevel>,           // its own log level, over its grants'
     pub transport: TransportKind,        // WireGuard | Tailscale (a device fact)
     pub enabled: bool,
     pub expires: Option<Date>,
@@ -119,6 +126,15 @@ grants changes neither the address nor its client config (except
 `server.wireguard.peer_defaults` when it's added. Files written with
 `[[template]]` still import (`model/legacy.rs`), each template becoming a
 grant of its name.
+
+Activity logging (`logging.rs`, docs/logging.md) is per peer, not per tier:
+a peer's own `log` wins, then the most detailed `log` among its grants, then
+`server.logs.level`. The firewall keeps two address sets, `log_flows` and
+`log_denied`, marks the new flows of the first (connection mark bit
+`0x20000000`) and hands the blocked attempts of the second to nflog group
+20568, rate-limited, before each drop they can reach (a tier's default deny,
+the unknown-source drop, the gateway host's). With nobody logged none of it
+is generated: the canonical goldens have no logging rule or set.
 
 Ports are lists, written the way ufw writes them: `445/tcp`, `137-138/udp`,
 or a bare `25565` for TCP and UDP. A service is a named host and its ports
@@ -375,7 +391,9 @@ alternatives: ADR 0005.
   otherwise each CLI command while it needs it. Every change is one write
   transaction (`Store::update`). With the daemon, changes queue in its one
   writer (ADR 0007).
-- The database and its log are 0600.
+- MVCC mode (`BEGIN CONCURRENT`, ADR 0011): opening a database switches it once,
+  before migrating. `sqlite3` can't open the live file; a backup's copy it can.
+- The database and its logs (`-wal`, MVCC's `-log`) are 0600.
 
 The CLI validates before every save, so the database only ever holds a valid
 configuration. `config import` and `config edit` also give WireGuard peers
@@ -383,7 +401,8 @@ without an address the next free one.
 
 Backups (`parallax_store::backup`, ADR 0006): `parallax-backup-<time>.tar`
 holds a plaintext `manifest.toml` and `payload.tar.age`, which is `age`
-passphrase-encrypted and holds a `VACUUM INTO` copy of the database and the
+passphrase-encrypted and holds a copy of the database, rebuilt from its rows
+in WAL mode (the live one runs in MVCC mode, ADR 0011), and the
 server key. Restore stages the backup's database next to the live one,
 migrates and checks it, then replaces every row of the live database with
 its rows in one write transaction. Operator guide: `docs/backup.md`.

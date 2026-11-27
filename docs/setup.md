@@ -1,5 +1,10 @@
 # Setting up a Parallax gateway (M1: WireGuard path)
 
+This guide runs Parallax in rootful Docker. To run it on the host as an
+unprivileged systemd service instead (a `.deb`, an Arch package or a static
+binary), see [native.md](native.md). The host, router, endpoint, grants and
+certificates sections here apply to both.
+
 ## What you need on the host
 
 - Linux with a current nftables and kernel that support prefix NAT (NETMAP;
@@ -102,13 +107,15 @@ It checks the following. `backups` only warns: the gateway runs without them.
 |---|---|---|
 | configuration | there's no database yet, or the configuration in it is invalid | import one (First start), or fix the listed errors with `parallax config edit` |
 | user namespace | running under rootless Docker or `userns-remap` | a rootful daemon (above) |
-| CAP_NET_ADMIN | the container lacks the capability | `cap_add: [NET_ADMIN]` |
+| CAP_NET_ADMIN | the container lacks the capability; or, not running as root, it isn't ambient, so `nft`, `ip` and `wg` start without it | `cap_add: [NET_ADMIN]`; natively, `AmbientCapabilities=` as in `packaging/systemd/parallax.service` |
+| CAP_NET_BIND_SERVICE | the DNS or proxy port is below `net.ipv4.ip_unprivileged_port_start` and the capability is missing (only checked then) | run as root, or the native unit's capabilities |
 | ip_forward | `net.ipv4.ip_forward` is 0 | `/etc/sysctl.d/` (above) |
 | tools | `nft`, `wg` or `ip` is missing | the image ships them; natively, install them |
 | interface \<name\> | a configured LAN or WAN interface doesn't exist | the name in the configuration (`ip link`, `parallax config edit`) |
 | wireguard | a WireGuard interface can't be created | `/etc/modules-load.d/` (above) |
 | NETMAP | the kernel or `nft` rejects prefix NAT (`nftables` backend only) | a newer kernel or nftables |
 | backups (warns) | automatic backups are off, the directory isn't writable, no passphrase is set, or unencrypted backups go to a network filesystem | [docs/backup.md](backup.md) |
+| byte counts (warns; only when a peer logs at `detailed`) | `net.netfilter.nf_conntrack_acct` is 0 | [docs/logging.md](logging.md) |
 
 ## Choosing the endpoint
 

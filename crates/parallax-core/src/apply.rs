@@ -194,12 +194,17 @@ fn apply_firewall(
                 sys.runner
                     .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
             }
-            // Sets of tiers that no longer exist: no rule uses them since the
-            // restore. Prefixed as the transports name them (and as builds
+            // Sets of tiers that no longer exist, and the logging sets once
+            // nobody is logged: no rule uses them since the restore. Tier
+            // sets are prefixed as the transports name them (and as builds
             // before grants did: `ts_<template>`).
             let live = sys.runner.run("ipset", &["list", "-n"], None)?;
+            let logging = [
+                crate::generate::firewall::LOG_FLOWS_SET,
+                crate::generate::firewall::LOG_DENIED_SET,
+            ];
             for name in live.stdout.lines().map(str::trim).filter(|n| {
-                (n.starts_with("wg_") || n.starts_with("ts_"))
+                (n.starts_with("wg_") || n.starts_with("ts_") || logging.contains(n))
                     && !rs.sets.iter().any(|s| s.name == *n)
             }) {
                 sys.runner.run("ipset", &["destroy", name], None)?;
@@ -260,13 +265,30 @@ fn apply_firewall(
 /// it someone else's grants; the old key must not hold it meanwhile, nor if
 /// a later step fails. Every other difference is left to `wg syncconf`, so
 /// unchanged peers keep their sessions. No interface yet: nothing to do.
+/// An interface whose peers can't be read stops the apply here, before the
+/// firewall changes: carrying on would skip the hand-over.
 fn drop_moved_peers(model: &Model<'_>, sys: System<'_>, log: &mut Vec<String>) -> Result<()> {
     let iface = model.server().wireguard.interface.as_str();
     let live = sys
         .runner
         .run("wg", &["show", iface, "allowed-ips"], None)?;
     if !live.ok() {
-        return Ok(());
+        let link = sys
+            .runner
+            .run("ip", &["link", "show", "dev", iface], None)?;
+        // Only `ip` saying so means there's no interface. Any other failure
+        // (no netlink permission, say) can't tell, so it stops too.
+        if !link.ok() && link.stderr.contains("does not exist") {
+            return Ok(());
+        }
+        let probe = match link.ok() {
+            true => String::new(),
+            false => format!("; `ip link show dev {iface}`: {}", link.stderr.trim()),
+        };
+        return Err(Error::Refused(format!(
+            "can't read which addresses the peers on {iface} hold, so the firewall stays as it is: `wg show {iface} allowed-ips`: {}{probe}",
+            live.stderr.trim()
+        )));
     }
     let owners: BTreeMap<Ipv4Addr, String> = model
         .peers_on(crate::model::TransportKind::WireGuard)
@@ -317,17 +339,90 @@ pub fn apply(
     drop_moved_peers(model, sys, &mut log)?;
     apply_firewall(model, bundle, out_dir, sys, &mut log)?;
     for transport in crate::transport::all() {
-        let owned: Vec<_> = bundle
-            .artifacts
-            .iter()
-            .map(|a| crate::generate::Artifact {
-                kind: a.kind,
-                path: out_dir.join(&a.path),
-                contents: String::new(),
-                secret: a.secret,
-            })
-            .collect();
-        log.extend(transport.apply(model, &owned, sys)?);
+        log.extend(transport.apply(model, &bundle.artifacts, sys)?);
     }
     Ok(ApplyReport { log })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test")]
+
+    use super::*;
+    use crate::io::memory::{MemoryFs, RecordingRunner};
+    use crate::io::Output;
+
+    fn failed(stderr: &str) -> Output {
+        Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// Apply the canonical scenario with `wg show` failing and `ip link
+    /// show` answering `link`.
+    fn apply_with_unreadable_wg0(link: Option<Output>) -> (Result<ApplyReport>, Vec<String>) {
+        let cfg = crate::testing::canonical_config();
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "wg",
+            &["show", "wg0", "allowed-ips"],
+            failed("Unable to access interface: Operation not permitted"),
+        );
+        // The hand-over asks first, then the WireGuard transport.
+        if let Some(link) = link {
+            runner.respond_to("ip", &["link", "show", "dev", "wg0"], link.clone());
+            runner.respond_to("ip", &["link", "show", "dev", "wg0"], link);
+        }
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        let result = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys);
+        (result, runner.command_lines())
+    }
+
+    /// Who holds which address can't be read, but the interface is there,
+    /// or `ip` can't tell: stop before the firewall changes instead of
+    /// skipping the hand-over.
+    #[test]
+    fn an_unreadable_interface_stops_before_the_firewall() {
+        let no_netlink = failed("Cannot open netlink socket: Operation not permitted");
+        for link in [None, Some(no_netlink)] {
+            let (result, lines) = apply_with_unreadable_wg0(link);
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("peers on wg0") && err.contains("Operation not permitted"),
+                "{err}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|l| l.starts_with("nft -f") || l.starts_with("wg set")),
+                "{lines:#?}"
+            );
+        }
+    }
+
+    /// No interface yet (first apply): nothing to hand over, and the apply
+    /// goes on to create it.
+    #[test]
+    fn a_missing_interface_is_created() {
+        let (result, lines) =
+            apply_with_unreadable_wg0(Some(failed("Device \"wg0\" does not exist.")));
+        result.unwrap();
+        let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
+        assert!(
+            pos("nft -f").unwrap() < pos("ip link add wg0").unwrap(),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.ends_with(" remove")), "{lines:#?}");
+    }
 }

@@ -71,16 +71,22 @@ impl Scratch {
     fn run(&self, args: &[&str]) -> (bool, String, String) {
         self.run_with_env(args, &[])
     }
-    fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_parallax"))
-            .arg("--db")
+    /// The command `run` runs, for tests that set up its streams themselves.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_parallax"));
+        cmd.arg("--db")
             .arg(self.db())
             .arg("--socket")
             .arg(self.socket())
             .args(args)
-            .envs(env.iter().copied())
             .env_remove("VISUAL")
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        cmd
+    }
+    fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
+        let out = self
+            .command(args)
+            .envs(env.iter().copied())
             .output()
             .unwrap();
         (
@@ -269,6 +275,54 @@ fn peer_show_marks_proxied_services() {
         out.contains("reaches service immich (443/tcp) as 198.18.1.5/32 through the HTTPS proxy"),
         "{out}"
     );
+}
+
+#[test]
+fn log_levels_are_set_for_everyone_a_grant_or_a_peer() {
+    let s = Scratch::new("log-level");
+    s.import();
+    let ok = |args: &[&str]| {
+        let (ok, out, err) = s.run(args);
+        assert!(ok, "{args:?}: {err}");
+        out
+    };
+    let refused = |args: &[&str]| {
+        let (ok, _, err) = s.run(args);
+        assert!(!ok, "{args:?} should fail");
+        err
+    };
+    let out = ok(&["log", "level", "blocked", "--grant", "family"]);
+    assert!(
+        out.contains("grant 'family' logs blocked for its peers now"),
+        "{out}"
+    );
+    let out = ok(&["log", "level", "detailed", "--peer", "sister-phone"]);
+    assert!(
+        out.contains("peer 'sister-phone' logs detailed now"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("in effect"),
+        "its own level is what's in effect: {out}"
+    );
+    // Back to its grant's level.
+    let out = ok(&["log", "level", "inherit", "--peer", "sister-phone"]);
+    assert!(out.contains("in effect: blocked"), "{out}");
+    let out = ok(&["log", "level", "connections"]);
+    assert!(
+        out.contains("everyone logs connections by default now"),
+        "{out}"
+    );
+    let text = ok(&["config", "export"]);
+    assert!(text.contains("level = \"connections\""), "{text}");
+    assert!(text.contains("log = \"blocked\""), "{text}");
+
+    let err = refused(&["log", "level", "inherit"]);
+    assert!(err.contains("nothing to inherit"), "{err}");
+    let err = refused(&["log", "level", "detailed", "--peer", "nobody"]);
+    assert!(err.contains("peer 'nobody' not found"), "{err}");
+    let err = refused(&["log", "level", "verbose"]);
+    assert!(err.contains("verbose"), "{err}");
 }
 
 #[test]
@@ -521,11 +575,11 @@ fn fake_daemon(
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let reply = match request["request"].as_str().unwrap() {
                 "load" => serde_json::json!({
-                    "protocol": 4, "reply": "configuration", "public_ip": null, "names": {},
+                    "protocol": 5, "reply": "configuration", "public_ip": null, "names": {},
                     "configuration": config, "revision": 3,
                 }),
                 "save" => serde_json::json!({
-                    "protocol": 4, "reply": "applied", "revision": 4,
+                    "protocol": 5, "reply": "applied", "revision": 4,
                     "log": ["applied by the fake daemon"], "error": null,
                 }),
                 other => panic!("unexpected request {other}"),
@@ -568,7 +622,7 @@ fn commands_go_through_a_running_daemon() {
     assert_eq!(seen[2]["revision"], 3, "saved against the loaded revision");
     let peers = seen[2]["configuration"]["peer"].as_array().unwrap();
     assert!(peers.iter().all(|p| p["name"] != "router"), "{peers:?}");
-    assert!(seen.iter().all(|r| r["protocol"] == 4));
+    assert!(seen.iter().all(|r| r["protocol"] == 5));
 }
 
 /// A stale socket file (its daemon is gone) means no daemon.
@@ -656,7 +710,7 @@ fn a_backup_restores_what_changed_since() {
     let file = s.backups().pop().unwrap();
     let (ok, out, _) = s.run(&["backup", "list"]);
     assert!(
-        ok && out.contains("encrypted") && out.contains("schema 6"),
+        ok && out.contains("encrypted") && out.contains("schema 7"),
         "{out}"
     );
 
@@ -864,4 +918,50 @@ fn a_backup_dated_in_the_future_does_not_stay_newest() {
     let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
     assert!(ok && out.is_empty(), "{out}{err}");
     assert_eq!(s.backups().len(), 2);
+}
+
+/// A reader that goes away (`parallax peer show | head -1`, a pager that quits)
+/// stops the command quietly with SIGPIPE's status, not a panic. The pipe's
+/// read end is closed before the command starts, so every write fails.
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_stops_the_command_without_a_panic() {
+    use std::os::unix::process::ExitStatusExt;
+    let s = Scratch::new("closed-stdout");
+    s.import();
+    for args in [&["config", "export"][..], &["peer", "show"], &["validate"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = s.command(args).stdout(writer).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            (out.status.code(), out.status.signal()),
+            (Some(141), None),
+            "{args:?}: {err}"
+        );
+        assert!(err.is_empty(), "{args:?}: {err}");
+    }
+}
+
+/// stderr only carries messages about the work: with it closed, `peer add`
+/// still saves the peer and prints its one-time config.
+#[test]
+fn a_closed_stderr_changes_nothing() {
+    let s = Scratch::new("closed-stderr");
+    s.import();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = s
+        .command(&["peer", "add", "tablet", "--grant", "family"])
+        .stderr(writer)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(
+        text.contains("[Interface]") && text.contains("PrivateKey"),
+        "{text}"
+    );
+    let (ok, shown, err) = s.run(&["peer", "show", "tablet"]);
+    assert!(ok && shown.contains("tablet"), "{shown}{err}");
 }

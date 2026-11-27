@@ -46,9 +46,10 @@ The database is the source of truth. TOML is how a configuration gets in
 EDITOR=nvim $parallax config edit -o /tmp/parallax-out
 ```
 
-`apply` needs Linux with `nft`, `wg` and `ip`; use the container (`docker/`)
-or read `docs/setup.md`. Backups (automatic, encrypted, one-command restore):
-`docs/backup.md`.
+`apply` needs Linux with `nft`, `wg` and `ip`. Run the gateway in rootful
+Docker (`docker/`, `docs/setup.md`), or natively as an unprivileged systemd
+service from a `.deb`, an Arch package or a static binary (`docs/native.md`). Backups (automatic, encrypted, one-command restore):
+`docs/backup.md`. Per-peer activity logging: `docs/logging.md`.
 
 ## Layout
 
@@ -66,6 +67,9 @@ or read `docs/setup.md`. Backups (automatic, encrypted, one-command restore):
   `export`, `doctor`, `backup create|list|restore|passphrase`. While the
   daemon runs, every command goes through its socket.
 - `docker/`: image, entrypoint, compose with `parallax` + `headscale`.
+- `packaging/`: the native install: systemd unit, sysusers.d, tmpfiles.d,
+  modules-load.d, sysctl.d, and the nfpm config for the `.deb` and Arch
+  package.
 - `example/parallax.toml`: the canonical scenario, fully commented.
 - `tests/integration/netns.sh`: Linux namespace test: mapping, DNS, per-tier access, the HTTPS proxy and the bypass matrix.
 - `dev/bench/firewall.sh`: what the firewall costs a WireGuard upload

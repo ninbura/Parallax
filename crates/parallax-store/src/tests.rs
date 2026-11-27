@@ -8,7 +8,7 @@ use parallax_core::model::*;
 use parallax_core::testing::{canonical_config, keypair, today};
 use parallax_core::{Config, Model};
 
-use crate::{Error, Store};
+use crate::{Error, Store, MVCC};
 
 pub(crate) const LATEST: i64 = crate::MIGRATIONS.len() as i64;
 
@@ -66,6 +66,12 @@ pub(crate) fn everything_config() -> Config {
         // Not in declaration order: the order is the try order.
         encrypted_dns: vec![EncryptedDns::Cloudflare, EncryptedDns::Quad9],
     };
+    c.server.logs = LogsServer {
+        level: LogLevel::Connections,
+        path: "/mnt/ssd/parallax-logs.db".into(),
+        keep: "7d".parse().unwrap(),
+        max_size: "256MiB".parse().unwrap(),
+    };
     c.networks.push(Network {
         name: "lab".into(),
         interface: "eth1".into(),
@@ -114,6 +120,7 @@ pub(crate) fn everything_config() -> Config {
     c.grants.push(Grant {
         name: "public".into(),
         everyone: true,
+        log: Some(LogLevel::Blocked),
         rules: Vec::new(),
     });
     let wg = c.peers[0].wireguard.as_mut().unwrap();
@@ -126,6 +133,7 @@ pub(crate) fn everything_config() -> Config {
     c.peers.push(Peer {
         name: "tv".into(),
         grants: vec!["family".into()],
+        log: Some(LogLevel::Off),
         transport: TransportKind::Tailscale,
         enabled: false,
         expires: Some(today()),
@@ -135,6 +143,7 @@ pub(crate) fn everything_config() -> Config {
     c.peers.push(Peer {
         name: "tablet".into(),
         grants: Vec::new(),
+        log: None,
         transport: TransportKind::Tailscale,
         enabled: true,
         expires: None,
@@ -283,13 +292,23 @@ async fn the_database_and_its_log_are_owner_only() {
     let dir = TempDir::new();
     let mut store = Store::create(&dir.db()).await.unwrap();
     store.save(&everything_config()).await.unwrap();
-    for file in ["parallax.db", "parallax.db-wal"] {
+    for file in ["parallax.db", "parallax.db-wal", "parallax.db-log"] {
         let mode = std::fs::metadata(dir.0.join(file))
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "{file}");
     }
+
+    // Turso names MVCC's log by replacing the extension.
+    let other = dir.0.join("state.sqlite");
+    let mut store = Store::create(&other).await.unwrap();
+    store.save(&everything_config()).await.unwrap();
+    let mode = std::fs::metadata(dir.0.join("state.db-log"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "state.db-log");
 }
 
 #[tokio::test]
@@ -345,6 +364,58 @@ async fn a_database_written_in_multi_process_mode_opens() {
     let store = Store::open(&path).await.unwrap();
     let rows = store.rows("SELECT x FROM t", Vec::new()).await.unwrap();
     assert_eq!(rows[0].get::<i64>(0).unwrap(), 7);
+    assert_eq!(store.journal_mode(None).await.unwrap(), MVCC);
+}
+
+/// Databases from before 7c are in WAL mode: opening one switches it to
+/// MVCC, once, and keeps what it holds.
+#[tokio::test]
+async fn an_older_database_switches_to_mvcc_and_keeps_its_data() {
+    let dir = TempDir::new();
+    {
+        let mut store = Store::create_plain(&dir.db()).await.unwrap();
+        assert_eq!(store.journal_mode(None).await.unwrap(), "wal");
+        store.save(&everything_config()).await.unwrap();
+    }
+    for _ in 0..2 {
+        let mut store = Store::open(&dir.db()).await.unwrap();
+        assert_eq!(store.journal_mode(None).await.unwrap(), MVCC);
+        assert_eq!(store.load().await.unwrap(), everything_config());
+    }
+    let created = Store::create(&dir.0.join("new.db")).await.unwrap();
+    assert_eq!(created.journal_mode(None).await.unwrap(), MVCC);
+}
+
+/// A database from a newer Parallax is refused before anything changes it,
+/// so the newer build can still open it as it was.
+#[tokio::test]
+async fn a_newer_database_is_refused_without_switching_it() {
+    let dir = TempDir::new();
+    let store = Store::create_plain(&dir.db()).await.unwrap();
+    store
+        .exec(
+            "INSERT INTO schema_version (version) VALUES (99)",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let err = Store::open(&dir.db()).await.unwrap_err();
+    assert!(matches!(err, Error::TooNew { found: 99, .. }), "{err}");
+    let db = turso::Builder::new_local(dir.db().to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("PRAGMA journal_mode", ()).await.unwrap();
+    let mode = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    assert_eq!(mode, "wal");
 }
 
 #[tokio::test]
@@ -667,6 +738,7 @@ async fn templates_become_grants_with_the_same_access() {
     expected.peers.push(Peer {
         name: "tv".into(),
         grants: vec!["personal".into()],
+        log: None,
         transport: TransportKind::Tailscale,
         enabled: true,
         expires: None,
@@ -680,6 +752,7 @@ async fn templates_become_grants_with_the_same_access() {
     expected.grants.push(Grant {
         name: "spare".into(),
         everyone: false,
+        log: None,
         rules: vec![
             Rule::Host {
                 host: Ipv4Addr::new(192, 168, 1, 9).into(),

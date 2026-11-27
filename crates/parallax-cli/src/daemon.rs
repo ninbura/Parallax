@@ -25,6 +25,7 @@
 //! the database copy; its encryption and writing run on a backup thread of
 //! their own, so they never delay a save.
 
+use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,12 +71,14 @@ const NAMES_EVERY: Duration = Duration::from_secs(300);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+// A log line nobody can read is dropped: `println!` would panic, possibly in a
+// task, leaving the rest of the daemon running without it.
 fn log(msg: impl std::fmt::Display) {
-    println!("parallax: {msg}");
+    let _ = writeln!(std::io::stdout(), "parallax: {msg}");
 }
 
 fn warn(msg: impl std::fmt::Display) {
-    eprintln!("parallax: {msg}");
+    let _ = writeln!(std::io::stderr(), "parallax: {msg}");
 }
 
 fn sys() -> System<'static> {
@@ -189,6 +192,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
         "gateway up; listening for commands on {}. Saved changes apply at once; SIGHUP re-applies",
         opts.socket.display()
     ));
+    notify_ready();
 
     let result = loop {
         tokio::select! {
@@ -279,6 +283,31 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path)
         .ok()
         .map(|m| (m.dev(), m.ino()))
+}
+
+/// Tell systemd the gateway is up (`Type=notify` in the native unit): applied,
+/// serving, and answering on its socket, so `systemctl start` returns only
+/// then. Outside systemd there's no `NOTIFY_SOCKET`, and nothing to do.
+fn notify_ready() {
+    let Some(target) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let sent = (|| -> std::io::Result<()> {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+        // "@name" is an abstract socket, anything else a path.
+        let addr = match target.as_encoded_bytes().strip_prefix(b"@") {
+            Some(name) => SocketAddr::from_abstract_name(name)?,
+            None => SocketAddr::from_pathname(Path::new(&target))?,
+        };
+        UnixDatagram::unbound()?.send_to_addr(b"READY=1", &addr)?;
+        Ok(())
+    })();
+    if let Err(e) = sent {
+        warn(format!(
+            "warning: couldn't tell systemd the gateway is up: {e}"
+        ));
+    }
 }
 
 /// Listen on `path`: directory 0700 when it's made here, socket 0600.
@@ -663,6 +692,14 @@ impl Engine {
             .enable_time()
             .build()
             .context("starting the engine's runtime")?;
+        if let Some((who, sudo_u)) = crate::owner::database_belongs_to_another_user(db) {
+            bail!(
+                "{} belongs to {who}: a daemon run as root would leave files that user can't \
+                 open. Start the service instead (`sudo systemctl start parallax`), or run it as \
+                 that user (`sudo -u {sudo_u} parallax daemon ...`)",
+                db.display()
+            );
+        }
         let mut store = rt.block_on(Store::open(db)).map_err(|e| match e {
             parallax_store::Error::InUse(_) => anyhow!(
                 "the database {} is open in another process; is another daemon running?",

@@ -315,8 +315,18 @@ pub mod real {
             tmp_name.push(".tmp");
             let tmp = dir.join(tmp_name);
             let mode = if secret { 0o600 } else { 0o644 };
+            // A fresh file, never one already there: on a native install
+            // root writes keys into the service's own directory, and a
+            // symlink or hard link the service left at this name must not
+            // send the write elsewhere. A leftover from a crash goes first.
+            match std::fs::remove_file(&tmp) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(Error::io(ctx(), e));
+                }
+                _ => {}
+            }
             let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -388,20 +398,101 @@ pub mod real {
             let mut child = cmd
                 .spawn()
                 .map_err(|e| Error::io(format!("spawning {program}"), e))?;
-            if let Some(input) = stdin {
-                if let Some(mut pipe) = child.stdin.take() {
-                    pipe.write_all(input.as_bytes())
-                        .map_err(|e| Error::io(format!("feeding stdin to {program}"), e))?;
-                }
-            }
-            let out = child
-                .wait_with_output()
-                .map_err(|e| Error::io(format!("waiting for {program}"), e))?;
+            // Input goes in on its own thread while this one drains stdout and
+            // stderr: a child that fills an output pipe before it has read all
+            // of its input would otherwise wait on us while we wait on it.
+            let pipe = child.stdin.take();
+            let (fed, out) = std::thread::scope(|s| {
+                // Builder, not `s.spawn`: no panic if no thread can be made.
+                // Then the closure and the pipe drop, the child sees end of
+                // input, and is still reaped below.
+                let writer =
+                    std::thread::Builder::new().spawn_scoped(s, move || match (pipe, stdin) {
+                        (Some(mut pipe), Some(input)) => match pipe.write_all(input.as_bytes()) {
+                            // It stopped reading (usually exited on an error):
+                            // its own output says why.
+                            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                            other => other,
+                        },
+                        // The pipe drops at the end of the thread: end of input.
+                        _ => Ok(()),
+                    });
+                let out = child.wait_with_output();
+                let fed = writer.and_then(|w| {
+                    w.join()
+                        .unwrap_or_else(|_| Err(std::io::Error::other("the stdin writer panicked")))
+                });
+                (fed, out)
+            });
+            // The child is reaped either way before an error returns.
+            let out = out.map_err(|e| Error::io(format!("waiting for {program}"), e))?;
+            fed.map_err(|e| Error::io(format!("feeding stdin to {program}"), e))?;
             Ok(Output {
                 status: out.status.code().unwrap_or(-1),
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // More than a pipe buffer (64 KiB on Linux): a large gateway's WireGuard config.
+        const BIG: usize = 1 << 20;
+
+        #[test]
+        fn feeds_input_larger_than_a_pipe_buffer() {
+            let input = "x".repeat(BIG);
+            let out = RealRunner.run("wc", &["-c"], Some(&input)).unwrap();
+            assert!(out.ok(), "{out:?}");
+            assert_eq!(out.stdout.trim(), BIG.to_string());
+        }
+
+        #[test]
+        fn a_child_that_writes_a_lot_before_reading_does_not_deadlock() {
+            let input = "x".repeat(BIG);
+            let script = format!("head -c {BIG} /dev/zero >&2; wc -c");
+            let out = RealRunner
+                .run("sh", &["-c", &script], Some(&input))
+                .unwrap();
+            assert_eq!(
+                (out.stdout.trim(), out.stderr.len()),
+                (BIG.to_string().as_str(), BIG)
+            );
+        }
+
+        #[test]
+        fn a_child_that_stops_reading_still_reports_its_own_result() {
+            let input = "x".repeat(BIG);
+            let out = RealRunner
+                .run("sh", &["-c", "echo refused >&2; exit 3"], Some(&input))
+                .unwrap();
+            assert_eq!((out.status, out.stderr.trim()), (3, "refused"));
+        }
+
+        #[test]
+        fn a_write_never_follows_a_link_left_at_its_temporary_name() {
+            let dir = std::env::temp_dir().join(format!("parallax-io-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let victim = dir.join("victim");
+            std::fs::write(&victim, "untouched").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.join(".key.tmp")).unwrap();
+
+            RealFs.write(&dir.join("key"), "secret\n", true).unwrap();
+
+            let victim_after = std::fs::read_to_string(&victim).unwrap();
+            let key = std::fs::read_to_string(dir.join("key")).unwrap();
+            let key_is_link = std::fs::symlink_metadata(dir.join("key"))
+                .unwrap()
+                .file_type()
+                .is_symlink();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_eq!(
+                (victim_after.as_str(), key.as_str(), key_is_link),
+                ("untouched", "secret\n", false)
+            );
         }
     }
 }

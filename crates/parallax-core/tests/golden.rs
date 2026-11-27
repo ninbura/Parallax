@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use parallax_core::generate::{self, ArtifactKind, Bundle};
 use parallax_core::io::memory::{MemoryFs, RecordingRunner};
 use parallax_core::io::System;
-use parallax_core::model::{FirewallBackend, Host, Platform, PortSpec, Proto, Rule};
+use parallax_core::model::{FirewallBackend, Host, LogLevel, Platform, PortSpec, Proto, Rule};
 use parallax_core::testing::{canonical_config, keypair, today};
 use parallax_core::transport::{self, Transport};
 use parallax_core::{Config, Model};
@@ -109,6 +109,52 @@ fn iptables_backend_matches_golden() {
         .chain(bundle.of_kind(ArtifactKind::FirewallDockerUser))
     {
         check_golden(&format!("iptables/{}", a.path.display()), &a.contents);
+    }
+}
+
+/// Logged peers get their blocked attempts handed to the collector, and at
+/// `connections` or more their flows marked; peers at `off` appear nowhere. (With nobody logged,
+/// the canonical goldens above have none of it.)
+#[test]
+fn logging_rules_match_golden() {
+    let mut cfg = canonical_config();
+    let family = cfg.grants.iter().position(|g| g.name == "family").unwrap();
+    cfg.grants[family].log = Some(LogLevel::Blocked);
+    cfg.peers[0].log = Some(LogLevel::Connections);
+    for backend in [FirewallBackend::Nftables, FirewallBackend::IptablesNft] {
+        cfg.server.firewall.backend = backend;
+        let bundle = bundle_for(&cfg);
+        let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
+        let name = match backend {
+            FirewallBackend::Nftables => "variants/logging.nft",
+            FirewallBackend::IptablesNft => "variants/logging.iptables",
+        };
+        check_golden(name, &fw.contents);
+    }
+    cfg.server.firewall.backend = FirewallBackend::Nftables;
+    let model = Model::resolve(&cfg, today()).unwrap();
+    let flows = parallax_core::logging::addresses(&model, LogLevel::Connections);
+    let denied = parallax_core::logging::addresses(&model, LogLevel::Blocked);
+    let address = |i: usize| {
+        cfg.peers[i]
+            .wireguard
+            .as_ref()
+            .and_then(|w| w.address)
+            .unwrap()
+    };
+    // Levels include the ones below: the peer at `connections` is in both
+    // sets; sister-phone, at `blocked` through family, only in the second.
+    assert!(flows.iter().any(|n| n.addr() == address(0)));
+    assert!(denied.iter().any(|n| n.addr() == address(0)));
+    assert!(!flows.iter().any(|n| n.addr() == address(2)));
+    assert!(denied.iter().any(|n| n.addr() == address(2)));
+    // Everyone not logged stays out of both sets.
+    for (i, p) in cfg.peers.iter().enumerate() {
+        let logged = p.log.is_some() || p.grants.iter().any(|g| g == "family");
+        if !logged {
+            assert!(!flows.iter().any(|n| n.addr() == address(i)), "{}", p.name);
+            assert!(!denied.iter().any(|n| n.addr() == address(i)), "{}", p.name);
+        }
     }
 }
 
@@ -609,6 +655,19 @@ fn apply_runs_expected_commands_and_is_idempotent() {
     let report = parallax_core::apply::apply(&model, &bundle, out, sys).unwrap();
     let lines = runner.command_lines();
     check_golden("apply/commands.txt", &(lines.join("\n") + "\n"));
+    // `wg` reads the config from the pipe, not a path (AppArmor on Ubuntu).
+    let fed = runner
+        .calls
+        .borrow()
+        .iter()
+        .find(|(p, a, _)| p == "wg" && a.first().is_some_and(|a| a == "syncconf"))
+        .and_then(|(_, _, stdin)| stdin.clone());
+    assert_eq!(
+        fed.as_deref(),
+        parallax_core::io::FileSystem::read(&fs, &out.join("wireguard/wg0.conf"))
+            .unwrap()
+            .as_deref()
+    );
     assert!(
         report
             .log
@@ -740,6 +799,7 @@ fn config_export_layout_matches_golden() {
     busy.grants.push(parallax_core::model::Grant {
         name: "public".into(),
         everyone: true,
+        log: None,
         rules: vec![Rule::PublicDns],
     });
     busy.peers[0].grants.push("family".into());
@@ -814,6 +874,7 @@ fn changing_grants_keeps_the_address_and_the_exported_config() {
     after.grants.push(parallax_core::model::Grant {
         name: "photos".into(),
         everyone: true,
+        log: None,
         rules: vec![Rule::Network {
             name: "home".into(),
         }],
@@ -841,11 +902,13 @@ fn a_peer_reaches_the_union_of_its_grants() {
     cfg.grants.push(parallax_core::model::Grant {
         name: "files".into(),
         everyone: false,
+        log: None,
         rules: vec![Rule::Service { name: "nas".into() }],
     });
     cfg.grants.push(parallax_core::model::Grant {
         name: "public".into(),
         everyone: true,
+        log: None,
         rules: vec![Rule::PublicDns],
     });
     cfg.peers[2].grants.push("files".into());

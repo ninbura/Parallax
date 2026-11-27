@@ -5,6 +5,9 @@
 //! back in a single transaction, row by row: rows keep their ids, so
 //! anything pointing at them (later, the GUI's own tables) survives.
 //!
+//! The database runs in Turso's MVCC mode, so writers on separate
+//! connections commit concurrently (docs/adr/0011-mvcc.md).
+//!
 //! One process at a time holds the database (Turso locks the file): the
 //! daemon while it runs, otherwise each CLI command for as long as it needs.
 //! Another process gets [`Error::InUse`]. Everything else asks the daemon
@@ -33,11 +36,15 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_host_names.sql"),
     include_str!("../migrations/0005_ports.sql"),
     include_str!("../migrations/0006_grants.sql"),
+    include_str!("../migrations/0007_logs.sql"),
 ];
 
 /// Tables holding what the daemon learned on this machine, not
 /// configuration: a restore keeps the current rows.
 const RUNTIME_TABLES: &[&str] = &["daemon_state"];
+
+/// The journal mode every database runs in (docs/adr/0011-mvcc.md).
+const MVCC: &str = "mvcc";
 
 /// How long a write waits for another connection's write to commit.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,7 +53,7 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Store {
     path: PathBuf,
     // Kept alive for as long as the connection is in use.
-    _db: turso::Database,
+    db: turso::Database,
     conn: turso::Connection,
 }
 
@@ -62,14 +69,21 @@ impl Store {
         if !path.exists() {
             return Err(Error::Missing(path.to_path_buf()));
         }
-        Store::open_inner(path).await
+        Store::open_inner(path, true).await
     }
 
     /// Open a database, creating an empty one (and its directory, 0700) if
     /// there is none.
     pub async fn create(path: &Path) -> Result<Store> {
         create_file(path)?;
-        Store::open_inner(path).await
+        Store::open_inner(path, true).await
+    }
+
+    /// Create a database left in the default journal mode, which `sqlite3`
+    /// can open: what a backup's copy is rebuilt into.
+    async fn create_plain(path: &Path) -> Result<Store> {
+        create_file(path)?;
+        Store::open_inner(path, false).await
     }
 
     /// Where the database lives.
@@ -77,7 +91,7 @@ impl Store {
         &self.path
     }
 
-    async fn open_inner(path: &Path) -> Result<Store> {
+    async fn open_inner(path: &Path, mvcc: bool) -> Result<Store> {
         let name = path
             .to_str()
             .ok_or_else(|| Error::Invalid(format!("{} is not valid UTF-8", path.display())))?;
@@ -90,9 +104,17 @@ impl Store {
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
         let store = Store {
             path: path.to_path_buf(),
-            _db: db,
+            db,
             conn,
         };
+        if mvcc {
+            // Refuse a database too new for this build before changing it.
+            store
+                .check_version(MIGRATIONS.len() as i64)
+                .await
+                .map_err(|e| store.busy(e))?;
+            store.use_mvcc().await.map_err(|e| store.busy(e))?;
+        }
         store.migrate().await.map_err(|e| store.busy(e))?;
         store.tighten()?;
         Ok(store)
@@ -104,11 +126,9 @@ impl Store {
     /// The CLI's owner-only umask covers files Turso creates later.
     fn tighten(&self) -> Result<()> {
         #[cfg(unix)]
-        for suffix in ["", "-wal"] {
+        for file in sidecars(&self.path) {
             use std::os::unix::fs::PermissionsExt;
-            let mut file = self.path.as_os_str().to_owned();
-            file.push(suffix);
-            let file = Path::new(&file);
+            let file = file.as_path();
             match std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -123,6 +143,38 @@ impl Store {
         match e {
             Error::Db(turso::Error::Busy(_)) => Error::Locked(self.path.clone()),
             e => e,
+        }
+    }
+
+    /// Switch the database to MVCC (docs/adr/0011-mvcc.md) if it isn't yet:
+    /// databases from before 7c are in WAL mode. The mode is stored in the
+    /// file, so this changes something only once.
+    async fn use_mvcc(&self) -> Result<()> {
+        if self.journal_mode(None).await? != MVCC {
+            let mode = self.journal_mode(Some(MVCC)).await?;
+            if mode != MVCC {
+                return Err(Error::Stored(format!(
+                    "{} stayed in journal mode '{mode}' instead of switching to '{MVCC}'",
+                    self.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The journal mode, after setting it to `set` if given.
+    async fn journal_mode(&self, set: Option<&str>) -> Result<String> {
+        let sql = match set {
+            Some(mode) => format!("PRAGMA journal_mode = '{mode}'"),
+            None => "PRAGMA journal_mode".to_owned(),
+        };
+        let mut rows = self.conn.query(&sql, ()).await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<String>(0)?.to_ascii_lowercase()),
+            None => Err(Error::Stored(format!(
+                "{} didn't report its journal mode",
+                self.path.display()
+            ))),
         }
     }
 
@@ -205,6 +257,21 @@ impl Store {
         Ok(())
     }
 
+    /// A second connection to this database, inside one read transaction:
+    /// every read through it sees the database at the same moment, while
+    /// this one keeps writing. Its own connection, so nothing else joins
+    /// the transaction, and dropping it (even mid-read) ends it.
+    async fn reader(&self) -> Result<Store> {
+        let conn = self.db.connect()?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        conn.execute("BEGIN", ()).await?;
+        Ok(Store {
+            path: self.path.clone(),
+            db: self.db.clone(),
+            conn,
+        })
+    }
+
     /// Commit if `result` is `Ok`, roll back otherwise, including when the
     /// commit itself fails, so the connection never stays inside a transaction.
     async fn finish<T>(&self, result: Result<T>) -> Result<T> {
@@ -223,6 +290,19 @@ impl Store {
     async fn rollback(&self) {
         let _ = self.conn.execute("ROLLBACK", ()).await;
     }
+}
+
+/// The database and the files Turso keeps beside it: the WAL
+/// (`<path>-wal`) and MVCC's log, which Turso names by replacing the
+/// extension (`parallax.db` → `parallax.db-log`, `x.sqlite` → `x.db-log`).
+fn sidecars(path: &Path) -> [PathBuf; 3] {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    [
+        path.to_path_buf(),
+        PathBuf::from(wal),
+        path.with_extension("db-log"),
+    ]
 }
 
 /// Turso refuses a file another process holds with a plain message; name

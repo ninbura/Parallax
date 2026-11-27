@@ -59,8 +59,11 @@ const MAX_PER_SOURCE: usize = 64;
 type Body = BoxBody<Bytes, hyper::Error>;
 type Upstream = Client<HttpsConnector<HttpConnector<FixedResolver>>, Incoming>;
 
+// Best effort: a log line nobody can read is dropped. `eprintln!` would panic
+// the task, and the daemon stops the gateway when this server's task ends.
 fn log(msg: impl std::fmt::Display) {
-    eprintln!("parallax proxy: {msg}");
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "parallax proxy: {msg}");
 }
 
 /// Resolves every name to the site's configured upstream: the proxy never
