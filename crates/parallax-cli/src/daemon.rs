@@ -807,6 +807,14 @@ impl Engine {
                 db.display()
             );
         }
+        if let Some((who, sudo_u)) = crate::owner::belongs_to_another_user(&out) {
+            bail!(
+                "{} belongs to {who}: a daemon run as root would write files there that user \
+                 can't replace. Start the service instead (`sudo systemctl start parallax`), or \
+                 run it as that user (`sudo -u {sudo_u} parallax daemon ...`)",
+                out.display()
+            );
+        }
         let mut store = rt.block_on(Store::open(db)).map_err(|e| match e {
             parallax_store::Error::InUse(_) => anyhow!(
                 "the database {} is open in another process; is another daemon running?",
@@ -1226,15 +1234,16 @@ impl Engine {
         let key = match (&passphrase, manifest.encrypted) {
             (_, false) => None,
             (Some(given), true) => Some(given.clone()),
-            (None, true) => {
-                Some(crate::backup::read_passphrase(server_file)?.ok_or_else(|| {
-                    anyhow!(
-                        "backup {} is encrypted and no passphrase is set in {}",
-                        path.display(),
-                        server_file.display()
-                    )
-                })?)
-            }
+            (None, true) => Some(
+                crate::backup::read_passphrase(&parallax_core::io::real::RealFs, server_file)?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "backup {} is encrypted and no passphrase is set in {}",
+                            path.display(),
+                            server_file.display()
+                        )
+                    })?,
+            ),
         };
         let contents = backup::open(path, key.as_ref())?;
         if contents.manifest.contents_sha256 != shown {

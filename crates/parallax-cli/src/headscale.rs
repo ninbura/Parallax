@@ -29,11 +29,14 @@ pub struct Api {
     url: String,
     key_file: PathBuf,
     ca: PathBuf,
+    /// How the key is read: as root, as the user the configuration is from.
+    files: crate::owner::ConfigFiles,
 }
 
 impl Api {
-    pub fn new(server: &ServerConfig) -> Self {
+    pub fn new(server: &ServerConfig, files: crate::owner::ConfigFiles) -> Self {
         Api {
+            files,
             url: server
                 .headscale
                 .server_url
@@ -51,9 +54,9 @@ impl Api {
         if !path.starts_with("/api/") {
             return Ok(None);
         }
-        let key = match std::fs::read_to_string(&self.key_file) {
-            Ok(key) => key.trim().to_string(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let key = match self.files.read_secret(&self.key_file) {
+            Ok(Some(key)) => key.trim().to_string(),
+            Ok(None) => {
                 return Err(Error::Headscale(format!(
                     "no API key for Headscale at {}: {} doesn't exist. Create a key with `headscale apikeys create` and write it there (mode 0600)",
                     self.url,
@@ -221,6 +224,7 @@ mod tests {
 
     fn api(url: &str, key_file: PathBuf) -> Api {
         Api {
+            files: crate::owner::ConfigFiles::default(),
             url: url.into(),
             key_file,
             ca: PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),

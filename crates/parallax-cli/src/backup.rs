@@ -81,8 +81,8 @@ fn now_secs() -> u64 {
 }
 
 /// The passphrase in `path`, if one is set there.
-pub(crate) fn read_passphrase(path: &Path) -> anyhow::Result<Option<Secret>> {
-    match RealFs.read(path)? {
+pub(crate) fn read_passphrase(fs: &dyn FileSystem, path: &Path) -> anyhow::Result<Option<Secret>> {
+    match fs.read(path)? {
         Some(text) => {
             let pass = text.trim_end_matches(['\n', '\r']);
             Ok((!pass.is_empty()).then(|| Secret::new(pass)))
@@ -96,7 +96,7 @@ fn backup_passphrase(settings: &BackupServer) -> anyhow::Result<Option<Secret>> 
     if !settings.encrypt {
         return Ok(None);
     }
-    match read_passphrase(&settings.passphrase_file)? {
+    match read_passphrase(&RealFs, &settings.passphrase_file)? {
         Some(p) => Ok(Some(p)),
         None => bail!(
             "backups are encrypted, but no passphrase is set ({} is missing); set one with `parallax backup passphrase`, or turn encryption off with server.backup.encrypt = false",
@@ -313,8 +313,9 @@ fn human_size(bytes: u64) -> String {
 
 fn set_passphrase(ctx: &Ctx, generate: bool, replace: bool) -> anyhow::Result<()> {
     let config = ctx.load()?;
+    let files = ctx.config_files();
     let path = &config.server.backup.passphrase_file;
-    if read_passphrase(path)?.is_some() && !replace {
+    if read_passphrase(&files, path)?.is_some() && !replace {
         bail!(
             "a backup passphrase is already set in {}; backups made with it need it to restore. Pass --replace to set a new one",
             path.display()
@@ -334,7 +335,7 @@ fn set_passphrase(ctx: &Ctx, generate: bool, replace: bool) -> anyhow::Result<()
         }
         first
     };
-    write_atomic(path, &format!("{passphrase}\n"))?;
+    files.write(path, &format!("{passphrase}\n"), true)?;
     if generate {
         outln!("{passphrase}")?;
     }
@@ -397,17 +398,18 @@ fn open_backup(
     file: &Path,
     given: Option<&Path>,
     server_file: &Path,
+    files: &dyn FileSystem,
 ) -> anyhow::Result<(backup::Contents, Option<Secret>)> {
     if let Some(given) = given {
         if !given.exists() {
             bail!("the passphrase file {} doesn't exist", given.display());
         }
-        let pass = read_passphrase(given)?
+        let pass = read_passphrase(&RealFs, given)?
             .ok_or_else(|| anyhow!("{} holds no passphrase", given.display()))?;
         let contents = backup::open(file, Some(&pass))?;
         return Ok((contents, Some(pass)));
     }
-    if let Some(pass) = read_passphrase(server_file)? {
+    if let Some(pass) = read_passphrase(files, server_file)? {
         match backup::open(file, Some(&pass)) {
             Ok(contents) => return Ok((contents, None)),
             Err(parallax_store::Error::WrongPassphrase(_)) => eoutln!(
@@ -462,12 +464,23 @@ fn restore(
     let defaults = BackupServer::default();
     let settings = before.as_ref().map_or(&defaults, |c| &c.server.backup);
     let (contents, typed) = if manifest.encrypted {
-        open_backup(file, passphrase_file, &settings.passphrase_file)?
+        open_backup(
+            file,
+            passphrase_file,
+            &settings.passphrase_file,
+            &ctx.config_files(),
+        )?
     } else {
         (backup::open(file, None)?, None)
     };
-    // Next to the database: it holds the same private data.
-    let staging = TempDir::new_in(&private_dir_of(ctx.db())?, ".parallax-restore")?;
+    // Next to the database: it holds the same private data. Unless that's
+    // the service's directory and this is root: then a directory of root's
+    // own, so the service can't swap what root opens there, and a killed
+    // restore leaves nothing root-owned in the service's way.
+    let staging = match crate::owner::database_belongs_to_another_user(ctx.db()) {
+        Some(_) => TempDir::new_in(&std::env::temp_dir(), "parallax-restore")?,
+        None => TempDir::new_in(&private_dir_of(ctx.db())?, ".parallax-restore")?,
+    };
 
     block_on(async {
         let (staged, restored) = stage(&contents, file, staging.path()).await?;
@@ -581,13 +594,15 @@ pub(crate) async fn restore_into(
     }
     // The key goes in first and comes back out if the database can't
     // be replaced, so the two always match.
+    // As root, files in another user's directory are written as that user.
+    let files = crate::owner::ConfigFiles::default();
     let key_file = &restored.server.wireguard.private_key_file;
-    let old_key = RealFs.read(key_file)?;
-    write_atomic(key_file, contents.server_key().expose())?;
+    let old_key = files.read(key_file)?;
+    files.write(key_file, contents.server_key().expose(), true)?;
     if let Err(e) = live.replace_with(staged, before).await {
         let undone = match &old_key {
-            Some(old) => write_atomic(key_file, old),
-            None => std::fs::remove_file(key_file).map_err(Into::into),
+            Some(old) => files.write(key_file, old, true),
+            None => files.remove(key_file).map(|_| ()),
         };
         if let Err(undo) = undone {
             // Best effort, not `eoutln!`: the daemon restores through here too.
@@ -609,9 +624,12 @@ pub(crate) async fn restore_into(
     let wanted = &restored.server.backup;
     if let Some(pass) = typed.filter(|_| wanted.encrypt) {
         let file = &wanted.passphrase_file;
-        let kept = match read_passphrase(file) {
+        let kept = match read_passphrase(&files, file) {
             Ok(Some(_)) => Ok(false),
-            Ok(None) => write_atomic(file, &format!("{}\n", pass.expose())).map(|()| true),
+            Ok(None) => files
+                .write(file, &format!("{}\n", pass.expose()), true)
+                .map(|()| true)
+                .map_err(Into::into),
             Err(e) => Err(e),
         };
         match kept {
@@ -734,5 +752,5 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
     f.write_all(contents.as_bytes()).with_context(ctx)?;
     f.sync_all().with_context(ctx)?;
     std::fs::rename(&tmp, path).with_context(ctx)?;
-    crate::owner::hand_to_directory_owner(path)
+    Ok(())
 }
