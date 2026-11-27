@@ -133,31 +133,37 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
     LiveState(listing)
 }
 
-/// Which of the parts [`teardown`] removes are on the host.
+/// Which of the parts [`teardown`] removes are on the host: `Some(true)`
+/// there, `Some(false)` confirmed gone, `None` couldn't tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parts {
-    /// The nftables table (the nftables backend only).
-    pub table: bool,
+    /// The nftables table (the nftables backend only; `Some(false)` otherwise).
+    pub table: Option<bool>,
     /// The WireGuard interface.
-    pub interface: bool,
+    pub interface: Option<bool>,
 }
 
 /// Which of the parts `apply` sets up for `server` are on the host now.
-/// One that can't be checked counts as there.
 pub fn parts_present(server: &ServerConfig, sys: System<'_>) -> Parts {
-    let there = |program: &str, args: &[&str]| {
-        sys.runner
-            .run(program, args, None)
-            .map_or(true, |out| out.ok())
+    // Gone only when the tool says so; any other failure is "can't tell".
+    let probe = |program: &str, args: &[&str], gone: &str| match sys.runner.run(program, args, None)
+    {
+        Ok(out) if out.ok() => Some(true),
+        Ok(out) if out.stderr.contains(gone) => Some(false),
+        _ => None,
     };
     let table = crate::generate::firewall::TABLE;
+    let iface = server.wireguard.interface.as_str();
     Parts {
-        table: server.firewall.backend == FirewallBackend::Nftables
-            && there("nft", &["-t", "list", "table", "inet", table]),
-        interface: there(
-            "ip",
-            &["link", "show", "dev", server.wireguard.interface.as_str()],
-        ),
+        table: match server.firewall.backend {
+            FirewallBackend::Nftables => probe(
+                "nft",
+                &["-t", "list", "table", "inet", table],
+                "No such file or directory",
+            ),
+            FirewallBackend::IptablesNft => Some(false),
+        },
+        interface: probe("ip", &["link", "show", "dev", iface], "does not exist"),
     }
 }
 
@@ -165,26 +171,35 @@ pub fn parts_present(server: &ServerConfig, sys: System<'_>) -> Parts {
 /// WireGuard interface, as the container's shutdown always did. Returns a
 /// log line per step; a step that fails is logged and the next one still runs.
 pub fn teardown(server: &ServerConfig, sys: System<'_>) -> Vec<String> {
-    let all = Parts {
+    let all = Removal {
         table: true,
         interface: true,
     };
     remove(server, all, sys)
 }
 
-/// After a failed apply: take down what it added, the parts on the host
-/// now that weren't in `before` (taken just before it). What was there
-/// already stays, whoever set it up. Log lines as for [`teardown`].
+/// After a failed apply: take down what it added, the parts confirmed on
+/// the host now that `before` (taken just before it) confirmed weren't.
+/// What was there already stays, whoever set it up, and so does a part
+/// either check couldn't tell about. Log lines as for [`teardown`].
 pub fn teardown_added(server: &ServerConfig, before: Parts, sys: System<'_>) -> Vec<String> {
     let now = parts_present(server, sys);
-    let added = Parts {
-        table: now.table && !before.table,
-        interface: now.interface && !before.interface,
+    let added =
+        |before: Option<bool>, now: Option<bool>| before == Some(false) && now == Some(true);
+    let parts = Removal {
+        table: added(before.table, now.table),
+        interface: added(before.interface, now.interface),
     };
-    remove(server, added, sys)
+    remove(server, parts, sys)
 }
 
-fn remove(server: &ServerConfig, parts: Parts, sys: System<'_>) -> Vec<String> {
+/// Which parts [`remove`] takes down.
+struct Removal {
+    table: bool,
+    interface: bool,
+}
+
+fn remove(server: &ServerConfig, parts: Removal, sys: System<'_>) -> Vec<String> {
     let iface = server.wireguard.interface.as_str();
     let table = crate::generate::firewall::TABLE;
     let mut steps: Vec<(String, &str, Vec<&str>)> = Vec::new();
@@ -389,66 +404,74 @@ mod tests {
         assert_eq!(log[1], "removed interface wg0");
     }
 
-    fn missing() -> Output {
+    /// How `parts_present`'s check for one part answers.
+    #[derive(Clone, Copy)]
+    enum Check {
+        There,
+        Gone,
+        /// Fails for another reason than "not there".
+        Unclear,
+    }
+    use Check::{Gone, There, Unclear};
+
+    fn answer(check: Check, gone: &str) -> Output {
+        let (status, stderr) = match check {
+            There => (0, String::new()),
+            Gone => (1, gone.to_string()),
+            Unclear => (1, "Operation not permitted".to_string()),
+        };
         Output {
-            status: 1,
+            status,
             stdout: String::new(),
-            stderr: "does not exist".into(),
+            stderr,
         }
     }
 
-    /// The table and the interface as `parts_present` asks for them.
-    fn respond_present(runner: &RecordingRunner, table: bool, interface: bool) {
-        let found = |there| {
-            if there {
-                Output {
-                    status: 0,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                }
-            } else {
-                missing()
-            }
-        };
+    /// Queue the answers for one `parts_present`.
+    fn respond_present(runner: &RecordingRunner, table: Check, interface: Check) {
         runner.respond_to(
             "nft",
             &["-t", "list", "table", "inet", "parallax"],
-            found(table),
+            answer(table, "Error: No such file or directory"),
         );
-        runner.respond_to("ip", &["link", "show", "dev", "wg0"], found(interface));
+        runner.respond_to(
+            "ip",
+            &["link", "show", "dev", "wg0"],
+            answer(interface, "Device \"wg0\" does not exist."),
+        );
     }
 
-    fn removals(runner: &RecordingRunner) -> Vec<String> {
-        runner
-            .command_lines()
-            .into_iter()
-            .filter(|l| l.contains(" del"))
-            .collect()
-    }
-
-    #[test]
-    fn a_failed_apply_takes_down_what_it_added() {
-        let config = canonical_config();
+    /// What a failed apply takes down, given what the checks before and
+    /// after it answer: (table, interface) each, then the removals run.
+    fn after_failed_apply(
+        config: &crate::model::Config,
+        before: (Check, Check),
+        now: (Check, Check),
+    ) -> (Vec<String>, Vec<String>) {
         let fs = MemoryFs::new();
         let runner = RecordingRunner::new();
         let sys = System {
             fs: &fs,
             runner: &runner,
         };
-        respond_present(&runner, false, false);
+        respond_present(&runner, before.0, before.1);
         let before = parts_present(&config.server, sys);
-        assert_eq!(
-            before,
-            Parts {
-                table: false,
-                interface: false
-            }
-        );
-        // The apply got as far as both before it failed.
-        respond_present(&runner, true, true);
+        respond_present(&runner, now.0, now.1);
         let log = teardown_added(&config.server, before, sys);
+        let removals = runner
+            .command_lines()
+            .into_iter()
+            .filter(|l| l.contains(" del"))
+            .collect();
+        (removals, log)
+    }
+
+    #[test]
+    fn a_failed_apply_takes_down_what_it_added() {
+        let config = canonical_config();
+        let (removals, log) = after_failed_apply(&config, (Gone, Gone), (There, There));
         assert_eq!(
-            removals(&runner),
+            removals,
             ["nft delete table inet parallax", "ip link del dev wg0"]
         );
         assert_eq!(
@@ -460,31 +483,92 @@ mod tests {
     #[test]
     fn a_failed_apply_leaves_what_was_there_before_it() {
         let config = canonical_config();
+        // An interface from before (a crashed daemon's, or someone else's).
+        let (removals, _) = after_failed_apply(&config, (Gone, There), (There, There));
+        assert_eq!(removals, ["nft delete table inet parallax"]);
+        // A table from before.
+        let (removals, _) = after_failed_apply(&config, (There, Gone), (There, There));
+        assert_eq!(removals, ["ip link del dev wg0"]);
+        // Both.
+        let (removals, log) = after_failed_apply(&config, (There, There), (There, There));
+        assert!(
+            removals.is_empty() && log.is_empty(),
+            "{removals:?} {log:?}"
+        );
+        // It failed before changing anything.
+        let (removals, log) = after_failed_apply(&config, (Gone, Gone), (Gone, Gone));
+        assert!(
+            removals.is_empty() && log.is_empty(),
+            "{removals:?} {log:?}"
+        );
+    }
+
+    /// A check that fails for another reason than "not there" removes
+    /// nothing: before, the part may have been there; after, it may be gone.
+    #[test]
+    fn an_unclear_check_removes_nothing() {
+        let config = canonical_config();
+        let (removals, _) = after_failed_apply(&config, (Unclear, Unclear), (There, There));
+        assert!(removals.is_empty(), "{removals:?}");
+        let (removals, log) = after_failed_apply(&config, (Gone, Gone), (Unclear, Unclear));
+        assert!(
+            removals.is_empty() && log.is_empty(),
+            "{removals:?} {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_check_that_cannot_run_is_unclear() {
+        struct NoPrograms;
+        impl crate::io::ProcessRunner for NoPrograms {
+            fn run(&self, program: &str, _: &[&str], _: Option<&str>) -> crate::Result<Output> {
+                Err(crate::Error::Invalid(vec![format!("no {program}")]))
+            }
+        }
+        let config = canonical_config();
+        let parts = parts_present(
+            &config.server,
+            System {
+                fs: &MemoryFs::new(),
+                runner: &NoPrograms,
+            },
+        );
+        assert_eq!(
+            parts,
+            Parts {
+                table: None,
+                interface: None
+            }
+        );
+    }
+
+    /// iptables-nft has no table of Parallax's own: only the interface.
+    #[test]
+    fn iptables_checks_and_takes_down_only_the_interface() {
+        let mut config = canonical_config();
+        config.server.firewall.backend = FirewallBackend::IptablesNft;
         let fs = MemoryFs::new();
         let runner = RecordingRunner::new();
         let sys = System {
             fs: &fs,
             runner: &runner,
         };
-        // An interface from before (a crashed daemon's, or someone else's);
-        // the apply added only the table.
-        respond_present(&runner, false, true);
+        runner.respond_to(
+            "ip",
+            &["link", "show", "dev", "wg0"],
+            answer(Gone, "Device \"wg0\" does not exist."),
+        );
         let before = parts_present(&config.server, sys);
-        respond_present(&runner, true, true);
+        assert_eq!(before.table, Some(false));
         let log = teardown_added(&config.server, before, sys);
-        assert_eq!(removals(&runner), ["nft delete table inet parallax"]);
-        assert_eq!(log, ["removed table inet parallax"]);
-
-        // It failed before changing anything: nothing to take down.
-        let runner = RecordingRunner::new();
-        let sys = System {
-            fs: &fs,
-            runner: &runner,
-        };
-        respond_present(&runner, false, false);
-        let before = parts_present(&config.server, sys);
-        respond_present(&runner, false, false);
-        assert!(teardown_added(&config.server, before, sys).is_empty());
-        assert!(removals(&runner).is_empty());
+        assert_eq!(
+            runner.command_lines(),
+            [
+                "ip link show dev wg0",
+                "ip link show dev wg0",
+                "ip link del dev wg0"
+            ]
+        );
+        assert_eq!(log, ["removed interface wg0"]);
     }
 }

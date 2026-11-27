@@ -811,19 +811,27 @@ else
 fi
 # A first apply that fails partway takes down what it set up (#53): another
 # socket holds WireGuard's port, so wg0 can't come up once the table and wg0 are in.
-inns gw python3 -c 'import socket, time
+# Not through `inns`: $! must be python itself, or killing it leaves the port held.
+ip netns exec "${PREFIX}gw" python3 -c 'import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 51820)); time.sleep(60)' &
 HOLDER=$!
 PIDS+=($HOLDER)
 for _ in $(seq 50); do inns gw ss -Hlun 'sport = :51820' | grep -q . && break; sleep 0.1; done
+inns gw ss -Hlun 'sport = :51820' | grep -q . || fail "(n) could not hold WireGuard's port"
 if [ "$MODE" = unit ]; then
-    held=(timeout 30 "${AS_UNIT[@]}" --wait --pipe "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK"
-        daemon -o "$WORK/out")
+    UNITS+=("${PREFIX}held")
+    held=(timeout 30 "${AS_UNIT[@]}" --unit="${PREFIX}held" --wait --pipe "$WORK/parallax"
+        --db "$WORK/parallax.db" --socket "$SOCK" daemon -o "$WORK/out")
 else
     held=(inns gw timeout 30 $P daemon -o "$WORK/out")
 fi
-if "${held[@]}" > "$WORK/held.log" 2>&1; then fail "(n) the daemon started with WireGuard's port taken"; fi
-kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+status=0
+"${held[@]}" > "$WORK/held.log" 2>&1 || status=$?
+# 124: still running when `timeout` stopped it, so it started.
+case $status in 0|124) cat "$WORK/held.log"; fail "(n) the daemon started with WireGuard's port taken" ;; esac
+kill "$HOLDER" 2>/dev/null || true
+wait "$HOLDER" 2>/dev/null || true
+inns gw ss -Hlun 'sport = :51820' | grep -q . && fail "(n) WireGuard's port is still held"
 grep -q "the first apply failed" "$WORK/held.log" || { cat "$WORK/held.log"; fail "(n) the held port didn't fail the first apply"; }
 inns gw nft list table inet parallax >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left the table"; }
 inns gw ip link show wg0 >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left wg0"; }
