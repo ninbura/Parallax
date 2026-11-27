@@ -866,7 +866,8 @@ fn engine_thread(
     };
     if public_ip::needed(&engine.view.config) {
         let found = crate::find_public_ip(&engine.view.config.server);
-        engine.note_public_ip(found);
+        let from = public_ip_source(&engine.view.config);
+        engine.note_public_ip(found, from);
     }
     // Before the first apply: a peer that names a node has no address
     // until Headscale answers, so a restart mustn't wait a poll for it.
@@ -942,6 +943,9 @@ struct Engine {
     /// The database holds `view.public_ip`; false after a failed write, so
     /// the next lookup writes it again.
     public_ip_saved: bool,
+    /// The settings `view.public_ip` was last found from; `None` when it
+    /// came from the database (before a restart) or was never found.
+    public_ip_from: Option<Source>,
     /// Why the last name lookups failed, logged once.
     name_problems: Vec<String>,
     /// Why Headscale didn't answer last time, logged once.
@@ -993,6 +997,7 @@ impl Engine {
             backups,
             public_ip_problems: None,
             public_ip_saved: true,
+            public_ip_from: None,
             name_problems: Vec::new(),
             tailnet_problem: None,
         };
@@ -1076,10 +1081,10 @@ impl Engine {
                 // A save changed the inputs, or looked itself, while this
                 // lookup ran: the lookup for the new ones is already on its way.
                 Msg::PublicIp(asked, _) if asked != lookup_inputs(&self.view) => {}
-                Msg::PublicIp(_, found) => {
+                Msg::PublicIp((from, _), found) => {
                     let server = &self.view.config.server;
                     let before = public_ip::effective(server, self.view.public_ip);
-                    self.note_public_ip(found);
+                    self.note_public_ip(found, from);
                     let server = &self.view.config.server;
                     if public_ip::effective(server, self.view.public_ip) != before {
                         why.get_or_insert("the home's public IP changed");
@@ -1161,20 +1166,21 @@ impl Engine {
         }
     }
 
-    /// Take a lookup's result: a new address is published and remembered
-    /// in the database; a failure is logged once.
-    fn note_public_ip(&mut self, found: Result<Found, Vec<String>>) {
-        if self.record_public_ip(found) {
+    /// Take a lookup's result, from the settings `from`: a new address is
+    /// published and remembered in the database; a failure is logged once.
+    fn note_public_ip(&mut self, found: Result<Found, Vec<String>>, from: Source) {
+        if self.record_public_ip(found, from) {
             self.publish();
         }
     }
 
     /// [`Engine::note_public_ip`] without publishing. Returns whether the
     /// address changed.
-    fn record_public_ip(&mut self, found: Result<Found, Vec<String>>) -> bool {
+    fn record_public_ip(&mut self, found: Result<Found, Vec<String>>, from: Source) -> bool {
         match found {
             Ok(found) => {
                 self.public_ip_problems = None;
+                self.public_ip_from = Some(from);
                 let changed = self.view.public_ip != Some(found.address);
                 if changed {
                     log(format!(
@@ -1339,14 +1345,19 @@ impl Engine {
         crate::check(&config).map_err(refuse)?;
         let old_ip = public_ip::effective(&self.view.config.server, self.view.public_ip);
         // A name may point at the home's public IP. Look before telling
-        // where a name points when nothing looked for it (nothing needed it)
-        // or the address known came from other settings than this change's
-        // (another endpoint): a few seconds at most, and only then. What it
-        // finds is kept only if the change is.
+        // where a name points (a few seconds at most, and only then): when
+        // this change looks names up and the address known wasn't found
+        // from its settings (nothing looked while nothing needed it, an
+        // earlier change or a restore moved the endpoint, or it's from
+        // before a restart), and when this change moves the endpoint of a
+        // configuration that uses names. What it finds is kept only if the
+        // change is.
+        let source = public_ip_source(&config);
         let asked = !names::asked_on_save(Some(&self.view.config), &config).is_empty();
-        let unknown = public_ip::effective(&config.server, self.view.public_ip).is_none();
-        let elsewhere = public_ip_source(&self.view.config) != public_ip_source(&config);
-        let found = ((unknown && asked) || (elsewhere && !names::used(&config).is_empty()))
+        let unverified = public_ip::effective(&config.server, self.view.public_ip).is_none()
+            || self.public_ip_from.as_ref() != Some(&source);
+        let elsewhere = public_ip_source(&self.view.config) != source;
+        let found = ((asked && unverified) || (elsewhere && !names::used(&config).is_empty()))
             .then(|| crate::find_public_ip(&config.server));
         let known_ip = match &found {
             Some(Ok(found)) => Some(found.address),
@@ -1382,7 +1393,7 @@ impl Engine {
             if found.is_ok() {
                 self.view.public_ip_set = self.view.public_ip_set.wrapping_add(1);
             }
-            self.record_public_ip(found);
+            self.record_public_ip(found, source);
         }
         self.replace(config);
         self.set_names_from_save(learned.names, asked);

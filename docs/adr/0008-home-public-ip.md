@@ -36,9 +36,11 @@ generation, like the date, so the ruleset stays deterministic.
 - **When.** The daemon looks at startup (before the first apply), every 5
   minutes, and when a saved change alters what the lookup depends on; it
   re-applies only when the address in effect changes. A result for
-  settings that changed while it ran is dropped. A save that adds a name
-  looks first when no address is known, and keeps what it finds only if
-  the save is accepted. Without a daemon, `parallax apply` looks and stores
+  settings that changed while it ran is dropped. A save looks first when it
+  looks names up and the address known wasn't found from its settings, or
+  when it moves the endpoint of a configuration that uses names; it keeps
+  what it finds only if the save is accepted, and a lookup that started
+  before it is dropped. Without a daemon, `parallax apply` looks and stores
   what it finds; `plan`, `generate`, `export` and `peer show` look without
   storing, so they show what `apply` would do. Each lookup gives up after 3 seconds per nameserver,
   and runs off the engine thread, so saves never wait on it.

@@ -827,6 +827,8 @@ public_ip_is 9.9.9.9 || fail "(o) the address changed after a refused answer"
 # Without a daemon, `generate` looks the public IP up as `apply` does (#44): on a
 # database that never stored one, the guests' drop still has the address.
 FRESH="${P%% --db *} --db $WORK/fresh.db --socket $WORK/fresh.sock"
+# As the service's user: root refuses a database under its directory.
+[ "$MODE" = unit ] && FRESH="runuser -u nobody -- $FRESH"
 $FRESH config import "$WORK/public-ip-name.toml" >/dev/null || fail "(o) import into a fresh database failed"
 inns gw $FRESH generate -o "$WORK/fresh-out" >/dev/null 2>"$WORK/fresh.err" \
     || { cat "$WORK/fresh.err"; fail "(o) generate without a daemon failed"; }
