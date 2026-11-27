@@ -787,6 +787,14 @@ public_ip_is() { # address
 grep -q "home public IP" <<<"$($P status)" && fail "(o) the private endpoint was taken as the public IP"
 grep -q "the endpoint 203.0.113.1:51820 is not a public address" "$WORK/daemon.log" \
     || fail "(o) the daemon did not say why the public IP is unknown"
+# A refused save changes nothing, not even the public IP its own endpoint gives (#45):
+# it adds a name, so its endpoint's hostname is looked up, but the name doesn't resolve.
+sed 's/^endpoint = .*/endpoint = "home.example.org:51820"/' "$(named nosuch.mydomain.com)" \
+    > "$WORK/refused-ip.toml"
+grep -q '^endpoint = "home.example.org:51820"$' "$WORK/refused-ip.toml" || fail "(o) no endpoint to change"
+$P config import "$WORK/refused-ip.toml" > "$WORK/refused-ip.err" 2>&1 \
+    && fail "(o) a save granting nosuch.mydomain.com was accepted"
+grep -q "home public IP" <<<"$($P status)" && fail "(o) a refused save recorded the public IP its endpoint gives"
 $P config export > "$WORK/public-ip.toml"
 sed -i 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' "$WORK/public-ip.toml"
 apply "$WORK/public-ip.toml"
