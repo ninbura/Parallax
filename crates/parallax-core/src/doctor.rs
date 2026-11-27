@@ -119,7 +119,7 @@ pub fn diagnose(config: Result<&Config, String>, sys: System<'_>) -> Vec<Check> 
     checks
 }
 
-/// Logging `bytes` needs the kernel to count each connection's bytes, a
+/// Logging at `detailed` needs the kernel to count each connection's bytes, a
 /// host setting like `ip_forward`. Only a warning: connections are still
 /// logged, just without their bytes.
 fn check_conntrack_acct(sys: System<'_>) -> Outcome {
@@ -702,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_counts_are_checked_only_when_some_peer_logs_bytes() {
+    fn byte_counts_are_checked_only_when_something_logs_detailed() {
         let names = |config: &Config, fs: &MemoryFs| -> Vec<(String, Outcome)> {
             run_with(Ok(config), fs, &RecordingRunner::new())
                 .into_iter()

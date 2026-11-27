@@ -71,16 +71,22 @@ impl Scratch {
     fn run(&self, args: &[&str]) -> (bool, String, String) {
         self.run_with_env(args, &[])
     }
-    fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_parallax"))
-            .arg("--db")
+    /// The command `run` runs, for tests that set up its streams themselves.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_parallax"));
+        cmd.arg("--db")
             .arg(self.db())
             .arg("--socket")
             .arg(self.socket())
             .args(args)
-            .envs(env.iter().copied())
             .env_remove("VISUAL")
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        cmd
+    }
+    fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
+        let out = self
+            .command(args)
+            .envs(env.iter().copied())
             .output()
             .unwrap();
         (
@@ -912,4 +918,50 @@ fn a_backup_dated_in_the_future_does_not_stay_newest() {
     let (ok, out, err) = s.run(&["backup", "create", "--if-due"]);
     assert!(ok && out.is_empty(), "{out}{err}");
     assert_eq!(s.backups().len(), 2);
+}
+
+/// A reader that goes away (`parallax peer show | head -1`, a pager that quits)
+/// stops the command quietly with SIGPIPE's status, not a panic. The pipe's
+/// read end is closed before the command starts, so every write fails.
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_stops_the_command_without_a_panic() {
+    use std::os::unix::process::ExitStatusExt;
+    let s = Scratch::new("closed-stdout");
+    s.import();
+    for args in [&["config", "export"][..], &["peer", "show"], &["validate"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = s.command(args).stdout(writer).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            (out.status.code(), out.status.signal()),
+            (Some(141), None),
+            "{args:?}: {err}"
+        );
+        assert!(err.is_empty(), "{args:?}: {err}");
+    }
+}
+
+/// stderr only carries messages about the work: with it closed, `peer add`
+/// still saves the peer and prints its one-time config.
+#[test]
+fn a_closed_stderr_changes_nothing() {
+    let s = Scratch::new("closed-stderr");
+    s.import();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = s
+        .command(&["peer", "add", "tablet", "--grant", "family"])
+        .stderr(writer)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(
+        text.contains("[Interface]") && text.contains("PrivateKey"),
+        "{text}"
+    );
+    let (ok, shown, err) = s.run(&["peer", "show", "tablet"]);
+    assert!(ok && shown.contains("tablet"), "{shown}{err}");
 }

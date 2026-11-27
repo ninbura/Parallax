@@ -153,6 +153,7 @@ fn logging_rules_match_golden() {
         let logged = p.log.is_some() || p.grants.iter().any(|g| g == "family");
         if !logged {
             assert!(!flows.iter().any(|n| n.addr() == address(i)), "{}", p.name);
+            assert!(!denied.iter().any(|n| n.addr() == address(i)), "{}", p.name);
         }
     }
 }
