@@ -821,6 +821,14 @@ grep -q "rebind.example.org through 9.9.9.9: answered 192.168.1.5, which isn't a
 grep -q "keeping the last known 9.9.9.9" "$WORK/daemon.log" || fail "(o) the last known address was not kept"
 public_ip_is 9.9.9.9 || fail "(o) the address changed after a refused answer"
 [ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(o) friend reached the home's public IP after a refused lookup"
+# Without a daemon, `generate` looks the public IP up as `apply` does (#44): on a
+# database that never stored one, the guests' drop still has the address.
+FRESH="${P%% --db *} --db $WORK/fresh.db --socket $WORK/fresh.sock"
+$FRESH config import "$WORK/public-ip-name.toml" >/dev/null || fail "(o) import into a fresh database failed"
+inns gw $FRESH generate -o "$WORK/fresh-out" >/dev/null 2>"$WORK/fresh.err" \
+    || { cat "$WORK/fresh.err"; fail "(o) generate without a daemon failed"; }
+grep -Eq 'elements = \{.* 9\.9\.9\.9, .*198\.18\.0\.0/15' "$WORK/fresh-out/nftables/parallax.nft" \
+    || fail "(o) generate without a daemon did not look the public IP up"
 pass "(o) guests drop the home's public IP: configured, looked up and re-applied on change; a private answer is refused"
 
 # (n) the daemon's lifecycle: SIGTERM takes the gateway down and removes the socket;
