@@ -981,11 +981,22 @@ impl Ctx {
     }
 
     /// The configuration and what the gateway learned: what generation
-    /// needs. Without a daemon, the named hosts are looked up and Headscale
-    /// is asked here; a Headscale that doesn't answer is a warning.
+    /// needs. Without a daemon, the home's public IP and the named hosts are
+    /// looked up and Headscale is asked here, as `apply` does, so what this
+    /// shows is what `apply` would do. Nothing is written: the public
+    /// IP is remembered by `apply` and the daemon. A lookup that fails, or a
+    /// Headscale that doesn't answer, is a warning.
     pub(crate) fn load_for_generation(&self) -> anyhow::Result<(Config, Learned)> {
         let (config, revision, mut learned) = self.load_full()?;
         if revision.is_none() {
+            if public_ip::needed(&config) {
+                match find_public_ip(&config.server) {
+                    Ok(found) => learned.public_ip = Some(found.address),
+                    Err(problems) => {
+                        print_warnings(&[public_ip_lookup_failed(&problems, learned.public_ip)])
+                    }
+                }
+            }
             let home = public_ip::effective(&config.server, learned.public_ip);
             learned.names = find_names(&config, home).resolved;
             learned.tailnet = find_tailnet(&config).unwrap_or_else(|problem| {

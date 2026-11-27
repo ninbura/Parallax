@@ -443,6 +443,9 @@ clients/<peer>/<platform>.conf     only for peers that retain their private key 
 
 `iptables-nft` backend writes `iptables/parallax.rules` (iptables-restore
 format, PARALLAX_* chains) and `iptables/docker-user.rules` instead.
+Apply keeps each PARALLAX_* jump first in its built-in chain, and
+`DOCKER-USER` starts with a jump to `PARALLAX_FORWARD`, so Docker's rules
+never come before Parallax's (ADR 0003).
 Its sets live in the host's one ipset namespace, so apply removes only
 stale sets named as Parallax names them (`wg_`, `ts_`, `lan_real_`,
 `not_public_`, `log_flows_` or `log_denied_` and a 16-digit hex hash, or

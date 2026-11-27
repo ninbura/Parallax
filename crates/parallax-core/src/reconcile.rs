@@ -17,7 +17,13 @@ use crate::model::{FirewallBackend, ServerConfig};
 /// A listing of what `apply` set up, compared as a whole. It holds no
 /// secrets: nothing here prints a private key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveState(String);
+pub struct LiveState {
+    listing: String,
+    /// Someone else's rule comes before Parallax's in a built-in chain
+    /// (issue #74). Always worth an apply, even when it was so right after
+    /// the last one.
+    out_of_order: bool,
+}
 
 /// Why the loop applies again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +73,10 @@ impl Reconciler {
         match &self.last {
             None => Some(Reason::Retry),
             Some((date, _)) if *date != today => Some(Reason::NewDay),
-            Some((_, recorded)) => (live() != *recorded).then_some(Reason::Drift),
+            Some((_, recorded)) => {
+                let live = live();
+                (live.out_of_order || live != *recorded).then_some(Reason::Drift)
+            }
         }
     }
 }
@@ -109,6 +118,7 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
         ("wg", vec!["show", iface, "allowed-ips"]),
     ]);
     let mut listing = String::new();
+    let mut out_of_order = false;
     for (program, args) in commands {
         listing.push_str(&format!("$ {program} {}\n", args.join(" ")));
         match sys.runner.run(program, &args, None) {
@@ -124,14 +134,54 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
                         listing.push_str(line);
                         listing.push('\n');
                     }
+                    // Lines only Parallax's own: someone else's rule going
+                    // in above its jump changes none of them (issue #74).
+                    if program == "iptables-save" {
+                        out_of_order = crate::generate::firewall::iptables::CHAINS.iter().any(
+                            |(table, builtin, own)| {
+                                !crate::apply::decides_first(
+                                    &save_table(&out.stdout, table),
+                                    builtin,
+                                    own,
+                                )
+                            },
+                        );
+                        // Docker's chain coming (it starts after Parallax)
+                        // or going: it needs Parallax's rules, as with nft.
+                        if server.firewall.docker_coexistence {
+                            let docker = save_table(&out.stdout, "filter")
+                                .lines()
+                                .any(|l| l.starts_with(":DOCKER-USER "));
+                            listing.push_str(&format!("DOCKER-USER there: {docker}\n"));
+                        }
+                    }
                 } else {
                     listing.push_str(&out.stdout);
                 }
             }
-            Err(e) => listing.push_str(&format!("error {e}\n")),
+            Err(e) => {
+                listing.push_str(&format!("error {e}\n"));
+                // No listing, so no knowing the order: not a baseline.
+                out_of_order |= program == "iptables-save";
+            }
         }
     }
-    LiveState(listing)
+    LiveState {
+        listing,
+        out_of_order,
+    }
+}
+
+/// The lines of `table` in an `iptables-save` listing: mangle and raw have
+/// chains named like nat's and filter's.
+fn save_table(save: &str, table: &str) -> String {
+    let header = format!("*{table}");
+    save.lines()
+        .skip_while(|l| *l != header)
+        .skip(1)
+        .take_while(|l| *l != "COMMIT")
+        .map(|l| format!("{l}\n"))
+        .collect()
 }
 
 /// The parts of the host `apply` sets up, in the order [`teardown`]
@@ -340,8 +390,11 @@ fn iptables_docker_user(sys: System<'_>) -> Result<Vec<Command>, String> {
         IPTABLES_GONE,
     )?
     .unwrap_or_default();
+    // Last first: Parallax's jump heads the chain, and the accepts after it
+    // must not run without it, even for a moment.
     Ok(crate::apply::docker_user_rules(&listing)
         .into_iter()
+        .rev()
         .map(|rule| {
             let mut args = vec!["-t", "filter", "-D"];
             args.extend(rule.iter().map(String::as_str));
@@ -410,7 +463,10 @@ mod tests {
     }
 
     fn state(s: &str) -> LiveState {
-        LiveState(s.into())
+        LiveState {
+            listing: s.into(),
+            out_of_order: false,
+        }
     }
 
     #[test]
@@ -444,6 +500,22 @@ mod tests {
         r.applied(day(24), state("table\nwg0"));
         assert_eq!(r.on_tick(day(24), || state("table\nwg0")), None);
         assert_eq!(r.on_tick(day(24), || state("wg0")), Some(Reason::Drift));
+    }
+
+    /// Issue #74: Docker can put its rule above Parallax's between an apply
+    /// and the listing after it. That order stays wrong, so it's no
+    /// baseline: every tick that still sees it applies.
+    #[test]
+    fn rules_out_of_order_always_apply() {
+        let wrong = LiveState {
+            listing: "table".into(),
+            out_of_order: true,
+        };
+        let mut r = Reconciler::new();
+        r.applied(day(24), wrong.clone());
+        assert_eq!(r.on_tick(day(24), || wrong.clone()), Some(Reason::Drift));
+        r.applied(day(24), state("table"));
+        assert_eq!(r.on_tick(day(24), || state("table")), None);
     }
 
     #[test]
@@ -539,6 +611,101 @@ mod tests {
             )
         };
         assert_eq!(listing("one"), listing("two"));
+    }
+
+    /// Docker starting after Parallax makes its chain without Parallax's
+    /// rules: that's drift, as it is with nftables.
+    #[test]
+    fn docker_user_appearing_counts_as_drift() {
+        let mut config = canonical_config();
+        config.server.firewall.backend = FirewallBackend::IptablesNft;
+        let fs = MemoryFs::new();
+        let listing = |docker: &str| {
+            let runner = RecordingRunner::new();
+            runner.respond(
+                "iptables-save",
+                Output {
+                    status: 0,
+                    stdout: format!("*filter\n:FORWARD ACCEPT [0:0]\n{docker}-A FORWARD -j PARALLAX_FORWARD\nCOMMIT\n"),
+                    stderr: String::new(),
+                },
+            );
+            live_state(
+                &config.server,
+                System {
+                    fs: &fs,
+                    runner: &runner,
+                },
+            )
+        };
+        assert_ne!(listing(""), listing(":DOCKER-USER - [0:0]\n"));
+    }
+
+    /// Each table's part of `iptables-save` alone: mangle has a FORWARD too.
+    #[test]
+    fn save_table_keeps_one_table() {
+        let save = "*mangle\n-A FORWARD -j MARKS\nCOMMIT\n*filter\n:FORWARD DROP [0:0]\n-A FORWARD -j PARALLAX_FORWARD\nCOMMIT\n*nat\n-A POSTROUTING -j DOCKER_POSTROUTING\n-A POSTROUTING -j PARALLAX_POSTROUTING\nCOMMIT\n";
+        let filter = save_table(save, "filter");
+        assert_eq!(
+            filter,
+            ":FORWARD DROP [0:0]\n-A FORWARD -j PARALLAX_FORWARD\n"
+        );
+        assert!(crate::apply::decides_first(
+            &filter,
+            "FORWARD",
+            "PARALLAX_FORWARD"
+        ));
+        let nat = save_table(save, "nat");
+        assert!(!crate::apply::decides_first(
+            &nat,
+            "POSTROUTING",
+            "PARALLAX_POSTROUTING"
+        ));
+        assert_eq!(save_table(save, "raw"), "");
+    }
+
+    /// Issue #74: a Docker restart puts its jumps above Parallax's. Only
+    /// Parallax's lines are listed, so the order has to be part of the state.
+    #[test]
+    fn a_rule_above_parallaxs_jump_counts_as_drift() {
+        let mut config = canonical_config();
+        config.server.firewall.backend = FirewallBackend::IptablesNft;
+        let fs = MemoryFs::new();
+        let listing = |forward: &str| {
+            let runner = RecordingRunner::new();
+            runner.respond(
+                "iptables-save",
+                Output {
+                    status: 0,
+                    stdout: format!(
+                        "*nat\n-A PREROUTING -j PARALLAX_PREROUTING\n-A POSTROUTING -j PARALLAX_POSTROUTING\nCOMMIT\n\
+                         *filter\n-A INPUT -j PARALLAX_INPUT\n{forward}\
+                         -A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD\n\
+                         -A DOCKER-USER -o wg0 -m comment --comment parallax -j ACCEPT\nCOMMIT\n"
+                    ),
+                    stderr: String::new(),
+                },
+            );
+            live_state(
+                &config.server,
+                System {
+                    fs: &fs,
+                    runner: &runner,
+                },
+            )
+        };
+        let ours = "-A FORWARD -j PARALLAX_FORWARD\n-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n";
+        let applied = listing(ours);
+        assert_ne!(
+            applied,
+            listing("-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n")
+        );
+        // DOCKER-USER first sends everything through Parallax's chain too,
+        // so Docker putting it back on top is no reason to apply again.
+        assert_eq!(
+            applied,
+            listing("-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n")
+        );
     }
 
     /// How a listing answers.
@@ -705,6 +872,7 @@ parallax-swap
 wg_external_allow
 not_public";
         let docker = "-N DOCKER-USER
+-A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD
 -A DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT
 -A DOCKER-USER -o wg0 -m comment --comment \"\\\"parallax\\\"\" -j ACCEPT
 -A DOCKER-USER -s 10.0.0.0/8 -m comment --comment parallax-backup -j DROP
@@ -732,9 +900,12 @@ not_public";
         assert_eq!(
             removals(&runner),
             [
-                "iptables -t filter -D DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT",
-                // One a build before this one inserted, the quotes kept.
+                // Last first: the accepts never run without the jump above
+                // them (#74). One a build before this one inserted, the
+                // quotes kept.
                 "iptables -t filter -D DOCKER-USER -o wg0 -m comment --comment \"parallax\" -j ACCEPT",
+                "iptables -t filter -D DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT",
+                "iptables -t filter -D DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD",
                 "ip link del dev wg0",
                 "iptables -t filter -D INPUT -j PARALLAX_INPUT",
                 "iptables -t filter -D FORWARD -j PARALLAX_FORWARD",

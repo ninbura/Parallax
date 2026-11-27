@@ -787,6 +787,17 @@ public_ip_is() { # address
 grep -q "home public IP" <<<"$($P status)" && fail "(o) the private endpoint was taken as the public IP"
 grep -q "the endpoint 203.0.113.1:51820 is not a public address" "$WORK/daemon.log" \
     || fail "(o) the daemon did not say why the public IP is unknown"
+# A refused save changes nothing, not even the public IP its own endpoint gives (#45):
+# it adds a name, so its endpoint's hostname is looked up, but the name doesn't resolve.
+sed 's/^endpoint = .*/endpoint = "home.example.org:51820"/' "$(named nosuch.mydomain.com)" \
+    > "$WORK/refused-ip.toml"
+grep -q '^endpoint = "home.example.org:51820"$' "$WORK/refused-ip.toml" || fail "(o) no endpoint to change"
+$P config import "$WORK/refused-ip.toml" > "$WORK/refused-ip.err" 2>&1 \
+    && fail "(o) a save granting nosuch.mydomain.com was accepted"
+grep -q "nosuch.mydomain.com" "$WORK/refused-ip.err" \
+    || { cat "$WORK/refused-ip.err"; fail "(o) the save was refused for another reason"; }
+STATUS=$($P status) || fail "(o) status failed"
+grep -q "home public IP" <<<"$STATUS" && fail "(o) a refused save recorded the public IP its endpoint gives"
 $P config export > "$WORK/public-ip.toml"
 sed -i 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' "$WORK/public-ip.toml"
 apply "$WORK/public-ip.toml"
@@ -813,6 +824,16 @@ grep -q "rebind.example.org through 9.9.9.9: answered 192.168.1.5, which isn't a
 grep -q "keeping the last known 9.9.9.9" "$WORK/daemon.log" || fail "(o) the last known address was not kept"
 public_ip_is 9.9.9.9 || fail "(o) the address changed after a refused answer"
 [ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(o) friend reached the home's public IP after a refused lookup"
+# Without a daemon, `generate` looks the public IP up as `apply` does (#44): on a
+# database that never stored one, the guests' drop still has the address.
+FRESH="${P%% --db *} --db $WORK/fresh.db --socket $WORK/fresh.sock"
+# As the service's user: root refuses a database under its directory.
+[ "$MODE" = unit ] && FRESH="runuser -u nobody -- $FRESH"
+$FRESH config import "$WORK/public-ip-name.toml" >/dev/null || fail "(o) import into a fresh database failed"
+inns gw $FRESH generate -o "$WORK/fresh-out" >/dev/null 2>"$WORK/fresh.err" \
+    || { cat "$WORK/fresh.err"; fail "(o) generate without a daemon failed"; }
+grep -Eq 'elements = \{.* 9\.9\.9\.9, .*198\.18\.0\.0/15' "$WORK/fresh-out/nftables/parallax.nft" \
+    || fail "(o) generate without a daemon did not look the public IP up"
 pass "(o) guests drop the home's public IP: configured, looked up and re-applied on change; a private answer is refused"
 
 # (n) the daemon's lifecycle: SIGTERM takes the gateway down and removes the socket;

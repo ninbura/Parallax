@@ -778,8 +778,20 @@ fn iptables_apply_refills_chains_in_one_restore() {
     };
     let (live, not_public) = (named("wg_"), named("not_public_"));
     let runner = RecordingRunner::new();
-    // A tier went away since the last apply: its chain is still there.
+    // Before the holds: Docker's chain is there, no hold yet.
     runner.respond_to(
+        "iptables",
+        &["-t", "filter", "-S"],
+        parallax_core::io::Output {
+            status: 0,
+            stdout: "-P INPUT ACCEPT\n-N DOCKER-USER\n-A FORWARD -j PARALLAX_FORWARD\n".into(),
+            stderr: String::new(),
+        },
+    );
+    // A tier went away since the last apply: its chain is still there.
+    // Listed once after the restore, and once for the filter hooks.
+    for _ in 0..2 {
+        runner.respond_to(
         "iptables",
         &["-t", "filter", "-S"],
         parallax_core::io::Output {
@@ -802,6 +814,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
             stderr: String::new(),
         },
     );
+    }
     // A set from before grants (not ours to judge by name), one of a tier
     // that went away, a live one, and not_public as builds before hashed
     // set names named it (not ours to judge by name either), beside its
@@ -815,19 +828,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
             stderr: String::new(),
         },
     );
-    // No hold is there yet.
     let holds = parallax_core::apply::hold_rules(&cfg.server);
-    for rule in &holds {
-        runner.respond_to(
-            "iptables",
-            &parallax_core::apply::hold_args("-C", rule),
-            parallax_core::io::Output {
-                status: 1,
-                stdout: String::new(),
-                stderr: "Bad rule".into(),
-            },
-        );
-    }
     let sys = System {
         fs: &fs,
         runner: &runner,
@@ -836,7 +837,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let lines = runner.command_lines();
     let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
     // Stale sets go after the restore; live ones and others' stay.
-    let restore = pos("iptables-restore --noflush").unwrap();
+    let restore = pos("iptables-restore --noflush /").unwrap();
     // A dry run first, once every set it names exists (#56).
     let dry_run = pos("iptables-restore --test --noflush").unwrap();
     let last_set = lines
@@ -844,45 +845,68 @@ fn iptables_apply_refills_chains_in_one_restore() {
         .rposition(|l| l.starts_with("ipset swap"))
         .unwrap();
     assert!(last_set < dry_run && dry_run < restore, "{lines:#?}");
+    // The hooks and the holds go in as transactions on stdin.
+    let txns: Vec<(usize, String)> = runner
+        .calls
+        .borrow()
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, a, _))| p == "iptables-restore" && a == &["--noflush"])
+        .filter_map(|(i, (_, _, stdin))| stdin.clone().map(|t| (i, t)))
+        .collect();
     // Tunnel peers open no new connections while the tables change: a hold
-    // per tunnel interface goes in after the dry run, and every hold the
-    // listing after the restore shows comes out once the hooks are in.
-    let hold_line = |op: &str, rule: &str| format!("iptables -t filter {op} {rule}");
+    // per tunnel interface goes in after the dry run, in one transaction at
+    // the top of each chain, Docker's too; every hold the listing after the
+    // restore shows comes out once the hooks are in.
     let suffix = "-m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP";
+    let (at, placing) = &txns[0];
+    assert!(dry_run < *at && *at < restore, "{lines:#?}");
     let mut placed = 0;
-    for (chain, dir) in [("INPUT", "-i"), ("FORWARD", "-i"), ("FORWARD", "-o")] {
+    for (chain, dir) in [
+        ("INPUT", "-i"),
+        ("FORWARD", "-i"),
+        ("FORWARD", "-o"),
+        ("DOCKER-USER", "-i"),
+        ("DOCKER-USER", "-o"),
+    ] {
         for iface in ["wg0", "tailscale0"] {
-            let at = pos(&hold_line("-I", &format!("{chain} {dir} {iface} {suffix}"))).unwrap();
-            assert!(dry_run < at && at < restore, "{lines:#?}");
+            let rule = format!("\n-I {chain} 1 {dir} {iface} {suffix}\n");
+            assert!(placing.contains(&rule), "{rule}: {placing}");
             placed += 1;
         }
     }
-    assert_eq!(placed, holds.len());
-    // nat hooked before filter: a filter jump goes in above the hold.
-    let hook = |chain: &str| {
-        lines
-            .iter()
-            .position(|l| l.contains(&format!(" -C {chain} -j PARALLAX_{chain}")))
-            .unwrap()
-    };
-    assert!(hook("POSTROUTING") < hook("FORWARD") && hook("PREROUTING") < hook("INPUT"));
-    let hooks = hook("INPUT").max(hook("FORWARD"));
+    assert_eq!(placed, holds.len() + 4);
+    assert_eq!(placing.lines().count(), placed + 2, "{placing}");
+    // nat hooked before filter: a filter jump goes in above the hold. A
+    // missing jump goes in at the top; one that's first already, holds
+    // aside, stays (#74). Each table's in one transaction, Docker's chain
+    // in between.
+    let texts: Vec<&str> = txns[1..txns.len() - 1]
+        .iter()
+        .map(|(_, t)| t.as_str())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "*nat\n-I PREROUTING 1 -j PARALLAX_PREROUTING\n-I POSTROUTING 1 -j PARALLAX_POSTROUTING\nCOMMIT\n",
+            "*filter\n-I DOCKER-USER 1 -m comment --comment \"parallax\" -j PARALLAX_FORWARD\n\
+             -I DOCKER-USER 2 -o wg0 -m comment --comment \"parallax\" -j ACCEPT\n\
+             -I DOCKER-USER 3 -o tailscale0 -m comment --comment \"parallax\" -j ACCEPT\nCOMMIT\n",
+            "*filter\n-I INPUT 1 -j PARALLAX_INPUT\nCOMMIT\n",
+        ],
+        "{lines:#?}"
+    );
+    // Last, every hold the listing after the restore shows comes off at
+    // once, also one for an interface since renamed.
+    let lift = &txns.last().unwrap().1;
     for rule in [
         format!("INPUT -i wg0 {suffix}"),
         format!("FORWARD -o tailscale0 {suffix}"),
         format!("FORWARD -i wg9 {suffix}"),
     ] {
-        let lifted = pos(&hold_line("-D", &rule)).unwrap();
-        assert!(hooks < lifted, "{rule}: {lines:#?}");
+        assert!(lift.contains(&format!("\n-D {rule}\n")), "{rule}: {lift}");
     }
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.contains("parallax-hold") && l.contains(" -D "))
-            .count(),
-        3,
-        "{lines:#?}"
-    );
+    assert_eq!(lift.lines().count(), 5, "{lift}");
     let gone = |set: &str| pos(&format!("ipset destroy {set}"));
     assert!(gone("wg_0000000000000000").unwrap() > restore);
     assert!(gone("not_public").is_none() && gone("ts_family").is_none());
