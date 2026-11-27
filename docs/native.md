@@ -113,8 +113,9 @@ Then set the backup passphrase and keep it in your password manager:
 sudo parallax backup passphrase --generate
 ```
 
-Stopping the service (`sudo systemctl stop parallax`) removes the firewall
-table and `wg0`. `sudo systemctl reload parallax` re-applies, like SIGHUP in
+Stopping the service (`sudo systemctl stop parallax`) removes what it set
+up: the firewall table (on iptables-nft, its `PARALLAX_*` chains and ipsets),
+its rules in Docker's `DOCKER-USER` chain, and `wg0`. `sudo systemctl reload parallax` re-applies, like SIGHUP in
 Docker. Every saved change applies anyway.
 
 ## Running `parallax` commands
