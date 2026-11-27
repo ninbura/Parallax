@@ -68,6 +68,7 @@ pub struct ServerConfig {
                                       // subnet_router_node, dns (tailnet-wide)
     pub dns: DnsServer,               // listen (default: WG gateway addr), port, public_resolver
     pub firewall: FirewallServer,     // backend (nftables | iptables-nft), docker_coexistence
+    pub logs: LogsServer,             // level, path, keep, max_size (docs/logging.md)
     pub wan_interface: Option<String>,
 }
 
@@ -90,6 +91,7 @@ pub enum Host { Ip(Ipv4Addr), Name(String) }   // TOML: a string either way
 pub struct Grant {
     pub name: String,
     pub everyone: bool,                 // every peer has it, unattached
+    pub log: Option<LogLevel>,          // sets its peers' log level (docs/logging.md)
     pub rules: Vec<Rule>,
 }
 
@@ -101,6 +103,7 @@ pub enum AllowedIpsStrategy { MappedSubnets, GrantsOnly, FullTunnel }
 pub struct Peer {
     pub name: String,
     pub grants: Vec<String>,             // besides every `everyone` grant
+    pub log: Option<LogLevel>,           // its own log level, over its grants'
     pub transport: TransportKind,        // WireGuard | Tailscale (a device fact)
     pub enabled: bool,
     pub expires: Option<Date>,
@@ -123,6 +126,15 @@ grants changes neither the address nor its client config (except
 `server.wireguard.peer_defaults` when it's added. Files written with
 `[[template]]` still import (`model/legacy.rs`), each template becoming a
 grant of its name.
+
+Activity logging (`logging.rs`, docs/logging.md) is per peer, not per tier:
+a peer's own `log` wins, then the most detailed `log` among its grants, then
+`server.logs.level`. The firewall keeps two address sets, `log_flows` and
+`log_denied`, marks the new flows of the first (connection mark bit
+`0x20000000`) and hands the blocked attempts of the second to nflog group
+20568, rate-limited, before each drop they can reach (a tier's default deny,
+the unknown-source drop, the gateway host's). With nobody logged none of it
+is generated: the canonical goldens have no logging rule or set.
 
 Ports are lists, written the way ufw writes them: `445/tcp`, `137-138/udp`,
 or a bare `25565` for TCP and UDP. A service is a named host and its ports

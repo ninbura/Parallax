@@ -20,6 +20,7 @@ pub mod error;
 pub mod generate;
 pub mod grants;
 pub mod io;
+pub mod logging;
 pub mod model;
 pub mod names;
 pub mod netmap;

@@ -54,6 +54,11 @@ pub struct Peer {
     /// it reaches only what those give.
     #[serde(default)]
     pub grants: Vec<String>,
+    /// How much to log for this peer, whatever its grants say
+    /// (docs/logging.md). Unset: the most detailed of its grants' levels,
+    /// otherwise `server.logs.level`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<super::LogLevel>,
     pub transport: TransportKind,
     #[serde(default = "default_true")]
     pub enabled: bool,
