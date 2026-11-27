@@ -2,9 +2,8 @@
 //! order — WireGuard peers whose address changed hands off the interface,
 //! then the firewall (so a half-configured interface never forwards
 //! unfiltered), then each transport. Every step is idempotent, so
-//! re-applying an unchanged bundle changes nothing. The DNS server reads the
-//! routes written here; the daemon has it re-read them after each apply.
-//! The HTTPS proxy gets its routes from the daemon, not this file.
+//! re-applying an unchanged bundle changes nothing. The DNS server and the
+//! HTTPS proxy get their routes from the daemon, not the files written here.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;

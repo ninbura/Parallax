@@ -4,8 +4,8 @@
 //! the configuration in memory, and applies it: at startup, after every
 //! saved change, on SIGHUP, when the UTC date changes, and when the live
 //! firewall or WireGuard interface drifts. The DNS server and the HTTPS
-//! proxy run as tasks: the DNS server re-reads its routes after each apply,
-//! and the proxy gets its routes from the engine around each one. The CLI
+//! proxy run as tasks, and both get their routes from the engine around
+//! each apply. The CLI
 //! talks to it over a Unix socket ([`crate::protocol`]).
 //!
 //! When guests have `internet`, it looks up the home's public IP

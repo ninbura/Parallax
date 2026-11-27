@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
-use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -151,13 +150,6 @@ impl Dns {
             reloads,
             tap: None,
         })
-    }
-
-    /// [`Dns::new`] with the routes file `apply` writes.
-    pub fn load(routes_path: &Path, upstream_port: u16) -> Result<Dns> {
-        let text = std::fs::read_to_string(routes_path)
-            .map_err(|e| Error::io(format!("reading {}", routes_path.display()), e))?;
-        Dns::new(DnsRoutes::from_toml(&text)?, upstream_port)
     }
 
     /// Hand the queries of peers whose DNS is logged to `tap`
@@ -311,7 +303,7 @@ pub fn overlap(served: &DnsRoutes, new: &DnsRoutes) -> DnsRoutes {
                     .iter()
                     .chain(&next.names)
                     .filter(|n| allows(served, old, n) && allows(new, next, n))
-                    .filter(|n| !served.zone_of(n).is_some_and(|z| zones.contains(&z.name)))
+                    .filter(|n| !out.zone_of(n).is_some_and(|z| zones.contains(&z.name)))
                     .cloned()
                     .collect();
                 names.sort();
