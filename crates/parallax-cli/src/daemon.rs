@@ -1398,11 +1398,13 @@ impl Engine {
             // The rows just copied in: what the database now holds.
             anyhow::Ok((lines, restored))
         })?;
-        // What the restored configuration doesn't use goes; the lookups for
-        // what it adds follow.
+        // What the restored configuration doesn't use, or asks other
+        // resolvers for, goes; the lookups for those follow.
         let used = names::used(&config);
+        let elsewhere = names::asked_on_save(Some(before.as_ref()), &config);
         let mut resolved = self.view.names.clone();
-        resolved.retain(|name, _| used.contains(name.as_str()));
+        resolved
+            .retain(|name, _| used.contains(name.as_str()) && !elsewhere.contains(name.as_str()));
         self.replace(config);
         self.set_names(resolved);
         Ok(lines)
