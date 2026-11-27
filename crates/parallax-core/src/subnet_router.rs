@@ -248,10 +248,12 @@ fn with_missing(have: &[String], wanted: &[Ipv4Net]) -> Option<String> {
     let parsed = parse_routes(have);
     let missing: Vec<&Ipv4Net> = wanted
         .iter()
+        // A default route is an exit node: devices accepting routes don't
+        // use it for Parallax's networks.
         .filter(|w| {
             !parsed
                 .iter()
-                .any(|h| matches!(h, IpNet::V4(h) if h.contains(*w)))
+                .any(|h| matches!(h, IpNet::V4(h) if h.prefix_len() > 0 && h.contains(*w)))
         })
         .collect();
     if missing.is_empty() {
@@ -327,11 +329,11 @@ pub fn decide(
     if needs_login {
         return Ok(Router::LoggedOut);
     }
-    let prefs = prefs()?;
     let mut steps = Vec::new();
     if client.state == "Stopped" {
         steps.push(Step::Up);
     } else {
+        let prefs = prefs()?;
         let mut why = Vec::new();
         let advertised = parse_routes(prefs.advertise_routes.as_deref().unwrap_or_default());
         if advertised != as_ip(&wanted) {
@@ -766,7 +768,7 @@ mod tests {
         let model = Model::resolve(&config, today()).unwrap();
         let never =
             || -> Result<Prefs> { panic!("the operator's prefs are none of Parallax's business") };
-        let nodes = [node("ninbura", "192.168.50.0/24", "192.168.50.0/24")];
+        let nodes = [node("operator", "192.168.50.0/24", "192.168.50.0/24")];
         let router = decide(&model, &client("Running"), never, &nodes).unwrap();
         assert_eq!(
             router,
@@ -779,7 +781,7 @@ mod tests {
             }
         );
         let nodes = [node(
-            "ninbura",
+            "operator",
             "0.0.0.0/0,10.8.0.1/32,198.18.1.0/24",
             "0.0.0.0/0,10.8.0.1/32,198.18.1.0/24",
         )];
@@ -828,7 +830,7 @@ mod tests {
         assert_eq!(router, Router::LoggedOut);
         // The operator's, expired: theirs to log in.
         let nodes = [node(
-            "ninbura",
+            "operator",
             "10.8.0.1/32,198.18.1.0/24",
             "10.8.0.1/32,198.18.1.0/24",
         )];
@@ -866,22 +868,19 @@ mod tests {
         let config = config();
         let model = Model::resolve(&config, today()).unwrap();
         let never = || -> Result<Prefs> { panic!("not needed") };
-        let nodes = [node(
-            "ninbura",
-            "0.0.0.0/0,::/0,fd00::/64",
-            "0.0.0.0/0,::/0,fd00::/64,10.8.0.1/32",
-        )];
-        let router = decide(&model, &client("Running"), never, &nodes).unwrap();
-        // 0.0.0.0/0 covers Parallax's routes: advertised already. Approved
-        // needs nothing either.
-        assert_eq!(
-            router,
-            Router::Theirs {
-                id: 1,
-                todo: vec![]
-            }
+        // An exit node's default routes don't carry Parallax's networks;
+        // the commands keep them, IPv6 included.
+        let nodes = [node("operator", "0.0.0.0/0,::/0", "0.0.0.0/0,::/0")];
+        let Router::Theirs { todo, .. } =
+            decide(&model, &client("Running"), never, &nodes).unwrap()
+        else {
+            panic!("not theirs");
+        };
+        assert!(
+            todo[0].contains("--advertise-routes=0.0.0.0/0,::/0,10.8.0.1/32,198.18.1.0/24"),
+            "{todo:?}"
         );
-        let nodes = [node("ninbura", "fd00::/64", "fd00::/64")];
+        let nodes = [node("operator", "fd00::/64", "fd00::/64")];
         let Router::Theirs { todo, .. } =
             decide(&model, &client("Running"), never, &nodes).unwrap()
         else {

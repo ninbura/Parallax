@@ -254,6 +254,36 @@ mod tests {
     }
 
     #[test]
+    fn posts_json_with_the_key() {
+        let dir = scratch("post");
+        let key_file = dir.join("headscale-api.key");
+        std::fs::write(&key_file, "hskey-api-test\n").unwrap();
+        let (url, request) = serve_once(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+        );
+        let reply = api(&url, key_file)
+            .post("/api/v1/user", r#"{"name":"parallax"}"#)
+            .unwrap();
+        let request = request.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(reply.status, 200);
+        assert!(
+            request.starts_with("POST /api/v1/user HTTP/1.1"),
+            "{request}"
+        );
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-type: application/json\r\n"),
+            "{request}"
+        );
+        assert!(
+            lower.contains("authorization: bearer hskey-api-test\r\n"),
+            "{request}"
+        );
+        assert!(request.ends_with(r#"{"name":"parallax"}"#), "{request}");
+    }
+
+    #[test]
     fn sends_the_key_and_returns_any_status() {
         let dir = scratch("key");
         let key_file = dir.join("headscale-api.key");

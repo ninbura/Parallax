@@ -16,13 +16,14 @@ Conflicts=tailscaled.service
 
 [Service]
 Type=notify
+# Clears what a crashed run left; a failure there mustn't stop the start.
+ExecStartPre=-/usr/sbin/tailscaled --cleanup
 # The socket is Tailscale's usual one, so `tailscale status` just works.
-ExecStartPre=/usr/sbin/tailscaled --cleanup
 ExecStart=/usr/sbin/tailscaled --state=/var/lib/parallax-tailscale/tailscaled.state --statedir=/var/lib/parallax-tailscale --socket=/run/tailscale/tailscaled.sock --tun=tailscale0 --port=41641
 # The `parallax` user may manage it: the daemon logs it in and changes its
 # routes. Kept by every `tailscale up` the daemon runs.
 ExecStartPost=/usr/bin/tailscale --socket=/run/tailscale/tailscaled.sock set --operator=parallax
-ExecStopPost=/usr/sbin/tailscaled --cleanup
+ExecStopPost=-/usr/sbin/tailscaled --cleanup
 Restart=on-failure
 RestartSec=5
 

@@ -369,7 +369,7 @@ impl WireUser {
 fn id(server: &HeadscaleServer, path: &str, id: &str) -> Result<u64> {
     id.parse().map_err(|_| {
         Error::Headscale(format!(
-            "Headscale at {} answered GET {path} with id '{id}', which isn't a number",
+            "Headscale at {} answered {path} with id '{id}', which isn't a number",
             server.server_url
         ))
     })

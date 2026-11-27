@@ -93,6 +93,8 @@ const ROUTER_EVERY: Duration = Duration::from_secs(subnet_router::POLL_SECONDS);
 /// How soon it's looked at again after a change, so a router that just
 /// logged in gets its routes approved without waiting a whole poll.
 const ROUTER_SOON: Duration = Duration::from_secs(2);
+/// The longest wait between looks while the router keeps failing.
+const ROUTER_BACKOFF: Duration = Duration::from_secs(900);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -747,37 +749,40 @@ async fn refresh_tailnet(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
 
 /// Keep the subnet router as the configuration says, every
 /// [`ROUTER_EVERY`] and when the configuration changes. Logs what it did,
-/// and each problem (or what the operator still has to do) once.
+/// and each problem (or what the operator still has to do) once. After a
+/// failure it waits longer each time, up to [`ROUTER_BACKOFF`], so a login
+/// that keeps failing doesn't mint a pre-auth key every poll.
 async fn keep_router(mut views: Views, socket: String) {
-    let mut every = tokio::time::interval(ROUTER_EVERY);
-    every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let config = |views: &Views| views.borrow().as_ref().map(|v| Arc::clone(&v.config));
     let mut last = config(&views);
     let mut said: Option<String> = None;
-    let mut soon = false;
+    let mut wait = Duration::ZERO;
+    let mut failures: u32 = 0;
+    // The last look was the quick one after a change.
+    let mut quick = false;
     loop {
-        if soon {
-            tokio::time::sleep(ROUTER_SOON).await;
-        } else {
-            tokio::select! {
-                _ = every.tick() => {}
-                changed = views.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    // Every apply publishes; only a new configuration counts.
-                    let now = config(&views);
-                    if now == last {
-                        continue;
-                    }
-                    last = now;
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            changed = views.changed() => {
+                if changed.is_err() {
+                    return;
                 }
+                // Every apply publishes; only a new configuration counts.
+                if config(&views) == last {
+                    continue;
+                }
+                failures = 0;
             }
         }
-        soon = false;
-        let Some(config) = config(&views) else {
+        wait = ROUTER_EVERY;
+        last = config(&views);
+        let Some(config) = last.clone() else {
             continue;
         };
+        if !subnet_router::needed(&config) {
+            // Nothing to report: the machine may have no Tailscale at all.
+            said = None;
+        }
         let socket = socket.clone();
         let Ok(looked) =
             tokio::task::spawn_blocking(move || crate::sync_router(&config, &socket)).await
@@ -785,12 +790,26 @@ async fn keep_router(mut views: Views, socket: String) {
             continue;
         };
         let note = match looked {
-            Ok((done, note)) => {
+            Ok((done, _)) if !done.is_empty() => {
                 done.iter().for_each(log);
-                soon = !done.is_empty();
+                // Once more soon (a router that just logged in gets its
+                // routes approved), then the usual pace.
+                quick = !quick;
+                if quick {
+                    wait = ROUTER_SOON;
+                }
+                continue;
+            }
+            Ok((_, note)) => {
+                (failures, quick) = (0, false);
                 note
             }
-            Err(e) => Some(e),
+            Err(e) => {
+                quick = false;
+                failures = failures.saturating_add(1);
+                wait = (ROUTER_EVERY * 2u32.saturating_pow(failures.min(5))).min(ROUTER_BACKOFF);
+                Some(e)
+            }
         };
         if note != said {
             match &note {

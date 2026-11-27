@@ -308,7 +308,7 @@ cp "$PARALLAX" "$WORK/parallax"
 # The subnet router's socket, (w); the daemon runs `tailscale` from PATH.
 TS_SOCK="$WORK/tsr/sock"
 mkdir -p "$WORK/bin" "$WORK/tsr"
-if [ -n "${TAILSCALE:-}" ]; then
+if [ -n "${TAILSCALE:-}" ] && [ -n "${TAILSCALED:-}" ]; then
     cp "$TAILSCALE" "$WORK/bin/tailscale"
     cp "$TAILSCALED" "$WORK/bin/tailscaled"
 fi
@@ -1205,6 +1205,12 @@ PY
         done < <(sed -n '/^\[Service\]/,/^\[/p' "$TSD_UNIT" | grep -E '^[A-Za-z]+=')
         printf '%s\n' "${TSD_SANDBOX[@]}" | grep -q '^CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW$' \
             || fail "(w) could not read the sandbox from $TSD_UNIT"
+        # Root without CAP_DAC_OVERRIDE: its directory is root's, as
+        # StateDirectory and RuntimeDirectory make it, and $WORK (the
+        # service's) only traversable.
+        chmod 0711 "$WORK"
+        chown root:root "$WORK/tsr"
+        chmod 0755 "$WORK/tsr"
         UNITS+=("${PREFIX}tailscaled")
         systemd-run --quiet --collect --unit="${PREFIX}tailscaled" -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" \
             -p "ReadWritePaths=$WORK" -p "StandardOutput=append:$HS/router.log" -p "StandardError=append:$HS/router.log" \
@@ -1216,7 +1222,11 @@ PY
     for _ in $(seq 50); do [ -S "$TS_SOCK" ] && break; sleep 0.1; done
     [ -S "$TS_SOCK" ] || { cat "$HS/router.log"; fail "(w) the router's tailscaled did not start"; }
     if [ "$MODE" = unit ]; then
-        inns gw tailscale --socket="$TS_SOCK" set --operator=nobody || fail "(w) could not make the service the router's operator"
+        # The unit's ExecStartPost, in its sandbox, with the test's user.
+        systemd-run --quiet --collect --unit="${PREFIX}tailscaled-operator" -p Type=exec --wait --pipe \
+            -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" -p "ReadWritePaths=$WORK" "${TSD_SANDBOX[@]}" \
+            "$WORK/bin/tailscale" --socket="$TS_SOCK" set --operator=nobody \
+            || fail "(w) could not make the service the router's operator"
     fi
 
     # Short-lived, and on stdin, as Parallax passes its own.
@@ -1265,7 +1275,7 @@ assert p["NetfilterMode"] == 0 and p["NoSNAT"] and not p["CorpDNS"] and not p["R
         || { inns tsc ip route show table 52; fail "(w) the phone has no route to the mapped network"; }
     phone() { inns tsc curl -s -m 3 "$@" || echo BLOCKED; }
     # The first packets may wait for the path between the two to be found.
-    for _ in $(seq 20); do [ "$(phone http://198.18.1.1:9090/)" = gw-self ] && break; done
+    for _ in $(seq 20); do [ "$(phone http://198.18.1.1:9090/)" = gw-self ] && break; sleep 0.5; done
     [ "$(phone http://198.18.1.1:9090/)" = gw-self ] || fail "(w) phone -> the granted service on the gateway host"
     for url in http://198.18.1.1:9090/ http://198.18.1.1:9091/ http://198.18.1.1:8080/ http://198.18.1.5:8080/ http://198.18.1.5:7000/ http://9.9.9.9/; do
         [ "$(phone "$url")" = "$(curl_as $GUEST "$url")" ] || fail "(w) the phone and the guest, same grant, differ on $url"
@@ -1283,7 +1293,7 @@ assert p["NetfilterMode"] == 0 and p["NoSNAT"] and not p["CorpDNS"] and not p["R
         || { cat "$WORK/doctor-router"; fail "(w) doctor does not see the router in place"; }
     pass "(w) the daemon logs the subnet router in and approves its routes; a Tailscale phone reaches what its grant allows, DNS and the proxy included"
 else
-    echo "SKIP: (u) Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
+    echo "SKIP: (u) and (w), Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
 fi
 
 echo "ALL PASS"
