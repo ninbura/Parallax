@@ -857,6 +857,7 @@ inns gw nft list table inet parallax >/dev/null 2>&1 && { cat "$WORK/held.log"; 
 inns gw ip link show wg0 >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left wg0"; }
 docker_user_is_dockers || { cat "$WORK/held.log"; fail "(n) DOCKER-USER isn't Docker's own after a failed first apply"; }
 grep -q "removed table inet parallax" "$WORK/held.log" && grep -q "removed interface wg0" "$WORK/held.log" \
+    && grep -q "removed Parallax's DOCKER-USER rules" "$WORK/held.log" \
     || { cat "$WORK/held.log"; fail "(n) a failed first apply didn't log what it took down"; }
 start_daemon 1
 # wg0 is new: the clients' sessions are gone until they handshake again (up to ~15 s).

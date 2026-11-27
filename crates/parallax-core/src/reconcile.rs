@@ -135,8 +135,9 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
 }
 
 /// The parts of the host `apply` sets up, in the order [`teardown`]
-/// removes them: rules before the sets they use, accepts before the
-/// interface they name.
+/// removes them: what lets traffic in first (the accepts in Docker's chain,
+/// then the interface), while Parallax's firewall still filters it; then the
+/// firewall, before the sets its rules use.
 const PARTS: usize = 4;
 
 /// What of each part [`teardown`] removes is on the host, as the commands
@@ -185,6 +186,15 @@ fn found(server: &ServerConfig, sys: System<'_>) -> [Found; PARTS] {
     let nftables = server.firewall.backend == FirewallBackend::Nftables;
     let table = crate::generate::firewall::TABLE;
     [
+        (
+            "Parallax's DOCKER-USER rules".into(),
+            if nftables {
+                nft_docker_user(sys)
+            } else {
+                iptables_docker_user(sys)
+            },
+        ),
+        (format!("interface {iface}"), interface(iface, sys)),
         if nftables {
             (format!("table inet {table}"), nft_table(sys))
         } else {
@@ -198,15 +208,6 @@ fn found(server: &ServerConfig, sys: System<'_>) -> [Found; PARTS] {
                 ipsets(sys)
             },
         ),
-        (
-            "Parallax's DOCKER-USER rules".into(),
-            if nftables {
-                nft_docker_user(sys)
-            } else {
-                iptables_docker_user(sys)
-            },
-        ),
-        (format!("interface {iface}"), interface(iface, sys)),
     ]
 }
 
@@ -609,18 +610,18 @@ mod tests {
         assert_eq!(
             removals(&runner),
             [
-                "nft delete table inet parallax",
                 "nft delete rule ip filter DOCKER-USER handle 7",
                 "nft delete rule ip filter DOCKER-USER handle 8",
                 "ip link del dev wg0",
+                "nft delete table inet parallax",
             ]
         );
         assert_eq!(
             log,
             [
-                "removed table inet parallax",
                 "removed Parallax's DOCKER-USER rules",
                 "removed interface wg0",
+                "removed table inet parallax",
             ]
         );
     }
@@ -638,11 +639,11 @@ mod tests {
             "",
         );
         let log = teardown(&config.server, on(&MemoryFs::new(), &runner));
+        assert_eq!(log[0], "removed interface wg0");
         assert!(
-            log[0].starts_with("could not remove table inet parallax"),
+            log[1].starts_with("could not remove table inet parallax"),
             "{log:?}"
         );
-        assert_eq!(log[1..], ["removed interface wg0"]);
     }
 
     /// Nothing there: nothing to remove, nothing to say. A listing that
@@ -660,13 +661,13 @@ mod tests {
         let log = teardown(&config.server, on(&MemoryFs::new(), &runner));
         assert_eq!(removals(&runner), ["ip link del dev wg0"]);
         assert!(
-            log[0].starts_with("could not check table inet parallax, left as it is: "),
+            log[1].starts_with("could not check table inet parallax, left as it is: "),
             "{log:?}"
         );
     }
 
-    /// iptables-nft: the jumps, then Parallax's chains (flushed, then
-    /// deleted), its sets and DOCKER-USER accepts. An operator's chains
+    /// iptables-nft: the DOCKER-USER accepts and the interface, then the
+    /// jumps, Parallax's chains (flushed, then deleted) and its sets. An operator's chains
     /// (`PARALLAX_MINE` too), jump, sets and DOCKER-USER rules stay.
     #[test]
     fn iptables_teardown_removes_only_parallaxs_own() {
@@ -718,6 +719,10 @@ not_public";
         assert_eq!(
             removals(&runner),
             [
+                "iptables -t filter -D DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT",
+                // One a build before this one inserted, the quotes kept.
+                "iptables -t filter -D DOCKER-USER -o wg0 -m comment --comment \"parallax\" -j ACCEPT",
+                "ip link del dev wg0",
                 "iptables -t filter -D INPUT -j PARALLAX_INPUT",
                 "iptables -t filter -D FORWARD -j PARALLAX_FORWARD",
                 "iptables -t nat -D POSTROUTING -j PARALLAX_POSTROUTING",
@@ -732,19 +737,15 @@ not_public";
                 "ipset destroy wg_0123456789abcdef",
                 "ipset destroy not_public_fedcba9876543210",
                 "ipset destroy parallax-swap",
-                "iptables -t filter -D DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT",
-                // One a build before this one inserted, the quotes kept.
-                "iptables -t filter -D DOCKER-USER -o wg0 -m comment --comment \"parallax\" -j ACCEPT",
-                "ip link del dev wg0",
             ]
         );
         assert_eq!(
             log,
             [
-                "removed the PARALLAX_* chains",
-                "removed Parallax's ipsets",
                 "removed Parallax's DOCKER-USER rules",
                 "removed interface wg0",
+                "removed the PARALLAX_* chains",
+                "removed Parallax's ipsets",
             ]
         );
     }
@@ -769,10 +770,10 @@ not_public";
         assert_eq!(
             after_failed_apply((Gone, Gone, Gone), (TABLE, DOCKER_USER, WG0)),
             [
-                "nft delete table inet parallax",
                 "nft delete rule ip filter DOCKER-USER handle 7",
                 "nft delete rule ip filter DOCKER-USER handle 8",
                 "ip link del dev wg0",
+                "nft delete table inet parallax",
             ]
         );
         // Docker's chain without Parallax's rules counts as none there.
@@ -781,9 +782,9 @@ not_public";
         assert_eq!(
             after_failed_apply((Gone, empty_docker_user, Gone), (TABLE, DOCKER_USER, Gone)),
             [
-                "nft delete table inet parallax",
                 "nft delete rule ip filter DOCKER-USER handle 7",
                 "nft delete rule ip filter DOCKER-USER handle 8",
+                "nft delete table inet parallax",
             ]
         );
     }
@@ -811,6 +812,18 @@ not_public";
         let unclear = (Unclear, Unclear, Unclear);
         assert!(after_failed_apply(unclear, (TABLE, DOCKER_USER, WG0)).is_empty());
         assert!(after_failed_apply((Gone, Gone, Gone), unclear).is_empty());
+        // And says why, after the apply.
+        let config = canonical_config();
+        let runner = RecordingRunner::new();
+        nft_host(&runner, Gone, Gone, Gone);
+        let before = parts_present(&config.server, on(&MemoryFs::new(), &runner));
+        nft_host(&runner, Unclear, Gone, Gone);
+        let log = teardown_added(&config.server, before, on(&MemoryFs::new(), &runner));
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(
+            log[0].starts_with("could not check table inet parallax, left as it is: "),
+            "{log:?}"
+        );
     }
 
     #[test]
@@ -830,7 +843,7 @@ not_public";
         // nftables has no ipsets to look for; nothing else can be told.
         assert_eq!(
             parts_present(&config.server, sys),
-            Parts([None, Some(BTreeSet::new()), None, None])
+            Parts([None, None, None, Some(BTreeSet::new())])
         );
         let log = teardown(&config.server, sys);
         assert_eq!(log.len(), 3, "{log:?}");
