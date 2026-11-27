@@ -135,7 +135,11 @@ Records are deleted once they're older than `keep` or once they take up more
 than `max_size`, whichever comes first, checked every 10 minutes. Past
 `max_size`, the oldest go until the records take up 90% of it. Deleted
 records leave space that new ones reuse, so the file levels off at about
-`max_size` rather than shrinking. Backups don't include records yet.
+`max_size` rather than shrinking.
+
+Backups never include records ([backups](backup.md)): a backup would keep
+them past `keep`, in every copy made of it, and they aren't needed to
+rebuild a gateway. Restoring one leaves `logs.db` as it is.
 
 ## Byte counts need a host setting
 

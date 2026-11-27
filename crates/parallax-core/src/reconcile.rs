@@ -252,15 +252,24 @@ fn nft_table(sys: System<'_>) -> Result<Vec<Command>, String> {
 }
 
 /// The jumps from the built-in chains first, then Parallax's chains
-/// flushed, then deleted: a chain something still jumps to can't go. Only
+/// flushed, then deleted: a chain something still jumps to can't go. Then
+/// any hold a failed apply left. Only
 /// the names the generator gives: an operator's `PARALLAX_MINE` stays.
 fn iptables_chains(sys: System<'_>) -> Result<Vec<Command>, String> {
     use crate::generate::firewall::iptables::CHAINS;
     let (mut jumps, mut flushes, mut deletes) = (Vec::new(), Vec::new(), Vec::new());
+    let mut holds = Vec::new();
     for table in ["filter", "nat"] {
         let Some(listing) = list(sys, "iptables", &["-t", table, "-S"], IPTABLES_GONE)? else {
             continue;
         };
+        if table == "filter" {
+            holds.extend(
+                crate::apply::held(&listing)
+                    .into_iter()
+                    .map(|args| ("iptables", args)),
+            );
+        }
         for line in listing.lines() {
             for (t, builtin, own) in CHAINS {
                 if t == table && line == format!("-A {builtin} -j {own}") {
@@ -285,7 +294,9 @@ fn iptables_chains(sys: System<'_>) -> Result<Vec<Command>, String> {
             }
         }
     }
-    Ok([jumps, flushes, deletes].concat())
+    // A failed apply's hold on new connections (issue #56) goes last: until
+    // the rules are gone, nothing starts under what's left of them.
+    Ok([jumps, flushes, deletes, holds].concat())
 }
 
 fn ipsets(sys: System<'_>) -> Result<Vec<Command>, String> {
@@ -680,9 +691,11 @@ mod tests {
 -N PARALLAX_INPUT
 -N PARALLAX_FORWARD
 -N PARALLAX_T0
+-A INPUT -i wg0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP
 -A INPUT -j MINE
 -A INPUT -j PARALLAX_INPUT
 -A FORWARD -j PARALLAX_FORWARD
+-A FORWARD -m comment --comment parallax-holdout -j ACCEPT
 -A PARALLAX_FORWARD -j PARALLAX_T0";
         let nat = "-N PARALLAX_POSTROUTING
 -A POSTROUTING -j PARALLAX_POSTROUTING";
@@ -734,6 +747,9 @@ not_public";
                 "iptables -t filter -X PARALLAX_FORWARD",
                 "iptables -t filter -X PARALLAX_T0",
                 "iptables -t nat -X PARALLAX_POSTROUTING",
+                // A failed apply's hold (#56), last; not a rule that only
+                // looks like one.
+                "iptables -t filter -D INPUT -i wg0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP",
                 "ipset destroy wg_0123456789abcdef",
                 "ipset destroy not_public_fedcba9876543210",
                 "ipset destroy parallax-swap",

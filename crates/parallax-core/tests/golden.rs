@@ -218,8 +218,14 @@ fn internet_grant_and_masquerade_match_golden() {
     assert!(rule("family").contains("ip daddr != @not_public"));
     // Merged, since nft rejects overlapping intervals: the configured
     // 192.168.1.0/24 sits inside 192.168.0.0/16.
-    assert!(fw.contents.contains("192.168.0.0/16"));
-    assert!(!fw.contents.contains("192.168.1.0/24,"));
+    let not_public = fw
+        .contents
+        .lines()
+        .skip_while(|l| !l.contains("set not_public_"))
+        .find(|l| l.contains("elements = "))
+        .unwrap();
+    assert!(not_public.contains("192.168.0.0/16"), "{not_public}");
+    assert!(!not_public.contains("192.168.1.0/24"), "{not_public}");
 }
 
 #[test]
@@ -778,7 +784,21 @@ fn iptables_apply_refills_chains_in_one_restore() {
         &["-t", "filter", "-S"],
         parallax_core::io::Output {
             status: 0,
-            stdout: "-P INPUT ACCEPT\n-N PARALLAX_FORWARD\n-N PARALLAX_T0\n-N PARALLAX_T1\n-N PARALLAX_T2\n".into(),
+            // The holds this apply placed, and one a failed apply left for
+            // an interface since renamed (#56).
+            stdout: [
+                "-P INPUT ACCEPT",
+                "-N PARALLAX_FORWARD",
+                "-N PARALLAX_T0",
+                "-N PARALLAX_T1",
+                "-N PARALLAX_T2",
+                "-A INPUT -i wg0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP",
+                "-A FORWARD -o tailscale0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP",
+                "-A FORWARD -i wg9 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP",
+                "-A FORWARD -j PARALLAX_FORWARD",
+                "",
+            ]
+            .join("\n"),
             stderr: String::new(),
         },
     );
@@ -795,6 +815,19 @@ fn iptables_apply_refills_chains_in_one_restore() {
             stderr: String::new(),
         },
     );
+    // No hold is there yet.
+    let holds = parallax_core::apply::hold_rules(&cfg.server);
+    for rule in &holds {
+        runner.respond_to(
+            "iptables",
+            &parallax_core::apply::hold_args("-C", rule),
+            parallax_core::io::Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: "Bad rule".into(),
+            },
+        );
+    }
     let sys = System {
         fs: &fs,
         runner: &runner,
@@ -804,6 +837,52 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle));
     // Stale sets go after the restore; live ones and others' stay.
     let restore = pos("iptables-restore --noflush").unwrap();
+    // A dry run first, once every set it names exists (#56).
+    let dry_run = pos("iptables-restore --test --noflush").unwrap();
+    let last_set = lines
+        .iter()
+        .rposition(|l| l.starts_with("ipset swap"))
+        .unwrap();
+    assert!(last_set < dry_run && dry_run < restore, "{lines:#?}");
+    // Tunnel peers open no new connections while the tables change: a hold
+    // per tunnel interface goes in after the dry run, and every hold the
+    // listing after the restore shows comes out once the hooks are in.
+    let hold_line = |op: &str, rule: &str| format!("iptables -t filter {op} {rule}");
+    let suffix = "-m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP";
+    let mut placed = 0;
+    for (chain, dir) in [("INPUT", "-i"), ("FORWARD", "-i"), ("FORWARD", "-o")] {
+        for iface in ["wg0", "tailscale0"] {
+            let at = pos(&hold_line("-I", &format!("{chain} {dir} {iface} {suffix}"))).unwrap();
+            assert!(dry_run < at && at < restore, "{lines:#?}");
+            placed += 1;
+        }
+    }
+    assert_eq!(placed, holds.len());
+    // nat hooked before filter: a filter jump goes in above the hold.
+    let hook = |chain: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(&format!(" -C {chain} -j PARALLAX_{chain}")))
+            .unwrap()
+    };
+    assert!(hook("POSTROUTING") < hook("FORWARD") && hook("PREROUTING") < hook("INPUT"));
+    let hooks = hook("INPUT").max(hook("FORWARD"));
+    for rule in [
+        format!("INPUT -i wg0 {suffix}"),
+        format!("FORWARD -o tailscale0 {suffix}"),
+        format!("FORWARD -i wg9 {suffix}"),
+    ] {
+        let lifted = pos(&hold_line("-D", &rule)).unwrap();
+        assert!(hooks < lifted, "{rule}: {lines:#?}");
+    }
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.contains("parallax-hold") && l.contains(" -D "))
+            .count(),
+        3,
+        "{lines:#?}"
+    );
     let gone = |set: &str| pos(&format!("ipset destroy {set}"));
     assert!(gone("wg_0000000000000000").unwrap() > restore);
     assert!(gone("not_public").is_none() && gone("ts_family").is_none());
