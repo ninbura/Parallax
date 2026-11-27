@@ -143,20 +143,48 @@ enum Msg {
 type Views = watch::Receiver<Option<View>>;
 
 pub fn run(opts: Options) -> anyhow::Result<()> {
-    // Root would make, chmod and remove the socket there as root.
-    if let Some((who, sudo_u)) = crate::owner::belongs_to_another_user(&opts.socket) {
-        bail!(
-            "{} belongs to {who}: a daemon run as root would manage its socket there. Start the \
-             service instead (`sudo systemctl start parallax`), or run it as that user (`sudo -u \
-             {sudo_u} parallax daemon ...`)",
-            opts.socket.display()
-        );
-    }
+    not_root_in_anothers_place(&opts)?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the async runtime")?
         .block_on(serve(opts))
+}
+
+/// Before anything: a daemon run as root where another user's files are
+/// (the service's, on a native install) would leave its database files,
+/// generated files and socket as root's there.
+fn not_root_in_anothers_place(opts: &Options) -> anyhow::Result<()> {
+    use crate::owner::{belongs_to_another_user, database_belongs_to_another_user};
+    let start = |sudo_u: &str| {
+        format!(
+            "Start the service instead (`sudo systemctl start parallax`), or run it as that user \
+             (`sudo -u {sudo_u} parallax daemon ...`)"
+        )
+    };
+    if let Some((who, sudo_u)) = database_belongs_to_another_user(&opts.db) {
+        bail!(
+            "{} belongs to {who}: a daemon run as root would leave files that user can't open. {}",
+            opts.db.display(),
+            start(&sudo_u)
+        );
+    }
+    if let Some((who, sudo_u)) = belongs_to_another_user(&opts.out) {
+        bail!(
+            "{} belongs to {who}: a daemon run as root would write files there that user can't \
+             replace. {}",
+            opts.out.display(),
+            start(&sudo_u)
+        );
+    }
+    if let Some((who, sudo_u)) = belongs_to_another_user(&opts.socket) {
+        bail!(
+            "{} belongs to {who}: a daemon run as root would manage its socket there. {}",
+            opts.socket.display(),
+            start(&sudo_u)
+        );
+    }
+    Ok(())
 }
 
 async fn serve(opts: Options) -> anyhow::Result<()> {
@@ -808,22 +836,6 @@ impl Engine {
             .enable_time()
             .build()
             .context("starting the engine's runtime")?;
-        if let Some((who, sudo_u)) = crate::owner::database_belongs_to_another_user(db) {
-            bail!(
-                "{} belongs to {who}: a daemon run as root would leave files that user can't \
-                 open. Start the service instead (`sudo systemctl start parallax`), or run it as \
-                 that user (`sudo -u {sudo_u} parallax daemon ...`)",
-                db.display()
-            );
-        }
-        if let Some((who, sudo_u)) = crate::owner::belongs_to_another_user(&out) {
-            bail!(
-                "{} belongs to {who}: a daemon run as root would write files there that user \
-                 can't replace. Start the service instead (`sudo systemctl start parallax`), or \
-                 run it as that user (`sudo -u {sudo_u} parallax daemon ...`)",
-                out.display()
-            );
-        }
         let mut store = rt.block_on(Store::open(db)).map_err(|e| match e {
             parallax_store::Error::InUse(_) => anyhow!(
                 "the database {} is open in another process; is another daemon running?",
