@@ -21,7 +21,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::header::UPGRADE;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -31,7 +31,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use parallax_core::generate::proxy::{ProxyRoutes, ProxySite};
-use parallax_core::logging::{self, Event, Tap};
+use parallax_core::logging::{self, Event, Logged, Tap};
+use parallax_core::model::LogLevel;
 use rustls::server::Acceptor;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -426,9 +427,10 @@ async fn while_authorized<F: Future>(work: F, mut state: Shared, hostname: &str,
     }
 }
 
-/// `tap`, if it wants what `client` does.
-fn tapped(tap: Option<&Tap>, client: Ipv4Addr) -> Option<&Tap> {
-    tap.filter(|t| t.wants(client))
+/// `tap` and the peer `client` is, if the tap wants what it does.
+fn admitted(tap: Option<&Tap>, client: Ipv4Addr) -> Option<(Tap, Logged)> {
+    let tap = tap?;
+    tap.admit(client).map(|logged| (tap.clone(), logged))
 }
 
 /// Tell the tap, if it wants `client`, that a connection was refused before
@@ -440,9 +442,10 @@ fn refused_connection(
     upstream: Option<SocketAddrV4>,
     why: &'static str,
 ) {
-    if let Some(tap) = tapped(tap, client) {
+    if let Some((tap, logged)) = admitted(tap, client) {
         tap.send(Event::Request(logging::Request {
             client,
+            peer: logged.peer,
             hostname: hostname.map(str::to_string),
             upstream,
             method: None,
@@ -520,7 +523,7 @@ async fn handle(stream: TcpStream, client: Ipv4Addr, state: Shared, _slot: Slot,
     let service = {
         let (hostname, state) = (hostname.clone(), state.clone());
         service_fn(move |req| {
-            let tap = tapped(tap.as_ref(), client).cloned();
+            let tap = admitted(tap.as_ref(), client);
             forward(req, hostname.clone(), client, state.clone(), tap)
         })
     };
@@ -568,20 +571,24 @@ fn chain(e: &dyn std::error::Error) -> String {
 
 /// A logged peer's request, handed to the tap once its response is done
 /// with (sent, or abandoned by the peer), with the bytes of the bodies
-/// each way.
+/// each way. A peer logged only at `blocked` hands over only refusals.
 struct Exchange {
     tap: Tap,
     event: Option<logging::Request>,
+    /// Whether a request that was forwarded is recorded too.
+    forwarded: bool,
     out: Arc<AtomicU64>,
     back: Arc<AtomicU64>,
 }
 
 impl Exchange {
-    fn new(tap: Tap, client: Ipv4Addr, hostname: &str, method: &Method) -> Self {
+    fn new(tap: Tap, logged: Logged, client: Ipv4Addr, hostname: &str, method: &Method) -> Self {
         Exchange {
             tap,
+            forwarded: logged.level >= LogLevel::Connections,
             event: Some(logging::Request {
                 client,
+                peer: logged.peer,
                 hostname: Some(hostname.to_string()),
                 upstream: None,
                 method: Some(method.to_string()),
@@ -600,24 +607,27 @@ impl Exchange {
 
     /// The request's body, counted on its way upstream.
     fn count_out(&self, body: Incoming) -> Body {
-        counted(body, Arc::clone(&self.out))
+        Counted {
+            body: body.boxed(),
+            tally: Arc::clone(&self.out),
+            _exchange: None,
+        }
+        .boxed()
     }
 
-    /// Answer with `resp`, counting its body on the way to the peer.
+    /// Answer with `resp`, counting its body on the way to the peer; the
+    /// record goes when the body does.
     fn answer(mut self, resp: Response<Body>) -> Response<Body> {
         if let Some(e) = self.event() {
             e.status = Some(resp.status().as_u16());
         }
-        let back = Arc::clone(&self.back);
+        let tally = Arc::clone(&self.back);
         resp.map(|body| {
-            // The record goes when the body does, which keeps `self` until then.
-            body.map_frame(move |frame| {
-                if let Some(data) = frame.data_ref() {
-                    back.fetch_add(data.len() as u64, Ordering::Relaxed);
-                }
-                let _ = &self;
-                frame
-            })
+            Counted {
+                body,
+                tally,
+                _exchange: Some(self),
+            }
             .boxed()
         })
     }
@@ -625,24 +635,53 @@ impl Exchange {
 
 impl Drop for Exchange {
     fn drop(&mut self) {
-        if let Some(mut event) = self.event.take() {
-            event.bytes = Some((
-                self.out.load(Ordering::Relaxed),
-                self.back.load(Ordering::Relaxed),
-            ));
-            self.tap.send(Event::Request(event));
+        let Some(mut event) = self.event.take() else {
+            return;
+        };
+        if event.refused.is_none() && !self.forwarded {
+            return;
         }
+        event.bytes = Some((
+            self.out.load(Ordering::Relaxed),
+            self.back.load(Ordering::Relaxed),
+        ));
+        self.tap.send(Event::Request(event));
     }
 }
 
-fn counted(body: Incoming, n: Arc<AtomicU64>) -> Body {
-    body.map_frame(move |frame| {
-        if let Some(data) = frame.data_ref() {
-            n.fetch_add(data.len() as u64, Ordering::Relaxed);
+/// A body that adds its data's length to a tally and passes the rest
+/// through (its size, its end), so counting never changes how it's framed.
+struct Counted {
+    body: Body,
+    tally: Arc<AtomicU64>,
+    /// Held for its drop: the response's record goes when the body does.
+    _exchange: Option<Exchange>,
+}
+
+impl hyper::body::Body for Counted {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Bytes>, hyper::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                self.tally.fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
         }
-        frame
-    })
-    .boxed()
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }
 
 /// A stream that adds the bytes read from it to a tally.
@@ -712,9 +751,10 @@ async fn forward(
     hostname: String,
     client: Ipv4Addr,
     state: Shared,
-    tap: Option<Tap>,
+    tap: Option<(Tap, Logged)>,
 ) -> std::result::Result<Response<Body>, Infallible> {
-    let mut exchange = tap.map(|t| Exchange::new(t, client, &hostname, req.method()));
+    let mut exchange =
+        tap.map(|(tap, logged)| Exchange::new(tap, logged, client, &hostname, req.method()));
     // Look the site up per request: a reload may have revoked or moved it.
     let Some(site) = state.borrow().authorized(&hostname, client).cloned() else {
         return Ok(refuse(

@@ -549,8 +549,7 @@ fn requests(events: &std::sync::mpsc::Receiver<Event>) -> Vec<parallax_core::log
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_logged_peer_s_requests_and_refusals_are_handed_over_without_paths() {
-    let (tap, events) = Tap::new(64);
-    tap.set_clients([std::net::Ipv4Addr::LOCALHOST].into());
+    let (tap, events) = tap_for(parallax_core::model::LogLevel::Detailed);
     let env = Env::start_tapped(Some(tap)).await;
     let (status, body) = env
         .h1(IMMICH, get("/api/assets/3f2a9c/thumbnail", IMMICH))
@@ -608,4 +607,55 @@ async fn peers_nobody_logs_hand_nothing_over() {
     assert_eq!(status, StatusCode::OK);
     assert!(env.connect("nope.example.test", b"http/1.1").await.is_err());
     assert!(requests(&events).is_empty());
+}
+
+fn tap_for(level: parallax_core::model::LogLevel) -> (Tap, std::sync::mpsc::Receiver<Event>) {
+    let (tap, events) = Tap::new(64);
+    tap.set_clients(
+        [(
+            std::net::Ipv4Addr::LOCALHOST,
+            parallax_core::logging::Logged {
+                peer: "guest".into(),
+                level,
+            },
+        )]
+        .into(),
+    );
+    (tap, events)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_logged_at_blocked_hands_over_only_refusals() {
+    let (tap, events) = tap_for(parallax_core::model::LogLevel::Blocked);
+    let env = Env::start_tapped(Some(tap)).await;
+    assert_eq!(env.h1(IMMICH, get("/", IMMICH)).await.0, StatusCode::OK);
+    assert_eq!(
+        env.h1(IMMICH, get("/", OTHER)).await.0,
+        StatusCode::MISDIRECTED_REQUEST
+    );
+    let got = requests(&events);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].status, Some(421));
+    assert_eq!(got[0].peer, "guest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logging_keeps_a_reply_s_length() {
+    let (tap, _events) = tap_for(parallax_core::model::LogLevel::Detailed);
+    let env = Env::start_tapped(Some(tap)).await;
+    let tls = env.connect(IMMICH, b"http/1.1").await.unwrap();
+    let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    // The proxy's own reply, and the upstream's.
+    for host in [OTHER, IMMICH] {
+        let resp = send.send_request(get("/", host)).await.unwrap();
+        assert!(
+            resp.headers().contains_key(hyper::header::CONTENT_LENGTH),
+            "{host}: {:?}",
+            resp.headers()
+        );
+        resp.into_body().collect().await.unwrap();
+    }
 }

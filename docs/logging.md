@@ -44,6 +44,8 @@ parallax log level inherit --peer laptop             # back to its grants' level
 
 A peer's own level wins. Otherwise it gets the most detailed level among its
 grants (grants for everyone included). Otherwise it gets `server.logs.level`.
+Only WireGuard peers are logged so far: a Tailscale peer's settings are kept
+but record nothing yet.
 So "my guests' blocked attempts, nothing of my own devices" is `log level
 blocked --grant family` with the global level left at `off`.
 

@@ -3,7 +3,7 @@
 //! attempts to the collector; nothing is marked or handed over for peers
 //! at `off`, so logging nobody costs nothing.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
@@ -158,27 +158,34 @@ pub fn addresses(model: &Model<'_>, at_least: LogLevel) -> Vec<Ipv4Net> {
     out
 }
 
-/// Tunnel addresses of the enabled WireGuard peers that `logged` picks.
-/// From the configuration alone; expired peers count, which only means
-/// listening for traffic nobody sends.
-fn logged_clients(config: &Config, logged: impl Fn(&Peer) -> bool) -> HashSet<Ipv4Addr> {
+/// The enabled WireGuard peers that `logged` picks, by tunnel address. From
+/// the configuration alone; expired peers count, which only means listening
+/// for traffic nobody sends.
+fn logged_clients(config: &Config, logged: impl Fn(&Peer) -> bool) -> HashMap<Ipv4Addr, Logged> {
     config
         .peers
         .iter()
         .filter(|p| p.enabled && p.transport == TransportKind::WireGuard)
         .filter(|p| logged(p))
-        .filter_map(|p| p.wireguard.as_ref().and_then(|w| w.address))
+        .filter_map(|p| {
+            let address = p.wireguard.as_ref().and_then(|w| w.address)?;
+            let logged = Logged {
+                peer: p.name.clone(),
+                level: level(config, p),
+            };
+            Some((address, logged))
+        })
         .collect()
 }
 
-/// Tunnel addresses of the peers logged at `at_least` or more: whose
-/// requests the HTTPS proxy hands over (at `blocked` and up).
-pub fn level_clients(config: &Config, at_least: LogLevel) -> HashSet<Ipv4Addr> {
+/// The peers logged at `at_least` or more: whose requests the HTTPS proxy
+/// hands over (at `blocked` and up).
+pub fn level_clients(config: &Config, at_least: LogLevel) -> HashMap<Ipv4Addr, Logged> {
     logged_clients(config, |p| level(config, p) >= at_least)
 }
 
-/// Tunnel addresses of the peers whose DNS queries are logged.
-pub fn dns_clients(config: &Config) -> HashSet<Ipv4Addr> {
+/// The peers whose DNS queries are logged.
+pub fn dns_clients(config: &Config) -> HashMap<Ipv4Addr, Logged> {
     logged_clients(config, |p| dns(config, p))
 }
 
@@ -232,6 +239,8 @@ pub struct Blocked {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub client: Ipv4Addr,
+    /// The peer the client was when the request came in.
+    pub peer: String,
     /// The site the peer asked for (the TLS server name), if it named one.
     pub hostname: Option<String>,
     /// The site's upstream, when the hostname is a configured site.
@@ -250,6 +259,8 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
     pub client: Ipv4Addr,
+    /// The peer the client was when the query came in.
+    pub peer: String,
     /// The DNS server's address.
     pub server: Ipv4Addr,
     pub protocol: u8,
@@ -295,13 +306,22 @@ pub enum Event {
     Query(Query),
 }
 
+/// A peer a tap wants, as it was when its request or query came in: its
+/// events are recorded for this peer or not at all, so an address that
+/// passed to another peer meanwhile can't move them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Logged {
+    pub peer: String,
+    pub level: LogLevel,
+}
+
 /// Where the HTTPS proxy and the DNS server hand over what logged peers do.
 /// Only callers in its set are handed over, so with nobody logged nothing
 /// is; a full queue drops (and counts) rather than slow anyone down.
 #[derive(Debug, Clone)]
 pub struct Tap {
     tx: SyncSender<Event>,
-    clients: Arc<RwLock<HashSet<Ipv4Addr>>>,
+    clients: Arc<RwLock<HashMap<Ipv4Addr, Logged>>>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -317,12 +337,13 @@ impl Tap {
         (tap, rx)
     }
 
-    /// Whether what `client` does is wanted.
-    pub fn wants(&self, client: Ipv4Addr) -> bool {
+    /// The peer `client` is, if what it does is wanted.
+    pub fn admit(&self, client: Ipv4Addr) -> Option<Logged> {
         self.clients
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .contains(&client)
+            .get(&client)
+            .cloned()
     }
 
     /// Hand `event` over, or count it as dropped if the queue is full.
@@ -333,7 +354,7 @@ impl Tap {
     }
 
     /// Whose events are wanted from now on.
-    pub fn set_clients(&self, clients: HashSet<Ipv4Addr>) {
+    pub fn set_clients(&self, clients: HashMap<Ipv4Addr, Logged>) {
         *self.clients.write().unwrap_or_else(|p| p.into_inner()) = clients;
     }
 
@@ -499,6 +520,15 @@ pub fn attribute(config: &Config, event: &Event, time: u64) -> Option<Record> {
         p.transport == TransportKind::WireGuard
             && p.wireguard.as_ref().and_then(|w| w.address) == Some(src)
     })?;
+    // Another peer has the address since the request or query came in.
+    let admitted = match event {
+        Event::Request(r) => Some(&r.peer),
+        Event::Query(q) => Some(&q.peer),
+        _ => None,
+    };
+    if admitted.is_some_and(|name| *name != peer.name) {
+        return None;
+    }
     let level = level(config, peer);
     let wanted = match event {
         Event::Opened(_) => level >= LogLevel::Connections,
@@ -808,6 +838,7 @@ mod tests {
     fn request(refused: Option<&'static str>) -> Request {
         Request {
             client: Ipv4Addr::new(10, 8, 2, 1),
+            peer: "sister-phone".into(),
             hostname: Some("immich.example.com".into()),
             upstream: Some("192.168.1.5:443".parse().unwrap()),
             method: Some("GET".into()),
@@ -872,12 +903,30 @@ mod tests {
     fn query() -> Event {
         Event::Query(Query {
             client: Ipv4Addr::new(10, 8, 2, 1),
+            peer: "sister-phone".into(),
             server: Ipv4Addr::new(10, 8, 0, 1),
             protocol: 17,
             name: "immich.example.com.".into(),
             query_type: "A".into(),
             outcome: QueryOutcome::Answered,
         })
+    }
+
+    #[test]
+    fn a_request_or_query_stays_with_the_peer_it_came_in_as() {
+        let mut cfg = canonical_config();
+        cfg.server.logs.level = LogLevel::Connections;
+        cfg.server.logs.dns = true;
+        let moved = Request {
+            peer: "a-removed-peer".into(),
+            ..request(None)
+        };
+        assert!(attribute(&cfg, &Event::Request(moved), 1).is_none());
+        let Event::Query(mut q) = query() else {
+            unreachable!()
+        };
+        q.peer = "a-removed-peer".into();
+        assert!(attribute(&cfg, &Event::Query(q), 1).is_none());
     }
 
     #[test]
@@ -946,11 +995,17 @@ mod tests {
     fn a_tap_hands_over_only_the_peers_it_wants_and_counts_what_it_drops() {
         let (tap, events) = Tap::new(1);
         let sister = Ipv4Addr::new(10, 8, 2, 1);
-        assert!(!tap.wants(sister), "nobody to begin with");
+        assert_eq!(tap.admit(sister), None, "nobody to begin with");
         let mut cfg = canonical_config();
         cfg.server.logs.dns = true;
         tap.set_clients(dns_clients(&cfg));
-        assert!(tap.wants(sister));
+        assert_eq!(
+            tap.admit(sister),
+            Some(Logged {
+                peer: "sister-phone".into(),
+                level: LogLevel::Off
+            })
+        );
         tap.send(query());
         tap.send(query());
         assert_eq!(events.try_iter().count(), 1);

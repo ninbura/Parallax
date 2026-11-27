@@ -24,7 +24,7 @@ use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseI
 use hickory_server::zone_handler::MessageResponseBuilder;
 use hickory_server::Server;
 use parallax_core::generate::dns::{DnsRoutes, Route};
-use parallax_core::logging::{Event, Query, QueryOutcome, Tap};
+use parallax_core::logging::{Event, Logged, Query, QueryOutcome, Tap};
 use parallax_core::netmap::Mapping;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Notify;
@@ -283,13 +283,19 @@ impl Handler {
         self.state.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// Hand the query to the tap, if its peer's DNS is logged.
-    fn record(&self, request: &Request, code: ResponseCode) {
-        let Some(tap) = &self.tap else { return };
-        let Ok(info) = request.request_info() else {
+    /// The peer that asked, if its queries are logged.
+    fn admit(&self, request: &Request) -> Option<Logged> {
+        let tap = self.tap.as_ref()?;
+        let client = ipv4(request.request_info().ok()?.src.ip())?;
+        tap.admit(client)
+    }
+
+    /// Hand the query to the tap for `logged`.
+    fn record(&self, request: &Request, logged: Logged, code: ResponseCode) {
+        let (Some(tap), Ok(info)) = (&self.tap, request.request_info()) else {
             return;
         };
-        let Some(client) = ipv4(info.src.ip()).filter(|c| tap.wants(*c)) else {
+        let Some(client) = ipv4(info.src.ip()) else {
             return;
         };
         let mut name: Name = info.query.name().clone().into();
@@ -302,6 +308,7 @@ impl Handler {
         };
         tap.send(Event::Query(Query {
             client,
+            peer: logged.peer,
             server: self.server,
             protocol: if info.protocol.is_datagram() { 17 } else { 6 },
             name: name.to_ascii(),
@@ -397,11 +404,15 @@ impl RequestHandler for Handler {
     ) -> ResponseInfo {
         // Only EDNS version 0 exists; anything newer gets BADVERS so the
         // client can fall back (RFC 6891).
+        // Whether it's wanted is decided as the query comes in.
+        let logged = self.admit(request);
         let (code, answers) = match &request.edns {
             Some(e) if e.version() > 0 => reply(ResponseCode::BADVERS),
             _ => self.answer(request).await,
         };
-        self.record(request, code);
+        if let Some(logged) = logged {
+            self.record(request, logged, code);
+        }
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
         metadata.response_code = code;

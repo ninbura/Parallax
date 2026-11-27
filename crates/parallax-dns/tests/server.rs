@@ -529,7 +529,16 @@ async fn reloads_take_effect_and_a_broken_one_refuses_everything() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_logged_peer_s_queries_are_handed_over_without_answers() {
     let (tap, events) = Tap::new(64);
-    tap.set_clients([FAMILY.parse().unwrap()].into());
+    tap.set_clients(
+        [(
+            FAMILY.parse().unwrap(),
+            parallax_core::logging::Logged {
+                peer: "guest".into(),
+                level: parallax_core::model::LogLevel::Detailed,
+            },
+        )]
+        .into(),
+    );
     let s = start_tapped(Some(tap)).await;
     ask(FAMILY, s.addr, "Immich.MyDomain.com.", RecordType::A).await;
     ask(FAMILY, s.addr, "other.mydomain.com.", RecordType::A).await;

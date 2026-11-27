@@ -491,9 +491,10 @@ impl Sink {
         }
     }
 
-    /// Write `batch` to the open database. With none open yet (the
-    /// supervisor opens it within seconds of logging starting), keep a
-    /// batch's worth and drop the rest.
+    /// Write `batch` to the open database. While none is open (the
+    /// supervisor lets the old one go before it opens one at a new path),
+    /// the records go to the one they were accepted for; with none at all
+    /// yet, keep a batch's worth and drop the rest.
     fn flush(&self, batch: &mut Vec<logging::Record>, writer: &mut Option<(Arc<Logs>, Writer)>) {
         let dropped = self.tap.take_dropped();
         if dropped > 0 {
@@ -506,8 +507,21 @@ impl Sink {
             return;
         }
         let current = self.slot.read().ok().and_then(|s| s.clone());
-        let Some(current) = current else {
-            *writer = None;
+        if let Some(current) = current {
+            if !writer
+                .as_ref()
+                .is_some_and(|(l, _)| Arc::ptr_eq(l, &current))
+            {
+                *writer = match current.writer() {
+                    Ok(w) => Some((Arc::clone(&current), w)),
+                    Err(e) => {
+                        warn(format!("activity logging: writing {}: {e}", self.name));
+                        None
+                    }
+                };
+            }
+        }
+        let Some((_, w)) = writer else {
             if batch.len() > BATCH {
                 warn(format!(
                     "activity logging: {} records of {} dropped: no database open",
@@ -518,26 +532,12 @@ impl Sink {
             }
             return;
         };
-        if !writer
-            .as_ref()
-            .is_some_and(|(l, _)| Arc::ptr_eq(l, &current))
-        {
-            *writer = match current.writer() {
-                Ok(w) => Some((Arc::clone(&current), w)),
-                Err(e) => {
-                    warn(format!("activity logging: writing {}: {e}", self.name));
-                    None
-                }
-            };
-        }
-        if let Some((_, w)) = writer {
-            if let Err(e) = self.runtime.block_on(w.write(batch)) {
-                warn(format!(
-                    "activity logging: writing {} records of {} failed: {e}",
-                    batch.len(),
-                    self.name
-                ));
-            }
+        if let Err(e) = self.runtime.block_on(w.write(batch)) {
+            warn(format!(
+                "activity logging: writing {} records of {} failed: {e}",
+                batch.len(),
+                self.name
+            ));
         }
         batch.clear();
     }
