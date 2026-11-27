@@ -21,6 +21,7 @@ pub mod generate;
 pub mod grants;
 pub mod headscale;
 pub mod io;
+pub mod logging;
 pub mod model;
 pub mod names;
 pub mod netmap;

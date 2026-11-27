@@ -717,6 +717,20 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
         }
     }
 
+    let logs = &server.logs;
+    if !logs.path.is_absolute() || logs.path.file_name().is_none() {
+        errors.push(format!(
+            "server.logs.path '{}' must be an absolute path to a file",
+            logs.path.display()
+        ));
+    }
+    if logs.max_size.as_bytes() < 1024 * 1024 {
+        errors.push(format!(
+            "server.logs.max_size {} is too small to hold any records; use at least 1MiB",
+            logs.max_size
+        ));
+    }
+
     let public_ip = &server.public_ip;
     if let Some(address) = public_ip.address {
         if !crate::public_ip::is_public(address) {
@@ -1211,6 +1225,18 @@ mod tests {
         );
         let e = errors_of(|c| c.server.backup.passphrase_file = "pass".into());
         assert!(has(&e, "server.backup.passphrase_file pass"), "{e:?}");
+        for bad in ["", "logs.db", "/"] {
+            let e = errors_of(|c| c.server.logs.path = bad.into());
+            assert!(
+                has(
+                    &e,
+                    &format!("server.logs.path '{bad}' must be an absolute path")
+                ),
+                "{e:?}"
+            );
+        }
+        let e = errors_of(|c| c.server.logs.max_size = "512KiB".parse().unwrap());
+        assert!(has(&e, "server.logs.max_size 512KiB is too small"), "{e:?}");
     }
 
     #[test]
@@ -1307,6 +1333,7 @@ mod tests {
         cfg.grants.push(Grant {
             name: "public".into(),
             everyone: true,
+            log: None,
             rules: vec![Rule::PublicDns],
         });
         let (errors, warnings) = check(&cfg);

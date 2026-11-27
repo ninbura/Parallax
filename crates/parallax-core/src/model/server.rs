@@ -24,6 +24,9 @@ pub struct ServerConfig {
     pub backup: BackupServer,
     #[serde(default)]
     pub public_ip: PublicIpServer,
+    /// Per-peer activity logging (docs/logging.md).
+    #[serde(default)]
+    pub logs: super::LogsServer,
     /// Interface with the default route, used by `internet` grants. Defaults
     /// to the first network's interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]

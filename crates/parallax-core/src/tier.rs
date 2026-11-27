@@ -191,6 +191,7 @@ mod tests {
         cfg.grants.push(Grant {
             name: "public".into(),
             everyone: true,
+            log: None,
             rules: vec![Rule::PublicDns],
         });
         cfg.peers[2].grants.clear();

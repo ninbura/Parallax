@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 
 /// The version this build speaks. 2: replies carry the home's public IP.
 /// 3: and what hosts named by DNS name resolved to. 4: services and host
-/// grants carry port lists.
-pub const PROTOCOL: u64 = 5;
+/// grants carry port lists. 5: the configuration carries log levels.
+/// 6: replies carry the addresses Headscale gave its nodes.
+pub const PROTOCOL: u64 = 6;
 /// The largest message either side accepts, newline included.
 pub const MAX_MESSAGE: usize = 16 << 20;
 
@@ -228,7 +229,12 @@ mod tests {
 
     #[test]
     fn a_configuration_survives_the_socket() {
-        let config = canonical_config();
+        let mut config = canonical_config();
+        // Every kind of log level: the socket reads peers through the same
+        // form as TOML.
+        config.server.logs.level = parallax_core::model::LogLevel::Connections;
+        config.grants[1].log = Some(parallax_core::model::LogLevel::Blocked);
+        config.peers[0].log = Some(parallax_core::model::LogLevel::Off);
         let Request::Save {
             configuration,
             revision,

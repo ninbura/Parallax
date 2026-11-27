@@ -21,8 +21,9 @@ use parallax_core::grants;
 use parallax_core::headscale::Tailnet;
 use parallax_core::io::real::{RealFs, RealRunner};
 use parallax_core::io::{FileSystem, KeyGenerator, OsKeyGenerator, System};
+use parallax_core::logging;
 use parallax_core::model::{
-    AllowedIpsStrategy, DnsMode, Peer, Platform, Rule, ServerConfig, TransportKind,
+    AllowedIpsStrategy, DnsMode, LogLevel, Peer, Platform, Rule, ServerConfig, TransportKind,
 };
 use parallax_core::names::{self, Resolved};
 use parallax_core::public_ip;
@@ -170,6 +171,11 @@ enum Command {
     Peer {
         #[command(subcommand)]
         command: PeerCommand,
+    },
+    /// Per-peer activity logging (docs/logging.md).
+    Log {
+        #[command(subcommand)]
+        command: LogCommand,
     },
     /// Ask Headscale, the Tailscale control server.
     Headscale {
@@ -353,6 +359,92 @@ enum GrantRule {
         #[arg(required = true)]
         rules: Vec<Rule>,
     },
+}
+
+#[derive(Subcommand)]
+enum LogCommand {
+    /// Set how much is logged: for everyone (`server.logs.level`), for a
+    /// grant's peers, or for one peer. A peer's own level wins, then the most
+    /// detailed of its grants', then the global one.
+    Level {
+        level: LevelArg,
+        /// Set this peer's own level (`inherit`: follow its grants again).
+        #[arg(long, conflicts_with = "grant")]
+        peer: Option<String>,
+        /// Set this grant's level for the peers that have it (`inherit`: none).
+        #[arg(long)]
+        grant: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LevelArg {
+    Off,
+    /// Attempts the firewall stopped.
+    Blocked,
+    /// Also every connection.
+    Connections,
+    /// Also the bytes of each connection.
+    Detailed,
+    /// Clear a peer's or grant's own level.
+    Inherit,
+}
+
+impl LevelArg {
+    fn level(self) -> Option<LogLevel> {
+        match self {
+            LevelArg::Off => Some(LogLevel::Off),
+            LevelArg::Blocked => Some(LogLevel::Blocked),
+            LevelArg::Connections => Some(LogLevel::Connections),
+            LevelArg::Detailed => Some(LogLevel::Detailed),
+            LevelArg::Inherit => None,
+        }
+    }
+}
+
+fn log_command(ctx: &Ctx, command: LogCommand) -> anyhow::Result<()> {
+    let LogCommand::Level { level, peer, grant } = command;
+    let target = match (peer, grant) {
+        (Some(p), _) => logging::Target::Peer(p),
+        (None, Some(g)) => logging::Target::Grant(g),
+        (None, None) => logging::Target::Global,
+    };
+    let level = level.level();
+    grant_change(
+        ctx,
+        |c| {
+            let changed = logging::set_level(c, &target, level)?;
+            // What a peer that went back to inheriting ends up with.
+            let effective = match (&target, level) {
+                (logging::Target::Peer(p), None) => c.peer(p).map(|peer| logging::level(c, peer)),
+                _ => None,
+            };
+            Ok((changed, effective))
+        },
+        |(changed, effective)| {
+            let what = match (&target, level) {
+                (logging::Target::Global, Some(l)) => format!("everyone logs {l} by default"),
+                (logging::Target::Peer(p), Some(l)) => format!("peer '{p}' logs {l}"),
+                (logging::Target::Peer(p), None) => {
+                    format!("peer '{p}' follows its grants and the global level")
+                }
+                (logging::Target::Grant(g), Some(l)) => {
+                    format!("grant '{g}' logs {l} for its peers")
+                }
+                (logging::Target::Grant(g), None) => format!("grant '{g}' sets no level"),
+                (logging::Target::Global, None) => String::new(),
+            };
+            if *changed {
+                outln!("{what} now")?;
+            } else {
+                outln!("{what} already")?;
+            }
+            if let Some(l) = effective {
+                outln!("in effect: {l}")?;
+            }
+            Ok(())
+        },
+    )
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -967,6 +1059,7 @@ fn run() -> anyhow::Result<()> {
         Command::Backup { command } => backup::run(&ctx, command)?,
         Command::Grant { command } => grant_command(&ctx, command)?,
         Command::Peer { command } => peer_command(&ctx, command)?,
+        Command::Log { command } => log_command(&ctx, command)?,
         Command::Headscale {
             command: HeadscaleCommand::Status,
         } => {

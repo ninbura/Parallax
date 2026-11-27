@@ -278,6 +278,54 @@ fn peer_show_marks_proxied_services() {
 }
 
 #[test]
+fn log_levels_are_set_for_everyone_a_grant_or_a_peer() {
+    let s = Scratch::new("log-level");
+    s.import();
+    let ok = |args: &[&str]| {
+        let (ok, out, err) = s.run(args);
+        assert!(ok, "{args:?}: {err}");
+        out
+    };
+    let refused = |args: &[&str]| {
+        let (ok, _, err) = s.run(args);
+        assert!(!ok, "{args:?} should fail");
+        err
+    };
+    let out = ok(&["log", "level", "blocked", "--grant", "family"]);
+    assert!(
+        out.contains("grant 'family' logs blocked for its peers now"),
+        "{out}"
+    );
+    let out = ok(&["log", "level", "detailed", "--peer", "sister-phone"]);
+    assert!(
+        out.contains("peer 'sister-phone' logs detailed now"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("in effect"),
+        "its own level is what's in effect: {out}"
+    );
+    // Back to its grant's level.
+    let out = ok(&["log", "level", "inherit", "--peer", "sister-phone"]);
+    assert!(out.contains("in effect: blocked"), "{out}");
+    let out = ok(&["log", "level", "connections"]);
+    assert!(
+        out.contains("everyone logs connections by default now"),
+        "{out}"
+    );
+    let text = ok(&["config", "export"]);
+    assert!(text.contains("level = \"connections\""), "{text}");
+    assert!(text.contains("log = \"blocked\""), "{text}");
+
+    let err = refused(&["log", "level", "inherit"]);
+    assert!(err.contains("nothing to inherit"), "{err}");
+    let err = refused(&["log", "level", "detailed", "--peer", "nobody"]);
+    assert!(err.contains("peer 'nobody' not found"), "{err}");
+    let err = refused(&["log", "level", "verbose"]);
+    assert!(err.contains("verbose"), "{err}");
+}
+
+#[test]
 fn grants_are_managed_from_either_side() {
     let s = Scratch::new("grants");
     s.import();
@@ -527,11 +575,11 @@ fn fake_daemon(
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let reply = match request["request"].as_str().unwrap() {
                 "load" => serde_json::json!({
-                    "protocol": 5, "reply": "configuration", "public_ip": null, "names": {}, "tailnet": null,
+                    "protocol": 6, "reply": "configuration", "public_ip": null, "names": {}, "tailnet": null,
                     "configuration": config, "revision": 3,
                 }),
                 "save" => serde_json::json!({
-                    "protocol": 5, "reply": "applied", "revision": 4,
+                    "protocol": 6, "reply": "applied", "revision": 4,
                     "log": ["applied by the fake daemon"], "error": null,
                 }),
                 other => panic!("unexpected request {other}"),
@@ -574,7 +622,7 @@ fn commands_go_through_a_running_daemon() {
     assert_eq!(seen[2]["revision"], 3, "saved against the loaded revision");
     let peers = seen[2]["configuration"]["peer"].as_array().unwrap();
     assert!(peers.iter().all(|p| p["name"] != "router"), "{peers:?}");
-    assert!(seen.iter().all(|r| r["protocol"] == 5));
+    assert!(seen.iter().all(|r| r["protocol"] == 6));
 }
 
 /// A stale socket file (its daemon is gone) means no daemon.
@@ -662,7 +710,7 @@ fn a_backup_restores_what_changed_since() {
     let file = s.backups().pop().unwrap();
     let (ok, out, _) = s.run(&["backup", "list"]);
     assert!(
-        ok && out.contains("encrypted") && out.contains("schema 6"),
+        ok && out.contains("encrypted") && out.contains("schema 7"),
         "{out}"
     );
 
