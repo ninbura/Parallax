@@ -174,7 +174,7 @@ fn as_user(
     let exe = std::env::current_exe().map_err(|e| io_error(what(), e))?;
     // The child starts in `/`: a relative path must mean what it means here.
     let path = std::path::absolute(path).map_err(|e| io_error(what(), e))?;
-    let mut child = Command::new(exe)
+    let mut child = Command::new(&exe)
         .arg("file")
         .arg(op)
         // A path starting with `-` is still a path.
@@ -192,7 +192,17 @@ fn as_user(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| io_error(what(), e))?;
+        .map_err(|e| {
+            io_error(
+                format!(
+                    "starting {} again as uid {} for {}, which that user must be able to run",
+                    exe.display(),
+                    user.uid,
+                    path.display()
+                ),
+                e,
+            )
+        })?;
     if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
         // A child that stopped early says why on stderr, collected below.
         match stdin.write_all(input.as_bytes()) {

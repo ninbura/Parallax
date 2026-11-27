@@ -982,19 +982,24 @@ pass "(t) each level records what it covers (blocked attempts; connections and b
 # (v) Root writes what the service's configuration names as the service: a
 # configuration naming a file in root's own directory gets no write from root.
 if [ "$MODE" = unit ]; then
+    # The copy in $WORK: root starts the CLI again as the service's user,
+    # who can't reach a binary under someone's home.
+    PW="$WORK/parallax --db $WORK/parallax.db --socket $SOCK"
     mkdir -m 0700 "$WORK/rootonly"
     echo untouched > "$WORK/rootonly/victim"
-    $P config export > "$WORK/before.toml" || fail "(v) config export"
+    $PW config export > "$WORK/before.toml" || fail "(v) config export"
     sed "s#^passphrase_file = .*#passphrase_file = \"$WORK/rootonly/victim\"#" "$WORK/before.toml" > "$WORK/rogue.toml"
     grep -q "rootonly/victim" "$WORK/rogue.toml" || fail "(v) the exported configuration has no passphrase_file"
-    $P config import "$WORK/rogue.toml" >/dev/null || fail "(v) importing through the daemon"
-    if $P backup passphrase --generate --replace > "$WORK/rogue.out" 2>&1; then
+    $PW config import "$WORK/rogue.toml" >/dev/null || fail "(v) importing through the daemon"
+    if $PW backup passphrase --generate --replace > "$WORK/rogue.out" 2>&1; then
         fail "(v) root wrote the file the service's configuration named in root's directory"
     fi
     [ "$(cat "$WORK/rootonly/victim")" = untouched ] || fail "(v) root's file changed"
-    grep -q "as uid $(id -u nobody)" "$WORK/rogue.out" || { cat "$WORK/rogue.out"; fail "(v) the refusal doesn't say whose write it was"; }
-    $P config import "$WORK/before.toml" >/dev/null || fail "(v) putting the configuration back"
-    $P backup passphrase --generate --replace >/dev/null 2>&1 || fail "(v) the service's own passphrase file"
+    grep -q "(as uid $(id -u nobody)).*$WORK/rootonly/victim: Permission denied" "$WORK/rogue.out" \
+        || { cat "$WORK/rogue.out"; fail "(v) the refusal isn't the service's user being denied root's file"; }
+    $PW config import "$WORK/before.toml" >/dev/null || fail "(v) putting the configuration back"
+    $PW backup passphrase --generate --replace > "$WORK/own.out" 2>&1 \
+        || { cat "$WORK/own.out"; fail "(v) the service's own passphrase file"; }
     [ "$(stat -c %U "$WORK/backup.passphrase")" = nobody ] || fail "(v) the passphrase isn't the service's"
     pass "(v) root writes the files the service's configuration names as the service, and nowhere else"
 fi
