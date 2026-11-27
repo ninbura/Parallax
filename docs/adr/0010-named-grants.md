@@ -51,11 +51,14 @@ configuration always numbers them alike.
   numbered (`tier_<n>`, `PARALLAX_T<n>`); a tier's name can be several
   grants long, and the rules' comments say which (`family+photos: ...`).
   INPUT and the proxy redirect match the tier's member set (`wg_<key>`,
-  `ts_<key>`, the key a hash of its grants' names), so they stay one rule
-  per tier however many peers. Sets are named by content, not position:
-  `iptables-nft` refills sets before it restores the rules, and a set
-  whose name moved to other access would briefly give old rules' access to
-  new members.
+  `ts_<key>`), so they stay one rule per tier however many peers. Sets are
+  named by content, not position: `iptables-nft` refills sets before it
+  restores the rules, and a set whose name moved to other access would
+  briefly give old rules' access to new members. *(Amended, issue #35: the
+  key first hashed the grants' names, which missed a grant whose rules
+  changed under the same name. It now hashes the tier's label and every
+  rule that uses the set or sits in the tier's chain, so a tier whose access
+  changes gets a fresh set and the restore switches to it in one step.)*
 - **Addresses change hands.** Since an address no longer implies access, a
   save can give a removed peer's address to someone with other grants.
   Apply first takes any live WireGuard peer off the interface that holds an

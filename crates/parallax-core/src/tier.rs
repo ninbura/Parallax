@@ -36,9 +36,9 @@ impl Tier<'_> {
             .join("+")
     }
 
-    /// 16 hex digits naming the tier by its grants, not its position. The
-    /// firewall then renames each tier set after its whole access
-    /// (`generate::firewall`, issue #35).
+    /// 16 hex digits naming the tier by its grants, not its position, so
+    /// the firewall can tell its sets apart while it builds the rules. It
+    /// then renames each set after the tier's whole access (issue #35).
     pub fn key(&self) -> String {
         fnv64(&self.label())
     }

@@ -204,8 +204,9 @@ and only use the methods above `provision`. That is why the M1 nftables table
 already has its final shape: NETMAP matches `{ "wg0", "tailscale0" }`, every
 tier has a member set per transport (`wg_<key>`, and `ts_<key>`, the
 addresses Headscale gave the tier's Tailscale peers' nodes, ADR 0014; the key
-is a hash of the tier's grants, so a set name never changes meaning between
-applies), and both transports end with a catch-all deny.
+is a hash of the tier's label and every rule that uses the set or sits in its
+chain, so a set name never changes meaning between applies), and both
+transports end with a catch-all deny.
 `TailscaleTransport` implements those today and returns `NotImplemented` for
 provision/export.
 
@@ -434,7 +435,7 @@ clients/<peer>/<platform>.conf     only for peers that retain their private key 
 format, PARALLAX_* chains) and `iptables/docker-user.rules` instead.
 Its sets live in the host's one ipset namespace, so apply removes only
 stale sets named as Parallax names them (`wg_` or `ts_` and a 16-digit hex
-tier key, `log_flows`, `log_denied`) and leaves every other set alone. Builds before named grants made
+hash, `log_flows`, `log_denied`) and leaves every other set alone. Builds before named grants made
 empty `ts_<template>` sets; those stay until removed with `ipset destroy`.
 
 ## Apply order and idempotency

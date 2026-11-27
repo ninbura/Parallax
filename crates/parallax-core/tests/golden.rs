@@ -51,27 +51,32 @@ fn check_golden(name: &str, actual: &str) {
     }
 }
 
-/// Tier set names (`wg_<16 hex>`) as `wg_*`: they hash each tier's access,
-/// so they differ between scenarios.
-fn anon(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find(['w', 't']) {
-        let (head, tail) = rest.split_at(i);
-        out.push_str(head);
-        let is_set = (tail.starts_with("wg_") || tail.starts_with("ts_"))
-            && tail.len() >= 19
-            && tail.as_bytes()[3..19].iter().all(u8::is_ascii_hexdigit);
-        if is_set {
-            out.push_str(&tail[..3]);
-            out.push('*');
-            rest = &tail[19..];
-        } else {
-            out.push_str(&tail[..1]);
-            rest = &tail[1..];
+/// `text` with each tier set's name (`wg_<16 hex>`, `ts_<16 hex>`) as its
+/// tier's label (`wg_family`): the names hash each tier's access (issue
+/// #35), so they change with the scenario and say nothing to a reader.
+fn tier_names(text: &str) -> String {
+    let mut out = text.to_owned();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(name) = line
+            .trim()
+            .strip_prefix("set ")
+            .and_then(|r| r.strip_suffix(" {"))
+            .filter(|n| n.starts_with("wg_") || n.starts_with("ts_"))
+        else {
+            continue;
+        };
+        let label = lines.by_ref().find_map(|l| {
+            let (_, tier) = l
+                .trim()
+                .strip_prefix("comment \"")?
+                .split_once(" of tier ")?;
+            tier.split([' ', '"']).next()
+        });
+        if let Some(label) = label {
+            out = out.replace(name, &format!("{}_{label}", &name[..2]));
         }
     }
-    out.push_str(rest);
     out
 }
 
@@ -245,7 +250,7 @@ fn proxied_service_gets_no_direct_accept() {
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     // Set names follow each scenario's access (issue #35).
-    let fw_text = anon(&fw.contents);
+    let fw_text = tier_names(&fw.contents);
     check_golden("variants/proxied-service.nft", &fw.contents);
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     check_golden("variants/proxied-service-routes.toml", &routes.contents);
@@ -256,24 +261,20 @@ fn proxied_service_gets_no_direct_accept() {
         "family must not reach immich directly, not even on the gateway host:\n{}",
         fw_text
     );
-    assert!(fw
-        .contents
-        .contains("drop comment \"family: default deny\""));
+    assert!(fw_text.contains("drop comment \"family: default deny\""));
     // Family's HTTPS to Immich's client address goes to the proxy, before
     // NETMAP would send it to the real host; only family may reach the proxy.
-    let pre: Vec<&str> = fw
-        .contents
+    let pre: Vec<&str> = fw_text
         .lines()
         .skip_while(|l| !l.contains("chain prerouting"))
         .collect();
     assert!(pre[2].contains(
-        "iifname \"wg0\" ip saddr @wg_* ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
+        "iifname \"wg0\" ip saddr @wg_family ip daddr 198.18.1.5 tcp dport 443 dnat ip to 10.8.0.1:8443"
     ), "{pre:#?}");
     assert!(pre.iter().any(|l| l.contains("netmap home")));
     assert!(!fw_text.contains("personal/wireguard: https proxy"));
-    assert!(
-        fw_text.contains("iifname \"wg0\" ip saddr @wg_* ip daddr 10.8.0.1 tcp dport 8443 accept")
-    );
+    assert!(fw_text
+        .contains("iifname \"wg0\" ip saddr @wg_family ip daddr 10.8.0.1 tcp dport 8443 accept"));
 }
 
 #[test]
@@ -295,12 +296,11 @@ fn tunnel_peers_are_checked_on_every_packet() {
     let bundle = bundle_for(&canonical_config());
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     // Set names follow each scenario's access (issue #35).
-    let fw_text = anon(&fw.contents);
+    let fw_text = tier_names(&fw.contents);
     // No blanket "established" accept: a removed grant cuts open flows.
     assert!(!fw_text.contains("established"), "{}", fw_text);
     for chain in ["chain input", "chain forward"] {
-        let body: Vec<&str> = fw
-            .contents
+        let body: Vec<&str> = fw_text
             .lines()
             .skip_while(|l| !l.contains(chain))
             .take_while(|l| !l.trim().starts_with('}'))
@@ -317,11 +317,8 @@ fn tunnel_peers_are_checked_on_every_packet() {
     assert!(fw_text.contains(
         "iifname \"wg0\" ip saddr vmap { 10.8.1.1 : jump tier_0, 10.8.1.2 : jump tier_0, 10.8.2.1 : jump tier_1 }"
     ));
-    assert!(fw
-        .contents
-        .contains("iifname \"tailscale0\" ip saddr @ts_* jump tier_1"));
-    let family: Vec<&str> = fw
-        .contents
+    assert!(fw_text.contains("iifname \"tailscale0\" ip saddr @ts_family jump tier_1"));
+    let family: Vec<&str> = fw_text
         .lines()
         .skip_while(|l| !l.contains("chain tier_1 {"))
         .take_while(|l| !l.trim().starts_with('}'))
@@ -339,10 +336,9 @@ fn gateway_address_turns_grants_into_input_accepts() {
     let bundle = bundle_for(&cfg);
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     // Set names follow each scenario's access (issue #35).
-    let fw_text = anon(&fw.contents);
+    let fw_text = tier_names(&fw.contents);
     check_golden("variants/gateway-address.nft", &fw.contents);
-    let input: Vec<&str> = fw
-        .contents
+    let input: Vec<&str> = fw_text
         .lines()
         .skip_while(|l| !l.contains("chain input"))
         .take_while(|l| !l.contains("chain forward"))
@@ -350,13 +346,13 @@ fn gateway_address_turns_grants_into_input_accepts() {
     assert!(
         input
             .iter()
-            .any(|l| l.contains("ip saddr @wg_* ip daddr 192.168.1.5 accept")),
+            .any(|l| l.contains("ip saddr @wg_personal ip daddr 192.168.1.5 accept")),
         "{input:#?}"
     );
     assert!(
         input
             .iter()
-            .any(|l| l.contains("ip saddr @wg_* ip daddr 192.168.1.5 tcp dport 443 accept")),
+            .any(|l| l.contains("ip saddr @wg_family ip daddr 192.168.1.5 tcp dport 443 accept")),
         "{input:#?}"
     );
     let drop_idx = input
@@ -494,7 +490,7 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
     // Set names follow each scenario's access (issue #35).
-    let fw_text = anon(&fw.contents);
+    let fw_text = tier_names(&fw.contents);
     check_golden("variants/home-public-names.nft", &fw.contents);
     let routes = bundle.of_kind(ArtifactKind::ProxyRoutes).next().unwrap();
     check_golden("variants/home-public-names-routes.toml", &routes.contents);
@@ -504,7 +500,7 @@ fn names_on_the_home_public_ip_are_port_forwards() {
     ), "{}", fw_text);
     // HTTPS by name: redirected to the proxy, which connects to the public IP.
     assert!(fw_text.contains(
-        "iifname \"wg0\" ip saddr @wg_* ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
+        "iifname \"wg0\" ip saddr @wg_family ip daddr 1.2.3.4 tcp dport 443 dnat ip to 10.8.0.1:8443"
     ), "{}", fw_text);
     assert!(
         routes.contents.contains("upstream = \"1.2.3.4:443\""),
@@ -526,9 +522,9 @@ fn names_on_the_home_public_ip_are_port_forwards() {
         .with_names(names.clone());
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
-    let fw_text = anon(&fw.contents);
+    let fw_text = tier_names(&fw.contents);
     assert!(
-        !fw_text.contains("ip saddr @wg_* ip daddr 1.2.3.4 tcp dport 443 dnat"),
+        !fw_text.contains("ip saddr @wg_personal ip daddr 1.2.3.4 tcp dport 443 dnat"),
         "{}",
         fw_text
     );
@@ -546,7 +542,7 @@ fn names_on_the_home_public_ip_are_port_forwards() {
         .with_names(names);
     let bundle = generate::generate_all(&model, &fs_with_server_key()).unwrap();
     let fw = bundle.of_kind(ArtifactKind::Firewall).next().unwrap();
-    let fw_text = anon(&fw.contents);
+    let fw_text = tier_names(&fw.contents);
     assert!(
         fw_text.contains("ip daddr 1.2.3.4 udp dport 25565 accept"),
         "{}",
