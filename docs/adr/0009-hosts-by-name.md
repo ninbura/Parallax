@@ -27,9 +27,9 @@ home's DNS stays the only place a machine's address is written down.
 - **The home's public IP is port forwards.** A name that resolves there is
   a service the router forwards in (no local path or record). Every port
   there may lead to a different machine, and a web port to every site
-  behind one nginx. So for a template that doesn't reach it anyway (one
+  behind one nginx. So for a tier that doesn't reach it anyway (one
   without both `all_networks` and `internet`):
-  - only one port at a time: a `host` grant there is refused;
+  - listed ports only: a `host` rule there without ports is refused;
   - no raw web ports (tcp/80, tcp/443, udp/443): web traffic must be a
     service with `hostnames`, so the HTTPS proxy checks the name and
     connects to the public IP itself.
@@ -58,12 +58,16 @@ home's DNS stays the only place a machine's address is written down.
   Answers aren't stored either; after a restart the first lookups run right
   after the first apply.
 - **A save can't add a problem.** The daemon looks up the names a change
-  adds before saving it, and refuses the change if one doesn't resolve or
-  resolves outside every network, naming the host and why; a typo fails
-  loudly. It also refuses a change that leaves a known address outside every
-  network (a subnet edited under it). Problems that were already there don't
-  block unrelated changes: a resolver being down must never stop the
-  operator removing a peer. Without a daemon, the CLI saves without asking
+  adds, and the names whose resolvers it changes (`upstream_dns`, or a zone
+  moved to another network), before saving it. It refuses the change if one
+  doesn't resolve or resolves outside every network, naming the host and
+  why; a typo fails loudly. It also refuses a change that leaves a known
+  address outside every network (a subnet edited under it) or off the
+  home's public IP (`server.public_ip.address` edited). Problems that were
+  already there don't block unrelated changes: a resolver being down must
+  never stop the operator removing a peer, and a grant's problem never
+  stops changing a peer's other grants. A problem is named by its grant
+  and rule, not by who holds them. Without a daemon, the CLI saves without asking
   DNS; the daemon warns when it starts.
 - **DNS for the tier.** A host granted by name, or a granted service whose
   host is a name, lets the tier look that name up (one name, not its zone),

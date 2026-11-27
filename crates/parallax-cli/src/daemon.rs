@@ -1302,6 +1302,7 @@ impl Engine {
         // most): known names aren't asked again.
         let resolved = names::check_save(
             Some(&self.view.config),
+            public_ip::effective(&self.view.config.server, self.view.public_ip),
             &config,
             public_ip::effective(&config.server, self.view.public_ip),
             &crate::lookup(&config.server),

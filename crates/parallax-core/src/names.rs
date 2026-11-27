@@ -11,7 +11,7 @@
 //!   network's real subnet, or be the home's public IP (a service behind a
 //!   port forward); otherwise the whole answer is refused, so a changed or
 //!   spoofed answer can't open a host Parallax doesn't know.
-//! - **The home's public IP, one port at a time.** There every port is a
+//! - **The home's public IP takes listed ports.** There every port is a
 //!   port forward, maybe each to another machine, and a raw web port
 //!   reaches every site behind it without the proxy's name check. So a
 //!   tier that doesn't reach it anyway (`all_networks` + `internet`) gets
@@ -22,10 +22,11 @@
 //!   again, with a warning saying why. An old answer is never kept: a name
 //!   that's gone may have been dropped on purpose, and its address may now
 //!   belong to something else.
-//! - **A save can't add a problem** ([`check_save`]): a new name must
-//!   resolve, and a change mustn't leave a known address outside every
-//!   network. Problems that were already there don't block unrelated
-//!   changes, so a resolver being down never stops removing a peer.
+//! - **A save can't add a problem** ([`check_save`]): a new name, or one
+//!   whose resolvers changed, must resolve, and a change mustn't leave a
+//!   known address outside every network or off the home's public IP.
+//!   Problems that were already there don't block unrelated changes, so a
+//!   resolver being down never stops removing a peer or a grant.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -212,8 +213,15 @@ pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolve
     let Some(home) = public_ip else {
         return out;
     };
+    // Named by the grant that holds the rule, not the tier: a change to a
+    // peer's other grants changes its tier, and mustn't make an old problem
+    // look new to `check_save`.
     for t in tier::tiers(config) {
-        for rule in &t.rules {
+        for (grant, rule) in t
+            .grants
+            .iter()
+            .flat_map(|g| g.rules.iter().map(move |r| (g, r)))
+        {
             let (what, host, ports, proxied) = match rule {
                 Rule::Host { host, ports } if ports.is_empty() => {
                     (format!("host {host}"), host, None, false)
@@ -246,10 +254,14 @@ pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolve
             let at_home = resolved.get(name).is_some_and(|a| a.contains(&home));
             if let Some(why) = public_ip_refusal(&t, ports.as_deref(), proxied).filter(|_| at_home)
             {
-                out.push(format!(
-                    "{}: rule {what}: {name} is the home's public IP {home}, and {why}; it gives nothing there",
-                    t.grant_context()
-                ));
+                let problem = format!(
+                    "grant '{}': rule {what}: {name} is the home's public IP {home}, and {why}; it gives nothing there",
+                    grant.name
+                );
+                // Every tier holding the grant would say it again.
+                if !out.contains(&problem) {
+                    out.push(problem);
+                }
             }
         }
     }
@@ -258,9 +270,11 @@ pub fn problems(config: &Config, public_ip: Option<Ipv4Addr>, resolved: &Resolve
 
 /// Before saving `new` over `old`: look up the names `new` adds, and refuse
 /// the change if a new name doesn't resolve or the change adds a problem.
-/// Returns the names to use from now on.
+/// `old_public_ip` and `public_ip` are the home's public IP in effect under
+/// each. Returns the names to use from now on.
 pub fn check_save(
     old: Option<&Config>,
+    old_public_ip: Option<Ipv4Addr>,
     new: &Config,
     public_ip: Option<Ipv4Addr>,
     resolver: &dyn Resolver,
@@ -268,28 +282,38 @@ pub fn check_save(
 ) -> Result<Resolved, Vec<String>> {
     let mut resolved = known.clone();
     let mut failed = Vec::new();
-    // Names `old` already had keep what they have; one never found is an
-    // old problem, and the regular lookups keep trying it. Every other name
-    // is asked now, even if an answer for it is lying around (from a
-    // configuration a restore replaced).
+    // Names `old` already had, through the same resolvers, keep what they
+    // have; one never found is an old problem, and the regular lookups keep
+    // trying it. Every other name is asked now and must resolve, even if an
+    // answer for it is lying around (from a configuration a restore
+    // replaced, or from the resolvers this change replaces).
     // A known answer `new` no longer allows (its network was renumbered in
     // this change) is asked again too.
-    let had = old.map(used).unwrap_or_default();
+    fn resolvers<'a>(config: &'a Config, name: &str) -> Option<&'a [Ipv4Addr]> {
+        network_of(config, name).map(|n| n.upstream_dns.as_slice())
+    }
+    let kept: BTreeSet<&str> = match old {
+        Some(old) => used(old)
+            .into_iter()
+            .filter(|name| resolvers(old, name) == resolvers(new, name))
+            .collect(),
+        None => BTreeSet::new(),
+    };
     for name in used(new) {
         let still_fine = match known.get(name) {
             Some(addresses) => refused(new, public_ip, name, addresses).is_none(),
             None => true,
         };
-        if had.contains(name) && still_fine {
+        if kept.contains(name) && still_fine {
             continue;
         }
         match lookup(new, public_ip, resolver, name) {
             Ok(addresses) => {
                 resolved.insert(name.to_string(), addresses);
             }
-            // A name `old` had: whether this change made it worse is for
+            // A name kept from `old`: whether this change made it worse is for
             // the comparison of problems below, not the lookup.
-            Err(_) if had.contains(name) => {}
+            Err(_) if kept.contains(name) => {}
             Err(why) => failed.push(why),
         }
     }
@@ -297,7 +321,7 @@ pub fn check_save(
         return Err(failed);
     }
     let before: BTreeSet<String> = old
-        .map(|old| problems(old, public_ip, known).into_iter().collect())
+        .map(|old| problems(old, old_public_ip, known).into_iter().collect())
         .unwrap_or_default();
     let added: Vec<String> = problems(new, public_ip, &resolved)
         .into_iter()
@@ -422,6 +446,7 @@ mod tests {
         let new = named();
         let err = check_save(
             Some(&old),
+            None,
             &new,
             None,
             &FakeResolver::new(),
@@ -433,11 +458,11 @@ mod tests {
             "{err:?}"
         );
         let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
-        let resolved = check_save(Some(&old), &new, None, &r, &Resolved::new()).unwrap();
+        let resolved = check_save(Some(&old), None, &new, None, &r, &Resolved::new()).unwrap();
         assert_eq!(resolved[NAS], [nas_addr()]);
         // Known names aren't asked again.
         let r = FakeResolver::new();
-        check_save(Some(&new), &new, None, &r, &resolved).unwrap();
+        check_save(Some(&new), None, &new, None, &r, &resolved).unwrap();
         assert!(r.asked.borrow().is_empty());
     }
 
@@ -455,7 +480,7 @@ mod tests {
             Nameserver::Plain(Ipv4Addr::new(192, 168, 2, 1)),
             &[nas_addr()],
         );
-        let err = check_save(Some(&old), &new, None, &r, &known).unwrap_err();
+        let err = check_save(Some(&old), None, &new, None, &r, &known).unwrap_err();
         assert!(
             err[0].contains("resolved to 192.168.1.9, outside every configured network"),
             "{err:?}"
@@ -467,7 +492,8 @@ mod tests {
         // Left over from a configuration a restore replaced.
         let stale: Resolved = [(NAS.to_string(), vec![Ipv4Addr::new(192, 168, 1, 99)])].into();
         let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
-        let resolved = check_save(Some(&canonical_config()), &named(), None, &r, &stale).unwrap();
+        let resolved =
+            check_save(Some(&canonical_config()), None, &named(), None, &r, &stale).unwrap();
         assert_eq!(resolved[NAS], [nas_addr()]);
         assert_eq!(r.asked.borrow().len(), 1);
     }
@@ -556,8 +582,15 @@ mod tests {
             host: Host::Name(NAS.into()),
             ports: vec![PortSpec::one(Proto::Tcp, 80)],
         });
-        let err =
-            check_save(Some(&old), &new, Some(HOME), &FakeResolver::new(), &known).unwrap_err();
+        let err = check_save(
+            Some(&old),
+            Some(HOME),
+            &new,
+            Some(HOME),
+            &FakeResolver::new(),
+            &known,
+        )
+        .unwrap_err();
         assert!(
             err[0].contains("rule host nas.mydomain.com 80/tcp"),
             "{err:?}"
@@ -566,7 +599,15 @@ mod tests {
         let mut new = old.clone();
         new.services[0].host = Host::Name(NAS.into());
         new.services[0].hostnames = vec![NAS.into()];
-        assert!(check_save(Some(&old), &new, Some(HOME), &FakeResolver::new(), &known).is_ok());
+        assert!(check_save(
+            Some(&old),
+            Some(HOME),
+            &new,
+            Some(HOME),
+            &FakeResolver::new(),
+            &known
+        )
+        .is_ok());
     }
 
     #[test]
@@ -582,7 +623,15 @@ mod tests {
         assert_eq!(problems(&old, Some(HOME), &known).len(), 1);
         let mut new = old.clone();
         new.peers.remove(1);
-        assert!(check_save(Some(&old), &new, Some(HOME), &FakeResolver::new(), &known).is_ok());
+        assert!(check_save(
+            Some(&old),
+            Some(HOME),
+            &new,
+            Some(HOME),
+            &FakeResolver::new(),
+            &known
+        )
+        .is_ok());
     }
 
     #[test]
@@ -595,7 +644,7 @@ mod tests {
         let moved = Ipv4Addr::new(192, 168, 2, 9);
         let r = FakeResolver::new().answer(NAS, home_dns(), &[moved]);
         assert_eq!(
-            check_save(Some(&old), &new, None, &r, &known).unwrap()[NAS],
+            check_save(Some(&old), None, &new, None, &r, &known).unwrap()[NAS],
             [moved]
         );
     }
@@ -616,7 +665,7 @@ mod tests {
         );
         let mut new = old.clone();
         new.peers.pop();
-        assert!(check_save(Some(&old), &new, moved, &r, &known).is_ok());
+        assert!(check_save(Some(&old), moved, &new, moved, &r, &known).is_ok());
     }
 
     #[test]
@@ -627,9 +676,88 @@ mod tests {
         new.peers.pop();
         let r = FakeResolver::new();
         assert_eq!(
-            check_save(Some(&old), &new, None, &r, &Resolved::new()),
+            check_save(Some(&old), None, &new, None, &r, &Resolved::new()),
             Ok(Resolved::new())
         );
         assert!(r.asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn changing_a_names_resolvers_asks_it_again() {
+        let old = named();
+        let known: Resolved = [(NAS.to_string(), vec![nas_addr()])].into();
+        let mut new = old.clone();
+        let other = Ipv4Addr::new(192, 168, 1, 53);
+        new.networks[0].upstream_dns = vec![other];
+        let moved = Ipv4Addr::new(192, 168, 1, 10);
+        let r = FakeResolver::new().answer(NAS, Nameserver::Plain(other), &[moved]);
+        let resolved = check_save(Some(&old), None, &new, None, &r, &known).unwrap();
+        assert_eq!(resolved[NAS], [moved]);
+        assert_eq!(
+            *r.asked.borrow(),
+            [(NAS.to_string(), Nameserver::Plain(other))]
+        );
+        // The new resolver doesn't have it: the old resolver's answer
+        // doesn't stand in, and the change is refused.
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[nas_addr()]);
+        let err = check_save(Some(&old), None, &new, None, &r, &known).unwrap_err();
+        assert!(
+            err[0].starts_with("can't look up nas.mydomain.com"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_public_ip_problem_doesnt_block_a_peers_other_grants() {
+        // `family` already has a problem there: a host rule without ports.
+        let mut old = named();
+        old.grants[1].rules.push(Rule::Host {
+            host: Host::Name(NAS.into()),
+            ports: Vec::new(),
+        });
+        let mut photos = old.grants[1].clone();
+        photos.name = "photos".into();
+        photos.rules = vec![Rule::PublicDns];
+        old.grants.push(photos);
+        old.peers[2].grants = vec!["family".into(), "photos".into()];
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        assert_eq!(problems(&old, Some(HOME), &known).len(), 1);
+        let save = |new: &Config| {
+            check_save(
+                Some(&old),
+                Some(HOME),
+                new,
+                Some(HOME),
+                &FakeResolver::new(),
+                &known,
+            )
+        };
+        // Revoking the other grant, and giving it to everyone.
+        let mut new = old.clone();
+        new.peers[2].grants = vec!["family".into()];
+        assert!(save(&new).is_ok(), "{:?}", save(&new));
+        let mut new = old.clone();
+        new.grants[2].everyone = true;
+        assert!(save(&new).is_ok(), "{:?}", save(&new));
+        // Two tiers holding `family` report its problem once.
+        let mut two = old.clone();
+        two.peers[1].grants = vec!["family".into()];
+        assert_eq!(tier::tiers(&two).len(), 3);
+        assert_eq!(problems(&two, Some(HOME), &known).len(), 1);
+    }
+
+    #[test]
+    fn a_public_ip_change_that_strands_a_known_name_is_refused() {
+        // `server.public_ip.address` edited to another address: NAS's
+        // answer, the old address, isn't allowed anymore.
+        let old = named();
+        let known: Resolved = [(NAS.to_string(), vec![HOME])].into();
+        let typo = Some(Ipv4Addr::new(1, 2, 3, 40));
+        let r = FakeResolver::new().answer(NAS, home_dns(), &[HOME]);
+        let err = check_save(Some(&old), Some(HOME), &old, typo, &r, &known).unwrap_err();
+        assert!(
+            err[0].contains("not the home's public IP 1.2.3.40"),
+            "{err:?}"
+        );
     }
 }
