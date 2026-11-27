@@ -143,6 +143,15 @@ enum Msg {
 type Views = watch::Receiver<Option<View>>;
 
 pub fn run(opts: Options) -> anyhow::Result<()> {
+    // Root would make, chmod and remove the socket there as root.
+    if let Some((who, sudo_u)) = crate::owner::belongs_to_another_user(&opts.socket) {
+        bail!(
+            "{} belongs to {who}: a daemon run as root would manage its socket there. Start the \
+             service instead (`sudo systemctl start parallax`), or run it as that user (`sudo -u \
+             {sudo_u} parallax daemon ...`)",
+            opts.socket.display()
+        );
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

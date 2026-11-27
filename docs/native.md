@@ -179,13 +179,14 @@ while it runs, put the backup in the backup directory first:
 
 ```sh
 sudo -u parallax install -d -m 0700 /var/lib/parallax/backups
-sudo -u parallax install -m 0600 /dev/stdin /var/lib/parallax/backups/parallax-backup-20261124T153000Z.tar < parallax-backup-20261124T153000Z.tar
+sudo -u parallax sh -c 'umask 077 && cat > /var/lib/parallax/backups/parallax-backup-20261124T153000Z.tar' < parallax-backup-20261124T153000Z.tar
 sudo parallax backup restore /var/lib/parallax/backups/parallax-backup-20261124T153000Z.tar
 ```
 
 As `parallax`, not `sudo install -o parallax`: root following a link the
 service left in its own directory would hand it whatever the link points
-to.
+to. Your shell opens the backup and `cat` only reads what it's given, so
+the file can stay private to you.
 
 **On a fresh install,** restore before the first start, from wherever the
 backup is. No `parallax.toml` is needed:

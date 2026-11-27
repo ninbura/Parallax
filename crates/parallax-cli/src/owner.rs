@@ -27,37 +27,42 @@ fn is_root() -> bool {
     rustix::process::geteuid().is_root()
 }
 
-/// Owner of `path`, or of its nearest existing ancestor when it doesn't
-/// exist yet, when this process is root and that owner isn't. Symlinks are
-/// followed: what counts is the file that would be opened.
+/// When this process is root: the user other than root who owns `path` or
+/// any directory on the way to it, the nearest first. Whoever owns a
+/// directory can swap what's below it, so a root-owned file or directory
+/// inside the service's directory is the service's to change all the same.
+/// Symlinks are followed: what counts is what would be opened. The group is
+/// the user's own (`/etc/passwd`), not whatever group the directory has.
 fn foreign_owner(path: &Path) -> Option<User> {
     if !is_root() {
         return None;
     }
-    // A relative path's ancestors end before `.`, so it comes last.
+    let path = std::path::absolute(path).ok()?;
     let meta = path
         .ancestors()
-        .filter(|p| !p.as_os_str().is_empty())
-        .chain(std::iter::once(Path::new(".")))
-        .find_map(|p| std::fs::metadata(p).ok())?;
-    (meta.uid() != 0).then(|| User {
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .find(|meta| meta.uid() != 0)?;
+    Some(User {
         uid: meta.uid(),
-        gid: meta.gid(),
+        gid: primary_gid(meta.uid()).unwrap_or(meta.gid()),
     })
 }
 
 /// The user a daemon on `stream` runs as, when this process is root and the
 /// daemon isn't: the configuration it hands out is that user's to write.
-pub(crate) fn daemon_user(stream: &std::os::unix::net::UnixStream) -> Option<User> {
+/// Not knowing is an error: guessing root would hand root's writes to it.
+pub(crate) fn daemon_user(
+    stream: &std::os::unix::net::UnixStream,
+) -> std::io::Result<Option<User>> {
     if !is_root() {
-        return None;
+        return Ok(None);
     }
-    let cred = rustix::net::sockopt::socket_peercred(stream).ok()?;
+    let cred = rustix::net::sockopt::socket_peercred(stream)?;
     let user = User {
         uid: cred.uid.as_raw(),
         gid: cred.gid.as_raw(),
     };
-    (user.uid != 0).then_some(user)
+    Ok((user.uid != 0).then_some(user))
 }
 
 /// The directory `path` is in.
@@ -68,14 +73,23 @@ fn dir_of(path: &Path) -> &Path {
     }
 }
 
-/// The name `/etc/passwd` gives `uid`, for messages only.
-fn user_name(uid: u32) -> Option<String> {
+/// The fields `/etc/passwd` has for `uid`.
+fn passwd_entry(uid: u32) -> Option<Vec<String>> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let name = fields.next()?;
-        (fields.nth(1)? == uid.to_string()).then(|| name.to_string())
+        let fields: Vec<String> = line.split(':').map(str::to_string).collect();
+        (fields.get(2)? == &uid.to_string()).then_some(fields)
     })
+}
+
+/// The name `/etc/passwd` gives `uid`, for messages only.
+fn user_name(uid: u32) -> Option<String> {
+    passwd_entry(uid)?.into_iter().next()
+}
+
+/// The primary group `/etc/passwd` gives `uid`.
+fn primary_gid(uid: u32) -> Option<u32> {
+    passwd_entry(uid)?.get(3)?.parse().ok()
 }
 
 /// When root is about to open or write `path` itself (the database, the
@@ -158,10 +172,12 @@ fn as_user(
 ) -> parallax_core::Result<std::process::Output> {
     let what = || format!("{op} {} as uid {}", path.display(), user.uid);
     let exe = std::env::current_exe().map_err(|e| io_error(what(), e))?;
+    // The child starts in `/`: a relative path must mean what it means here.
+    let path = std::path::absolute(path).map_err(|e| io_error(what(), e))?;
     let mut child = Command::new(exe)
         .arg("file")
         .arg(op)
-        .arg(path)
+        .arg(&path)
         .uid(user.uid)
         .gid(user.gid)
         .env_clear()
@@ -176,9 +192,15 @@ fn as_user(
         .spawn()
         .map_err(|e| io_error(what(), e))?;
     if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|e| io_error(what(), e))?;
+        // A child that stopped early says why on stderr, collected below.
+        match stdin.write_all(input.as_bytes()) {
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io_error(what(), e));
+            }
+            _ => {}
+        }
     }
     child.wait_with_output().map_err(|e| io_error(what(), e))
 }

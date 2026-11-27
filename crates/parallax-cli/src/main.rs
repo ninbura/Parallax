@@ -726,8 +726,14 @@ impl Ctx {
                 })
             }
         };
-        if let Some(user) = owner::daemon_user(&stream) {
-            self.daemon_user.set(Some(user));
+        let user = owner::daemon_user(&stream).with_context(|| {
+            format!(
+                "reading which user the daemon at {} runs as",
+                self.socket.display()
+            )
+        })?;
+        if user.is_some() {
+            self.daemon_user.set(user);
         }
         stream
             .write_all(&protocol::encode_request(request, &self.db)?)
@@ -1478,7 +1484,8 @@ fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
             let text = ctx.load()?.to_toml()?;
             match output {
                 Some(path) => {
-                    RealFs.write(&path, &text, true)?;
+                    // As root, into another user's directory as that user.
+                    owner::ConfigFiles::default().write(&path, &text, true)?;
                     eoutln!("wrote {} (mode 0600)", path.display());
                 }
                 None => out!("{text}")?,

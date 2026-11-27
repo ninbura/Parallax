@@ -597,7 +597,9 @@ pub(crate) async fn restore_into(
     // As root, files in another user's directory are written as that user.
     let files = crate::owner::ConfigFiles::default();
     let key_file = &restored.server.wireguard.private_key_file;
-    let old_key = files.read(key_file)?;
+    // Read as it's written back if the restore fails: a file root can read
+    // but that user can't mustn't end up theirs.
+    let old_key = files.read_secret(key_file)?;
     files.write(key_file, contents.server_key().expose(), true)?;
     if let Err(e) = live.replace_with(staged, before).await {
         let undone = match &old_key {
