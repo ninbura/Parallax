@@ -4,7 +4,8 @@
 //! the configuration in memory, and applies it: at startup, after every
 //! saved change, on SIGHUP, when the UTC date changes, and when the live
 //! firewall or WireGuard interface drifts. The DNS server and the HTTPS
-//! proxy run as tasks and re-read their routes after each apply. The CLI
+//! proxy run as tasks: the DNS server re-reads its routes after each apply,
+//! and the proxy gets its routes from the engine around each one. The CLI
 //! talks to it over a Unix socket ([`crate::protocol`]).
 //!
 //! When guests have `internet`, it looks up the home's public IP
@@ -986,30 +987,29 @@ const PROXY_TAKES: Duration = Duration::from_secs(10);
 /// changed and the apply stops.
 fn narrow_proxy(
     rt: &tokio::runtime::Runtime,
-    servers: Option<&Reloaders>,
+    proxy: Option<&parallax_proxy::Reload>,
     served: &mut Option<ProxyRoutes>,
     new: &ProxyRoutes,
 ) -> anyhow::Result<()> {
-    let Some(before) = served.as_ref() else {
+    // No proxy runs before the first apply has worked.
+    let (Some(proxy), Some(before)) = (proxy, served.as_ref()) else {
         return Ok(());
     };
     let both = generate::proxy::overlap(before, new);
     if both == *before {
         return Ok(());
     }
-    if let Some(servers) = servers {
-        let taken = servers.proxy.send(both.clone());
-        // Inside the runtime: a timer needs its clock.
-        match rt.block_on(async { tokio::time::timeout(PROXY_TAKES, taken).await }) {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => bail!(
-                "the HTTPS proxy couldn't take its routes for the change (stopped, or open connections didn't move on); nothing was changed"
-            ),
-            Err(_) => bail!(
-                "the HTTPS proxy didn't take its routes for the change within {} s; nothing was changed",
-                PROXY_TAKES.as_secs()
-            ),
-        }
+    let taken = proxy.send(both.clone());
+    // Inside the runtime: a timer needs its clock.
+    match rt.block_on(async { tokio::time::timeout(PROXY_TAKES, taken).await }) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => bail!(
+            "the HTTPS proxy couldn't take its routes for the change (stopped, or open connections didn't move on); nothing was changed"
+        ),
+        Err(_) => bail!(
+            "the HTTPS proxy didn't take its routes for the change within {} s; nothing was changed",
+            PROXY_TAKES.as_secs()
+        ),
     }
     *served = Some(both);
     Ok(())
@@ -1211,7 +1211,7 @@ impl Engine {
             &self.view.learned(),
             |model| {
                 let new = generate::proxy::build(model);
-                narrow_proxy(rt, servers.as_ref(), served, &new)?;
+                narrow_proxy(rt, servers.as_ref().map(|s| &s.proxy), served, &new)?;
                 made = Some(new);
                 Ok(())
             },
@@ -1622,20 +1622,21 @@ mod tests {
     use super::*;
     use parallax_core::generate::proxy::ProxySite;
 
-    /// `immich.mydomain.com` for each of `allowed`; none needs a CA bundle.
+    /// `immich.mydomain.com` for `allowed`, or no site for none; neither
+    /// needs a CA bundle loaded.
     fn routes(allowed: &[&str]) -> ProxyRoutes {
         ProxyRoutes {
             listen: "127.0.0.1:0".parse().unwrap(),
             certificates: "/nonexistent/certs".into(),
             upstream_ca: "/nonexistent/ca.pem".into(),
-            sites: allowed
-                .iter()
-                .map(|a| ProxySite {
+            sites: (!allowed.is_empty())
+                .then(|| ProxySite {
                     hostname: "immich.mydomain.com".into(),
                     service: "immich".into(),
                     upstream: "192.168.1.5:443".parse().unwrap(),
-                    allowed: vec![a.parse().unwrap()],
+                    allowed: allowed.iter().map(|a| a.parse().unwrap()).collect(),
                 })
+                .into_iter()
                 .collect(),
         }
     }
@@ -1648,14 +1649,11 @@ mod tests {
     }
 
     /// A proxy that has stopped: anything sent to it fails.
-    fn stopped() -> Reloaders {
+    fn stopped() -> parallax_proxy::Reload {
         let proxy = parallax_proxy::Proxy::new(routes(&[])).unwrap();
-        let reloaders = Reloaders {
-            dns: Arc::new(Notify::new()),
-            proxy: proxy.reloader(),
-        };
+        let reload = proxy.reloader();
         drop(proxy);
-        reloaders
+        reload
     }
 
     /// #71: a change that takes `immich` away has the running proxy drop it
@@ -1665,14 +1663,11 @@ mod tests {
         let proxy_rt = tokio::runtime::Runtime::new().unwrap();
         // Sites would need a CA bundle; the engine's side is what's tested.
         let proxy = parallax_proxy::Proxy::new(routes(&[])).unwrap();
-        let reloaders = Reloaders {
-            dns: Arc::new(Notify::new()),
-            proxy: proxy.reloader(),
-        };
+        let reload = proxy.reloader();
         let listener = proxy_rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         proxy_rt.spawn(proxy.run(listener));
         let mut served = Some(routes(&["10.8.2.1/32"]));
-        narrow_proxy(&engine_rt(), Some(&reloaders), &mut served, &routes(&[])).unwrap();
+        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap();
         assert_eq!(served, Some(routes(&[])));
     }
 
@@ -1687,7 +1682,7 @@ mod tests {
     }
 
     /// A proxy that can't take the overlap stops the apply before anything
-    /// live changes, and what it serves is still what it was.
+    /// changes, and what it serves is still what it was.
     #[test]
     fn a_stopped_proxy_stops_the_apply() {
         let mut served = Some(routes(&["10.8.2.1/32"]));
@@ -1696,5 +1691,20 @@ mod tests {
             .to_string();
         assert!(err.contains("the HTTPS proxy couldn't take"), "{err}");
         assert_eq!(served, Some(routes(&["10.8.2.1/32"])));
+    }
+
+    /// The proxy task ended (the daemon aborts it on shutdown): its reloader
+    /// went with it, so nothing is confirmed.
+    #[test]
+    fn a_proxy_task_that_ended_confirms_nothing() {
+        let proxy_rt = tokio::runtime::Runtime::new().unwrap();
+        let proxy = parallax_proxy::Proxy::new(routes(&[])).unwrap();
+        let reload = proxy.reloader();
+        let listener = proxy_rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let task = proxy_rt.spawn(proxy.run(listener));
+        task.abort();
+        let _ = proxy_rt.block_on(task);
+        let mut served = Some(routes(&["10.8.2.1/32"]));
+        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap_err();
     }
 }

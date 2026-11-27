@@ -196,7 +196,8 @@ impl Proxy {
             self.state.sites.len()
         ));
         let (tx, rx) = watch::channel(self.state);
-        tokio::spawn(reloader(tx, self.refresh, self.reloads));
+        // Stops with this task, so a stopped proxy confirms no routes.
+        let _reloader = AbortOnDrop(tokio::spawn(reloader(tx, self.refresh, self.reloads)));
         let counts: Arc<Mutex<HashMap<Ipv4Addr, usize>>> = Arc::default();
         loop {
             match listener.accept().await {
@@ -227,6 +228,15 @@ impl Proxy {
                 }
             }
         }
+    }
+}
+
+/// Aborts the task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -350,41 +360,55 @@ async fn reloader(
     let mut tick = tokio::time::interval(refresh);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
+    // Every state replaced that an open connection may still answer to, by
+    // reloads and certificate renewals alike.
+    let mut replaced: Vec<Arc<State>> = Vec::new();
     loop {
         tokio::select! {
             handover = reloads.recv() => {
                 // Nobody can send routes any more: the last ones stay.
                 let Some((routes, done)) = handover else { return };
-                let old = reload(routes, &tx);
+                replaced.push(reload(routes, &tx));
                 // Not confirmed until then: the daemon changes the firewall
-                // next. Dropping `done` tells it so.
-                if drained(old).await {
+                // next. Dropping `done` tells it so. Nobody waiting: the next
+                // confirmation waits for these too.
+                if !done.is_closed() && drained(&mut replaced).await {
                     let _ = done.send(());
                 }
             }
-            _ = tick.tick() => refresh_certificates(&tx),
+            _ = tick.tick() => {
+                let before = Arc::clone(&tx.borrow());
+                refresh_certificates(&tx);
+                if !Arc::ptr_eq(&before, &tx.borrow()) {
+                    replaced.push(before);
+                }
+            }
         }
+        replaced.retain(|s| Arc::strong_count(s) > 1);
     }
 }
 
-/// Wait until no open connection answers to `old` any more: each has
-/// checked the routes that replaced it, or closed. False if some still do
-/// after [`DRAIN`].
-async fn drained(old: Arc<State>) -> bool {
+/// Wait until no open connection answers to any state in `replaced` any
+/// more: each has checked the current routes, or closed. False if some
+/// still do after [`DRAIN`].
+async fn drained(replaced: &mut Vec<Arc<State>>) -> bool {
     let start = tokio::time::Instant::now();
-    // Ours is the last reference once every connection has moved on.
-    while Arc::strong_count(&old) > 1 {
+    loop {
+        // Ours is the last reference once every connection has moved on.
+        replaced.retain(|s| Arc::strong_count(s) > 1);
+        if replaced.is_empty() {
+            return true;
+        }
         if start.elapsed() > DRAIN {
+            let held: usize = replaced.iter().map(|s| Arc::strong_count(s) - 1).sum();
             log(format!(
-                "{} connection(s) still on the old routes after {} s",
-                Arc::strong_count(&old) - 1,
+                "{held} connection(s) still on older routes after {} s",
                 DRAIN.as_secs()
             ));
             return false;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    true
 }
 
 /// Serve `routes`. When they don't load, refuse everything until some do:
