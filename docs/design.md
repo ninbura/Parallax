@@ -437,6 +437,9 @@ Its sets live in the host's one ipset namespace, so apply removes only
 stale sets named as Parallax names them (`wg_` or `ts_` and a 16-digit hex
 hash, `log_flows`, `log_denied`) and leaves every other set alone. Builds before named grants made
 empty `ts_<template>` sets; those stay until removed with `ipset destroy`.
+Apply fills the new sets first, empties the stale ones (the old rules
+still use them, and a peer that moved tiers would otherwise match both),
+then restores the rules in one step and destroys the stale sets.
 
 ## Apply order and idempotency
 

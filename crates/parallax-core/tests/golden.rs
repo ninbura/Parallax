@@ -790,6 +790,13 @@ fn iptables_apply_refills_chains_in_one_restore() {
     assert!(gone("ts_family").is_none());
     assert!(gone(&live).is_none() && gone("not_public").is_none());
     let restore = pos("iptables-restore --noflush").unwrap();
+    // A stale set is emptied before the restore: the old rules still use
+    // it, and a peer that moved to an unchanged tier would otherwise have
+    // both tiers' access until the restore, or for good if it failed (#35).
+    let flushed = |set: &str| pos(&format!("ipset flush {set}"));
+    assert!(flushed("wg_0000000000000000").unwrap() < restore);
+    assert!(flushed("ts_family").is_none() && flushed(&live).is_none());
+    assert!(flushed("not_public").is_none());
     // No flush of live chains before the restore: that left a window with
     // empty chains, and empty ones if the restore failed.
     assert!(

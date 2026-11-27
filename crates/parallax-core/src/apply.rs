@@ -145,6 +145,12 @@ fn apply_firewall(
         FirewallBackend::IptablesNft => {
             use crate::generate::firewall::iptables::CHAINS;
             let rs = crate::generate::firewall::build(model)?;
+            // Sets this ruleset drops: those of tiers that went away or whose
+            // access changed (they get a new name, issue #35), and the
+            // logging sets once nobody is logged. Listed before anything
+            // changes, so a failed listing changes nothing.
+            let listing = sys.runner.run_checked("ipset", &["list", "-n"], None)?;
+            let stale = stale_sets(&listing.stdout, &rs.sets);
             // Fill a fresh set and swap it in: flushing the live one would
             // briefly leave `! --match-set not_public` matching everything.
             // One short scratch name: ipset names stop at 31 characters.
@@ -168,6 +174,15 @@ fn apply_firewall(
                 sys.runner
                     .run_checked("ipset", &["swap", next, &set.name], None)?;
                 sys.runner.run_checked("ipset", &["destroy", next], None)?;
+            }
+            // The old rules still use the stale sets until the restore. A peer
+            // that left a changed tier for an unchanged one is in the new
+            // tier's set already, and would have both tiers' access until
+            // then, or for good if the restore failed. Emptied, the stale
+            // sets give nobody anything; their tiers' peers have only what
+            // their new sets give them, and only once the new rules are in.
+            for name in &stale {
+                sys.runner.run_checked("ipset", &["flush", name], None)?;
             }
             // The restore file declares every PARALLAX_* chain, which creates
             // it or flushes it in the same transaction as the refill: no
@@ -194,17 +209,10 @@ fn apply_firewall(
                 sys.runner
                     .run_checked("iptables", &["-t", "filter", "-X", chain], None)?;
             }
-            // Sets of tiers that no longer exist, and the logging sets once
-            // nobody is logged: no rule uses them since the restore. The rules are in by now, so a failure here is only a
-            // leftover set: say so and carry on to the hooks.
-            let live = sys.runner.run("ipset", &["list", "-n"], None)?;
-            if !live.ok() {
-                log.push(format!(
-                    "firewall: couldn't list ipsets, stale sets stay: {}",
-                    live.stderr.trim()
-                ));
-            }
-            for name in stale_sets(&live.stdout, &rs.sets) {
+            // No rule uses the stale sets since the restore. The rules are in
+            // by now, so a failure here is only a leftover (empty) set: say so
+            // and carry on to the hooks.
+            for name in stale {
                 let destroy = sys.runner.run("ipset", &["destroy", name], None)?;
                 if !destroy.ok() {
                     log.push(format!(
