@@ -1449,8 +1449,10 @@ impl Engine {
             Some(Ok(found)) => Some(found.address),
             _ => self.view.public_ip,
         };
-        // Blocks this thread for those names' lookups only (a few seconds
-        // at most): known names aren't asked again.
+        // Blocks this thread for those names' lookups only, up to a few
+        // seconds per resolver asked (a name the new resolvers can't answer
+        // and nothing knows is asked through the old ones too): known names
+        // aren't asked again.
         let resolved = names::check_save(
             Some(&self.view.config),
             old_ip,
@@ -1562,11 +1564,13 @@ impl Engine {
             // The rows just copied in: what the database now holds.
             anyhow::Ok((lines, restored))
         })?;
-        // What the restored configuration doesn't use goes; the lookups for
-        // what it adds follow.
+        // What the restored configuration doesn't use, or asks other
+        // resolvers for, goes; the lookups for those follow.
         let used = names::used(&config);
+        let elsewhere = names::asked_on_save(Some(before.as_ref()), &config);
         let mut resolved = self.view.names.clone();
-        resolved.retain(|name, _| used.contains(name.as_str()));
+        resolved
+            .retain(|name, _| used.contains(name.as_str()) && !elsewhere.contains(name.as_str()));
         self.replace(config);
         self.set_names_from_save(resolved, false);
         self.publish();
