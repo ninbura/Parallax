@@ -986,8 +986,9 @@ struct Engine {
 /// How long the proxy may take to serve the routes an apply needs first
 /// (its own wait for open connections is shorter).
 const PROXY_TAKES: Duration = Duration::from_secs(10);
-/// The same for the DNS server, which has no connections to wait for.
-const DNS_TAKES: Duration = Duration::from_secs(5);
+/// The same for the DNS server (its own wait for queries under the old
+/// routes is shorter).
+const DNS_TAKES: Duration = Duration::from_secs(8);
 
 /// Before the apply writes or changes anything, like [`narrow_proxy`]: the
 /// DNS server answers each member only what both its routes `served` and
@@ -1013,10 +1014,10 @@ fn narrow_dns(
     match rt.block_on(async { tokio::time::timeout(DNS_TAKES, taken).await }) {
         Ok(Ok(())) => {}
         Ok(Err(_)) => bail!(
-            "the DNS server couldn't take its routes for the change (stopped); nothing was changed"
+            "the DNS server couldn't take its routes for the change (stopped); the firewall and WireGuard weren't changed"
         ),
         Err(_) => bail!(
-            "the DNS server didn't take its routes for the change within {} s; nothing was changed",
+            "the DNS server didn't take its routes for the change within {} s; the firewall and WireGuard weren't changed",
             DNS_TAKES.as_secs()
         ),
     }

@@ -35,6 +35,8 @@ use crate::{answer, Error, Result};
 /// Time one upstream gets to answer. Clients usually retry after 5 seconds,
 /// so a SERVFAIL comes back before they give up on us.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a reload waits for queries under the old routes to answer.
+const DRAIN: Duration = Duration::from_secs(5);
 /// Idle time before a TCP client is dropped.
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Answers each resolver keeps (a small cache: the upstreams cache too).
@@ -244,8 +246,21 @@ async fn reloader(
                 None
             }
         };
-        *shared.write().unwrap_or_else(|p| p.into_inner()) = next;
-        // Queries that come in from now on take the new state.
+        let old = std::mem::replace(
+            &mut *shared.write().unwrap_or_else(|p| p.into_inner()),
+            next,
+        );
+        // Queries that come in from now on take the new state. Those under
+        // way still answer by the old one: let them finish first, since the
+        // address that asked may belong to another peer once this is
+        // confirmed. A query holds its state until it has answered, and
+        // gives up on its upstreams long before this.
+        if let Some(old) = old {
+            let deadline = tokio::time::Instant::now() + DRAIN;
+            while Arc::strong_count(&old) > 1 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         let _ = done.send(());
     }
 }
@@ -257,7 +272,8 @@ async fn reloader(
 /// zone), and public names if both do; a member only one of them has gets
 /// nothing. So an address moving to another peer answers neither owner's
 /// names beyond what both may see. Zones, mappings and resolvers stay
-/// `served`'s.
+/// `served`'s, plus the zones only `new` has, which nobody gets: a name in
+/// one isn't sent to the public resolver meanwhile.
 pub fn overlap(served: &DnsRoutes, new: &DnsRoutes) -> DnsRoutes {
     fn allows(routes: &DnsRoutes, tier: &DnsTier, name: &str) -> bool {
         tier.names.iter().any(|n| n == name)
@@ -269,6 +285,11 @@ pub fn overlap(served: &DnsRoutes, new: &DnsRoutes) -> DnsRoutes {
         tiers: Vec::new(),
         ..served.clone()
     };
+    let added = new
+        .zones
+        .iter()
+        .filter(|z| !served.zones.iter().any(|s| s.name == z.name));
+    out.zones.extend(added.cloned());
     for old in &served.tiers {
         for member in &old.members {
             let Some(next) = new.tiers.iter().find(|t| t.members.contains(member)) else {

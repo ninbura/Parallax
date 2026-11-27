@@ -553,6 +553,23 @@ async fn a_logged_peer_s_queries_are_handed_over_without_answers() {
     );
 }
 
+/// A query under way when new routes come answers before they're
+/// confirmed: by then its address may be another peer's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_is_confirmed_once_queries_under_the_old_routes_answered() {
+    let s = start().await;
+    let addr = s.addr;
+    // The upstream never answers this one: it ends at the upstream timeout.
+    let slow =
+        tokio::spawn(async move { ask(PERSONAL, addr, "slow.mydomain.com.", RecordType::A).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    s.reload(parsed(true)).await;
+    assert!(
+        slow.is_finished(),
+        "confirmed while a query under the old routes was still out"
+    );
+}
+
 /// Where `client` may look `name` up: `Home`, `Public` or `Refused`.
 fn route_of(routes: &DnsRoutes, client: &str, name: &str) -> &'static str {
     match routes.route(client.parse().unwrap(), name) {
@@ -581,6 +598,29 @@ fn while_an_apply_runs_a_member_gets_what_both_routes_give_it() {
     // FAMILY gains public names in `after`: not before the apply has worked.
     assert_eq!(route_of(&both, FAMILY, "example.org"), "refused");
     assert_eq!(route_of(&both, FAMILY, "photos.mydomain.com"), "home");
+    // A zone only `after` has: nobody's yet, and not a public name either.
+    let mut zoned = parsed(true);
+    zoned.zones.push(parallax_core::generate::dns::DnsZone {
+        name: "internal.example".into(),
+        network: "lab".into(),
+        upstream: vec![UPSTREAM],
+    });
+    let both = parallax_dns::overlap(&parsed(true), &zoned);
+    assert_eq!(
+        route_of(&both, PERSONAL, "host.internal.example"),
+        "refused"
+    );
+    assert_eq!(route_of(&both, PERSONAL, "example.org"), "public");
+    // A child zone carved out of a zone a tier has whole: refused meanwhile.
+    let mut child = parsed(false);
+    child.zones.push(parallax_core::generate::dns::DnsZone {
+        name: "lab.mydomain.com".into(),
+        network: "lab".into(),
+        upstream: vec![UPSTREAM],
+    });
+    let both = parallax_dns::overlap(&before, &child);
+    assert_eq!(route_of(&both, PERSONAL, "x.lab.mydomain.com"), "refused");
+    assert_eq!(route_of(&both, PERSONAL, "nas.mydomain.com"), "home");
     // A member only one side has gets nothing.
     let mut gone = parsed(false);
     gone.tiers.remove(1);

@@ -354,10 +354,13 @@ async fn purge_now(views: &Views, slot: &Slot) {
     let Some(logs) = slot.read().ok().and_then(|s| s.clone()) else {
         return;
     };
+    // The open database is the applied configuration's, and so are its
+    // limits: a saved change not applied yet mustn't purge it by its own.
     let Some(limits) = views
         .borrow()
         .as_ref()
-        .map(|v| (v.config.server.logs.keep, v.config.server.logs.max_size))
+        .and_then(|v| v.applied.as_ref())
+        .map(|c| (c.server.logs.keep, c.server.logs.max_size))
     else {
         return;
     };
