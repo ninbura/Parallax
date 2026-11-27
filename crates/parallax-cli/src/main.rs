@@ -803,7 +803,7 @@ pub(crate) fn find_tailnet(config: &Config) -> Result<Option<Tailnet>, String> {
 
 /// Why Headscale's nodes are unknown, and what that means.
 pub(crate) fn tailnet_unknown(problem: &str) -> String {
-    format!("{problem}; Tailscale peers keep their configured addresses")
+    format!("{problem}; Tailscale peers that name a node get no access until it answers")
 }
 
 pub(crate) fn print_warnings(warnings: &[String]) {

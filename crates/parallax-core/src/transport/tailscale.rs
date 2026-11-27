@@ -42,8 +42,11 @@ impl Transport for TailscaleTransport {
             .members_on(tier, TransportKind::Tailscale)
             .filter_map(|p| {
                 let ts = p.tailscale.as_ref()?;
-                match model.tailnet() {
-                    Some(nodes) => nodes.get(&ts.node_id?).copied(),
+                // A peer that names a node is wherever Headscale says, and
+                // nowhere until it has said: a configured address could be
+                // another node's by now.
+                match ts.node_id {
+                    Some(id) => model.tailnet()?.get(&id).copied(),
                     None => ts.address,
                 }
             })
@@ -124,8 +127,10 @@ mod tests {
     #[test]
     fn a_peer_is_where_headscale_says_its_node_is() {
         let config = with_tailscale_peer();
+        // Headscale hasn't answered: the configured address could be
+        // another node's by now, so none.
         let model = Model::resolve(&config, today()).unwrap();
-        assert_eq!(members(&model), vec![Ipv4Net::from(STORED)]);
+        assert!(members(&model).is_empty());
 
         let known = Tailnet::from([(1, FROM_HEADSCALE)]);
         let model = Model::resolve(&config, today())
@@ -138,6 +143,31 @@ mod tests {
             .unwrap()
             .with_tailnet(Some(Tailnet::new()));
         assert!(members(&model).is_empty());
+    }
+
+    #[test]
+    fn a_peer_without_a_node_keeps_its_configured_address() {
+        let mut config = with_tailscale_peer();
+        let mut plain = config.peers.last().unwrap().clone();
+        plain.name = "plain-tablet".into();
+        plain.tailscale = Some(TailscalePeer {
+            node_id: None,
+            address: Some(Ipv4Addr::new(100, 64, 0, 20)),
+        });
+        config.peers.push(plain);
+        let model = Model::resolve(&config, today())
+            .unwrap()
+            .with_tailnet(Some(Tailnet::from([(1, FROM_HEADSCALE)])));
+        // Same grants, so the same tier: both, each from its own source.
+        let mut got = members(&model);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                Ipv4Net::from(FROM_HEADSCALE),
+                Ipv4Net::from(Ipv4Addr::new(100, 64, 0, 20))
+            ]
+        );
     }
 
     #[test]

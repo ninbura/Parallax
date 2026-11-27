@@ -44,16 +44,23 @@ Tailscale's API, with scoped OAuth credentials, but can't create users.
   title, detail and messages only, since their `value` fields can echo the
   request.
 - **A Tailscale peer's address is its node's.** The daemon asks Headscale
-  for its nodes right after startup, every 10 seconds and when a saved change
-  alters where Headscale is, but only while some Tailscale peer names a node
-  (`peer.tailscale.node_id`). Addresses are an input to generation
+  for its nodes before its first apply, every 10 seconds and when a saved
+  change alters where Headscale is, but only while some Tailscale peer names
+  a node (`peer.tailscale.node_id`). Addresses are an input to generation
   (`Model::with_tailnet`), like the home's public IP. When they change, the
-  daemon applies again, as for any other input. Once Headscale has answered,
-  a peer whose node isn't there has no address and no access. When it
-  doesn't answer, the last answer stays in effect and the failure is logged
-  once: the nodes keep the tunnels they have meanwhile, so cutting their
-  access would only break what still works. Until the first answer, the
-  configured `peer.tailscale.address` counts.
+  daemon applies again, as for any other input. A peer that names a node has
+  only the address Headscale gave it: none before Headscale first answers,
+  and none once the node is gone. A configured `peer.tailscale.address`
+  could belong to another node by then. A peer that names no node keeps its
+  configured address. When Headscale stops answering, the last answer stays
+  in effect and the failure is logged once: the nodes keep the tunnels they
+  have meanwhile, so cutting their access would only break what still
+  works. The answer isn't stored, so a restart while Headscale is down
+  leaves node peers without access until it answers (fail closed). A saved
+  change or a restored backup that points at another Headscale drops the
+  last answer: node ids mean nothing there.
+- **A node is one peer.** Validation refuses two peers naming the same node,
+  whose address would otherwise sit in two tiers.
 - **Only addresses in `100.64.0.0/10` count.** Headscale's prefix is
   configurable, but the firewall only takes Tailscale traffic from that
   range.
@@ -66,7 +73,12 @@ Tailscale's API, with scoped OAuth credentials, but can't create users.
 
 - `parallax headscale status` shows Headscale's version, users and nodes,
   and which peer each node is. `parallax doctor` checks that Headscale
-  answers with every Tailscale peer's node, only while a peer names one.
+  answers with every Tailscale peer's node, only while a peer names one. It
+  only warns: doctor gates the gateway's start, and WireGuard, DNS and the
+  proxy run without Headscale.
+- Proxy certificates are checked for every proxied hostname a tier may use,
+  whether or not its peers have addresses yet, so a node appearing later
+  can't start failing applies.
   `parallax status` lists the addresses the daemon follows.
 - The daemon protocol carries the node addresses (protocol 5).
 - The integration test (`netns.sh` (t)) runs a real Headscale from the

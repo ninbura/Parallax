@@ -206,8 +206,10 @@ pub fn check(config: &Config, api: &dyn HeadscaleApi) -> Check {
         Outcome::Ok("not asked: no Tailscale peer names a Headscale node".into())
     } else {
         match version(server, api).and_then(|v| Ok((v, nodes(server, api)?))) {
-            Err(e) => Outcome::Fail(format!(
-                "{e}. Tailscale peers keep the addresses Headscale last gave them until it answers"
+            // A warning: the gateway runs without Headscale (WireGuard,
+            // DNS, the proxy), and doctor gates its start.
+            Err(e) => Outcome::Warn(format!(
+                "{e}. The daemon keeps the addresses Headscale last gave; after a restart, Tailscale peers that name a node get no access until it answers"
             )),
             Ok((version, nodes)) => {
                 let peers = peer_nodes(config, &nodes);
@@ -514,8 +516,9 @@ mod tests {
             panic!("not a warning");
         };
         assert!(w.contains("sister-tablet (node 7)"), "{w}");
-        let Outcome::Fail(f) = check(&with_node(1), &FakeHeadscale::new()).outcome else {
-            panic!("not a failure");
+        // Never a failure: doctor gates the gateway's start.
+        let Outcome::Warn(f) = check(&with_node(1), &FakeHeadscale::new()).outcome else {
+            panic!("not a warning");
         };
         assert!(f.contains("connection refused"), "{f}");
     }

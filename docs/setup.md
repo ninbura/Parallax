@@ -363,8 +363,10 @@ sudo docker compose exec headscale headscale apikeys create --expiration 365d \
 ```
 
 A key expires (90 days without `--expiration`); Parallax then keeps the
-addresses Headscale gave last, logs the refusal, and `parallax doctor` fails
-until there's a new key in the file. No restart is needed.
+addresses Headscale gave last, logs the refusal, and `parallax doctor` warns
+until there's a new key in the file. No restart is needed. Don't restart
+meanwhile: the addresses aren't stored, and peers that name a node get no
+access until Headscale answers again.
 
 A Tailscale peer names its Headscale node by id, which `parallax headscale
 status` lists:
@@ -379,7 +381,8 @@ node_id = 3
 ```
 
 Its access follows the address Headscale gives that node: the daemon asks
-every 10 seconds and applies again when an address changes. `parallax
+every 10 seconds and applies again when an address changes. Each node can be
+only one peer. `parallax
 headscale status` shows each node and its peer, and `parallax status` the
 addresses in effect.
 

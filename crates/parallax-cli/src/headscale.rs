@@ -45,13 +45,14 @@ impl Api {
     }
 
     /// Read on every request, so a new key takes effect without a restart.
-    /// `/version` needs none.
+    /// Only the API gets it: `/version` is public, and a reverse proxy may
+    /// log it differently.
     fn key(&self, path: &str) -> Result<Option<Secret>> {
+        if !path.starts_with("/api/") {
+            return Ok(None);
+        }
         let key = match std::fs::read_to_string(&self.key_file) {
             Ok(key) => key.trim().to_string(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.starts_with("/api/") => {
-                return Ok(None);
-            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::Headscale(format!(
                     "no API key for Headscale at {}: {} doesn't exist. Create a key with `headscale apikeys create` and write it there (mode 0600)",
@@ -103,7 +104,16 @@ impl Api {
         let client = Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(https);
         let mut request = Request::get(uri).header(header::ACCEPT, "application/json");
         if let Some(key) = &key {
-            request = request.header(header::AUTHORIZATION, format!("Bearer {}", key.expose()));
+            let mut value = header::HeaderValue::try_from(format!("Bearer {}", key.expose()))
+                .map_err(|_| {
+                    format!(
+                        "the API key in {} isn't a valid header value",
+                        self.key_file.display()
+                    )
+                })?;
+            // Kept out of hyper's debug output.
+            value.set_sensitive(true);
+            request = request.header(header::AUTHORIZATION, value);
         }
         let request = request.body(Empty::new()).map_err(|e| e.to_string())?;
         let exchange = async {
@@ -228,6 +238,22 @@ mod tests {
             request
                 .to_ascii_lowercase()
                 .contains("authorization: bearer hskey-api-test\r\n"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn version_gets_no_key() {
+        let dir = scratch("version");
+        let key_file = dir.join("headscale-api.key");
+        std::fs::write(&key_file, "hskey-api-test\n").unwrap();
+        let (url, request) =
+            serve_once("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+        api(&url, key_file).get("/version").unwrap();
+        let request = request.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization"),
             "{request}"
         );
     }

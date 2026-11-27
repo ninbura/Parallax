@@ -260,9 +260,10 @@ impl<'a> Model<'a> {
         &self.names
     }
 
-    /// The addresses Headscale gave its nodes ([`crate::headscale`]). Once
-    /// known, a Tailscale peer's address is its node's, and a peer whose
-    /// node isn't there has none; `None` keeps the configured addresses.
+    /// The addresses Headscale gave its nodes ([`crate::headscale`]). A
+    /// Tailscale peer that names a node has that node's address, and none
+    /// while Headscale hasn't answered (`None`) or doesn't know the node.
+    /// One that names no node keeps its configured address.
     pub fn with_tailnet(mut self, tailnet: Option<Tailnet>) -> Self {
         self.tailnet = tailnet;
         self
@@ -1042,6 +1043,7 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
     let mut split_dns: Vec<&str> = Vec::new();
     let mut addresses: BTreeMap<Ipv4Addr, &str> = BTreeMap::new();
     let mut pubkeys: BTreeMap<String, &str> = BTreeMap::new();
+    let mut nodes: BTreeMap<u64, &str> = BTreeMap::new();
     for p in &config.peers {
         let ctx = format!("peer '{}'", p.name);
         if !valid_ident(&p.name) {
@@ -1145,6 +1147,15 @@ pub fn check(config: &Config) -> (Vec<String>, Vec<String>) {
                         "{ctx}: transport is tailscale but a [peer.wireguard] block is present"
                     ));
                 }
+                // One device, one set of grants: the node's address can't
+                // be in two tiers.
+                if let Some(id) = p.tailscale.as_ref().and_then(|t| t.node_id) {
+                    if let Some(other) = nodes.insert(id, &p.name) {
+                        errors.push(format!(
+                            "{ctx}: Headscale node {id} is already peer '{other}'"
+                        ));
+                    }
+                }
                 if let Some(addr) = p.tailscale.as_ref().and_then(|t| t.address) {
                     if !TAILSCALE_CGNAT.contains(&addr) {
                         errors.push(format!(
@@ -1180,6 +1191,28 @@ mod tests {
         let cfg = canonical_config();
         let (errors, _) = check(&cfg);
         assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn a_node_is_one_peer() {
+        let e = errors_of(|c| {
+            for name in ["tablet", "tv"] {
+                let mut p = c.peers[0].clone();
+                p.name = name.into();
+                p.transport = TransportKind::Tailscale;
+                p.wireguard = None;
+                p.tailscale = Some(TailscalePeer {
+                    node_id: Some(3),
+                    address: None,
+                });
+                c.peers.push(p);
+            }
+        });
+        assert!(
+            e.iter()
+                .any(|e| e.ends_with("'tv': Headscale node 3 is already peer 'tablet'")),
+            "{e:?}"
+        );
     }
 
     #[test]

@@ -467,11 +467,12 @@ it up first and is refused if it doesn't resolve to addresses inside the
 configured networks.
 
 When a Tailscale peer names a Headscale node (`peer.tailscale.node_id`), the
-daemon asks Headscale's admin API for its nodes (ADR 0014): right after
-startup, every 10 seconds and when a saved change alters where Headscale is.
-The addresses are an input to generation (`Model::with_tailnet`), and a
-change applies again. Once Headscale has answered, a peer whose node isn't
-there has no address; when it doesn't answer, the last answer stays. The
+daemon asks Headscale's admin API for its nodes (ADR 0014): before the
+first apply, every 10 seconds and when a saved change alters where Headscale
+is. The addresses are an input to generation (`Model::with_tailnet`), and a
+change applies again. Such a peer has only its node's address: none before
+Headscale first answers or once the node is gone. When Headscale stops
+answering, the last answer stays. The
 logic is `parallax_core::headscale`, behind the `HeadscaleApi` trait in
 `io.rs`; the real client is `parallax-cli`'s `headscale.rs`, and Headscale
 itself is built from a pinned commit (`docker/headscale.Dockerfile`).
