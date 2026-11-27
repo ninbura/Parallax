@@ -218,21 +218,72 @@ fn apply_firewall(
             let listing = sys
                 .runner
                 .run_checked("iptables", &["-t", "filter", "-S"], None)?;
-            // Hooks first, then the hold comes off: until both tables are
-            // attached nothing new starts. `nat` first: a filter jump goes in
-            // above the hold, so once it's there both tables must be. Every
-            // hold goes, also one for an interface since renamed.
-            for (table, builtin, own) in CHAINS.iter().rev() {
-                let present = sys
+            // Docker's chain before the hooks, so a FORWARD that Docker's jump
+            // heads already counts as Parallax deciding first (issue #74);
+            // and before the hold comes off, so nothing new starts while
+            // Parallax's rules there are out.
+            if let Some(docker) = bundle.of_kind(ArtifactKind::FirewallDockerUser).next() {
+                let exists = sys
                     .runner
-                    .run("iptables", &["-t", table, "-C", builtin, "-j", own], None)?
+                    .run(
+                        "iptables",
+                        &["-t", "filter", "-L", "DOCKER-USER", "-n"],
+                        None,
+                    )?
                     .ok();
-                if !present {
+                if exists {
+                    // Remove previous parallax rules, then insert the generated ones.
+                    let listing =
+                        sys.runner
+                            .run("iptables", &["-t", "filter", "-S", "DOCKER-USER"], None)?;
+                    for rule in docker_user_rules(&listing.stdout) {
+                        let mut del = vec!["-t", "filter", "-D"];
+                        del.extend(rule.iter().map(String::as_str));
+                        sys.runner.run("iptables", &del, None)?;
+                    }
+                    for line in docker.contents.lines().filter(|l| l.starts_with("-I")) {
+                        let words = iptables_words(line);
+                        let args: Vec<&str> = words.iter().map(String::as_str).collect();
+                        sys.runner.run_checked("iptables", &args, None)?;
+                    }
+                    log.push("firewall: DOCKER-USER rules refreshed".into());
+                } else {
+                    log.push("firewall: DOCKER-USER chain not present, skipping Docker coexistence rules".into());
+                }
+            }
+            // Hooks next, then the hold comes off: until both tables are
+            // attached nothing new starts. `nat` first: a filter jump goes in
+            // above the hold, so once it's there both tables must be. A jump
+            // that's present but below someone else's rules (Docker's, after
+            // it restarts: issue #74) moves to the top. Every hold goes, also
+            // one for an interface since renamed.
+            for (table, builtin, own) in CHAINS.iter().rev() {
+                let live = sys
+                    .runner
+                    .run_checked("iptables", &["-t", table, "-S"], None)?;
+                // Present too, not only reached through DOCKER-USER: Docker
+                // may drop its jump, and then nothing would lead to Parallax.
+                let jump = format!("-A {builtin} -j {own}");
+                let present = live.stdout.lines().filter(|l| *l == jump).count();
+                if present > 0 && decides_first(&live.stdout, builtin, own) {
+                    continue;
+                }
+                for _ in 0..present {
                     sys.runner.run_checked(
                         "iptables",
-                        &["-t", table, "-I", builtin, "-j", own],
+                        &["-t", table, "-D", builtin, "-j", own],
                         None,
                     )?;
+                }
+                sys.runner.run_checked(
+                    "iptables",
+                    &["-t", table, "-I", builtin, "1", "-j", own],
+                    None,
+                )?;
+                if present > 0 {
+                    log.push(format!(
+                        "firewall: other rules came before {own} in {builtin}; its jump is first again"
+                    ));
                 }
             }
             for args in held(&listing.stdout) {
@@ -276,35 +327,6 @@ fn apply_firewall(
                 }
             }
             log.push("firewall: PARALLAX_* chains restored".into());
-            if let Some(docker) = bundle.of_kind(ArtifactKind::FirewallDockerUser).next() {
-                let exists = sys
-                    .runner
-                    .run(
-                        "iptables",
-                        &["-t", "filter", "-L", "DOCKER-USER", "-n"],
-                        None,
-                    )?
-                    .ok();
-                if exists {
-                    // Remove previous parallax rules, then insert the generated ones.
-                    let listing =
-                        sys.runner
-                            .run("iptables", &["-t", "filter", "-S", "DOCKER-USER"], None)?;
-                    for rule in docker_user_rules(&listing.stdout) {
-                        let mut del = vec!["-t", "filter", "-D"];
-                        del.extend(rule.iter().map(String::as_str));
-                        sys.runner.run("iptables", &del, None)?;
-                    }
-                    for line in docker.contents.lines().filter(|l| l.starts_with("-I")) {
-                        let words = iptables_words(line);
-                        let args: Vec<&str> = words.iter().map(String::as_str).collect();
-                        sys.runner.run_checked("iptables", &args, None)?;
-                    }
-                    log.push("firewall: DOCKER-USER rules refreshed".into());
-                } else {
-                    log.push("firewall: DOCKER-USER chain not present, skipping Docker coexistence rules".into());
-                }
-            }
         }
     }
     Ok(())
@@ -552,6 +574,46 @@ pub fn held(listing: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Whether Parallax's chain `own` sees every packet of the built-in chain
+/// `builtin` before anything else does, in `listing` (`iptables -t <table>
+/// -S`, or that table's part of `iptables-save`). Holds don't count. The
+/// first rule must jump to `own`, or, in `FORWARD`, jump to Docker's
+/// `DOCKER-USER` whose first rule jumps to `own`: Docker puts that jump
+/// back on top whenever it starts (issue #74), and this way neither order
+/// needs undoing.
+pub fn decides_first(listing: &str, builtin: &str, own: &str) -> bool {
+    use crate::generate::firewall::iptables::DOCKER_USER;
+    let hold = format!("--comment {HOLD_COMMENT} ");
+    let first = |chain: &str| {
+        let prefix = format!("-A {chain} ");
+        listing
+            .lines()
+            .filter(|l| l.starts_with(&prefix) && !l.contains(&hold))
+            .map(iptables_words)
+            .next()
+    };
+    let Some(rule) = first(builtin) else {
+        return false;
+    };
+    if rule == ["-A", builtin, "-j", own] {
+        return true;
+    }
+    builtin == "FORWARD"
+        && rule == ["-A", builtin, "-j", DOCKER_USER]
+        && first(DOCKER_USER).is_some_and(|r| {
+            r == [
+                "-A",
+                DOCKER_USER,
+                "-m",
+                "comment",
+                "--comment",
+                "parallax",
+                "-j",
+                own,
+            ]
+        })
+}
+
 /// `iptables` arguments to check for (`-C`) or insert (`-I`, at the top)
 /// one of [`hold_rules`].
 pub fn hold_args<'a>(op: &'a str, rule: &'a [String]) -> Vec<&'a str> {
@@ -676,6 +738,145 @@ mod tests {
             ["--comment", "two words"]
         );
         assert_eq!(iptables_words(r#"--comment """#), ["--comment", ""]);
+    }
+
+    /// Issue #74: Parallax's chain must see a packet before Docker's (or
+    /// anyone's) rules do. Present is not enough.
+    #[test]
+    fn decides_first_needs_the_first_rule() {
+        let first = |forward: &str, docker_user: &str| {
+            let listing = format!("-P FORWARD DROP\n-N DOCKER-USER\n{forward}{docker_user}");
+            decides_first(&listing, "FORWARD", "PARALLAX_FORWARD")
+        };
+        let ours = "-A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD\n";
+        let hold = "-A FORWARD -i wg0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP\n";
+        assert!(first(
+            "-A FORWARD -j PARALLAX_FORWARD\n-A FORWARD -j DOCKER-USER\n",
+            ours
+        ));
+        // Holds sit above while an apply runs.
+        assert!(first(
+            &format!("{hold}-A FORWARD -j PARALLAX_FORWARD\n"),
+            ""
+        ));
+        // Docker restarted: its jumps went in above.
+        assert!(!first(
+            "-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n",
+            ours
+        ));
+        // DOCKER-USER first is fine once it starts with Parallax's chain,
+        // not with an older build's accepts or an operator's rule.
+        assert!(first(
+            "-A FORWARD -j DOCKER-USER\n-A FORWARD -j PARALLAX_FORWARD\n",
+            ours
+        ));
+        let accept = "-A DOCKER-USER -i wg0 -m comment --comment parallax -j ACCEPT\n";
+        assert!(!first(
+            "-A FORWARD -j DOCKER-USER\n-A FORWARD -j PARALLAX_FORWARD\n",
+            accept
+        ));
+        assert!(!first(
+            "-A FORWARD -j DOCKER-USER\n",
+            &format!("-A DOCKER-USER -s 10.0.0.0/8 -j DROP\n{ours}")
+        ));
+        assert!(!first("", ours));
+        // Only FORWARD goes through DOCKER-USER.
+        let listing = format!("-A INPUT -j DOCKER-USER\n{ours}");
+        assert!(!decides_first(&listing, "INPUT", "PARALLAX_INPUT"));
+    }
+
+    /// Issue #74, through a whole apply: a jump that's there but below
+    /// Docker's moves to the top; Docker's chain gets Parallax's rules before
+    /// the hold comes off.
+    #[test]
+    fn an_iptables_apply_puts_its_jump_back_on_top() {
+        let mut cfg = crate::testing::canonical_config();
+        cfg.server.firewall.backend = crate::FirewallBackend::IptablesNft;
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let runner = RecordingRunner::new();
+        let listing = |forward: &str| {
+            Output {
+            status: 0,
+            stdout: format!(
+                "-P FORWARD DROP\n-N DOCKER-USER\n\
+                 -A INPUT -j PARALLAX_INPUT\n\
+                 -A FORWARD -i wg0 -m conntrack --ctstate NEW -m comment --comment parallax-hold -j DROP\n\
+                 {forward}"
+            ),
+            stderr: String::new(),
+        }
+        };
+        let docker_first = "-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n";
+        // After the restore (holds), then the FORWARD hook, then INPUT.
+        for _ in 0..3 {
+            runner.respond_to("iptables", &["-t", "filter", "-S"], listing(docker_first));
+        }
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        let report = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+        let lines = runner.command_lines();
+        let pos = |line: &str| lines.iter().position(|l| l == line);
+        let removed = lines
+            .iter()
+            .filter(|l| *l == "iptables -t filter -D FORWARD -j PARALLAX_FORWARD")
+            .count();
+        assert_eq!(removed, 2, "{lines:#?}");
+        let top = pos("iptables -t filter -I FORWARD 1 -j PARALLAX_FORWARD").unwrap();
+        assert!(
+            pos("iptables -t filter -D FORWARD -j PARALLAX_FORWARD").unwrap() < top,
+            "{lines:#?}"
+        );
+        // INPUT's jump is first: left alone.
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains("INPUT -j PARALLAX_INPUT") && !l.contains(" -S")));
+        let docker =
+            pos("iptables -I DOCKER-USER 1 -m comment --comment parallax -j PARALLAX_FORWARD")
+                .unwrap();
+        let lifted = lines
+            .iter()
+            .position(|l| l.contains(" -D FORWARD -i wg0 ") && l.contains(HOLD_COMMENT))
+            .unwrap();
+        assert!(docker < top && top < lifted, "{lines:#?}");
+        assert!(
+            report
+                .log
+                .iter()
+                .any(|l| l.contains("PARALLAX_FORWARD in FORWARD")),
+            "{:#?}",
+            report.log
+        );
+
+        // DOCKER-USER first and starting with Parallax's jump, but no jump
+        // of Parallax's own in FORWARD (a first apply beside Docker): it goes
+        // in at the top, or nothing leads to Parallax once Docker drops its
+        // jump.
+        let runner = RecordingRunner::new();
+        let through_docker = "-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n\
+             -A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD\n";
+        for _ in 0..3 {
+            runner.respond_to("iptables", &["-t", "filter", "-S"], listing(through_docker));
+        }
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        apply(&model, &bundle, Path::new("/var/lib/parallax"), sys).unwrap();
+        let lines = runner.command_lines();
+        assert!(
+            lines.contains(&"iptables -t filter -I FORWARD 1 -j PARALLAX_FORWARD".into()),
+            "{lines:#?}"
+        );
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains("-D FORWARD -j PARALLAX_FORWARD")));
     }
 
     /// Exactly `parallax`, or `"parallax"` from builds that kept the

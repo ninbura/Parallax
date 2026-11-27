@@ -124,6 +124,18 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
                         listing.push_str(line);
                         listing.push('\n');
                     }
+                    // Lines only Parallax's own: someone else's rule going
+                    // in above its jump changes none of them (issue #74).
+                    if program == "iptables-save" {
+                        for (table, builtin, own) in crate::generate::firewall::iptables::CHAINS {
+                            let first = crate::apply::decides_first(
+                                &save_table(&out.stdout, table),
+                                builtin,
+                                own,
+                            );
+                            listing.push_str(&format!("{own} first in {builtin}: {first}\n"));
+                        }
+                    }
                 } else {
                     listing.push_str(&out.stdout);
                 }
@@ -132,6 +144,18 @@ pub fn live_state(server: &ServerConfig, sys: System<'_>) -> LiveState {
         }
     }
     LiveState(listing)
+}
+
+/// The lines of `table` in an `iptables-save` listing: mangle and raw have
+/// chains named like nat's and filter's.
+fn save_table(save: &str, table: &str) -> String {
+    let header = format!("*{table}");
+    save.lines()
+        .skip_while(|l| *l != header)
+        .skip(1)
+        .take_while(|l| *l != "COMMIT")
+        .map(|l| format!("{l}\n"))
+        .collect()
 }
 
 /// The parts of the host `apply` sets up, in the order [`teardown`]
@@ -539,6 +563,50 @@ mod tests {
             )
         };
         assert_eq!(listing("one"), listing("two"));
+    }
+
+    /// Issue #74: a Docker restart puts its jumps above Parallax's. Only
+    /// Parallax's lines are listed, so the order has to be part of the state.
+    #[test]
+    fn a_rule_above_parallaxs_jump_counts_as_drift() {
+        let mut config = canonical_config();
+        config.server.firewall.backend = FirewallBackend::IptablesNft;
+        let fs = MemoryFs::new();
+        let listing = |forward: &str| {
+            let runner = RecordingRunner::new();
+            runner.respond(
+                "iptables-save",
+                Output {
+                    status: 0,
+                    stdout: format!(
+                        "*nat\n-A PREROUTING -j PARALLAX_PREROUTING\n-A POSTROUTING -j PARALLAX_POSTROUTING\nCOMMIT\n\
+                         *filter\n-A INPUT -j PARALLAX_INPUT\n{forward}\
+                         -A DOCKER-USER -m comment --comment parallax -j PARALLAX_FORWARD\n\
+                         -A DOCKER-USER -o wg0 -m comment --comment parallax -j ACCEPT\nCOMMIT\n"
+                    ),
+                    stderr: String::new(),
+                },
+            );
+            live_state(
+                &config.server,
+                System {
+                    fs: &fs,
+                    runner: &runner,
+                },
+            )
+        };
+        let ours = "-A FORWARD -j PARALLAX_FORWARD\n-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n";
+        let applied = listing(ours);
+        assert_ne!(
+            applied,
+            listing("-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n")
+        );
+        // DOCKER-USER first sends everything through Parallax's chain too,
+        // so Docker putting it back on top is no reason to apply again.
+        assert_eq!(
+            applied,
+            listing("-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j PARALLAX_FORWARD\n")
+        );
     }
 
     /// How a listing answers.

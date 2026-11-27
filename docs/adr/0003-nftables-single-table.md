@@ -34,6 +34,18 @@ tunnel interfaces into `DOCKER-USER`; apply removes rules commented
 `parallax` before inserting them, so it stays idempotent without flushing
 Docker's chain.
 
+With the `iptables-nft` backend, Parallax's jumps share the built-in chains
+with Docker's, and order decides: an accept in a chain that comes first ends
+`FORWARD` before Parallax's tiers see the packet. Docker puts its
+`DOCKER-USER` jump back on top whenever it starts (issue #74). So
+`DOCKER-USER` starts with a jump to `PARALLAX_FORWARD` (the accepts follow
+it), and apply makes each `PARALLAX_*` jump the first rule of its built-in
+chain (a hold aside), moving it back up when something got above it. Either
+`FORWARD` order, Parallax's or Docker's after a restart, has Parallax decide
+first, so the two don't keep reordering each other. Drift detection records
+whether each chain decides first, so a rule put above it is repaired at the
+next check.
+
 ## Rejected
 
 - Per-peer rules: the template pool already encodes the tier; a per-peer rule

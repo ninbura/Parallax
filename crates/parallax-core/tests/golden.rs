@@ -779,7 +779,9 @@ fn iptables_apply_refills_chains_in_one_restore() {
     let (live, not_public) = (named("wg_"), named("not_public_"));
     let runner = RecordingRunner::new();
     // A tier went away since the last apply: its chain is still there.
-    runner.respond_to(
+    // Listed once after the restore, and once per filter hook.
+    for _ in 0..3 {
+        runner.respond_to(
         "iptables",
         &["-t", "filter", "-S"],
         parallax_core::io::Output {
@@ -802,6 +804,7 @@ fn iptables_apply_refills_chains_in_one_restore() {
             stderr: String::new(),
         },
     );
+    }
     // A set from before grants (not ours to judge by name), one of a tier
     // that went away, a live one, and not_public as builds before hashed
     // set names named it (not ours to judge by name either), beside its
@@ -858,15 +861,33 @@ fn iptables_apply_refills_chains_in_one_restore() {
         }
     }
     assert_eq!(placed, holds.len());
-    // nat hooked before filter: a filter jump goes in above the hold.
+    // nat hooked before filter: a filter jump goes in above the hold. A
+    // missing jump goes in at the top; one that's first already, holds
+    // aside, stays (#74).
     let hook = |chain: &str| {
-        lines
-            .iter()
-            .position(|l| l.contains(&format!(" -C {chain} -j PARALLAX_{chain}")))
-            .unwrap()
+        pos(&format!(
+            "iptables -t {} -I {chain} 1 -j PARALLAX_{chain}",
+            if chain.ends_with("ROUTING") {
+                "nat"
+            } else {
+                "filter"
+            }
+        ))
     };
-    assert!(hook("POSTROUTING") < hook("FORWARD") && hook("PREROUTING") < hook("INPUT"));
-    let hooks = hook("INPUT").max(hook("FORWARD"));
+    assert!(hook("POSTROUTING").unwrap() < hook("INPUT").unwrap());
+    assert!(hook("PREROUTING").unwrap() < hook("INPUT").unwrap());
+    assert_eq!(hook("FORWARD"), None, "{lines:#?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("-D FORWARD -j PARALLAX_FORWARD")),
+        "{lines:#?}"
+    );
+    let hooks = lines
+        .iter()
+        .rposition(|l| l == "iptables -t filter -S")
+        .unwrap()
+        .max(hook("INPUT").unwrap());
     for rule in [
         format!("INPUT -i wg0 {suffix}"),
         format!("FORWARD -o tailscale0 {suffix}"),
