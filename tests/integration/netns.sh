@@ -73,7 +73,11 @@ MODE="${NETNS_DAEMON:-root}"
 case $MODE in
     root) ;;
     unit) command -v systemd-run >/dev/null && command -v runuser >/dev/null && [ -d /run/systemd/system ] \
-              || { echo "NETNS_DAEMON=unit needs systemd and runuser"; exit 2; } ;;
+              || { echo "NETNS_DAEMON=unit needs systemd and runuser"; exit 2; }
+          # The iptables-nft backend's capability check, below.
+          for t in iptables iptables-restore ipset; do
+              command -v $t >/dev/null || { echo "NETNS_DAEMON=unit needs $t"; exit 2; }
+          done ;;
     *) echo "NETNS_DAEMON is root or unit"; exit 2 ;;
 esac
 UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.service"
@@ -404,6 +408,58 @@ if [ "$MODE" = unit ]; then
     grep -q "^ok    CAP_NET_ADMIN: held, and ambient" "$WORK/doctor-unit" \
         || { cat "$WORK/doctor-unit"; fail "doctor did not see CAP_NET_ADMIN as ambient"; }
     pass "doctor passes as the native service: unprivileged, sandboxed, two ambient capabilities"
+
+    # The iptables-nft backend (issue #52): `iptables-restore` looks the ipsets its
+    # rules match up through a raw socket. The unit leaves CAP_NET_RAW out, so
+    # doctor stops the start; docs/native.md's drop-in adds it. A drop-in's
+    # capability lines add to the unit's, but systemd-run's -p replaces them, so
+    # the merged sets are spelled out here.
+    WITH_NET_RAW=()
+    for p in "${AS_UNIT[@]}"; do
+        case $p in
+            CapabilityBoundingSet=* | AmbientCapabilities=*) WITH_NET_RAW+=("$p CAP_NET_RAW") ;;
+            *) WITH_NET_RAW+=("$p") ;;
+        esac
+    done
+    [ "$(printf '%s\n' "${WITH_NET_RAW[@]}" | grep -c ' CAP_NET_RAW$')" = 2 ] \
+        || fail "could not add CAP_NET_RAW to the unit's capabilities"
+    mkdir "$WORK/ipt"
+    sed 's|^docker_coexistence = true$|&\nbackend = "iptables-nft"|' "$WORK/parallax.toml" > "$WORK/ipt/parallax.toml"
+    grep -q '^backend = "iptables-nft"$' "$WORK/ipt/parallax.toml" || fail "could not set the iptables-nft backend"
+    printf '*filter\n:PARALLAX_PROBE - [0:0]\n-A PARALLAX_PROBE -m set --match-set netraw_probe src -j ACCEPT\nCOMMIT\n' \
+        > "$WORK/ipt/rules"
+    chown -R nobody "$WORK/ipt"
+    "${AS_UNIT[@]}" --unit="${PREFIX}ipt-import" -p Type=exec --wait --pipe \
+        "$WORK/parallax" --db "$WORK/ipt/parallax.db" config import "$WORK/ipt/parallax.toml" > "$WORK/ipt/import" 2>&1 \
+        || { cat "$WORK/ipt/import"; fail "could not import the iptables-nft configuration as the service"; }
+    inns gw ipset create netraw_probe hash:net
+    ipt_doctor() { # unit name, then systemd-run's options
+        local name=$1; shift
+        "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe \
+            "$WORK/parallax" --db "$WORK/ipt/parallax.db" --socket "$WORK/ipt/parallax.sock" doctor
+    }
+    ipt_restore() { # unit name, then systemd-run's options
+        local name=$1; shift
+        "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe iptables-restore --test --noflush "$WORK/ipt/rules"
+    }
+    if ipt_doctor ipt-doctor "${AS_UNIT[@]}" > "$WORK/ipt/doctor" 2>&1; then
+        cat "$WORK/ipt/doctor"; fail "doctor passed iptables-nft under the unit without CAP_NET_RAW"
+    fi
+    grep -q '^FAIL  CAP_NET_RAW: missing' "$WORK/ipt/doctor" \
+        || { cat "$WORK/ipt/doctor"; fail "doctor did not name the missing CAP_NET_RAW"; }
+    if ipt_restore ipt-restore "${AS_UNIT[@]}" > "$WORK/ipt/restore" 2>&1; then
+        fail "iptables-restore matched an ipset under the unit without CAP_NET_RAW (is the unit too wide?)"
+    fi
+    grep -q "Can't open socket to ipset" "$WORK/ipt/restore" \
+        || { cat "$WORK/ipt/restore"; fail "iptables-restore failed under the unit for another reason"; }
+    ipt_doctor ipt-doctor-raw "${WITH_NET_RAW[@]}" > "$WORK/ipt/doctor-raw" 2>&1 \
+        || { cat "$WORK/ipt/doctor-raw"; fail "doctor fails iptables-nft under the unit with the drop-in"; }
+    grep -q '^ok    CAP_NET_RAW: held, and ambient' "$WORK/ipt/doctor-raw" \
+        || { cat "$WORK/ipt/doctor-raw"; fail "doctor did not see CAP_NET_RAW as ambient with the drop-in"; }
+    ipt_restore ipt-restore-raw "${WITH_NET_RAW[@]}" > "$WORK/ipt/restore-raw" 2>&1 \
+        || { cat "$WORK/ipt/restore-raw"; fail "iptables-restore can't match an ipset under the unit with the drop-in"; }
+    inns gw ipset destroy netraw_probe
+    pass "iptables-nft under the unit: doctor asks for CAP_NET_RAW, and with the drop-in ipset rules load"
 fi
 
 # The daemon applies, then serves DNS and the proxy on the tunnel address. Drift

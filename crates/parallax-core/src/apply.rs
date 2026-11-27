@@ -181,11 +181,13 @@ fn apply_firewall(
             // both tables are in. Open ones carry on under the NAT they
             // started with. If the restore fails, the hold stays until an
             // apply succeeds (the daemon retries).
-            sys.runner.run_checked(
-                "iptables-restore",
-                &["--test", "--noflush", &main_str],
-                None,
-            )?;
+            sys.runner
+                .run_checked(
+                    "iptables-restore",
+                    &["--test", "--noflush", &main_str],
+                    None,
+                )
+                .map_err(net_raw_hint)?;
             for rule in hold_rules(model.server()) {
                 // A failed apply may have left it: keep that one rather than
                 // lift it for a moment.
@@ -499,6 +501,28 @@ pub fn apply(
 
 /// Comment on the hold rules, one word so `iptables -S` prints it plain.
 pub const HOLD_COMMENT: &str = "parallax-hold";
+
+/// `iptables-restore` looks up each `--match-set` ipset through a raw socket,
+/// so without CAP_NET_RAW it fails with only iptables' own words. The shipped
+/// unit leaves the capability out (it's only for this backend); say how to
+/// add it. `doctor` catches this at start, but the backend can change later.
+fn net_raw_hint(e: Error) -> Error {
+    match e {
+        Error::Command {
+            command,
+            status,
+            stderr,
+        } if stderr.contains("Can't open socket to ipset") => Error::Command {
+            command,
+            status,
+            stderr: format!(
+                "{}; matching ipsets needs CAP_NET_RAW (docs/native.md, The iptables-nft backend)",
+                stderr.trim_end()
+            ),
+        },
+        e => e,
+    }
+}
 
 /// What keeps tunnel peers from opening connections while `iptables-restore`
 /// swaps the rules (issue #56): rules at the top of INPUT and FORWARD that
@@ -820,6 +844,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #52: under the shipped unit `iptables-restore` can't open its
+    /// raw socket to look sets up. The dry run stops it before anything
+    /// changes, and the error says what's missing.
+    #[test]
+    fn an_iptables_restore_without_net_raw_names_the_capability() {
+        let mut cfg = crate::testing::canonical_config();
+        cfg.server.firewall.backend = crate::FirewallBackend::IptablesNft;
+        let model = Model::resolve(&cfg, crate::testing::today()).unwrap();
+        let fs = MemoryFs::new().with_file(
+            "/etc/parallax/wg-server.key",
+            crate::testing::keypair(200).private.expose_base64(),
+        );
+        let bundle = crate::generate::generate_all(&model, &fs).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "iptables-restore",
+            &[
+                "--test",
+                "--noflush",
+                "/var/lib/parallax/iptables/parallax.rules",
+            ],
+            failed("iptables-restore v1.8.13 (nf_tables): Can't open socket to ipset.\n"),
+        );
+        let sys = System {
+            fs: &fs,
+            runner: &runner,
+        };
+        let err = apply(&model, &bundle, Path::new("/var/lib/parallax"), sys)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "Can't open socket to ipset.; matching ipsets needs CAP_NET_RAW \
+                 (docs/native.md, The iptables-nft backend)"
+            ),
+            "{err}"
+        );
+        let lines = runner.command_lines();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("iptables-restore --noflush")),
+            "{lines:#?}"
+        );
     }
 
     /// Through a whole iptables-nft apply: once the rules are restored, a

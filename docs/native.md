@@ -118,6 +118,32 @@ up: the firewall table (on iptables-nft, its `PARALLAX_*` chains and ipsets),
 its rules in Docker's `DOCKER-USER` chain, and `wg0`. `sudo systemctl reload parallax` re-applies, like SIGHUP in
 Docker. Every saved change applies anyway.
 
+## The iptables-nft backend
+
+The service's two capabilities cover the default `nftables` backend. With
+`backend = "iptables-nft"` it needs `CAP_NET_RAW` too: `iptables-restore`
+looks up the ipsets its rules match through a raw socket, and fails with
+"Can't open socket to ipset" without it. `parallax doctor` checks for it, so
+the service won't start until it's there. Add it with a drop-in, which keeps
+the packaged unit as it is across upgrades:
+
+```sh
+sudo systemctl edit parallax
+```
+
+```ini
+[Service]
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+```
+
+Both lines add to the unit's own, so the service then holds three
+capabilities. Then `sudo systemctl restart parallax`. Without systemd's
+editor, put the same lines in
+`/etc/systemd/system/parallax.service.d/iptables-nft.conf` and run
+`sudo systemctl daemon-reload`. Going back to `nftables`, remove the
+drop-in (`sudo systemctl revert parallax`).
+
 ## Running `parallax` commands
 
 Run the CLI as root: `sudo parallax <command>`. While the service runs,
@@ -271,7 +297,7 @@ distribution (Arch) or Tailscale's own repository (Debian, Ubuntu), then:
 - runs as `parallax`, with `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE` as its
   only capabilities, both ambient so the `nft`, `ip` and `wg` it runs get
   them too. It can't gain more: `NoNewPrivileges`, and a bounding set of
-  just those two;
+  just those two (plus `CAP_NET_RAW` with the iptables-nft drop-in, above);
 - the whole file system is read-only except `/var/lib/parallax`,
   `/run/parallax` and `/etc/parallax`. It sees no home directories, its own
   `/tmp`, no devices and no kernel tunables, modules or logs;

@@ -14,6 +14,7 @@ const INIT_USERNS_UID_MAP: (u64, u64, u64) = (0, 0, 4_294_967_295);
 /// Bits in `/proc/self/status` capability masks.
 const CAP_NET_BIND_SERVICE_BIT: u32 = 10;
 const CAP_NET_ADMIN_BIT: u32 = 12;
+const CAP_NET_RAW_BIT: u32 = 13;
 /// Where the kernel's default puts it when the sysctl can't be read.
 const DEFAULT_UNPRIVILEGED_PORT_START: u32 = 1024;
 const UNIT_DOC: &str = "packaging/systemd/parallax.service";
@@ -28,6 +29,7 @@ const NETMAP_PROBE: &str = "table inet parallax_probe {
 }
 ";
 const SETUP_DOC: &str = "docs/setup.md";
+const IPTABLES_DOC: &str = "docs/native.md, The iptables-nft backend";
 
 /// One check and what it found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +78,9 @@ pub fn diagnose(config: Result<&Config, String>, sys: System<'_>) -> Vec<Check> 
         }
     }
     let backend = config.map_or(FirewallBackend::Nftables, |c| c.server.firewall.backend);
+    if backend == FirewallBackend::IptablesNft {
+        checks.push(Check::new("CAP_NET_RAW", check_net_raw(sys)));
+    }
     let missing = crate::apply::preflight(backend, sys);
     checks.push(Check::new(
         "tools",
@@ -372,6 +377,36 @@ fn check_net_admin(sys: System<'_>) -> Result<String, String> {
     }
     Ok(format!(
         "held, and ambient for `nft`, `ip` and `wg` (uid {})",
+        p.effective_uid
+    ))
+}
+
+/// Only for `backend = "iptables-nft"`: `iptables-restore` looks each ipset in
+/// a `--match-set` rule up through a raw socket, so without the capability
+/// every apply with a tier set fails ("Can't open socket to ipset"). The
+/// nftables backend doesn't need it, so the unit leaves it out by default.
+fn check_net_raw(sys: System<'_>) -> Result<String, String> {
+    let p = privileges(sys)?;
+    let bit = 1 << CAP_NET_RAW_BIT;
+    if p.effective & bit == 0 {
+        return Err(format!(
+            "missing, and `backend = \"iptables-nft\"` needs it: `iptables-restore` opens a raw \
+             socket to look up ipsets. Run as root, give the container `cap_add: [NET_RAW]`, or \
+             add CAP_NET_RAW to the native service with a drop-in (see {IPTABLES_DOC})"
+        ));
+    }
+    if p.effective_uid == 0 {
+        return Ok("held, for `iptables-restore`".into());
+    }
+    if p.ambient & bit == 0 {
+        return Err(format!(
+            "held, but not ambient: running as uid {}, so `iptables-restore` starts without \
+             it. Add CAP_NET_RAW to `AmbientCapabilities=` too (see {IPTABLES_DOC})",
+            p.effective_uid
+        ));
+    }
+    Ok(format!(
+        "held, and ambient for `iptables-restore` (uid {})",
         p.effective_uid
     ))
 }
@@ -1074,6 +1109,68 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert!(p[0].1.contains("`ipset` is not available"), "{}", p[0].1);
         assert!(!checks.iter().any(|c| c.name == "NETMAP"));
+    }
+
+    #[test]
+    fn iptables_backend_needs_net_raw_ambient_under_the_unit() {
+        let mut cfg = canonical_config();
+        cfg.server.firewall.backend = FirewallBackend::IptablesNft;
+        let net_raw = |status: &str| {
+            let fs = healthy_fs().with_file("/proc/self/status", status);
+            let checks = run_with(Ok(&cfg), &fs, &RecordingRunner::new());
+            let p = problems(&checks);
+            assert!(p.iter().all(|p| p.0 == "CAP_NET_RAW"), "{p:?}");
+            checks
+                .into_iter()
+                .find(|c| c.name == "CAP_NET_RAW")
+                .map(|c| c.outcome)
+        };
+
+        // The shipped unit: CAP_NET_ADMIN and CAP_NET_BIND_SERVICE only.
+        let Some(Outcome::Fail(f)) = net_raw(SERVICE_STATUS) else {
+            panic!("expected a failure");
+        };
+        assert!(
+            f.starts_with("missing, and `backend = \"iptables-nft\"` needs it"),
+            "{f}"
+        );
+        assert!(
+            f.contains("docs/native.md, The iptables-nft backend"),
+            "{f}"
+        );
+
+        // In the bounding set but not ambient: `iptables-restore` wouldn't get it.
+        let bounded =
+            SERVICE_STATUS.replace("CapEff:\t0000000000001400", "CapEff:\t0000000000003400");
+        let Some(Outcome::Fail(f)) = net_raw(&bounded) else {
+            panic!("expected a failure");
+        };
+        assert!(
+            f.starts_with("held, but not ambient: running as uid 999"),
+            "{f}"
+        );
+
+        // With the documented drop-in.
+        let drop_in = bounded.replace("CapAmb:\t0000000000001400", "CapAmb:\t0000000000003400");
+        assert_eq!(
+            net_raw(&drop_in),
+            Some(Outcome::Ok(
+                "held, and ambient for `iptables-restore` (uid 999)".into()
+            ))
+        );
+
+        // Root (Docker, or a root service) holds it without ambient.
+        assert_eq!(
+            net_raw(ROOT_STATUS),
+            Some(Outcome::Ok("held, for `iptables-restore`".into()))
+        );
+    }
+
+    #[test]
+    fn nftables_backend_does_not_ask_for_net_raw() {
+        let fs = healthy_fs().with_file("/proc/self/status", SERVICE_STATUS);
+        let checks = run(&fs, &RecordingRunner::new());
+        assert!(!checks.iter().any(|c| c.name == "CAP_NET_RAW"));
     }
 
     #[test]
