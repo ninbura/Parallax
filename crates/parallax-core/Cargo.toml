@@ -2,6 +2,7 @@
 name = "parallax-core"
 description = "Parallax engine: policy model, validation, address allocation, transports and generators"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

@@ -92,5 +92,8 @@ sudo dev/staging/staging.sh up && sudo dev/staging/staging.sh smoke   # staging 
 ## License
 
 MIT or Apache-2.0, at your option (`LICENSE-MIT`, `LICENSE-APACHE`). The
-`parallax-headscale` image also carries Headscale's BSD-3-Clause license and
-those of the Go modules built into it, under `/usr/share/licenses/headscale`.
+licenses of the Rust crates built into `parallax` are collected into
+`THIRD-PARTY-LICENSES` (`about.toml`), shipped in the packages, the image
+and each release. The `parallax-headscale` image carries Headscale's
+BSD-3-Clause license and those of the Go modules built into it, under
+`/usr/share/licenses/headscale`.

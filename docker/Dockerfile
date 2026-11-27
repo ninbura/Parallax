@@ -37,6 +37,7 @@ LABEL org.opencontainers.image.source=https://github.com/ninbura/Parallax \
 FROM runtime AS release
 ARG TARGETARCH
 COPY --chmod=0755 dist/parallax-${TARGETARCH}/parallax /usr/local/bin/parallax
+COPY dist/parallax-${TARGETARCH}/THIRD-PARTY-LICENSES /usr/share/licenses/parallax/
 
 FROM runtime AS local
 COPY --from=build /src/target/release/parallax /usr/local/bin/parallax

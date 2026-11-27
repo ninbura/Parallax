@@ -1,7 +1,8 @@
 name: release
 # A tag vX.Y.Z publishes Parallax X.Y.Z (docs/releasing.md):
 #   - the static binaries, the .deb and the Arch package from ci.yml's
-#     package job, with SHA256SUMS, on a GitHub Release;
+#     package job, with THIRD-PARTY-LICENSES and SHA256SUMS, on a GitHub
+#     Release;
 #   - ghcr.io/<owner>/parallax and parallax-headscale for amd64 and arm64,
 #     tagged X.Y.Z, plus X.Y and latest when it's the newest of those;
 #   - a build provenance attestation for each of them.
@@ -167,10 +168,13 @@ jobs:
             cp "dist/parallax-$arch/parallax" "release/parallax-$VERSION-linux-$arch"
             cp dist/parallax-$arch/*.deb dist/parallax-$arch/*.pkg.tar.zst release/
           done
+          # The same crates on both; one copy.
+          cmp dist/parallax-amd64/THIRD-PARTY-LICENSES dist/parallax-arm64/THIRD-PARTY-LICENSES
+          cp dist/parallax-amd64/THIRD-PARTY-LICENSES release/
           cd release
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" = 6
+          test "$(wc -l < SHA256SUMS)" = 7
       - uses: actions/attest-build-provenance@v4
         with:
           subject-checksums: release/SHA256SUMS

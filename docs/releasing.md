@@ -8,7 +8,7 @@ passes on the tagged commit first.
 
 | Where | What |
 |---|---|
-| [GitHub Release](https://github.com/ninbura/Parallax/releases) | `parallax-X.Y.Z-linux-amd64` and `-arm64` (static, musl), the `.deb` and Arch package for both, `SHA256SUMS` |
+| [GitHub Release](https://github.com/ninbura/Parallax/releases) | `parallax-X.Y.Z-linux-amd64` and `-arm64` (static, musl), the `.deb` and Arch package for both, `THIRD-PARTY-LICENSES`, `SHA256SUMS` |
 | `ghcr.io/ninbura/parallax` | the gateway image, amd64 and arm64, built from the same static binaries |
 | `ghcr.io/ninbura/parallax-headscale` | Headscale from the commit `docker/headscale.Dockerfile` pins, amd64 and arm64 |
 
@@ -22,6 +22,11 @@ pre-release's suffix from the Arch package's version).
 The binaries, the packages and both images have a GitHub build provenance
 attestation, which records the repository, workflow and commit that built
 them. `SHA256SUMS` itself isn't attested; it lists the attested files.
+
+`THIRD-PARTY-LICENSES` lists the license of every Rust crate in the binary,
+made by `cargo-about` from `about.toml`. A new dependency under a license
+not in its `accepted` list fails CI until someone checks the license and
+adds it.
 
 ## Cutting a release
 
