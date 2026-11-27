@@ -119,7 +119,10 @@ whatever reads or changes the configuration goes through its socket
 the daemon holds the database and applies each change as it's saved.
 `sudo parallax doctor` checks the host as root, with the configuration from
 the daemon. There's no `parallax` group. Opening the CLI to
-another user would hand them the gateway.
+another user would hand them the gateway. Files the configuration names
+(the server key, the backup passphrase) are written as `parallax`, even
+under `sudo`: root never writes where only the service's configuration
+says to.
 
 When the service isn't running, root refuses commands that would open the
 database itself:
@@ -175,10 +178,15 @@ The service can't see `/home`, `/root`, `/tmp` or `/var/tmp`. To restore
 while it runs, put the backup in the backup directory first:
 
 ```sh
-sudo install -d -m 0700 -o parallax -g parallax /var/lib/parallax/backups
-sudo install -m 0600 -o parallax -g parallax parallax-backup-20261124T153000Z.tar /var/lib/parallax/backups/
+sudo -u parallax install -d -m 0700 /var/lib/parallax/backups
+sudo -u parallax sh -c 'umask 077 && cat > /var/lib/parallax/backups/parallax-backup-20261124T153000Z.tar' < parallax-backup-20261124T153000Z.tar
 sudo parallax backup restore /var/lib/parallax/backups/parallax-backup-20261124T153000Z.tar
 ```
+
+As `parallax`, not `sudo install -o parallax`: root following a link the
+service left in its own directory would hand it whatever the link points
+to. Your shell opens the backup and `cat` only reads what it's given, so
+the file can stay private to you.
 
 **On a fresh install,** restore before the first start, from wherever the
 backup is. No `parallax.toml` is needed:

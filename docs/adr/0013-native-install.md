@@ -52,12 +52,17 @@ profile. The only file it lets `wg` open is under `/etc/wireguard`, so
 - **The CLI is root's** (`sudo parallax`). The socket stays 0600, owned by
   `parallax`, with no group for it: whoever can use the CLI controls the
   gateway. With no daemon answering, root refuses to open a database
-  another user owns, and `daemon` and `generate` refuse to write into the
-  service's directories. Root would otherwise leave root-owned `-wal`,
-  `.db-log` or generated files that the service can't open. Keys and
-  passphrases root writes into `/etc/parallax` go to the directory's owner.
-  Root writes them as new files and hands them over with `lchown`, so a
-  link the service left there can't redirect root's write or `chown`.
+  another user owns, and `daemon`, `apply` and `generate` refuse to write
+  into the service's directories. Root would otherwise leave root-owned
+  `-wal`, `.db-log` or generated files that the service can't open.
+- **Root never writes for the service.** The files the configuration names
+  (the server key, the backup passphrase, doctor's probe in the backup
+  directory) are the service's: when the configuration came from a daemon
+  running as another user (its socket's peer credentials), or the file's
+  directory belongs to one, root writes and removes them in a child of the
+  CLI running as that user. Otherwise a compromised service could hand
+  root a path outside its directories, or swap entries in its own while
+  root works there, and get root's write. Root still reads them.
 - **Packages:** one nfpm config builds the `.deb` and the Arch package from
   the static musl binary. Arch's systemd pacman hooks create the user and
   the directory, set the sysctl and load the module. The `.deb` does the

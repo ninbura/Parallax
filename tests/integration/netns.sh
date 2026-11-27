@@ -295,7 +295,15 @@ name = "friend"
 rules = [{ kind = "internet" }]
 TOML
 SOCK="$WORK/run/parallax.sock"
-P="$PARALLAX --db $WORK/parallax.db --socket $SOCK"
+# A copy every user can run. Root runs this one too in unit mode, as it
+# would /usr/bin/parallax: it starts the CLI again as the service's user for
+# the service's files, and that user can't reach a build under a home.
+cp "$PARALLAX" "$WORK/parallax"
+if [ "$MODE" = unit ]; then
+    P="$WORK/parallax --db $WORK/parallax.db --socket $SOCK"
+else
+    P="$PARALLAX --db $WORK/parallax.db --socket $SOCK"
+fi
 $P config import "$WORK/parallax.toml" >/dev/null
 $P keygen --write-config >/dev/null
 # Addresses come from the supernet in order: 10.8.0.2, .3, .4.
@@ -308,7 +316,6 @@ $P validate >/dev/null
 inns gw $P doctor > "$WORK/doctor" || { cat "$WORK/doctor"; fail "doctor rejects the gateway namespace"; }
 # Root in a user namespace (as under rootless Docker) must be refused. That root
 # maps only uid 0, so run a copy it can reach (not one under someone's home).
-cp "$PARALLAX" "$WORK/parallax"
 if inns gw unshare -U -r "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" doctor > "$WORK/doctor-userns" 2>&1; then
     fail "doctor accepted a user namespace"
 fi
@@ -978,6 +985,28 @@ inns gw nft list table inet parallax | grep -q 'log_flows\|log prefix' \
 # The records stay readable with logging off.
 [ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
 pass "(t) each level records what it covers (blocked attempts; connections and bytes) with both destinations; nobody else's; off removes the rules"
+
+# (v) Root writes what the service's configuration names as the service: a
+# configuration naming a file in root's own directory gets no write from root.
+if [ "$MODE" = unit ]; then
+    mkdir -m 0700 "$WORK/rootonly"
+    echo untouched > "$WORK/rootonly/victim"
+    $P config export > "$WORK/before.toml" || fail "(v) config export"
+    sed "s#^passphrase_file = .*#passphrase_file = \"$WORK/rootonly/victim\"#" "$WORK/before.toml" > "$WORK/rogue.toml"
+    grep -q "rootonly/victim" "$WORK/rogue.toml" || fail "(v) the exported configuration has no passphrase_file"
+    $P config import "$WORK/rogue.toml" >/dev/null || fail "(v) importing through the daemon"
+    if $P backup passphrase --generate --replace > "$WORK/rogue.out" 2>&1; then
+        fail "(v) root wrote the file the service's configuration named in root's directory"
+    fi
+    [ "$(cat "$WORK/rootonly/victim")" = untouched ] || fail "(v) root's file changed"
+    grep -q "(as uid $(id -u nobody)).*$WORK/rootonly/victim: Permission denied" "$WORK/rogue.out" \
+        || { cat "$WORK/rogue.out"; fail "(v) the refusal isn't the service's user being denied root's file"; }
+    $P config import "$WORK/before.toml" >/dev/null || fail "(v) putting the configuration back"
+    $P backup passphrase --generate --replace > "$WORK/own.out" 2>&1 \
+        || { cat "$WORK/own.out"; fail "(v) the service's own passphrase file"; }
+    [ "$(stat -c %U "$WORK/backup.passphrase")" = nobody ] || fail "(v) the passphrase isn't the service's"
+    pass "(v) root writes the files the service's configuration names as the service, and nowhere else"
+fi
 
 # (u) Tailscale peers follow Headscale: a real Headscale and a node logged in to it
 # (userspace tailscaled) in the gateway's namespace. The daemon puts the node's

@@ -146,6 +146,13 @@ enum Command {
     },
     /// Show whether a daemon is running and how its last apply went.
     Status,
+    /// One file operation as whoever runs it; root runs it as the service's
+    /// user (`owner::ConfigFiles`).
+    #[command(hide = true)]
+    File {
+        #[command(subcommand)]
+        op: owner::FileOp,
+    },
     /// Create the gateway's WireGuard private key file and print its public key.
     Keygen {
         /// Also record the public key in the configuration.
@@ -485,8 +492,24 @@ fn read_records(ctx: &Ctx, query: &Query) -> anyhow::Result<Vec<(i64, Record)>> 
         Some(Reply::Logs { records }) => Ok(records),
         Some(other) => Err(unexpected(other)),
         None => {
-            let (config, _, _) = ctx.load_full()?;
+            let (config, revision, _) = ctx.load_full()?;
+            // A daemon that skipped the logs but answered for the
+            // configuration: its logs.db isn't root's to open.
+            if revision.is_some() {
+                bail!(
+                    "the daemon at {} didn't answer for the logs; run it again",
+                    ctx.socket.display()
+                );
+            }
             let path = config.server.logs.path;
+            if let Some((who, sudo_u)) = owner::database_belongs_to_another_user(&path) {
+                bail!(
+                    "{} belongs to {who}, and no daemon answers on {}: start the service, or \
+                     run this as that user (`sudo -u {sudo_u} parallax log ...`)",
+                    path.display(),
+                    ctx.socket.display()
+                );
+            }
             if !path.exists() {
                 return Ok(Vec::new());
             }
@@ -684,6 +707,8 @@ const SAVE_ATTEMPTS: usize = 10;
 pub(crate) struct Ctx {
     db: PathBuf,
     socket: PathBuf,
+    /// Set once a daemon running as another user answered, when this is root.
+    daemon_user: std::cell::Cell<Option<owner::User>>,
 }
 
 /// How a change was saved.
@@ -717,6 +742,15 @@ impl Ctx {
                 })
             }
         };
+        let user = owner::daemon_user(&stream).with_context(|| {
+            format!(
+                "reading which user the daemon at {} runs as",
+                self.socket.display()
+            )
+        })?;
+        if user.is_some() {
+            self.daemon_user.set(user);
+        }
         stream
             .write_all(&protocol::encode_request(request, &self.db)?)
             .with_context(|| format!("writing to the daemon at {}", self.socket.display()))?;
@@ -727,6 +761,15 @@ impl Ctx {
         {
             Reply::Error { message } => Err(anyhow!(message)),
             reply => Ok(Some(reply)),
+        }
+    }
+
+    /// The files the configuration names, as this process should touch
+    /// them. Ask after loading the configuration: as root, the files of a
+    /// configuration a daemon handed out are its user's to write.
+    pub(crate) fn config_files(&self) -> owner::ConfigFiles {
+        owner::ConfigFiles {
+            from: self.daemon_user.get(),
         }
     }
 
@@ -985,7 +1028,8 @@ pub(crate) fn find_tailnet(config: &Config) -> Result<Option<Tailnet>, String> {
     if !parallax_core::headscale::needed(config) {
         return Ok(None);
     }
-    let api = headscale::Api::new(&config.server);
+    // Without a daemon (or in it): the configuration is this process's own.
+    let api = headscale::Api::new(&config.server, owner::ConfigFiles::default());
     parallax_core::headscale::nodes(&config.server.headscale, &api)
         .map(|nodes| Some(parallax_core::headscale::tailnet(&nodes)))
         .map_err(|e| e.to_string())
@@ -1100,6 +1144,7 @@ fn run() -> anyhow::Result<()> {
     let ctx = Ctx {
         db: cli.db,
         socket: cli.socket,
+        daemon_user: std::cell::Cell::new(None),
     };
     let db = ctx.db();
     match cli.command {
@@ -1160,6 +1205,16 @@ fn run() -> anyhow::Result<()> {
             }
             Some(other) => return Err(unexpected(other)),
             None => {
+                if let Some((who, _)) = owner::belongs_to_another_user(&out.out) {
+                    bail!(
+                        "{} belongs to {who}, and no daemon answers on {}: files applied there \
+                         as root would be ones the service can't replace. Start the service \
+                         (`sudo systemctl start parallax`) so this goes through it, or apply \
+                         elsewhere (`-o <dir>`)",
+                        out.out.display(),
+                        ctx.socket.display()
+                    );
+                }
                 // The database stays open (locked) through the apply, so a
                 // daemon starting meanwhile can't apply something newer first.
                 let (warnings, log) = block_on(async {
@@ -1245,6 +1300,7 @@ fn run() -> anyhow::Result<()> {
             write_config,
             if_missing,
         } => keygen(&ctx, write_config, if_missing)?,
+        Command::File { op } => owner::file_command(op)?,
         Command::Config { command } => config_command(&ctx, command)?,
         Command::Backup { command } => backup::run(&ctx, command)?,
         Command::Grant { command } => grant_command(&ctx, command)?,
@@ -1254,7 +1310,7 @@ fn run() -> anyhow::Result<()> {
             command: HeadscaleCommand::Status,
         } => {
             let config = ctx.load()?;
-            let api = headscale::Api::new(&config.server);
+            let api = headscale::Api::new(&config.server, ctx.config_files());
             for line in parallax_core::headscale::status(&config, &api)? {
                 outln!("{line}")?;
             }
@@ -1272,12 +1328,14 @@ fn run() -> anyhow::Result<()> {
 
 fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
     let runner = RealRunner;
-    let sys = System {
-        fs: &RealFs,
-        runner: &runner,
-    };
     // Not `load_for_generation`: the Headscale check below asks it itself.
     let loaded = ctx.load_full().map_err(|e| format!("{e:#}"));
+    // As root, the backup directory is probed as the service would write it.
+    let files = ctx.config_files();
+    let sys = System {
+        fs: &files,
+        runner: &runner,
+    };
     let config = loaded
         .as_ref()
         .map(|(config, _, _)| config)
@@ -1286,7 +1344,7 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
     if let Ok((config, _, learned)) = &loaded {
         let known = public_ip::effective(&config.server, learned.public_ip);
         checks.push(parallax_core::doctor::public_ip_check(config, known));
-        let api = headscale::Api::new(&config.server);
+        let api = headscale::Api::new(&config.server, files);
         checks.push(parallax_core::headscale::check(config, &api));
     }
     let mut failed = 0;
@@ -1308,11 +1366,11 @@ fn doctor(ctx: &Ctx) -> anyhow::Result<()> {
 }
 
 fn keygen(ctx: &Ctx, write_config: bool, if_missing: bool) -> anyhow::Result<()> {
-    let fs = RealFs;
     let db = ctx.db();
     let config = ctx.load()?;
+    let fs = ctx.config_files();
     let path = config.server.wireguard.private_key_file.clone();
-    if let Some(existing) = fs.read(&path)? {
+    if let Some(existing) = fs.read_secret(&path)? {
         if if_missing {
             // Finish an earlier run that wrote the key but stopped before
             // recording its public half.
@@ -1345,7 +1403,6 @@ fn keygen(ctx: &Ctx, write_config: bool, if_missing: bool) -> anyhow::Result<()>
     }
     let kp = OsKeyGenerator.keypair();
     fs.write(&path, &format!("{}\n", kp.private.expose_base64()), true)?;
-    owner::hand_to_directory_owner(&path)?;
     // Record the key before printing anything, so a reader that goes away
     // can't leave a new key file with the old public key in the database.
     let saved = if write_config {
@@ -1443,7 +1500,8 @@ fn config_command(ctx: &Ctx, command: ConfigCommand) -> anyhow::Result<()> {
             let text = ctx.load()?.to_toml()?;
             match output {
                 Some(path) => {
-                    RealFs.write(&path, &text, true)?;
+                    // As root, into another user's directory as that user.
+                    owner::ConfigFiles::default().write(&path, &text, true)?;
                     eoutln!("wrote {} (mode 0600)", path.display());
                 }
                 None => out!("{text}")?,

@@ -965,3 +965,48 @@ fn a_closed_stderr_changes_nothing() {
     let (ok, shown, err) = s.run(&["peer", "show", "tablet"]);
     assert!(ok && shown.contains("tablet"), "{shown}{err}");
 }
+
+/// What root runs as the service's user for a file the configuration names
+/// (`owner::ConfigFiles`): stdin replaces the file, owner-only, its
+/// directory made if missing; read prints it; a missing file is exit 4.
+#[test]
+fn file_writes_and_removes_as_whoever_runs_it() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("file");
+    let target = s.dir.join("keys/wg-server.key");
+    let path = target.to_string_lossy();
+    let mut child = s
+        .command(&["file", "write", &path])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"secret\n").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "secret\n");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&target), 0o600);
+    assert_eq!(mode(&s.dir.join("keys")), 0o700);
+    // Hidden: only Parallax runs it.
+    let (_, help, _) = s.run(&["--help"]);
+    assert!(!help.contains("\n  file "), "{help}");
+
+    let read = s.command(&["file", "read", &path]).output().unwrap();
+    assert!(read.status.success());
+    assert_eq!(read.stdout, b"secret\n");
+    // What `ConfigFiles` passes: `--`, so a path starting with `-` is a path.
+    let dashed = s
+        .command(&["file", "read", "--", "-not-a-flag"])
+        .current_dir(&s.dir)
+        .output()
+        .unwrap();
+    assert_eq!(dashed.status.code(), Some(4), "{dashed:?}");
+
+    let removed = s.command(&["file", "remove", &path]).status().unwrap();
+    assert!(removed.success());
+    assert!(!target.exists());
+    let again = s.command(&["file", "remove", &path]).status().unwrap();
+    assert_eq!(again.code(), Some(4));
+    let gone = s.command(&["file", "read", &path]).status().unwrap();
+    assert_eq!(gone.code(), Some(4));
+}
