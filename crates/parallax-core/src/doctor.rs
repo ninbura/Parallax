@@ -1112,6 +1112,58 @@ mod tests {
     }
 
     #[test]
+    fn iptables_backend_refuses_the_legacy_variant() {
+        let mut cfg = canonical_config();
+        cfg.server.firewall.backend = FirewallBackend::IptablesNft;
+        let runner = RecordingRunner::new();
+        for tool in ["iptables", "iptables-restore"] {
+            runner.respond_to(
+                tool,
+                &["--version"],
+                Output {
+                    status: 0,
+                    stdout: format!("{tool} v1.8.10 (legacy)\n"),
+                    stderr: String::new(),
+                },
+            );
+        }
+        let checks = run_with(Ok(&cfg), &healthy_fs(), &runner);
+        let p = problems(&checks);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].0, "tools");
+        assert!(
+            p[0].1
+                .contains("`iptables` is the legacy variant (iptables v1.8.10 (legacy))"),
+            "{}",
+            p[0].1
+        );
+        assert!(
+            p[0].1.contains("`iptables-restore` is the legacy variant"),
+            "{}",
+            p[0].1
+        );
+        assert!(p[0]
+            .1
+            .contains("update-alternatives --set iptables /usr/sbin/iptables-nft"));
+
+        // The nf_tables variant passes.
+        let runner = RecordingRunner::new();
+        runner.respond_to(
+            "iptables",
+            &["--version"],
+            Output {
+                status: 0,
+                stdout: "iptables v1.8.13 (nf_tables)\n".into(),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(
+            problems(&run_with(Ok(&cfg), &healthy_fs(), &runner)),
+            vec![]
+        );
+    }
+
+    #[test]
     fn iptables_backend_needs_net_raw_ambient_under_the_unit() {
         let mut cfg = canonical_config();
         cfg.server.firewall.backend = FirewallBackend::IptablesNft;

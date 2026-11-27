@@ -121,7 +121,7 @@ It checks the following. `backups` only warns: the gateway runs without them.
 | CAP_NET_BIND_SERVICE | the DNS or proxy port is below `net.ipv4.ip_unprivileged_port_start` and the capability is missing (only checked then) | run as root, or the native unit's capabilities |
 | CAP_NET_RAW (`iptables-nft` backend only) | the capability is missing, or, not running as root, it isn't ambient; `iptables-restore` needs it to look up ipsets | Docker grants it by default; natively, the drop-in in [docs/native.md](native.md) (The iptables-nft backend) |
 | ip_forward | `net.ipv4.ip_forward` is 0 | `/etc/sysctl.d/` (above) |
-| tools | `nft`, `wg` or `ip` is missing | the image ships them; natively, install them |
+| tools | `nft`, `wg` or `ip` is missing; for `iptables-nft`, `iptables`, `iptables-restore` or `ipset` is missing, or `iptables` is the legacy variant | the image ships them; natively, install them (and `update-alternatives --set iptables /usr/sbin/iptables-nft`) |
 | interface \<name\> | a configured LAN or WAN interface doesn't exist | the name in the configuration (`ip link`, `parallax config edit`) |
 | wireguard | a WireGuard interface can't be created | `/etc/modules-load.d/` (above) |
 | NETMAP | the kernel or `nft` rejects prefix NAT (`nftables` backend only) | a newer kernel or nftables |

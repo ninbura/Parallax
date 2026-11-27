@@ -124,25 +124,26 @@ The service's two capabilities cover the default `nftables` backend. With
 `backend = "iptables-nft"` it needs `CAP_NET_RAW` too: `iptables-restore`
 looks up the ipsets its rules match through a raw socket, and fails with
 "Can't open socket to ipset" without it. `parallax doctor` checks for it, so
-the service won't start until it's there. Add it with a drop-in, which keeps
-the packaged unit as it is across upgrades:
+the service won't start until it's there. Add it with a drop-in of its own,
+which keeps the packaged unit as it is across upgrades:
 
 ```sh
-sudo systemctl edit parallax
-```
-
-```ini
-[Service]
-CapabilityBoundingSet=CAP_NET_RAW
-AmbientCapabilities=CAP_NET_RAW
+sudo mkdir -p /etc/systemd/system/parallax.service.d
+printf '[Service]\nCapabilityBoundingSet=CAP_NET_RAW\nAmbientCapabilities=CAP_NET_RAW\n' \
+  | sudo tee /etc/systemd/system/parallax.service.d/iptables-nft.conf
+sudo systemctl daemon-reload
+sudo systemctl restart parallax
 ```
 
 Both lines add to the unit's own, so the service then holds three
-capabilities. Then `sudo systemctl restart parallax`. Without systemd's
-editor, put the same lines in
-`/etc/systemd/system/parallax.service.d/iptables-nft.conf` and run
-`sudo systemctl daemon-reload`. Going back to `nftables`, remove the
-drop-in (`sudo systemctl revert parallax`).
+capabilities. Going back to `nftables`, remove just that file, then
+`daemon-reload` and restart again. (`systemctl revert` would also remove any
+other overrides you made.)
+
+The backend also needs the nf_tables variant of `iptables`, which
+`parallax doctor` checks. The legacy one writes other tables, and its lock
+in `/run` is read-only to the service. On Debian and Ubuntu:
+`sudo update-alternatives --set iptables /usr/sbin/iptables-nft`.
 
 ## Running `parallax` commands
 

@@ -432,7 +432,6 @@ if [ "$MODE" = unit ]; then
     "${AS_UNIT[@]}" --unit="${PREFIX}ipt-import" -p Type=exec --wait --pipe \
         "$WORK/parallax" --db "$WORK/ipt/parallax.db" config import "$WORK/ipt/parallax.toml" > "$WORK/ipt/import" 2>&1 \
         || { cat "$WORK/ipt/import"; fail "could not import the iptables-nft configuration as the service"; }
-    inns gw ipset create netraw_probe hash:net
     ipt_doctor() { # unit name, then systemd-run's options
         local name=$1; shift
         "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe \
@@ -440,7 +439,8 @@ if [ "$MODE" = unit ]; then
     }
     ipt_restore() { # unit name, then systemd-run's options
         local name=$1; shift
-        "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe iptables-restore --test --noflush "$WORK/ipt/rules"
+        "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe \
+            /bin/sh -c 'ipset create -exist netraw_probe hash:net && iptables-restore --noflush "$1"' sh "$WORK/ipt/rules"
     }
     if ipt_doctor ipt-doctor "${AS_UNIT[@]}" > "$WORK/ipt/doctor" 2>&1; then
         cat "$WORK/ipt/doctor"; fail "doctor passed iptables-nft under the unit without CAP_NET_RAW"
@@ -456,10 +456,16 @@ if [ "$MODE" = unit ]; then
         || { cat "$WORK/ipt/doctor-raw"; fail "doctor fails iptables-nft under the unit with the drop-in"; }
     grep -q '^ok    CAP_NET_RAW: held, and ambient' "$WORK/ipt/doctor-raw" \
         || { cat "$WORK/ipt/doctor-raw"; fail "doctor did not see CAP_NET_RAW as ambient with the drop-in"; }
+    inns gw iptables -S PARALLAX_PROBE >/dev/null 2>&1 && fail "iptables-restore loaded rules without CAP_NET_RAW"
+    # With it the service makes the set and commits the rule itself, as apply does.
     ipt_restore ipt-restore-raw "${WITH_NET_RAW[@]}" > "$WORK/ipt/restore-raw" 2>&1 \
-        || { cat "$WORK/ipt/restore-raw"; fail "iptables-restore can't match an ipset under the unit with the drop-in"; }
+        || { cat "$WORK/ipt/restore-raw"; fail "the service can't make an ipset and load a rule matching it with the drop-in"; }
+    inns gw iptables -S PARALLAX_PROBE | grep -q -- '-m set --match-set netraw_probe src -j ACCEPT' \
+        || { inns gw iptables -S PARALLAX_PROBE; fail "the rule matching the service's ipset is not in"; }
+    inns gw iptables -F PARALLAX_PROBE
+    inns gw iptables -X PARALLAX_PROBE
     inns gw ipset destroy netraw_probe
-    pass "iptables-nft under the unit: doctor asks for CAP_NET_RAW, and with the drop-in ipset rules load"
+    pass "iptables-nft under the unit: doctor asks for CAP_NET_RAW; with the drop-in the service makes an ipset and loads a rule matching it"
 fi
 
 # The daemon applies, then serves DNS and the proxy on the tunnel address. Drift

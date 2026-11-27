@@ -26,33 +26,39 @@ pub struct ApplyReport {
 /// Check the host has the tools apply runs. Returns one message per missing tool.
 pub fn preflight(backend: FirewallBackend, sys: System<'_>) -> Vec<String> {
     let mut missing = Vec::new();
-    let fw_bin = match backend {
-        FirewallBackend::Nftables => "nft",
-        FirewallBackend::IptablesNft => "iptables",
+    // `--version`'s output, or None when the tool doesn't run.
+    let version = |tool: &str| {
+        sys.runner
+            .run(tool, &["--version"], None)
+            .ok()
+            .filter(|o| o.ok())
+            .map(|o| o.stdout)
     };
-    if sys
-        .runner
-        .run(fw_bin, &["--version"], None)
-        .map(|o| !o.ok())
-        .unwrap_or(true)
-    {
-        missing.push(format!(
-            "`{fw_bin}` is not available: install {}",
-            match backend {
-                FirewallBackend::Nftables => "nftables",
-                FirewallBackend::IptablesNft => "iptables (nft variant)",
+    match backend {
+        FirewallBackend::Nftables => {
+            if version("nft").is_none() {
+                missing.push("`nft` is not available: install nftables".into());
             }
-        ));
-    }
-    if backend == FirewallBackend::IptablesNft {
-        for (tool, package) in [("iptables-restore", "iptables"), ("ipset", "ipset")] {
-            if sys
-                .runner
-                .run(tool, &["--version"], None)
-                .map(|o| !o.ok())
-                .unwrap_or(true)
-            {
-                missing.push(format!("`{tool}` is not available: install {package}"));
+        }
+        FirewallBackend::IptablesNft => {
+            for tool in ["iptables", "iptables-restore"] {
+                match version(tool) {
+                    None => missing.push(format!(
+                        "`{tool}` is not available: install iptables (nft variant)"
+                    )),
+                    // Debian and Ubuntu switch both with one alternative. The
+                    // legacy variant writes other tables, and takes a lock in
+                    // /run that the native service can't write.
+                    Some(v) if v.contains("(legacy)") => missing.push(format!(
+                        "`{tool}` is the legacy variant ({}); `backend = \"iptables-nft\"` needs \
+                         the nf_tables one: `update-alternatives --set iptables /usr/sbin/iptables-nft`",
+                        v.trim()
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if version("ipset").is_none() {
+                missing.push("`ipset` is not available: install ipset".into());
             }
         }
     }
