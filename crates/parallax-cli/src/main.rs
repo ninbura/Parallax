@@ -1242,8 +1242,8 @@ pub(crate) fn preview(config: &Config, today: Date, learned: &Learned) -> anyhow
 
 /// Generate, write and reconcile the live gateway with what the gateway
 /// learned. Returns the warnings and the apply log.
-/// `before_live` runs once the files are written, before anything live
-/// changes; its error stops the apply there.
+/// `before_live` runs before anything is written or changed; its error
+/// stops the apply there.
 pub(crate) fn apply_config(
     config: &Config,
     out: &Path,
@@ -1262,9 +1262,8 @@ pub(crate) fn apply_config(
         fs: &RealFs,
         runner: &runner,
     };
-    let log = parallax_core::apply::write(&model, &bundle, out, sys)?;
     before_live(&model)?;
-    let report = parallax_core::apply::reconcile(&model, &bundle, out, sys, log)?;
+    let report = parallax_core::apply::apply(&model, &bundle, out, sys)?;
     Ok((warnings, report.log))
 }
 

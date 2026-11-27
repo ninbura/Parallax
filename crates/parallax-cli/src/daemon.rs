@@ -975,14 +975,15 @@ struct Engine {
     tailnet_problem: Option<String>,
 }
 
-/// How long the proxy may take to load the routes an apply needs first.
+/// How long the proxy may take to serve the routes an apply needs first
+/// (its own wait for open connections is shorter).
 const PROXY_TAKES: Duration = Duration::from_secs(10);
 
-/// Before anything live changes: an apply that fails partway can leave the
-/// old firewall, the new one or (iptables) a mix, so the proxy first serves
-/// only what both its routes `served` and the `new` ones grant (issue #71).
-/// Waits until it does; if it doesn't in time, nothing live has changed and
-/// the apply stops.
+/// Before the apply writes or changes anything: one that fails partway can
+/// leave the old firewall, the new one or (iptables) a mix, so the proxy
+/// first serves only what both its routes `served` and the `new` ones grant
+/// (issue #71). Waits until it does; if it doesn't in time, nothing has
+/// changed and the apply stops.
 fn narrow_proxy(
     rt: &tokio::runtime::Runtime,
     servers: Option<&Reloaders>,
@@ -1001,9 +1002,11 @@ fn narrow_proxy(
         // Inside the runtime: a timer needs its clock.
         match rt.block_on(async { tokio::time::timeout(PROXY_TAKES, taken).await }) {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => bail!("the HTTPS proxy has stopped"),
+            Ok(Err(_)) => bail!(
+                "the HTTPS proxy couldn't take its routes for the change (stopped, or open connections didn't move on); nothing was changed"
+            ),
             Err(_) => bail!(
-                "the HTTPS proxy didn't take its routes for the change within {} s; nothing live was changed",
+                "the HTTPS proxy didn't take its routes for the change within {} s; nothing was changed",
                 PROXY_TAKES.as_secs()
             ),
         }
@@ -1691,7 +1694,7 @@ mod tests {
         let err = narrow_proxy(&engine_rt(), Some(&stopped()), &mut served, &routes(&[]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("the HTTPS proxy has stopped"), "{err}");
+        assert!(err.contains("the HTTPS proxy couldn't take"), "{err}");
         assert_eq!(served, Some(routes(&["10.8.2.1/32"])));
     }
 }
