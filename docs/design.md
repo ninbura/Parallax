@@ -289,17 +289,26 @@ or (iptables) a mix (issue #71). So before anything live changes, the daemon
 hands the proxy only what its current routes and the new ones both grant:
 the sites both have alike (hostname, service, upstream), each for the
 addresses both allow, with the current listener, certificates and upstream
-CA bundle (a new bundle may trust more upstreams; issue #104). It waits
-until the proxy serves them, and stops the apply if that takes more than
-10 s. The proxy puts routes in force in the order it gets them, even when
+CA bundle (a new bundle may trust more upstreams; issue #104). An address
+that changes hands (a WireGuard key or Tailscale node gives way to another)
+is allowed nothing meanwhile, whatever both grant it: until WireGuard has
+changed, the old device may still send from it. The daemon remembers every
+device that may hold each address since the last apply that worked, failed
+applies included (issue #115). It waits until the proxy serves them and
+every open connection, WebSocket relay and still-streaming response has
+moved on from the routes they replace, and stops the apply if that takes
+more than 10 s. Narrowed routes that don't load leave the proxy refusing
+everything, which grants less than either; the daemon records that and
+goes on (issue #114). The proxy puts routes in force in the order it gets them, even when
 the daemon has stopped waiting, so after a failure the daemon counts the
 overlap as served (issue #103), and narrows it again on each failed retry,
 until an apply succeeds. Until the proxy has confirmed what it was last
 handed, each retry hands it over again and waits, even with nothing new to
 take away. Only once the apply has worked does the proxy get
 the new routes in full. The daemon waits until they're in force; if they
-don't load, the proxy refuses everything and the apply counts as failed, so
-the next tick tries again.
+don't load, the proxy refuses everything, the daemon records that it serves
+nothing (issue #114), and the apply counts as failed, so the next tick tries
+again.
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
