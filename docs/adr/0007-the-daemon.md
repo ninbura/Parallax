@@ -28,7 +28,7 @@ socket.
   serves them. It gets the new routes in full once the apply has worked.
   *Amended (issues #102, #103):* the daemon records the narrowed routes as
   served even when the wait fails, since the proxy puts routes in force in
-  the order sent; new routes that don't load after an apply count as a
+  the order sent, and waits for them again on the next try; new routes that don't load after an apply count as a
   failed apply, retried like any other. When the proxy stops, its open
   connections close instead of keeping their last routes.
   *Amended (issue #37):* the DNS server gets its routes the same way. Before

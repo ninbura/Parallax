@@ -124,7 +124,7 @@ type Shared = watch::Receiver<Arc<State>>;
 struct Handover {
     routes: ProxyRoutes,
     loaded: oneshot::Sender<std::result::Result<(), String>>,
-    checked: oneshot::Sender<()>,
+    checked: oneshot::Sender<bool>,
 }
 
 /// Hands a proxy new routes ([`Proxy::reloader`]).
@@ -138,10 +138,11 @@ pub struct Taking {
     /// Once they're in force: `Ok` when they loaded, or why they didn't,
     /// in which case the proxy refuses every connection until some do.
     pub loaded: oneshot::Receiver<std::result::Result<(), String>>,
-    /// `()` once they're in force and every open connection has checked
-    /// them. An error also when connections didn't all check them in time.
-    /// Drop it when nobody waits: the proxy then doesn't wait either.
-    pub checked: oneshot::Receiver<()>,
+    /// Once they're in force, whether every open connection has checked
+    /// them in time (`false` when some still held older routes after a few
+    /// seconds). Drop it when nobody waits: the proxy then doesn't wait
+    /// either.
+    pub checked: oneshot::Receiver<bool>,
 }
 
 impl Reload {
@@ -399,10 +400,11 @@ async fn reloader(
                 replaced.push(old);
                 let _ = loaded.send(outcome);
                 // Not confirmed until then: the daemon changes the firewall
-                // next. Dropping `checked` tells it so. Nobody waiting: the
-                // next confirmation waits for these too.
-                if !checked.is_closed() && drained(&mut replaced).await {
-                    let _ = checked.send(());
+                // next. Nobody waiting: the next confirmation waits for
+                // these too.
+                if !checked.is_closed() {
+                    let all = drained(&mut replaced).await;
+                    let _ = checked.send(all);
                 }
             }
             _ = tick.tick() => {

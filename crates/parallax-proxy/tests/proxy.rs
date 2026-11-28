@@ -254,7 +254,7 @@ impl Env {
     /// them. Returns whether they loaded.
     async fn reload_with(&self, routes: ProxyRoutes) -> Result<(), String> {
         let taking = self.reload.send(routes);
-        taking.checked.await.unwrap();
+        assert!(taking.checked.await.unwrap(), "connections didn't move on");
         taking.loaded.await.unwrap()
     }
 
@@ -601,10 +601,11 @@ async fn open_connections_close_when_the_proxy_stops() {
     let _ = (&mut env.task).await;
     let mut buf = [0u8; 4];
     let _ = ws.write_all(b"ping").await;
+    // Closed, not just quiet: an end or an error before the timeout.
     assert!(
-        !matches!(
+        matches!(
             tokio::time::timeout(Duration::from_secs(5), ws.read(&mut buf)).await,
-            Ok(Ok(n)) if n > 0
+            Ok(Ok(0) | Err(_))
         ),
         "the WebSocket must be closed"
     );

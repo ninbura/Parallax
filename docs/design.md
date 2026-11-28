@@ -294,7 +294,9 @@ until the proxy serves them, and stops the apply if that takes more than
 10 s. The proxy puts routes in force in the order it gets them, even when
 the daemon has stopped waiting, so after a failure the daemon counts the
 overlap as served (issue #103), and narrows it again on each failed retry,
-until an apply succeeds. Only once the apply has worked does the proxy get
+until an apply succeeds. Until the proxy has confirmed what it was last
+handed, each retry hands it over again and waits, even with nothing new to
+take away. Only once the apply has worked does the proxy get
 the new routes in full. The daemon waits until they're in force; if they
 don't load, the proxy refuses everything and the apply counts as failed, so
 the next tick tries again.

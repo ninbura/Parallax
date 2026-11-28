@@ -964,6 +964,10 @@ struct Engine {
     /// order sent. Only what a good apply made, or what that and every
     /// apply since, failed ones too, all grant (issue #71).
     proxy_routes: Option<ProxyRoutes>,
+    /// Whether the proxy has confirmed `proxy_routes`: in force, and no open
+    /// connection on older ones. Until it has, the next apply waits for it
+    /// again, even with nothing new to narrow (#103).
+    proxy_confirmed: bool,
     /// The routes the DNS server answers by, or will next, likewise: an
     /// address that changes hands answers neither owner's names beyond
     /// what both may see until the apply has worked (issue #37).
@@ -1029,11 +1033,13 @@ fn narrow_dns(
 /// leave the old firewall, the new one or (iptables) a mix, so the proxy
 /// first serves only what both its routes `served` and the `new` ones grant
 /// (issue #71). Waits until it does; if it doesn't in time, the apply stops
-/// before anything else has changed.
+/// before anything else has changed. `confirmed` says whether the proxy
+/// has confirmed `served`.
 fn narrow_proxy(
     rt: &tokio::runtime::Runtime,
     proxy: Option<&parallax_proxy::Reload>,
     served: &mut Option<ProxyRoutes>,
+    confirmed: &mut bool,
     new: &ProxyRoutes,
 ) -> anyhow::Result<()> {
     // No proxy runs before the first apply has worked.
@@ -1041,29 +1047,29 @@ fn narrow_proxy(
         return Ok(());
     };
     let both = generate::proxy::overlap(before, new);
-    if both.serves_alike(before) {
+    if *confirmed && both.serves_alike(before) {
         return Ok(());
     }
-    let parallax_proxy::Taking {
-        checked,
-        mut loaded,
-    } = proxy.send(both.clone());
+    let checked = proxy.send(both.clone()).checked;
     // The proxy serves them next whatever comes of the wait: routes go in
-    // in the order sent, even once nobody waits for them (#103).
+    // in the order sent, even once nobody waits for them (#103). Its wait
+    // for open connections also covers every older routes still held.
     *served = Some(both);
+    *confirmed = false;
     // Inside the runtime: a timer needs its clock.
     let checked = rt.block_on(async { tokio::time::timeout(PROXY_TAKES, checked).await });
-    const LEFT: &str = "the firewall and WireGuard weren't changed, and the proxy serves only what both configurations grant until an apply works";
+    const LEFT: &str = "the firewall and WireGuard weren't changed, and the proxy is held to what both configurations grant until an apply works";
     match checked {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => match loaded.try_recv() {
-            // Told whether they loaded: they went in, and the wait for
-            // open connections ran out.
-            Ok(_) => bail!(
-                "the HTTPS proxy's open connections didn't all move on to its routes for the change in time; {LEFT}"
-            ),
-            Err(_) => bail!("the HTTPS proxy has stopped; {LEFT}"),
-        },
+        Ok(Ok(true)) => {
+            *confirmed = true;
+            Ok(())
+        }
+        Ok(Ok(false)) => bail!(
+            "the HTTPS proxy's open connections didn't all move on to its routes for the change in time; {LEFT}"
+        ),
+        Ok(Err(_)) => bail!(
+            "the HTTPS proxy has stopped; the firewall and WireGuard weren't changed"
+        ),
         Err(_) => bail!(
             "the HTTPS proxy didn't take its routes for the change within {} s; {LEFT}",
             PROXY_TAKES.as_secs()
@@ -1139,6 +1145,8 @@ impl Engine {
             applied: None,
             servers: None,
             proxy_routes: None,
+            // The proxy starts on the routes the first apply made.
+            proxy_confirmed: true,
             dns_routes: None,
             backups,
             public_ip_problems: None,
@@ -1287,6 +1295,7 @@ impl Engine {
         let mut made = None;
         let (servers, rt) = (&self.servers, &self.rt);
         let (served, dns_served) = (&mut self.proxy_routes, &mut self.dns_routes);
+        let confirmed = &mut self.proxy_confirmed;
         let applied = crate::apply_config(
             &self.view.config,
             &self.out,
@@ -1295,7 +1304,13 @@ impl Engine {
             |model| {
                 let new = generate::proxy::build(model);
                 let new_dns = generate::dns::build(model);
-                narrow_proxy(rt, servers.as_ref().map(|s| &s.proxy), served, &new)?;
+                narrow_proxy(
+                    rt,
+                    servers.as_ref().map(|s| &s.proxy),
+                    served,
+                    confirmed,
+                    &new,
+                )?;
                 narrow_dns(rt, servers.as_ref().map(|s| &s.dns), dns_served, &new_dns)?;
                 made = Some((new, new_dns));
                 Ok(())
@@ -1319,6 +1334,9 @@ impl Engine {
                     // taken after these.
                     drop(servers.dns.send(dns.clone()));
                     proxy_failed = widen_proxy(&self.rt, &servers.proxy, routes).err();
+                    // In force (or refusing everything), and wider than
+                    // anything older an open connection may still hold.
+                    self.proxy_confirmed = proxy_failed.is_none();
                 }
                 if let Some((routes, dns)) = made {
                     self.proxy_routes = Some(routes);
@@ -1769,7 +1787,15 @@ mod tests {
         let listener = proxy_rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         proxy_rt.spawn(proxy.run(listener));
         let mut served = Some(routes(&["10.8.2.1/32"]));
-        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap();
+        let mut confirmed = true;
+        narrow_proxy(
+            &engine_rt(),
+            Some(&reload),
+            &mut served,
+            &mut confirmed,
+            &routes(&[]),
+        )
+        .unwrap();
         assert_eq!(served, Some(routes(&[])));
     }
 
@@ -1778,8 +1804,16 @@ mod tests {
     #[test]
     fn an_unchanged_proxy_is_not_asked() {
         let mut served = Some(routes(&["10.8.2.1/32"]));
+        let mut confirmed = true;
         let wider = routes(&["10.8.2.1/32", "10.8.3.0/24"]);
-        narrow_proxy(&engine_rt(), Some(&stopped()), &mut served, &wider).unwrap();
+        narrow_proxy(
+            &engine_rt(),
+            Some(&stopped()),
+            &mut served,
+            &mut confirmed,
+            &wider,
+        )
+        .unwrap();
         assert_eq!(served, Some(routes(&["10.8.2.1/32"])));
     }
 
@@ -1789,20 +1823,46 @@ mod tests {
     #[test]
     fn a_stopped_proxy_stops_the_apply() {
         let mut served = Some(routes(&["10.8.2.1/32"]));
-        let err = narrow_proxy(&engine_rt(), Some(&stopped()), &mut served, &routes(&[]))
-            .unwrap_err()
-            .to_string();
+        let mut confirmed = true;
+        let err = narrow_proxy(
+            &engine_rt(),
+            Some(&stopped()),
+            &mut served,
+            &mut confirmed,
+            &routes(&[]),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("the HTTPS proxy has stopped"), "{err}");
         assert!(err.contains("weren't changed"), "{err}");
         assert_eq!(served, Some(routes(&[])));
+        // Unconfirmed: a retry of the same change asks again, rather than
+        // taking an overlap it was never told is in force (#103).
+        assert!(!confirmed);
+        narrow_proxy(
+            &engine_rt(),
+            Some(&stopped()),
+            &mut served,
+            &mut confirmed,
+            &routes(&[]),
+        )
+        .unwrap_err();
     }
 
     /// #104: routes that differ only in order aren't a change to narrow.
     #[test]
     fn reordered_routes_are_not_narrowed() {
         let mut served = Some(routes(&["10.8.2.1/32", "10.8.3.0/24"]));
+        let mut confirmed = true;
         let reordered = routes(&["10.8.3.0/24", "10.8.2.1/32"]);
-        narrow_proxy(&engine_rt(), Some(&stopped()), &mut served, &reordered).unwrap();
+        narrow_proxy(
+            &engine_rt(),
+            Some(&stopped()),
+            &mut served,
+            &mut confirmed,
+            &reordered,
+        )
+        .unwrap();
     }
 
     /// #103: after a good apply, routes the proxy can't load fail it (the
@@ -1838,11 +1898,27 @@ mod tests {
         let task = proxy_rt.spawn(proxy.run(listener));
         // Running: it confirms.
         let mut served = Some(routes(&["10.8.2.1/32"]));
-        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap();
+        let mut confirmed = true;
+        narrow_proxy(
+            &engine_rt(),
+            Some(&reload),
+            &mut served,
+            &mut confirmed,
+            &routes(&[]),
+        )
+        .unwrap();
         task.abort();
         let _ = proxy_rt.block_on(task);
         let mut served = Some(routes(&["10.8.2.1/32"]));
-        narrow_proxy(&engine_rt(), Some(&reload), &mut served, &routes(&[])).unwrap_err();
+        let mut confirmed = true;
+        narrow_proxy(
+            &engine_rt(),
+            Some(&reload),
+            &mut served,
+            &mut confirmed,
+            &routes(&[]),
+        )
+        .unwrap_err();
     }
 
     /// Routes where `personal` (10.8.1.1) has the whole zone and public
