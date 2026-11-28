@@ -5,7 +5,9 @@
 //! The routes live behind a lock. The daemon hands new ones over a channel
 //! ([`Reload`]); taking them swaps in a new state. Routes that fail to load
 //! leave none, and every query is refused until good ones come, rather than
-//! keep answering by grants that may have been revoked.
+//! keep answering by grants that may have been revoked. Each query holds
+//! the state it answers by until its reply is handed over, which is how a
+//! reload knows the queries under older routes are done.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -23,7 +25,7 @@ use hickory_server::resolver::TokioResolver;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use hickory_server::Server;
-use parallax_core::generate::dns::{DnsRoutes, DnsTier, Route};
+use parallax_core::generate::dns::{DnsRoutes, DnsTier, DnsZone, Route};
 use parallax_core::logging::{Event, Logged, Query, QueryOutcome, Tap};
 use parallax_core::netmap::Mapping;
 use tokio::net::{TcpListener, UdpSocket};
@@ -34,7 +36,11 @@ use crate::{answer, Error, Result};
 /// Time one upstream gets to answer. Clients usually retry after 5 seconds,
 /// so a SERVFAIL comes back before they give up on us.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long a reload waits for queries under the old routes to answer.
+/// The most one query may take, all its upstreams and CNAMEs together: it
+/// ends before a reload stops waiting for it, and before most clients retry.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long a reload waits for queries under older routes to answer. Past
+/// that, the reload isn't confirmed.
 const DRAIN: Duration = Duration::from_secs(5);
 /// Idle time before a TCP client is dropped.
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -109,23 +115,49 @@ fn load_state(routes: DnsRoutes, upstream_port: u16) -> Result<State> {
     })
 }
 
-/// Routes on their way to the server, and who to tell once they're in force.
-type Handover = (DnsRoutes, oneshot::Sender<()>);
+/// Routes on their way to the server, and who to tell what came of them.
+struct Handover {
+    routes: DnsRoutes,
+    loaded: oneshot::Sender<std::result::Result<(), String>>,
+    checked: oneshot::Sender<bool>,
+}
 
 /// Hands a DNS server new routes ([`Dns::reloader`]).
 #[derive(Debug, Clone)]
 pub struct Reload(mpsc::UnboundedSender<Handover>);
 
 impl Reload {
-    /// Have the server answer by `routes`. The receiver gets `()` once
-    /// queries that come in from then on are (or, routes that didn't load,
-    /// once every query is refused), and an error if the server has
-    /// stopped. Routes are taken in the order sent.
-    pub fn send(&self, routes: DnsRoutes) -> oneshot::Receiver<()> {
-        let (done, taken) = oneshot::channel();
-        // A stopped server drops `done`, which the receiver reports.
-        let _ = self.0.send((routes, done));
-        taken
+    /// Have the server answer by `routes`, and wait for the queries under
+    /// older ones. The receiver gets whether every query under older routes
+    /// had sent its reply in time, once the new routes are in force (or,
+    /// routes that didn't load, once every query is refused), and an error
+    /// if the server has stopped. Routes are put in force in the order sent,
+    /// even once nobody waits for them.
+    pub fn send(&self, routes: DnsRoutes) -> oneshot::Receiver<bool> {
+        let (loaded, _) = oneshot::channel();
+        let (checked, checked_rx) = oneshot::channel();
+        // A stopped server drops `checked`, which the receiver reports.
+        let _ = self.0.send(Handover {
+            routes,
+            loaded,
+            checked,
+        });
+        checked_rx
+    }
+
+    /// [`Reload::send`] for routes nobody waits on older queries for: the
+    /// server doesn't wait either. The receiver says whether they loaded.
+    pub fn load(&self, routes: DnsRoutes) -> oneshot::Receiver<std::result::Result<(), String>> {
+        let (loaded, loaded_rx) = oneshot::channel();
+        // Closed before it's sent, so the reloader never starts a wait
+        // that would hold up the next routes.
+        let (checked, _) = oneshot::channel();
+        let _ = self.0.send(Handover {
+            routes,
+            loaded,
+            checked,
+        });
+        loaded_rx
     }
 }
 
@@ -215,8 +247,15 @@ async fn reloader(
     shared: Shared,
     mut reloads: mpsc::UnboundedReceiver<Handover>,
 ) {
-    while let Some((routes, done)) = reloads.recv().await {
-        let next = match load_state(routes, upstream_port) {
+    // Every state replaced that a query under way may still answer by.
+    let mut replaced: Vec<Arc<State>> = Vec::new();
+    while let Some(Handover {
+        routes,
+        loaded,
+        mut checked,
+    }) = reloads.recv().await
+    {
+        let (next, outcome) = match load_state(routes, upstream_port) {
             Ok(state) => {
                 if state.routes.listen != listening {
                     log(format!(
@@ -229,43 +268,76 @@ async fn reloader(
                     state.routes.zones.len(),
                     state.routes.tiers.len()
                 ));
-                Some(Arc::new(state))
+                (Some(Arc::new(state)), Ok(()))
             }
             Err(e) => {
                 log(format!(
                     "reload failed, refusing every query until one succeeds: {e}"
                 ));
-                None
+                (None, Err(e.to_string()))
             }
         };
         let old = std::mem::replace(
             &mut *shared.write().unwrap_or_else(|p| p.into_inner()),
             next,
         );
+        replaced.extend(old);
+        let _ = loaded.send(outcome);
         // Queries that come in from now on take the new state. Those under
-        // way still answer by the old one: let them finish first, since the
-        // address that asked may belong to another peer once this is
-        // confirmed. A query holds its state until it has answered, and
-        // gives up on its upstreams long before this.
-        if let Some(old) = old {
-            let deadline = tokio::time::Instant::now() + DRAIN;
-            while Arc::strong_count(&old) > 1 && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        // way still answer by an older one: whoever waits is told once
+        // they've all sent their replies, since the address that asked may
+        // belong to another peer next. Nobody waiting: the next wait covers
+        // these too.
+        if checked.is_closed() {
+            replaced.retain(|s| Arc::strong_count(s) > 1);
+            continue;
         }
-        let _ = done.send(());
+        tokio::select! {
+            all = drained(&mut replaced, DRAIN) => {
+                let _ = checked.send(all);
+            }
+            // The waiter gave up: on to the next routes, whose wait covers
+            // these queries too.
+            () = checked.closed() => {}
+        }
     }
 }
 
-/// What both `served` and `new` let each member look up: for while an
-/// apply is under way, which can leave either configuration's firewall and
-/// WireGuard peers live (or, failing partway, a mix). A member keeps the
-/// zones both give it, the names both allow (by name or by their whole
-/// zone), and public names if both do; a member only one of them has gets
-/// nothing. So an address moving to another peer answers neither owner's
-/// names beyond what both may see. Zones, mappings and resolvers stay
-/// `served`'s, plus the zones only `new` has, which nobody gets: a name in
-/// one isn't sent to the public resolver meanwhile.
+/// Wait until no query holds a state in `replaced`: each has sent its
+/// reply. False if some still do after `cap`.
+async fn drained(replaced: &mut Vec<Arc<State>>, cap: Duration) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        // Ours is the last reference once every query under it has replied.
+        replaced.retain(|s| Arc::strong_count(s) > 1);
+        if replaced.is_empty() {
+            return true;
+        }
+        if start.elapsed() > cap {
+            let held: usize = replaced.iter().map(|s| Arc::strong_count(s) - 1).sum();
+            log(format!(
+                "{held} queries still under older routes after {cap:?}"
+            ));
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// What both `served` and `new` let each member look up, and alike: for
+/// while an apply is under way, which can leave either configuration's
+/// firewall and WireGuard peers live (or, failing partway, a mix). A member
+/// keeps the zones both give it, the names both allow (by name or by their
+/// whole zone), and public names if both do; a member only one of them has
+/// gets nothing. So an address moving to another peer answers neither
+/// owner's names beyond what both may see.
+///
+/// Answers are what both routes give alike, too: an address is rewritten
+/// only by a mapping both have, and passed unchanged only where both leave
+/// it unmapped. A zone only one of them has, or with other resolvers in
+/// each, is nobody's: a name in it is refused, not sent to the public
+/// resolver or a parent zone's resolvers. Public names need the same public
+/// resolver in both.
 pub fn overlap(served: &DnsRoutes, new: &DnsRoutes) -> DnsRoutes {
     fn allows(routes: &DnsRoutes, tier: &DnsTier, name: &str) -> bool {
         tier.names.iter().any(|n| n == name)
@@ -273,48 +345,67 @@ pub fn overlap(served: &DnsRoutes, new: &DnsRoutes) -> DnsRoutes {
                 .zone_of(name)
                 .is_some_and(|z| tier.zones.contains(&z.name))
     }
+    fn zone<'r>(routes: &'r DnsRoutes, name: &str) -> Option<&'r DnsZone> {
+        routes.zones.iter().find(|z| z.name == name)
+    }
+    // Both have it, with the same resolvers.
+    let alike = |name: &str| zone(served, name).is_some_and(|z| zone(new, name) == Some(z));
     let mut out = DnsRoutes {
+        listen: served.listen,
+        public_resolver: served.public_resolver,
+        unmapped: served
+            .unmapped
+            .iter()
+            .filter(|n| new.unmapped.contains(n))
+            .copied()
+            .collect(),
+        zones: served.zones.clone(),
+        mappings: served
+            .mappings
+            .iter()
+            .filter(|m| new.mappings.contains(m))
+            .cloned()
+            .collect(),
         tiers: Vec::new(),
-        ..served.clone()
     };
+    // Kept, so a name in one stays out of a parent zone and public lookups.
     let added = new
         .zones
         .iter()
         .filter(|z| !served.zones.iter().any(|s| s.name == z.name));
     out.zones.extend(added.cloned());
+    let same_public = served.public_resolver == new.public_resolver;
     for old in &served.tiers {
         for member in &old.members {
             let Some(next) = new.tiers.iter().find(|t| t.members.contains(member)) else {
                 continue;
             };
-            let same =
-                old.zones == next.zones && old.names == next.names && old.public == next.public;
-            let (zones, names) = if same {
-                (old.zones.clone(), old.names.clone())
-            } else {
-                let zones: Vec<String> = old
-                    .zones
-                    .iter()
-                    .filter(|z| next.zones.contains(z))
-                    .cloned()
-                    .collect();
-                let mut names: Vec<String> = old
-                    .names
-                    .iter()
-                    .chain(&next.names)
-                    .filter(|n| allows(served, old, n) && allows(new, next, n))
-                    .filter(|n| !out.zone_of(n).is_some_and(|z| zones.contains(&z.name)))
-                    .cloned()
-                    .collect();
-                names.sort();
-                names.dedup();
-                (zones, names)
-            };
-            let public = old.public && next.public;
-            let alike = |t: &&mut DnsTier| {
+            let zones: Vec<String> = old
+                .zones
+                .iter()
+                .filter(|z| next.zones.contains(z) && alike(z))
+                .cloned()
+                .collect();
+            let mut names: Vec<String> = Vec::new();
+            for n in old.names.iter().chain(&next.names) {
+                let Some(zone) = out.zone_of(n) else {
+                    continue;
+                };
+                // A name also in a whole zone stays: the generator keeps
+                // those, and dropping it would narrow routes that don't change.
+                if allows(served, old, n)
+                    && allows(new, next, n)
+                    && alike(&zone.name)
+                    && !names.contains(n)
+                {
+                    names.push(n.clone());
+                }
+            }
+            let public = old.public && next.public && same_public;
+            let same_tier = |t: &&mut DnsTier| {
                 t.tier == old.tier && t.zones == zones && t.names == names && t.public == public
             };
-            match out.tiers.iter_mut().find(alike) {
+            match out.tiers.iter_mut().find(same_tier) {
                 Some(tier) => tier.members.push(*member),
                 None => out.tiers.push(DnsTier {
                     tier: old.tier.clone(),
@@ -428,8 +519,13 @@ impl Handler {
         }));
     }
 
-    /// The response code and answer records for `request`.
-    async fn answer(&self, request: &Request) -> (ResponseCode, Vec<Record>) {
+    /// The response code and answer records for `request`, by `state`
+    /// (`None`: refuse).
+    async fn answer(
+        &self,
+        request: &Request,
+        state: Option<&State>,
+    ) -> (ResponseCode, Vec<Record>) {
         if request.metadata.message_type != MessageType::Query
             || request.metadata.op_code != OpCode::Query
         {
@@ -449,7 +545,7 @@ impl Handler {
         {
             return reply(ResponseCode::Refused);
         }
-        let Some(state) = self.current() else {
+        let Some(state) = state else {
             return reply(ResponseCode::Refused);
         };
         let mut name: Name = query.name().clone().into();
@@ -478,7 +574,16 @@ impl Handler {
         let Some(_slot) = Slot::take(&self.inflight, client) else {
             return reply(ResponseCode::Refused);
         };
-        match resolver.lookup(name.clone(), qtype).await {
+        let Ok(found) =
+            tokio::time::timeout(LOOKUP_TIMEOUT, resolver.lookup(name.clone(), qtype)).await
+        else {
+            log(format!(
+                "{asked} {qtype} from {client}: {upstream} took over {} s",
+                LOOKUP_TIMEOUT.as_secs()
+            ));
+            return reply(ResponseCode::ServFail);
+        };
+        match found {
             Ok(lookup) => {
                 let records = match kind {
                     Kind::Home { whole_zone: true } => {
@@ -517,9 +622,13 @@ impl RequestHandler for Handler {
         // client can fall back (RFC 6891).
         // Whether it's wanted is decided as the query comes in.
         let logged = self.admit(request);
+        // Held until the reply is handed to hickory, which sends it next:
+        // a reload waits for that, as the address may be another peer's
+        // once it's confirmed.
+        let state = self.current();
         let (code, answers) = match &request.edns {
             Some(e) if e.version() > 0 => reply(ResponseCode::BADVERS),
-            _ => self.answer(request).await,
+            _ => self.answer(request, state.as_deref()).await,
         };
         if let Some(logged) = logged {
             self.record(request, logged, code);
@@ -547,7 +656,7 @@ impl RequestHandler for Handler {
             std::iter::empty(),
             std::iter::empty(),
         );
-        match response_handle.send_response(response).await {
+        let sent = match response_handle.send_response(response).await {
             Ok(info) => info,
             Err(e) => {
                 log(format!("sending a response to {}: {e}", request.src()));
@@ -557,6 +666,33 @@ impl RequestHandler for Handler {
                     counts: HeaderCounts::default(),
                 })
             }
-        }
+        };
+        drop(state);
+        sent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests: failures should panic loudly")]
+
+    use super::*;
+
+    /// #108: a query that holds older routes past the cap fails the wait,
+    /// rather than confirm a handover it hasn't finished.
+    #[tokio::test]
+    async fn a_drain_past_its_cap_is_not_confirmed() {
+        let routes = DnsRoutes::from_toml(
+            "listen = \"127.0.0.1:53\"\npublic_resolver = \"127.0.0.1\"\nunmapped = []\n",
+        )
+        .unwrap();
+        let old = Arc::new(load_state(routes, 53).unwrap());
+        let query = Arc::clone(&old);
+        let mut replaced = vec![old];
+        assert!(!drained(&mut replaced, Duration::from_millis(30)).await);
+        assert_eq!(replaced.len(), 1);
+        drop(query);
+        assert!(drained(&mut replaced, Duration::from_millis(30)).await);
+        assert!(replaced.is_empty());
     }
 }
