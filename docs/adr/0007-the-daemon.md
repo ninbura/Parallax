@@ -31,6 +31,10 @@ socket.
   the order sent, and waits for them again on the next try; new routes that don't load after an apply count as a
   failed apply, retried like any other. When the proxy stops, its open
   connections close instead of keeping their last routes.
+  *Amended (issues #114, #115):* routes that don't load are recorded as
+  serving nothing. A reload is confirmed only once responses still
+  streaming under the old routes have moved on too, and narrowing allows
+  nothing to an address another device may still hold.
   *Amended (issue #37):* the DNS server gets its routes the same way. Before
   an apply changes anything live, each member is answered only what both
   routes let it look up, so an address moving to another peer answers

@@ -10,15 +10,16 @@
 //! same proxy, and the source address is what keeps one tier off another
 //! tier's hostnames.
 
-use std::net::SocketAddrV4;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
 use super::{Artifact, ArtifactKind};
-use crate::model::{Proto, Rule};
-use crate::transport;
+use crate::model::{Proto, Rule, TransportKind};
+use crate::transport::{self, TailscaleTransport};
 use crate::validate::Model;
 use crate::{Error, Result};
 
@@ -209,7 +210,13 @@ pub fn render(model: &Model<'_>) -> Result<Artifact> {
 /// serves only this. The listener, certificates and upstream CA bundle stay
 /// `served`'s: a new bundle may trust more upstreams, and isn't in force
 /// until the apply has worked (#104).
-pub fn overlap(served: &ProxyRoutes, new: &ProxyRoutes) -> ProxyRoutes {
+///
+/// Addresses in `moved` ([`Holders::moved`]) are allowed nothing: an
+/// address says nothing about who sends from it, and until WireGuard has
+/// changed hands the old device may still hold it, whatever both grant
+/// the address (#115). A prefix holding one is dropped whole; tier members
+/// are single addresses.
+pub fn overlap(served: &ProxyRoutes, new: &ProxyRoutes, moved: &[Ipv4Addr]) -> ProxyRoutes {
     let sites = new
         .sites
         .iter()
@@ -231,6 +238,9 @@ pub fn overlap(served: &ProxyRoutes, new: &ProxyRoutes) -> ProxyRoutes {
                     } else {
                         continue;
                     };
+                    if moved.iter().any(|m| both.contains(m)) {
+                        continue;
+                    }
                     if !allowed.contains(&both) {
                         allowed.push(both);
                     }
@@ -247,6 +257,58 @@ pub fn overlap(served: &ProxyRoutes, new: &ProxyRoutes) -> ProxyRoutes {
         certificates: served.certificates.clone(),
         upstream_ca: served.upstream_ca.clone(),
         sites,
+    }
+}
+
+/// The devices that may hold each tunnel address: a WireGuard key, or a
+/// Tailscale node (a peer that names none yet: the peer). Kept by the
+/// daemon so narrowing knows which addresses may still be someone else's
+/// ([`overlap`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Holders(BTreeMap<Ipv4Addr, BTreeSet<String>>);
+
+impl Holders {
+    /// Who holds each address once `model` is applied: one device each.
+    pub fn of(model: &Model<'_>) -> Holders {
+        let mut held: BTreeMap<Ipv4Addr, BTreeSet<String>> = BTreeMap::new();
+        for p in model.peers_on(TransportKind::WireGuard) {
+            if let Some(w) = &p.wireguard {
+                if let Some(addr) = w.address {
+                    let key = format!("wireguard key {}", w.public_key.to_base64());
+                    held.entry(addr).or_default().insert(key);
+                }
+            }
+        }
+        for p in model.peers_on(TransportKind::Tailscale) {
+            let Some(addr) = TailscaleTransport::address(model, p) else {
+                continue;
+            };
+            let device = match p.tailscale.as_ref().and_then(|t| t.node_id) {
+                Some(id) => format!("tailscale node {id}"),
+                None => format!("tailscale peer {}", p.name),
+            };
+            held.entry(addr).or_default().insert(device);
+        }
+        Holders(held)
+    }
+
+    /// After an apply that failed partway, either set may be live.
+    pub fn add(&mut self, other: Holders) {
+        for (addr, devices) in other.0 {
+            self.0.entry(addr).or_default().extend(devices);
+        }
+    }
+
+    /// Addresses some device besides the one `new` gives them to may hold.
+    pub fn moved(&self, new: &Holders) -> Vec<Ipv4Addr> {
+        self.0
+            .iter()
+            .filter(|(addr, devices)| {
+                let kept = new.0.get(addr);
+                devices.iter().any(|d| !kept.is_some_and(|k| k.contains(d)))
+            })
+            .map(|(addr, _)| *addr)
+            .collect()
     }
 }
 
@@ -416,7 +478,7 @@ mod tests {
         // A wider CA bundle and another certificate folder.
         new.upstream_ca = "/etc/ssl/certs/everything.crt".into();
         new.certificates = "/srv/other-certs".into();
-        let both = overlap(&served, &new);
+        let both = overlap(&served, &new, &[]);
         assert_eq!(
             both,
             routes(
@@ -438,11 +500,71 @@ mod tests {
             )],
         );
         assert_eq!(
-            overlap(&wide, &served).sites[0].allowed,
+            overlap(&wide, &served, &[]).sites[0].allowed,
             served.sites[0].allowed
         );
         // Same routes: nothing changes.
-        assert_eq!(overlap(&new, &new), new);
+        assert_eq!(overlap(&new, &new, &[]), new);
+    }
+
+    /// #115: an address that changes hands is allowed nothing while the
+    /// old device may still hold it, even where both grant the address.
+    #[test]
+    fn a_moved_address_is_allowed_nothing() {
+        let served = routes(
+            "10.8.0.1:8443",
+            vec![site(
+                "immich.mydomain.com",
+                "192.168.1.5:443",
+                &["10.8.2.1/32", "10.8.2.2/32"],
+            )],
+        );
+        let moved: [Ipv4Addr; 1] = ["10.8.2.1".parse().unwrap()];
+        assert_eq!(
+            overlap(&served, &served, &moved).sites[0].allowed,
+            vec!["10.8.2.2/32".parse::<Ipv4Net>().unwrap()]
+        );
+        let only = routes(
+            "10.8.0.1:8443",
+            vec![site(
+                "immich.mydomain.com",
+                "192.168.1.5:443",
+                &["10.8.2.1/32"],
+            )],
+        );
+        assert!(overlap(&only, &only, &moved).sites.is_empty());
+    }
+
+    /// The family peer's address given to a new key, and back again: moved
+    /// both times, and moved while a failed apply may have left either key.
+    #[test]
+    fn holders_see_an_address_change_hands() {
+        let cfg = canonical_config();
+        let before = Holders::of(&Model::resolve(&cfg, today()).unwrap());
+        assert!(before.moved(&before).is_empty());
+        let mut rekeyed = cfg.clone();
+        let family = rekeyed
+            .peers
+            .iter_mut()
+            .find(|p| p.grants == ["family"])
+            .unwrap();
+        let addr = family.wireguard.as_ref().unwrap().address.unwrap();
+        family.wireguard.as_mut().unwrap().public_key =
+            crate::secret::PublicKey::from_bytes([7; 32]);
+        let after = Holders::of(&Model::resolve(&rekeyed, today()).unwrap());
+        assert_eq!(before.moved(&after), vec![addr]);
+        assert_eq!(after.moved(&before), vec![addr]);
+        // A failed apply: either key may hold it, even once the next
+        // configuration settles on one.
+        let mut either = before.clone();
+        either.add(after.clone());
+        assert_eq!(either.moved(&after), vec![addr]);
+        assert_eq!(either.moved(&before), vec![addr]);
+        // A peer taken away: its address is held by nobody next.
+        let mut removed = cfg.clone();
+        removed.peers.retain(|p| p.grants != ["family"]);
+        let gone = Holders::of(&Model::resolve(&removed, today()).unwrap());
+        assert_eq!(before.moved(&gone), vec![addr]);
     }
 
     /// #104: order isn't what's served.

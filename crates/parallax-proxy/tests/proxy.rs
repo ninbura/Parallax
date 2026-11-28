@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONNECTION, HOST, UPGRADE};
@@ -122,7 +123,7 @@ async fn fake_upstream((chain, key): (String, String)) -> SocketAddrV4 {
 /// [`an_upload_stops_at_the_revocation`] uploads.
 static UPLOADED: AtomicUsize = AtomicUsize::new(0);
 
-/// A request body fed from a channel, one frame per message.
+/// A body fed from a channel, one frame per message.
 struct Chunks(tokio::sync::mpsc::Receiver<Bytes>);
 
 impl hyper::body::Body for Chunks {
@@ -138,7 +139,48 @@ impl hyper::body::Body for Chunks {
     }
 }
 
-async fn upstream_service(mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+/// Chunks the fake upstream has had taken from each `/download?<id>`
+/// response, by id.
+static DOWNLOADED: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn downloaded(id: &str) -> usize {
+    DOWNLOADED
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(i, _)| i == id)
+        .map_or(0, |(_, n)| *n)
+}
+
+/// A response body that never ends: a chunk every 20 ms, counted under
+/// `id` as each one is taken, until the reader goes.
+fn endless(id: String) -> BoxBody<Bytes, Infallible> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        loop {
+            if tx.send(Bytes::from(vec![b'd'; 1000])).await.is_err() {
+                return;
+            }
+            {
+                let mut counts = DOWNLOADED.lock().unwrap();
+                match counts.iter_mut().find(|(i, _)| *i == id) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((id.clone(), 1)),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    Chunks(rx).boxed()
+}
+
+async fn upstream_service(
+    mut req: Request<Incoming>,
+) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+    if req.uri().path() == "/download" {
+        let id = req.uri().query().unwrap_or_default().to_string();
+        return Ok(Response::new(endless(id)));
+    }
     if req.uri().path() == "/upload" {
         let mut body = req.into_body();
         while let Some(Ok(frame)) = body.frame().await {
@@ -146,7 +188,7 @@ async fn upstream_service(mut req: Request<Incoming>) -> Result<Response<Full<By
                 UPLOADED.fetch_add(data.len(), Ordering::SeqCst);
             }
         }
-        return Ok(Response::new(Full::default()));
+        return Ok(Response::new(Full::default().boxed()));
     }
     if req.headers().contains_key(UPGRADE) {
         let on = hyper::upgrade::on(&mut req);
@@ -160,7 +202,7 @@ async fn upstream_service(mut req: Request<Incoming>) -> Result<Response<Full<By
             .status(StatusCode::SWITCHING_PROTOCOLS)
             .header(CONNECTION, "upgrade")
             .header(UPGRADE, "websocket")
-            .body(Full::default())
+            .body(Full::default().boxed())
             .unwrap();
         return Ok(resp);
     }
@@ -176,7 +218,7 @@ async fn upstream_service(mut req: Request<Incoming>) -> Result<Response<Full<By
         req.uri(),
         header("x-forwarded-for")
     );
-    Ok(Response::new(Full::new(Bytes::from(body))))
+    Ok(Response::new(Full::new(Bytes::from(body)).boxed()))
 }
 
 struct Env {
@@ -537,6 +579,102 @@ async fn moving_a_hostname_closes_relays_to_the_old_upstream() {
     assert!(
         !matches!(ws.read(&mut buf).await, Ok(n) if n > 0),
         "the WebSocket must be closed"
+    );
+}
+
+/// Start `/download?<id>` on `send` and take its first chunk.
+async fn start_download<B>(send: impl std::future::Future<Output = hyper::Result<Response<B>>>) -> B
+where
+    B: hyper::body::Body + Unpin,
+    B::Error: std::fmt::Debug,
+{
+    let resp = send.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+    let first = body.frame().await.unwrap().unwrap();
+    assert!(first.is_data(), "the download never started");
+    body
+}
+
+/// Whether `body` fails within two seconds; not if it goes on streaming,
+/// or ends as if complete.
+async fn fails_soon<B: hyper::body::Body + Unpin>(body: &mut B) -> bool {
+    let read = async {
+        loop {
+            match body.frame().await {
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => return true,
+                None => return false,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(2), read)
+        .await
+        .unwrap_or(false)
+}
+
+/// #115: an HTTP/2 download in progress when the grant is revoked takes
+/// nothing more from the upstream once the revocation is confirmed, and
+/// fails rather than ending as if complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_stops_at_the_revocation() {
+    let env = Env::start().await;
+    let tls = env.connect(IMMICH, b"h2").await.unwrap();
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let req = Request::builder()
+        .uri(format!("https://{IMMICH}/download?revoked"))
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let mut body = start_download(h2.send_request(req)).await;
+
+    env.revoke_immich().await;
+    let taken = downloaded("revoked");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        downloaded("revoked") <= taken + 1,
+        "the upstream was still read after the revocation was confirmed"
+    );
+    assert!(fails_soon(&mut body).await, "the download must fail");
+}
+
+/// #115: a hostname moved to another upstream cuts downloads streaming
+/// from the old one, as it does a WebSocket relay, over HTTP/1.1 and
+/// HTTP/2 alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_a_hostname_cuts_downloads_from_the_old_upstream() {
+    let env = Env::start().await;
+    let tls = env.connect(IMMICH, b"http/1.1").await.unwrap();
+    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let mut over_h1 = start_download(h1.send_request(get("/download?moved-h1", IMMICH))).await;
+    let tls = env.connect(IMMICH, b"h2").await.unwrap();
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let req = Request::builder()
+        .uri(format!("https://{IMMICH}/download?moved-h2"))
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let mut over_h2 = start_download(h2.send_request(req)).await;
+
+    let mut moved = env.routes.clone();
+    moved.sites[0].upstream = "127.0.0.1:9".parse().unwrap();
+    env.reload_with(moved).await.unwrap();
+    assert!(
+        fails_soon(&mut over_h1).await,
+        "the HTTP/1.1 download must be cut off"
+    );
+    assert!(
+        fails_soon(&mut over_h2).await,
+        "the HTTP/2 download must be cut off"
     );
 }
 

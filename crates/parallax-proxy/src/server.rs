@@ -20,7 +20,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Frame, Incoming, SizeHint};
+use hyper::body::{Body as _, Frame, Incoming, SizeHint};
 use hyper::header::UPGRADE;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -67,7 +67,10 @@ const MAX_PER_SOURCE: usize = 64;
 /// and one guest's records mustn't grow with it (#65).
 const LOGGED_METHOD: usize = 32;
 
-type Body = BoxBody<Bytes, hyper::Error>;
+/// Boxed, so a response can end in an error of the proxy's own: one cut
+/// off mid-body must not look complete to the peer.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type Body = BoxBody<Bytes, BoxError>;
 type Upstream = Client<HttpsConnector<HttpConnector<FixedResolver>>, Body>;
 
 // Best effort: a log line nobody can read is dropped. `eprintln!` would panic
@@ -555,8 +558,10 @@ async fn while_authorized<F: Future>(
     client: Ipv4Addr,
     upstream: Option<SocketAddrV4>,
 ) -> Option<F::Output> {
-    tokio::pin!(work);
+    // Declared before `work` so it's dropped after it: the routes checked
+    // are held until the connection or relay has closed (#115).
     let mut checked: Option<Arc<State>> = None;
+    tokio::pin!(work);
     loop {
         let now = Arc::clone(&state.borrow_and_update());
         if !checked.as_ref().is_some_and(|c| Arc::ptr_eq(c, &now)) {
@@ -773,7 +778,7 @@ impl Exchange {
     /// The request's body, counted on its way upstream.
     fn count_out(&self, body: Incoming) -> Body {
         Counted {
-            body: body.boxed(),
+            body: body.map_err(BoxError::from).boxed(),
             tally: Arc::clone(&self.out),
             _exchange: None,
         }
@@ -825,12 +830,12 @@ struct Counted {
 
 impl hyper::body::Body for Counted {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = BoxError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<std::result::Result<Frame<Bytes>, hyper::Error>>> {
+    ) -> Poll<Option<std::result::Result<Frame<Bytes>, BoxError>>> {
         let polled = Pin::new(&mut self.body).poll_frame(cx);
         if let Poll::Ready(Some(Ok(frame))) = &polled {
             if let Some(data) = frame.data_ref() {
@@ -938,7 +943,7 @@ async fn forward(
     let downstream_upgrade = http::upgrade(&req).map(|_| hyper::upgrade::on(&mut req));
     let req = match &exchange {
         Some(x) => req.map(|b| x.count_out(b)),
-        None => req.map(BodyExt::boxed),
+        None => req.map(|b| b.map_err(BoxError::from).boxed()),
     };
     let up = match http::upstream_request(req, &hostname, site.route.upstream.port(), client) {
         Ok(up) => up,
@@ -977,7 +982,9 @@ async fn forward(
     };
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
         http::strip_hop_by_hop(resp.headers_mut(), None);
-        return Ok(respond(exchange, resp.map(BodyExt::boxed)));
+        let upstream = site.route.upstream;
+        let resp = resp.map(|body| guarded(body, state, hostname, client, upstream));
+        return Ok(respond(exchange, resp));
     }
     // Only a WebSocket switch we asked for: another protocol on the raw
     // stream would carry requests the checks above never see.
@@ -1021,5 +1028,100 @@ async fn forward(
         }
         drop(exchange);
     });
-    Ok(resp.map(BodyExt::boxed))
+    Ok(resp.map(|b| b.map_err(BoxError::from).boxed()))
+}
+
+/// What a frame of a response body comes as, from [`pass_on`]: `None` once
+/// the body has ended.
+type Piece = Option<std::result::Result<Frame<Bytes>, hyper::Error>>;
+
+/// `body` for the peer, passed on only while `client` keeps `hostname` at
+/// `upstream`, like a WebSocket relay: the response may stream long after
+/// its headers (a download), and a reload takes it away mid-way (#115).
+/// Its pump holds the routes it last checked, so a reload isn't confirmed
+/// while it streams under ones it replaced. Cut off, the body ends in an
+/// error rather than early, so it doesn't look complete.
+fn guarded(
+    body: Incoming,
+    state: Shared,
+    hostname: String,
+    client: Ipv4Addr,
+    upstream: SocketAddrV4,
+) -> Body {
+    if body.is_end_stream() {
+        return body.map_err(BoxError::from).boxed();
+    }
+    let size = body.size_hint();
+    let (tx, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let pump = pass_on(body, &tx);
+        // `None` drops the sender without an end: the body fails.
+        let _ = while_authorized(pump, state, &hostname, client, Some(upstream)).await;
+    });
+    Streamed {
+        pieces: rx,
+        size,
+        ended: false,
+    }
+    .boxed()
+}
+
+/// Send `body`'s frames down `tx` until it ends, fails or nobody reads.
+async fn pass_on(mut body: Incoming, tx: &mpsc::Sender<Piece>) {
+    loop {
+        let piece = tokio::select! {
+            piece = body.frame() => piece,
+            // The peer has gone: stop reading the upstream.
+            () = tx.closed() => return,
+        };
+        let last = !matches!(piece, Some(Ok(_)));
+        if tx.send(piece).await.is_err() || last {
+            return;
+        }
+    }
+}
+
+/// A response body fed by [`pass_on`].
+struct Streamed {
+    pieces: mpsc::Receiver<Piece>,
+    /// The upstream body's: passing it on keeps a known length known.
+    size: SizeHint,
+    ended: bool,
+}
+
+impl hyper::body::Body for Streamed {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Bytes>, BoxError>>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        Poll::Ready(match std::task::ready!(self.pieces.poll_recv(cx)) {
+            Some(Some(Ok(frame))) => Some(Ok(frame)),
+            Some(Some(Err(e))) => {
+                self.ended = true;
+                Some(Err(e.into()))
+            }
+            Some(None) => {
+                self.ended = true;
+                None
+            }
+            None => {
+                self.ended = true;
+                Some(Err("access was revoked, or the proxy stopped".into()))
+            }
+        })
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size
+    }
 }
