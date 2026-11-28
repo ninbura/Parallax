@@ -578,7 +578,17 @@ async fn a_reload_is_confirmed_once_queries_under_the_old_routes_answered() {
     // The upstream never answers this one: it ends at the upstream timeout.
     let slow =
         tokio::spawn(async move { ask(PERSONAL, addr, "slow.mydomain.com.", RecordType::A).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Under way: the server has asked the upstream.
+    for _ in 0..100 {
+        if s.upstream.asked("slow.mydomain.com. A") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        s.upstream.asked("slow.mydomain.com. A"),
+        "the query never reached the upstream"
+    );
     s.reload(parsed(true)).await;
     // Its answer is sent by then; the client may take a moment to read it.
     // Confirmed too early, it would still be over a second from its timeout.
