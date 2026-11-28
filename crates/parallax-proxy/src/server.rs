@@ -162,6 +162,21 @@ impl Reload {
             checked: checked_rx,
         }
     }
+
+    /// [`Reload::send`] for routes nobody waits on open connections for:
+    /// the proxy doesn't wait either. The receiver says whether they loaded.
+    pub fn load(&self, routes: ProxyRoutes) -> oneshot::Receiver<std::result::Result<(), String>> {
+        let (loaded, loaded_rx) = oneshot::channel();
+        // Closed before it's sent, so the reloader never starts a wait
+        // that would hold up the next routes.
+        let (checked, _) = oneshot::channel();
+        let _ = self.0.send(Handover {
+            routes,
+            loaded,
+            checked,
+        });
+        loaded_rx
+    }
 }
 
 /// A loaded proxy, ready to run on a listener.

@@ -1058,7 +1058,8 @@ fn narrow_proxy(
     *confirmed = false;
     // Inside the runtime: a timer needs its clock.
     let checked = rt.block_on(async { tokio::time::timeout(PROXY_TAKES, checked).await });
-    const LEFT: &str = "the firewall and WireGuard weren't changed, and the proxy is held to what both configurations grant until an apply works";
+    const LEFT: &str =
+        "the firewall and WireGuard weren't changed, and the next try waits for the proxy again";
     match checked {
         Ok(Ok(true)) => {
             *confirmed = true;
@@ -1087,7 +1088,7 @@ fn widen_proxy(
     proxy: &parallax_proxy::Reload,
     routes: &ProxyRoutes,
 ) -> anyhow::Result<()> {
-    let loaded = proxy.send(routes.clone()).loaded;
+    let loaded = proxy.load(routes.clone());
     match rt.block_on(async { tokio::time::timeout(PROXY_TAKES, loaded).await }) {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(why))) => bail!(
