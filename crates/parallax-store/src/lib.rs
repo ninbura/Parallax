@@ -117,6 +117,8 @@ impl Store {
             db,
             conn,
         };
+        // Before a migration or the switch to MVCC writes to it (#99).
+        store.tighten()?;
         if mvcc {
             // Refuse a database too new for this build before changing it.
             store
@@ -126,23 +128,43 @@ impl Store {
             store.use_mvcc().await.map_err(|e| store.busy(e))?;
         }
         store.migrate().await.map_err(|e| store.busy(e))?;
-        store.tighten()?;
+        store.tighten_after_commit();
         Ok(store)
     }
 
     /// The database, its log and its coordination file hold private keys:
     /// make whichever exist owner-only. By path, never by opening them:
     /// closing any descriptor of a file drops this process's locks on it.
-    /// The CLI's owner-only umask covers files Turso creates later.
+    /// The CLI's owner-only umask covers files Turso creates later. Turso
+    /// names its log after the database's real path, so a database opened
+    /// through a symlink has its files secured at both.
     fn tighten(&self) -> Result<()> {
         #[cfg(unix)]
-        for file in sidecars(&self.path) {
+        {
             use std::os::unix::fs::PermissionsExt;
-            let file = file.as_path();
-            match std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(Error::io(format!("securing {}", file.display()), e)),
+            let mut files = sidecars(&self.path).to_vec();
+            if let Ok(real) = std::fs::canonicalize(&self.path) {
+                for file in sidecars(&real) {
+                    if !files.contains(&file) {
+                        files.push(file);
+                    }
+                }
+            }
+            for file in &files {
+                let mode = match std::fs::metadata(file) {
+                    Ok(m) => m.permissions().mode(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(Error::io(format!("securing {}", file.display()), e)),
+                };
+                // Already private: nothing to change, so no need to be its owner.
+                if mode & 0o777 == 0o600 {
+                    continue;
+                }
+                match std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::io(format!("securing {}", file.display()), e)),
+                }
             }
         }
         Ok(())
