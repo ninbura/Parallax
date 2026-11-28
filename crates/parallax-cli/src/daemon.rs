@@ -273,7 +273,11 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let ((mut dns, mut proxy, reloaders), (listener, socket_id)) = match started {
         Ok(started) => started,
         Err(e) => {
-            stop_engine(&tx, &mut done_rx, true).await;
+            // The router may still route from a run before (one that
+            // crashed): take that away too before this teardown.
+            let config = views.borrow().as_ref().map(|v| Arc::clone(&v.config));
+            let teardown = withdraw(config, opts.tailscale_socket.clone(), None).await;
+            stop_engine(&tx, &mut done_rx, teardown).await;
             return Err(e);
         }
     };
@@ -839,8 +843,10 @@ async fn keep_router(mut views: Views, socket: String, mut stop: watch::Receiver
     let mut ours: Option<String> = None;
     'looking: loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(next) => {}
+            // Stopping wins over a look that's due.
+            biased;
             _ = stop.changed() => break,
+            _ = tokio::time::sleep_until(next) => {}
             changed = views.changed() => {
                 if changed.is_err() {
                     break;
@@ -893,8 +899,8 @@ async fn keep_router(mut views: Views, socket: String, mut stop: watch::Receiver
         if stopping {
             break;
         }
-        if config(&views) != last {
-            // Replaced meanwhile: look again at once, at the new one.
+        if !current.load(std::sync::atomic::Ordering::SeqCst) {
+            // Replaced meanwhile (even if changed back): look again at once.
             pace = Pace::default();
             next = tokio::time::Instant::now();
             continue;
@@ -924,7 +930,15 @@ async fn keep_router(mut views: Views, socket: String, mut stop: watch::Receiver
             said = note;
         }
     }
-    let Some(config) = last else {
+    // The latest configuration: a change that came in during the last look
+    // may be what makes the router reachable.
+    withdraw(config(&views).or(last), socket, ours).await
+}
+
+/// Take Parallax's own router's routes away ([`crate::withdraw_router`]).
+/// True if it's known to route nothing now, so the firewall may go.
+async fn withdraw(config: Option<Arc<Config>>, socket: String, ours: Option<String>) -> bool {
+    let Some(config) = config else {
         return true;
     };
     let withdrawn = tokio::task::spawn_blocking(move || {

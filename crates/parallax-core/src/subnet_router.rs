@@ -366,7 +366,15 @@ pub fn decide(
 ) -> Result<Router> {
     let server = &model.server().headscale;
     let wanted = routes(model);
-    let node = client.node(nodes);
+    // Read once, whichever branch asks first.
+    let (mut prefs, mut read) = (Some(prefs), None::<Prefs>);
+    let mut prefs = move || -> Result<Prefs> {
+        if let Some(prefs) = prefs.take() {
+            read = Some(prefs()?);
+        }
+        read.clone()
+            .ok_or_else(|| Error::Tailscale("the router's prefs couldn't be read".into()))
+    };
     let needs_login = match client.state.as_str() {
         "NeedsLogin" => true,
         "Running" | "Stopped" => false,
@@ -388,31 +396,34 @@ pub fn decide(
             server.server_url
         ))
     };
-    let Some(node) = node else {
-        if !needs_login {
-            return Ok(elsewhere());
+    let node = match client.node(nodes) {
+        Some(node) => node,
+        // Running, its key unknown here: another control server's node.
+        None if client.node_key.is_some() && !needs_login => return Ok(elsewhere()),
+        None => {
+            let read = prefs()?;
+            // No node at all: never logged in, `tailscale logout`, or a first
+            // login that didn't finish (`LoggedOut` false, but no profile).
+            let no_profile = read.profile.as_ref().is_none_or(|p| p.node_id.is_empty());
+            if read.logged_out || (client.node_key.is_none() && no_profile) {
+                if needs_login {
+                    return Ok(Router::LoggedOut);
+                }
+                return Ok(Router::Waiting(format!(
+                    "the router's tailscaled is {} with no node",
+                    client.state
+                )));
+            }
+            // A tailscaled restarted with an expired or stopped profile has
+            // no node key, only its profile's node (#76). It may be anyone's.
+            let Some(node) = profile_node(&read, server, nodes) else {
+                return Ok(Router::Elsewhere(format!(
+                    "the router's tailscaled is set up for a node Headscale at {} doesn't have. Log it in there (`tailscale up`), or log it out (`tailscale logout`) to let Parallax log it in",
+                    server.server_url
+                )));
+            };
+            node
         }
-        // Logged out means never logged in, or `tailscale logout`.
-        let prefs = prefs()?;
-        if prefs.logged_out {
-            return Ok(Router::LoggedOut);
-        }
-        // An expired profile: a tailscaled restarted with one has no node
-        // key, only its profile's node (#76). It may be anyone's.
-        let same_server =
-            prefs.control_url.trim_end_matches('/') == server.server_url.trim_end_matches('/');
-        let profile = prefs.profile.as_ref().filter(|_| same_server);
-        let Some(node) = profile.and_then(|p| nodes.iter().find(|n| n.id.to_string() == p.node_id))
-        else {
-            return Ok(Router::Elsewhere(format!(
-                "the router's tailscaled needs to log in again, to a node Headscale at {} doesn't have. Log it in (`tailscale up`), or log it out (`tailscale logout`) to let Parallax log it in there",
-                server.server_url
-            )));
-        };
-        if node.user != USER {
-            return Ok(theirs(node, &client.state, &wanted));
-        }
-        return Ok(Router::LoggedOut);
     };
     if node.user != USER {
         return Ok(theirs(node, &client.state, &wanted));
@@ -458,6 +469,19 @@ pub fn decide(
         key: node.node_key.clone(),
         steps,
     })
+}
+
+/// The node a client's profile is for, if it's one of `nodes` on the
+/// configured Headscale.
+fn profile_node<'a>(
+    prefs: &Prefs,
+    server: &HeadscaleServer,
+    nodes: &'a [Node],
+) -> Option<&'a Node> {
+    let same_server =
+        prefs.control_url.trim_end_matches('/') == server.server_url.trim_end_matches('/');
+    let profile = prefs.profile.as_ref().filter(|_| same_server)?;
+    nodes.iter().find(|n| n.id.to_string() == profile.node_id)
 }
 
 /// The flags Parallax's router always has.
@@ -613,18 +637,30 @@ pub fn withdraw(
     known: Option<&str>,
 ) -> Result<bool> {
     let client = client(ts)?;
-    // Not logged in: it routes nothing.
-    let Some(key) = client.node_key.as_deref() else {
-        return Ok(false);
-    };
-    if known != Some(key) && server.server_url.is_empty() {
+    let ours = match client.node_key.as_deref() {
+        Some(key) if known == Some(key) => true,
         // No Headscale: Parallax never logged it in.
-        return Ok(false);
-    }
-    let ours = known == Some(key)
-        || client
+        _ if server.server_url.is_empty() => false,
+        Some(_) => client
             .node(&headscale::nodes(server, api)?)
-            .is_some_and(|n| n.user == USER);
+            .is_some_and(|n| n.user == USER),
+        // No node key yet (starting, stopped, or expired, after a restart):
+        // it routes what its prefs keep once it connects, so whose its
+        // profile is decides.
+        None => {
+            let read = prefs(ts)?;
+            if read
+                .advertise_routes
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Ok(false);
+            }
+            profile_node(&read, server, &headscale::nodes(server, api)?)
+                .is_some_and(|n| n.user == USER)
+        }
+    };
     if !ours {
         return Ok(false);
     }
@@ -1348,6 +1384,97 @@ mod tests {
         let (_, done) = sync(&model, &ts, &api, true, &|| false).unwrap();
         assert!(done.is_empty(), "{done:?}");
         assert!(api.posted.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_first_login_that_failed_is_tried_again() {
+        // `tailscale up` sets LoggedOut false before the login works; one
+        // that failed leaves no key and no profile: no node, nobody's.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let failed = || {
+            let mut p: Prefs = serde_json::from_str(LOGGED_OUT_PREFS).unwrap();
+            p.logged_out = false;
+            p.control_url = "https://headscale.mydomain.com".into();
+            Ok(p)
+        };
+        let fresh = Client {
+            state: "NeedsLogin".into(),
+            node_key: None,
+            id: None,
+        };
+        let router = decide(&model, &fresh, failed, &[]).unwrap();
+        assert_eq!(router, Router::LoggedOut);
+    }
+
+    #[test]
+    fn a_stopped_profile_restarted_is_found_by_its_node() {
+        // `tailscale down`, then a restart: Stopped, no node key in the
+        // status, the node in its profile.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let stopped = Client {
+            state: "Stopped".into(),
+            node_key: None,
+            id: None,
+        };
+        let profile = || Ok(serde_json::from_str(EXPIRED_PREFS).unwrap());
+        let nodes = [node(USER, ROUTES, ROUTES)];
+        let router = decide(&model, &stopped, profile, &nodes).unwrap();
+        assert_eq!(
+            router,
+            Router::Ours {
+                id: 1,
+                key: KEY.into(),
+                steps: vec![Step::Up]
+            }
+        );
+        let nodes = [node("family", ROUTES, ROUTES)];
+        let router = decide(&model, &stopped, profile, &nodes).unwrap();
+        assert_eq!(
+            router,
+            Router::Theirs {
+                id: 1,
+                todo: vec!["start it: `tailscale up`".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn withdraw_reaches_a_router_that_has_not_connected_yet() {
+        // Restarted and still starting: no node key yet, but its saved
+        // routes come back once it connects.
+        let config = config();
+        let server = &config.server.headscale;
+        let starting = LOGGED_OUT.replace("NeedsLogin", "Starting");
+        let saved = EXPIRED_PREFS.replace(
+            r#""AdvertiseRoutes":null"#,
+            r#""AdvertiseRoutes":["198.18.1.0/24"]"#,
+        );
+        let ours = r#"{"nodes":[{"id":"1","nodeKey":"nodekey:old","ipAddresses":["100.64.0.1"],"givenName":"parallax-gateway","user":{"id":"3","name":"parallax"},"online":false,"availableRoutes":[],"approvedRoutes":[]}]}"#;
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&starting));
+        runner.respond("tailscale", ok(&saved));
+        runner.respond("tailscale", ok(""));
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let api = FakeHeadscale::new().reply("/api/v1/node", 200, ours);
+        assert!(withdraw(server, &ts, &api, None).unwrap());
+        assert!(runner.command_lines()[2]
+            .ends_with("set --advertise-routes= --advertise-exit-node=false"));
+        // Nothing saved: nothing to withdraw, and Headscale isn't asked.
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&starting));
+        runner.respond("tailscale", ok(EXPIRED_PREFS));
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        assert!(!withdraw(server, &ts, &FakeHeadscale::new(), None).unwrap());
     }
 
     #[test]
