@@ -1298,14 +1298,12 @@ fn widen_proxy(
     routes: ProxyRoutes,
 ) -> anyhow::Result<()> {
     let loaded = proxy.load(routes.clone());
-    let refused = served.as_ref().map(nothing_served);
+    let refused = nothing_served(served.as_ref().unwrap_or(&routes));
     *served = Some(routes);
     match rt.block_on(async { tokio::time::timeout(PROXY_TAKES, loaded).await }) {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(why))) => {
-            if refused.is_some() {
-                *served = refused;
-            }
+            *served = Some(refused);
             bail!(
                 "the HTTPS proxy couldn't load its new routes ({why}); it refuses every connection until a reload works"
             )

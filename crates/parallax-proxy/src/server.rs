@@ -984,6 +984,18 @@ async fn forward(
             ));
         }
     };
+    // A reload may have come while the upstream answered: nothing from it
+    // goes out once it's taken away or moved, headers included (#115).
+    if !state
+        .borrow()
+        .still(&hostname, client, Some(site.route.upstream))
+    {
+        return Ok(refuse(
+            exchange,
+            StatusCode::FORBIDDEN,
+            "access was revoked",
+        ));
+    }
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
         http::strip_hop_by_hop(resp.headers_mut(), None);
         let upstream = site.route.upstream;
@@ -1075,15 +1087,21 @@ fn guarded(
 }
 
 /// Send `body`'s frames down `tx` until it ends, fails or nobody reads.
+/// Reads the next only once there's room for it, so a peer that stops
+/// reading holds up the upstream rather than the proxy's memory.
 async fn pass_on(mut body: Incoming, tx: &mpsc::Sender<Piece>) {
     loop {
+        // The peer has gone: stop reading the upstream.
+        let Ok(room) = tx.reserve().await else {
+            return;
+        };
         let piece = tokio::select! {
             piece = body.frame() => piece,
-            // The peer has gone: stop reading the upstream.
             () = tx.closed() => return,
         };
         let last = !matches!(piece, Some(Ok(_)));
-        if tx.send(piece).await.is_err() || last {
+        room.send(piece);
+        if last {
             return;
         }
     }
@@ -1092,7 +1110,8 @@ async fn pass_on(mut body: Incoming, tx: &mpsc::Sender<Piece>) {
 /// A response body fed by [`pass_on`].
 struct Streamed {
     pieces: mpsc::Receiver<Piece>,
-    /// The upstream body's: passing it on keeps a known length known.
+    /// What's left of the upstream body: passing it on keeps a known
+    /// length known.
     size: SizeHint,
     ended: bool,
     /// Checked again for each frame: one queued before the pump was cut
@@ -1124,7 +1143,18 @@ impl hyper::body::Body for Streamed {
                 self.ended = true;
                 Some(Err("access was revoked or moved".into()))
             }
-            Some(Some(Ok(frame))) => Some(Ok(frame)),
+            Some(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    let n = data.len() as u64;
+                    let mut left = SizeHint::new();
+                    left.set_lower(self.size.lower().saturating_sub(n));
+                    if let Some(upper) = self.size.upper() {
+                        left.set_upper(upper.saturating_sub(n));
+                    }
+                    self.size = left;
+                }
+                Some(Ok(frame))
+            }
             Some(Some(Err(e))) => {
                 self.ended = true;
                 Some(Err(e.into()))
@@ -1145,6 +1175,9 @@ impl hyper::body::Body for Streamed {
     }
 
     fn size_hint(&self) -> SizeHint {
+        if self.ended {
+            return SizeHint::with_exact(0);
+        }
         self.size
     }
 }
