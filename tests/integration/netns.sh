@@ -1253,7 +1253,9 @@ YAML
         inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$HS/headscale.pid" \
             "$HEADSCALE" serve -c "$HS/config.yaml" >> "$HS/headscale.log" 2>&1 &
         PIDS+=($!)
-        # The backgrounded subshell lives as long as Headscale does.
+        # The backgrounded subshell lives as long as Headscale does; (u) waits
+        # on it to know the first one has stopped.
+        HS_BG=$!
         local pid=$! start=$SECONDS
         # A first start makes its database and keys, which can take a while
         # on a busy CI runner (#91). One that exits says so at once.
@@ -1315,9 +1317,8 @@ PY
     $P status | grep "^Headscale node $NODE: $NODE_IP$" >/dev/null || { $P status; fail "(u) the daemon's status lacks the node"; }
     HS_PID=$(cat "$HS/headscale.pid")
     kill "$HS_PID"
-    for _ in $(seq 50); do kill -0 "$HS_PID" 2>/dev/null || break; sleep 0.1; done
-    # Else the restart below could be answered by this one.
-    kill -0 "$HS_PID" 2>/dev/null && fail "(u) Headscale did not stop within 5 s"
+    # Gone before the restart below, so that one can't be answered by this one.
+    wait "$HS_BG" || true
     sleep 12
     in_set || fail "(u) the node lost its access while Headscale was down"
     grep -q "keeping the addresses it gave last" "$WORK/daemon.log" || fail "(u) Headscale being down was not logged"
