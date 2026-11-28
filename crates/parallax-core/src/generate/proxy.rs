@@ -67,6 +67,23 @@ impl ProxyRoutes {
     pub fn site(&self, hostname: &str) -> Option<&ProxySite> {
         self.sites.iter().find(|s| s.hostname == hostname)
     }
+
+    /// Whether `self` and `other` serve the same, in whatever order their
+    /// sites and addresses come: `allowed` follows tier order and `sites`
+    /// configuration order, so a change elsewhere can reorder them (#104).
+    pub fn serves_alike(&self, other: &ProxyRoutes) -> bool {
+        self.sorted() == other.sorted()
+    }
+
+    fn sorted(&self) -> ProxyRoutes {
+        let mut routes = self.clone();
+        for site in &mut routes.sites {
+            site.allowed.sort();
+            site.allowed.dedup();
+        }
+        routes.sites.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+        routes
+    }
 }
 
 impl ProxySite {
@@ -186,10 +203,12 @@ pub fn render(model: &Model<'_>) -> Result<Artifact> {
 }
 
 /// What both `served` and `new` grant: the sites they have alike (apart
-/// from who may use them), each for the addresses both allow, and `new`'s
-/// listener and certificates. While an apply is under way, or after it
-/// failed partway, the live firewall may be the old one, the new one, or
-/// (iptables) a mix (issue #71), so the proxy serves only this.
+/// from who may use them), each for the addresses both allow. While an
+/// apply is under way, or after it failed partway, the live firewall may be
+/// the old one, the new one, or (iptables) a mix (issue #71), so the proxy
+/// serves only this. The listener, certificates and upstream CA bundle stay
+/// `served`'s: a new bundle may trust more upstreams, and isn't in force
+/// until the apply has worked (#104).
 pub fn overlap(served: &ProxyRoutes, new: &ProxyRoutes) -> ProxyRoutes {
     let sites = new
         .sites
@@ -224,9 +243,9 @@ pub fn overlap(served: &ProxyRoutes, new: &ProxyRoutes) -> ProxyRoutes {
         })
         .collect();
     ProxyRoutes {
-        listen: new.listen,
-        certificates: new.certificates.clone(),
-        upstream_ca: new.upstream_ca.clone(),
+        listen: served.listen,
+        certificates: served.certificates.clone(),
+        upstream_ca: served.upstream_ca.clone(),
         sites,
     }
 }
@@ -363,7 +382,8 @@ mod tests {
     }
 
     /// #71: a site stays only if both have it alike, for the addresses
-    /// both allow; the listener is the new one's.
+    /// both allow; the listener, certificates and CA bundle are the served
+    /// ones (#104).
     #[test]
     fn the_overlap_is_what_both_grant() {
         let served = routes(
@@ -378,7 +398,7 @@ mod tests {
                 site("wiki.mydomain.com", "192.168.1.7:443", &["10.8.2.1/32"]),
             ],
         );
-        let new = routes(
+        let mut new = routes(
             "10.8.0.1:9443",
             vec![
                 // Someone else's now, and narrower inside the /24.
@@ -393,11 +413,14 @@ mod tests {
                 site("jellyfin.mydomain.com", "192.168.1.8:443", &["10.8.2.1/32"]),
             ],
         );
+        // A wider CA bundle and another certificate folder.
+        new.upstream_ca = "/etc/ssl/certs/everything.crt".into();
+        new.certificates = "/srv/other-certs".into();
         let both = overlap(&served, &new);
         assert_eq!(
             both,
             routes(
-                "10.8.0.1:9443",
+                "10.8.0.1:8443",
                 vec![site(
                     "immich.mydomain.com",
                     "192.168.1.5:443",
@@ -420,5 +443,31 @@ mod tests {
         );
         // Same routes: nothing changes.
         assert_eq!(overlap(&new, &new), new);
+    }
+
+    /// #104: order isn't what's served.
+    #[test]
+    fn reordered_routes_serve_alike() {
+        let a = routes(
+            "10.8.0.1:8443",
+            vec![
+                site(
+                    "immich.mydomain.com",
+                    "192.168.1.5:443",
+                    &["10.8.2.1/32", "10.8.3.0/24"],
+                ),
+                site("photos.mydomain.com", "192.168.1.6:443", &["10.8.2.1/32"]),
+            ],
+        );
+        let mut b = a.clone();
+        b.sites.reverse();
+        b.sites[1].allowed.reverse();
+        assert_ne!(a, b);
+        assert!(a.serves_alike(&b));
+        b.sites[1].allowed.pop();
+        assert!(!a.serves_alike(&b));
+        let mut c = a.clone();
+        c.upstream_ca = "/etc/ssl/certs/everything.crt".into();
+        assert!(!a.serves_alike(&c));
     }
 }

@@ -19,7 +19,7 @@ pub mod certs;
 pub mod http;
 
 pub use error::{Error, Result};
-pub use server::{Proxy, Reload};
+pub use server::{Proxy, Reload, Taking};
 
 use parallax_core::generate::proxy::ProxyRoutes;
 
