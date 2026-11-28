@@ -627,3 +627,84 @@ fn while_an_apply_runs_a_member_gets_what_both_routes_give_it() {
     let both = parallax_dns::overlap(&before, &gone);
     assert_eq!(route_of(&both, FAMILY, "immich.mydomain.com"), "refused");
 }
+
+/// Lane C's repro of a #96 post-merge finding: with three upstreams that don't
+/// answer, a lookup outlasts the reload's drain, so the reload is confirmed
+/// while a query under the old routes is still out.
+#[tokio::test(flavor = "multi_thread")]
+async fn lc_a_lookup_through_five_silent_upstreams_ends_within_the_drain() {
+    let s = start().await;
+    let two = routes(false).replace(
+        &format!("upstream = [\"{UPSTREAM}\"]"),
+        &format!("upstream = [\"{UPSTREAM}\", \"127.0.0.11\", \"127.0.0.12\", \"127.0.0.13\", \"127.0.0.14\"]"),
+    );
+    assert_ne!(two, routes(false));
+    s.reload(DnsRoutes::from_toml(&two).unwrap()).await;
+    let addr = s.addr;
+    let started = std::time::Instant::now();
+    let slow = tokio::spawn(async move {
+        let socket = UdpSocket::bind((PERSONAL, 0)).await.unwrap();
+        socket
+            .send_to(&query("slow.mydomain.com.", RecordType::A, true), addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 65535];
+        let got = tokio::time::timeout(Duration::from_secs(20), socket.recv_from(&mut buf)).await;
+        (got.is_ok(), started.elapsed())
+    });
+    for _ in 0..100 {
+        if s.upstream.asked("slow.mydomain.com. A") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    s.reload(parsed(true)).await;
+    let confirmed = started.elapsed();
+    let (answered, took) = slow.await.unwrap();
+    eprintln!("lc: confirmed after {confirmed:?}; answered {answered} after {took:?}");
+    assert!(
+        !answered || took <= confirmed + Duration::from_millis(300),
+        "confirmed after {confirmed:?}, but the query under the old routes answered after {took:?}"
+    );
+}
+
+/// Lane C's repro of a #96 post-merge finding: remapping a network keeps the
+/// old rewrite while an apply runs, an address only the old routes give.
+#[test]
+fn lc_the_overlap_drops_a_mapping_only_the_old_routes_have() {
+    let served = parsed(false);
+    let remapped =
+        routes(false).replace("virtual = \"198.18.1.0/24\"", "virtual = \"198.18.2.0/24\"");
+    assert_ne!(remapped, routes(false));
+    let new = DnsRoutes::from_toml(&remapped).unwrap();
+    let both = parallax_dns::overlap(&served, &new);
+    assert!(
+        !both
+            .mappings
+            .iter()
+            .any(|m| served.mappings.contains(m) && !new.mappings.contains(m)),
+        "the overlap keeps a mapping only the old routes have: {:?}",
+        both.mappings
+    );
+}
+
+/// Lane C's repro of a #96 post-merge finding: a zone only the new routes
+/// have must be nobody's while an apply runs, also for a single name in it.
+#[test]
+fn lc_a_zone_only_the_new_routes_have_answers_nobody_during_the_apply() {
+    let served = parsed(false);
+    let with_zone = routes(false).replace(
+        "[[mapping]]",
+        "[[zone]]\nname = \"photos.mydomain.com\"\nnetwork = \"lab\"\nupstream = [\"127.0.0.11\"]\n\n[[mapping]]",
+    );
+    let new = DnsRoutes::from_toml(&with_zone).unwrap();
+    assert!(new.zones.iter().any(|z| z.name == "photos.mydomain.com"));
+    let both = parallax_dns::overlap(&served, &new);
+    let route = both.route(FAMILY.parse().unwrap(), "photos.mydomain.com");
+    if let parallax_core::generate::dns::Route::Home { zone, .. } = route {
+        assert_ne!(
+            zone.name, "photos.mydomain.com",
+            "family's photos.mydomain.com goes to the zone only the new routes have"
+        );
+    }
+}
