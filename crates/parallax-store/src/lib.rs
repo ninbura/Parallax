@@ -148,6 +148,15 @@ impl Store {
         Ok(())
     }
 
+    /// After a commit: secure the files Turso may have just created (its
+    /// log appears with the first write). The commit has happened, so a
+    /// failure here mustn't turn it into a refusal (#99). The same files
+    /// were made owner-only before the write began, and the CLI's umask
+    /// covers new ones; this is for library use without it.
+    fn tighten_after_commit(&self) {
+        let _ = self.tighten();
+    }
+
     /// Name the database when another process held it too long.
     fn busy(&self, e: Error) -> Error {
         match e {
