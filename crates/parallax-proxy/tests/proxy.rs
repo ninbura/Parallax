@@ -118,7 +118,35 @@ async fn fake_upstream((chain, key): (String, String)) -> SocketAddrV4 {
     addr
 }
 
+/// Bytes the fake upstream has read from `/upload` bodies (lane C's #94 repro).
+static UPLOADED: AtomicUsize = AtomicUsize::new(0);
+
+/// A request body fed from a channel, one frame per message.
+struct Chunks(tokio::sync::mpsc::Receiver<Bytes>);
+
+impl hyper::body::Body for Chunks {
+    type Data = Bytes;
+    type Error = Infallible;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        self.0
+            .poll_recv(cx)
+            .map(|b| b.map(|b| Ok(hyper::body::Frame::data(b))))
+    }
+}
+
 async fn upstream_service(mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.uri().path() == "/upload" {
+        let mut body = req.into_body();
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Some(data) = frame.data_ref() {
+                UPLOADED.fetch_add(data.len(), Ordering::SeqCst);
+            }
+        }
+        return Ok(Response::new(Full::default()));
+    }
     if req.headers().contains_key(UPGRADE) {
         let on = hyper::upgrade::on(&mut req);
         tokio::spawn(async move {
@@ -442,6 +470,46 @@ async fn revoking_a_grant_closes_open_connections() {
         "the WebSocket must be closed"
     );
     assert!(env.connect(IMMICH, b"http/1.1").await.is_err());
+}
+
+/// Lane C's repro of a #94 post-merge finding: an upload in progress when
+/// the grant is revoked must not keep reaching the upstream once the proxy
+/// has confirmed the revocation.
+#[tokio::test(flavor = "multi_thread")]
+async fn lc_an_upload_stops_at_the_revocation() {
+    let env = Env::start().await;
+    let tls = env.connect(IMMICH, b"h2").await.unwrap();
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("https://{IMMICH}/upload"))
+        .body(Chunks(rx))
+        .unwrap();
+    let resp = tokio::spawn(async move { h2.send_request(req).await.map(|r| r.status()) });
+    tx.send(Bytes::from(vec![b'a'; 1000])).await.unwrap();
+    for _ in 0..50 {
+        if UPLOADED.load(Ordering::SeqCst) >= 1000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(UPLOADED.load(Ordering::SeqCst), 1000, "the first chunk never arrived");
+
+    env.revoke_immich().await;
+    let _ = tx.send(Bytes::from(vec![b'b'; 1000])).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        UPLOADED.load(Ordering::SeqCst),
+        1000,
+        "bytes sent after the revocation reached the upstream"
+    );
+    drop(tx);
+    let _ = resp.await;
 }
 
 /// A hostname moved to another upstream closes the WebSocket relayed to the
