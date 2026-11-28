@@ -224,9 +224,10 @@ struct Running {
 }
 
 impl Running {
-    /// Hand the server `routes` and wait until it answers by them.
+    /// Hand the server `routes` and wait until it answers by them, and
+    /// queries under older ones have replied.
     async fn reload(&self, routes: DnsRoutes) {
-        self.reload.send(routes).await.unwrap();
+        assert!(self.reload.send(routes).await.unwrap());
     }
 }
 
@@ -656,4 +657,123 @@ fn while_an_apply_runs_a_member_gets_what_both_routes_give_it() {
     gone.tiers.remove(1);
     let both = parallax_dns::overlap(&before, &gone);
     assert_eq!(route_of(&both, FAMILY, "immich.mydomain.com"), "refused");
+}
+
+/// #107: answers while an apply runs are what both routes give alike. A
+/// remap rewrites by neither mapping, and a zone only one side has, or
+/// with other resolvers in each, is nobody's, single names in it too.
+#[test]
+fn while_an_apply_runs_answers_are_what_both_routes_give_alike() {
+    use parallax_core::generate::dns::DnsZone;
+    let served = parsed(false);
+    let remapped = DnsRoutes::from_toml(
+        &routes(false).replace("virtual = \"198.18.1.0/24\"", "virtual = \"198.18.2.0/24\""),
+    )
+    .unwrap();
+    assert_ne!(remapped, served);
+    let both = parallax_dns::overlap(&served, &remapped);
+    assert!(both.mappings.is_empty(), "{:?}", both.mappings);
+    // Narrowed even though every member keeps its names.
+    assert_ne!(both, served);
+    // A network moving between mapped and unmapped: neither way meanwhile.
+    let mut unmapped = parsed(false);
+    unmapped.mappings.clear();
+    unmapped.unmapped.push("192.168.1.0/24".parse().unwrap());
+    let both = parallax_dns::overlap(&served, &unmapped);
+    assert!(both.mappings.is_empty() && both.unmapped.is_empty());
+    let both = parallax_dns::overlap(&unmapped, &served);
+    assert!(both.mappings.is_empty() && both.unmapped.is_empty());
+
+    // A zone only the new routes have, holding a name `family` has alone.
+    let mut zoned = parsed(false);
+    zoned.zones.push(DnsZone {
+        name: "photos.mydomain.com".into(),
+        network: "lab".into(),
+        upstream: vec!["127.0.0.11".parse().unwrap()],
+    });
+    let both = parallax_dns::overlap(&served, &zoned);
+    assert_eq!(route_of(&both, FAMILY, "photos.mydomain.com"), "refused");
+    assert_eq!(route_of(&both, FAMILY, "immich.mydomain.com"), "home");
+    // And removed again: the zone's resolvers aren't asked meanwhile.
+    let both = parallax_dns::overlap(&zoned, &served);
+    assert_eq!(route_of(&both, FAMILY, "photos.mydomain.com"), "refused");
+    assert_eq!(route_of(&both, PERSONAL, "photos.mydomain.com"), "refused");
+    assert_eq!(route_of(&both, PERSONAL, "nas.mydomain.com"), "home");
+
+    // The same zone, other resolvers: nobody's, whole or by name.
+    let mut moved = parsed(false);
+    moved.zones[0].upstream = vec!["127.0.0.11".parse().unwrap()];
+    let both = parallax_dns::overlap(&served, &moved);
+    assert_eq!(route_of(&both, PERSONAL, "nas.mydomain.com"), "refused");
+    assert_eq!(route_of(&both, FAMILY, "immich.mydomain.com"), "refused");
+    assert_eq!(route_of(&both, PERSONAL, "www.xn--bcher-kva.ch"), "home");
+
+    // Another public resolver: public names wait for the apply.
+    let mut public = parsed(false);
+    public.public_resolver = "127.0.0.11".parse().unwrap();
+    let both = parallax_dns::overlap(&served, &public);
+    assert_eq!(route_of(&both, PERSONAL, "example.org"), "refused");
+    assert_eq!(route_of(&both, PERSONAL, "nas.mydomain.com"), "home");
+}
+
+/// #108: routes nobody waits for don't wait for queries either, so the
+/// next reload isn't held up behind them; the next one that's waited for
+/// covers the queries under every older routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unwaited_reload_does_not_hold_up_the_next() {
+    let s = start().await;
+    let addr = s.addr;
+    let answered = Arc::new(Mutex::new(None));
+    let at = Arc::clone(&answered);
+    let slow = tokio::spawn(async move {
+        ask(PERSONAL, addr, "slow.mydomain.com.", RecordType::A).await;
+        *at.lock().unwrap() = Some(Instant::now());
+    });
+    for _ in 0..100 {
+        if s.upstream.asked("slow.mydomain.com. A") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(s.upstream.asked("slow.mydomain.com. A"));
+    let started = Instant::now();
+    s.reload.load(parsed(true)).await.unwrap().unwrap();
+    s.reload.load(parsed(false)).await.unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "loading waited {:?} for the query",
+        started.elapsed()
+    );
+    assert!(answered.lock().unwrap().is_none(), "the query ended early");
+    assert!(s.reload.send(parsed(true)).await.unwrap());
+    // Confirmed only once the query under the first routes had replied.
+    let confirmed = Instant::now();
+    slow.await.unwrap();
+    let replied = answered.lock().unwrap().unwrap();
+    assert!(
+        replied <= confirmed + Duration::from_millis(300),
+        "confirmed before the query under older routes replied"
+    );
+}
+
+/// A lookup through many upstreams that never answer still ends before a
+/// reload stops waiting for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lookup_ends_before_a_reload_stops_waiting() {
+    let s = start().await;
+    let many = routes(false).replace(
+        &format!("upstream = [\"{UPSTREAM}\"]"),
+        &format!(
+            "upstream = [\"{UPSTREAM}\", \"127.0.0.11\", \"127.0.0.12\", \"127.0.0.13\", \"127.0.0.14\"]"
+        ),
+    );
+    s.reload(DnsRoutes::from_toml(&many).unwrap()).await;
+    let started = Instant::now();
+    let m = ask(PERSONAL, s.addr, "slow.mydomain.com.", RecordType::A).await;
+    assert_eq!(m.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        started.elapsed() < Duration::from_millis(4500),
+        "took {:?}",
+        started.elapsed()
+    );
 }

@@ -373,8 +373,12 @@ server (crate `parallax-dns`, built on hickory, a task in the daemon)
 answers by the routes `apply` makes (`dns/routes.toml` is written for
 `plan`), which the daemon hands it like the proxy's: before an apply
 changes anything live, each member gets only what both the current and the
-new routes let it look up (`parallax_dns::overlap`); after the apply has
-worked, the new routes in full.
+new routes let it look up, and alike (`parallax_dns::overlap`): an address
+is rewritten only by a mapping both have, and a zone only one side has, or
+with other resolvers in each, answers nobody. The apply goes on once every
+query under older routes has sent its reply; a lookup gives up after 4 s,
+and if some query still holds older routes after 5 s, the apply stops
+there. After it has worked, the new routes in full, without that wait.
 
 - **Who asks.** The source address picks the tier: its peers' WireGuard
   addresses, or (M2) its Tailscale nodes. WireGuard ties the source address

@@ -1142,6 +1142,9 @@ struct Engine {
     /// address that changes hands answers neither owner's names beyond
     /// what both may see until the apply has worked (issue #37).
     dns_routes: Option<DnsRoutes>,
+    /// The DNS server has confirmed `dns_routes`: no query under older
+    /// routes is still to reply.
+    dns_confirmed: bool,
     /// Why the last public IP lookup failed, so the same failure is
     /// logged once, not every 5 minutes.
     public_ip_problems: Option<Vec<String>>,
@@ -1166,14 +1169,17 @@ const DNS_TAKES: Duration = Duration::from_secs(8);
 
 /// Before the apply writes or changes anything, like [`narrow_proxy`]: the
 /// DNS server answers each member only what both its routes `served` and
-/// the `new` ones let it look up (issue #37), so an address that changes
-/// hands answers neither owner's names beyond that while WireGuard may
-/// still give it to either. Waits until it does; if it doesn't in time,
-/// nothing has changed and the apply stops.
+/// the `new` ones give it alike (issues #37, #107), so an address that
+/// changes hands answers neither owner's names beyond that while WireGuard
+/// may still give it to either. Waits until it does and every query under
+/// older routes has replied; if it doesn't in time, the apply stops before
+/// anything else has changed. `confirmed` says whether the server has
+/// confirmed `served`.
 fn narrow_dns(
     rt: &tokio::runtime::Runtime,
     dns: Option<&parallax_dns::Reload>,
     served: &mut Option<DnsRoutes>,
+    confirmed: &mut bool,
     new: &DnsRoutes,
 ) -> anyhow::Result<()> {
     // No DNS server runs before the first apply has worked.
@@ -1181,22 +1187,57 @@ fn narrow_dns(
         return Ok(());
     };
     let both = parallax_dns::overlap(before, new);
-    if both == *before {
+    if *confirmed && both == *before {
         return Ok(());
     }
-    let taken = dns.send(both.clone());
-    match rt.block_on(async { tokio::time::timeout(DNS_TAKES, taken).await }) {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => bail!(
-            "the DNS server couldn't take its routes for the change (stopped); the firewall and WireGuard weren't changed"
-        ),
+    let checked = dns.send(both.clone());
+    // The server answers by them next whatever comes of the wait: routes go
+    // in in the order sent, like the proxy's (#103). Its wait for queries
+    // also covers every older routes still held.
+    *served = Some(both);
+    *confirmed = false;
+    const LEFT: &str =
+        "the firewall and WireGuard weren't changed, and the next try waits for the DNS server again";
+    match rt.block_on(async { tokio::time::timeout(DNS_TAKES, checked).await }) {
+        Ok(Ok(true)) => {
+            *confirmed = true;
+            Ok(())
+        }
+        Ok(Ok(false)) => {
+            bail!("the DNS server's queries under its old routes didn't all reply in time; {LEFT}")
+        }
+        Ok(Err(_)) => {
+            bail!("the DNS server has stopped; the firewall and WireGuard weren't changed")
+        }
         Err(_) => bail!(
-            "the DNS server didn't take its routes for the change within {} s; the firewall and WireGuard weren't changed",
+            "the DNS server didn't take its routes for the change within {} s; {LEFT}",
             DNS_TAKES.as_secs()
         ),
     }
-    *served = Some(both);
-    Ok(())
+}
+
+/// After a good apply: the DNS server answers by the new routes in full.
+/// Waits only until they're in force, not for queries under older routes,
+/// which give no more than these (#108). When they don't load, the server
+/// refuses every query, and the apply counts as failed so the next tick
+/// tries again.
+fn widen_dns(
+    rt: &tokio::runtime::Runtime,
+    dns: &parallax_dns::Reload,
+    routes: &DnsRoutes,
+) -> anyhow::Result<()> {
+    let loaded = dns.load(routes.clone());
+    match rt.block_on(async { tokio::time::timeout(DNS_TAKES, loaded).await }) {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(why))) => bail!(
+            "the DNS server couldn't load its new routes ({why}); it refuses every query until a reload works"
+        ),
+        Ok(Err(_)) => bail!("the DNS server has stopped"),
+        Err(_) => bail!(
+            "the DNS server didn't take its new routes within {} s",
+            DNS_TAKES.as_secs()
+        ),
+    }
 }
 
 /// Before the apply writes or changes anything: one that fails partway can
@@ -1319,6 +1360,8 @@ impl Engine {
             // The proxy starts on the routes the first apply made.
             proxy_confirmed: true,
             dns_routes: None,
+            // Likewise.
+            dns_confirmed: true,
             backups,
             public_ip_problems: None,
             public_ip_saved: true,
@@ -1470,7 +1513,7 @@ impl Engine {
         let mut made = None;
         let (servers, rt) = (&self.servers, &self.rt);
         let (served, dns_served) = (&mut self.proxy_routes, &mut self.dns_routes);
-        let confirmed = &mut self.proxy_confirmed;
+        let (confirmed, dns_confirmed) = (&mut self.proxy_confirmed, &mut self.dns_confirmed);
         let applied = crate::apply_config(
             &self.view.config,
             &self.out,
@@ -1486,7 +1529,13 @@ impl Engine {
                     confirmed,
                     &new,
                 )?;
-                narrow_dns(rt, servers.as_ref().map(|s| &s.dns), dns_served, &new_dns)?;
+                narrow_dns(
+                    rt,
+                    servers.as_ref().map(|s| &s.dns),
+                    dns_served,
+                    dns_confirmed,
+                    &new_dns,
+                )?;
                 made = Some((new, new_dns));
                 Ok(())
             },
@@ -1503,15 +1552,17 @@ impl Engine {
                 self.reconciler
                     .applied(today, reconcile::live_state(server, sys()));
                 self.applied = Some(server.clone());
-                let mut proxy_failed = None;
+                let mut failed = Vec::new();
                 if let (Some(servers), Some((routes, dns))) = (&self.servers, &made) {
-                    // DNS not waited for: the next apply's narrowing is
-                    // taken after these.
-                    drop(servers.dns.send(dns.clone()));
-                    proxy_failed = widen_proxy(&self.rt, &servers.proxy, routes).err();
+                    let dns_failed = widen_dns(&self.rt, &servers.dns, dns).err();
+                    let proxy_failed = widen_proxy(&self.rt, &servers.proxy, routes).err();
                     // In force (or refusing everything), and wider than
-                    // anything older an open connection may still hold.
+                    // anything older an open connection or query may still
+                    // hold.
+                    self.dns_confirmed = dns_failed.is_none();
                     self.proxy_confirmed = proxy_failed.is_none();
+                    failed.extend(dns_failed);
+                    failed.extend(proxy_failed);
                 }
                 if let Some((routes, dns)) = made {
                     self.proxy_routes = Some(routes);
@@ -1519,8 +1570,9 @@ impl Engine {
                 }
                 // What the activity log attributes by from now on.
                 self.view.applied = Some(Arc::clone(&self.view.config));
-                if let Some(e) = proxy_failed {
-                    let e = format!("{e:#}");
+                if !failed.is_empty() {
+                    let e: Vec<String> = failed.iter().map(|e| format!("{e:#}")).collect();
+                    let e = e.join("; ");
                     warn(format!(
                         "apply failed after the firewall changed, trying again in a minute: {e}"
                     ));
@@ -2184,7 +2236,16 @@ mod tests {
         let (reload, _task) = running_dns(&dns_rt, before.clone());
         let after = dns_routes(&[], &["10.8.1.1/32", "10.8.2.1/32"]);
         let mut served = Some(before);
-        narrow_dns(&engine_rt(), Some(&reload), &mut served, &after).unwrap();
+        let mut confirmed = true;
+        narrow_dns(
+            &engine_rt(),
+            Some(&reload),
+            &mut served,
+            &mut confirmed,
+            &after,
+        )
+        .unwrap();
+        assert!(confirmed);
         let both = served.unwrap();
         let client = "10.8.1.1".parse().unwrap();
         assert!(matches!(
@@ -2213,12 +2274,22 @@ mod tests {
         task.abort();
         let _ = dns_rt.block_on(task);
         let mut served = Some(before.clone());
-        narrow_dns(&engine_rt(), Some(&reload), &mut served, &before).unwrap();
+        let mut confirmed = true;
+        narrow_dns(
+            &engine_rt(),
+            Some(&reload),
+            &mut served,
+            &mut confirmed,
+            &before,
+        )
+        .unwrap();
         assert_eq!(served, Some(before));
     }
 
     /// A DNS server that stopped (its task ended) confirms nothing: the
-    /// apply stops before anything changes, and the routes stay.
+    /// apply stops before anything changes. The overlap is what it's
+    /// recorded to answer by next: a server that's slow, not stopped, still
+    /// puts it in.
     #[test]
     fn a_stopped_dns_server_stops_the_apply() {
         let dns_rt = tokio::runtime::Runtime::new().unwrap();
@@ -2228,10 +2299,59 @@ mod tests {
         let _ = dns_rt.block_on(task);
         let after = dns_routes(&[], &["10.8.1.1/32", "10.8.2.1/32"]);
         let mut served = Some(before.clone());
-        let err = narrow_dns(&engine_rt(), Some(&reload), &mut served, &after)
+        let mut confirmed = true;
+        let err = narrow_dns(
+            &engine_rt(),
+            Some(&reload),
+            &mut served,
+            &mut confirmed,
+            &after,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("the DNS server has stopped"), "{err}");
+        assert!(err.contains("weren't changed"), "{err}");
+        let both = parallax_dns::overlap(&before, &after);
+        assert_eq!(served.as_ref(), Some(&both));
+        // Unconfirmed: a retry of the same change asks again, rather than
+        // taking an overlap it was never told is in force.
+        assert!(!confirmed);
+        narrow_dns(
+            &engine_rt(),
+            Some(&reload),
+            &mut served,
+            &mut confirmed,
+            &after,
+        )
+        .unwrap_err();
+    }
+
+    /// #108: after a good apply, routes the DNS server can't load fail it
+    /// (the next tick tries again), and routes it loads don't.
+    #[test]
+    fn the_full_dns_routes_must_load() {
+        let dns_rt = tokio::runtime::Runtime::new().unwrap();
+        let before = dns_routes(&["10.8.1.1/32"], &["10.8.2.1/32"]);
+        let (reload, task) = running_dns(&dns_rt, before.clone());
+        let mut broken = before.clone();
+        // Prefixes of different lengths: no mapping can be made of them.
+        broken
+            .mappings
+            .push(parallax_core::generate::dns::DnsMapping {
+                real: "192.168.1.0/24".parse().unwrap(),
+                virt: "198.18.0.0/16".parse().unwrap(),
+            });
+        let err = widen_dns(&engine_rt(), &reload, &broken)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("the DNS server couldn't take"), "{err}");
-        assert_eq!(served, Some(before));
+        assert!(err.contains("couldn't load its new routes"), "{err}");
+        assert!(err.contains("prefix lengths"), "{err}");
+        widen_dns(&engine_rt(), &reload, &before).unwrap();
+        task.abort();
+        let _ = dns_rt.block_on(task);
+        let err = widen_dns(&engine_rt(), &reload, &before)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stopped"), "{err}");
     }
 }
