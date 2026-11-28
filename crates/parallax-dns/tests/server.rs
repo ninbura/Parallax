@@ -615,6 +615,11 @@ fn while_an_apply_runs_a_member_gets_what_both_routes_give_it() {
     let before = parsed(false);
     // Nothing changes: the routes stay as they are.
     assert_eq!(parallax_dns::overlap(&before, &before), before);
+    // Also with a single name inside a zone the tier has whole, as the
+    // generator writes a granted network's service.
+    let mut both_ways = parsed(false);
+    both_ways.tiers[0].names.push("immich.mydomain.com".into());
+    assert_eq!(parallax_dns::overlap(&both_ways, &both_ways), both_ways);
     // PERSONAL's address moves to someone with only `family`'s names.
     let mut after = parsed(true);
     after.tiers[0].members.clear();
@@ -776,4 +781,30 @@ async fn a_lookup_ends_before_a_reload_stops_waiting() {
         "took {:?}",
         started.elapsed()
     );
+}
+
+/// Routes the generator makes don't narrow when nothing changes, also for a
+/// tier with a whole zone and a single name inside it.
+#[test]
+fn generated_routes_overlap_with_themselves_unchanged() {
+    use parallax_core::model::Rule;
+    use parallax_core::testing::{canonical_config, today};
+    let mut cfg = canonical_config();
+    cfg.services[0].hostnames = vec!["immich.mydomain.com".into()];
+    let model = parallax_core::Model::resolve(&cfg, today()).unwrap();
+    let routes = parallax_core::generate::dns::build(&model);
+    assert_eq!(parallax_dns::overlap(&routes, &routes), routes);
+    cfg.grants[1].rules.push(Rule::Network {
+        name: "home".into(),
+    });
+    let model = parallax_core::Model::resolve(&cfg, today()).unwrap();
+    let routes = parallax_core::generate::dns::build(&model);
+    assert!(
+        routes
+            .tiers
+            .iter()
+            .any(|t| !t.zones.is_empty() && !t.names.is_empty()),
+        "{routes:?}"
+    );
+    assert_eq!(parallax_dns::overlap(&routes, &routes), routes);
 }

@@ -25,7 +25,7 @@ use hickory_server::resolver::TokioResolver;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use hickory_server::Server;
-use parallax_core::generate::dns::{DnsRoutes, DnsTier, Route};
+use parallax_core::generate::dns::{DnsRoutes, DnsTier, DnsZone, Route};
 use parallax_core::logging::{Event, Logged, Query, QueryOutcome, Tap};
 use parallax_core::netmap::Mapping;
 use tokio::net::{TcpListener, UdpSocket};
@@ -252,7 +252,7 @@ async fn reloader(
     while let Some(Handover {
         routes,
         loaded,
-        checked,
+        mut checked,
     }) = reloads.recv().await
     {
         let (next, outcome) = match load_state(routes, upstream_port) {
@@ -290,9 +290,15 @@ async fn reloader(
         // these too.
         if checked.is_closed() {
             replaced.retain(|s| Arc::strong_count(s) > 1);
-        } else {
-            let all = drained(&mut replaced, DRAIN).await;
-            let _ = checked.send(all);
+            continue;
+        }
+        tokio::select! {
+            all = drained(&mut replaced, DRAIN) => {
+                let _ = checked.send(all);
+            }
+            // The waiter gave up: on to the next routes, whose wait covers
+            // these queries too.
+            () = checked.closed() => {}
         }
     }
 }
@@ -339,11 +345,11 @@ pub fn overlap(served: &DnsRoutes, new: &DnsRoutes) -> DnsRoutes {
                 .zone_of(name)
                 .is_some_and(|z| tier.zones.contains(&z.name))
     }
+    fn zone<'r>(routes: &'r DnsRoutes, name: &str) -> Option<&'r DnsZone> {
+        routes.zones.iter().find(|z| z.name == name)
+    }
     // Both have it, with the same resolvers.
-    let alike = |zone: &str| {
-        let find = |r: &DnsRoutes| r.zones.iter().find(|z| z.name == zone).cloned();
-        find(served).is_some_and(|z| Some(z) == find(new))
-    };
+    let alike = |name: &str| zone(served, name).is_some_and(|z| zone(new, name) == Some(z));
     let mut out = DnsRoutes {
         listen: served.listen,
         public_resolver: served.public_resolver,
@@ -385,20 +391,21 @@ pub fn overlap(served: &DnsRoutes, new: &DnsRoutes) -> DnsRoutes {
                 let Some(zone) = out.zone_of(n) else {
                     continue;
                 };
+                // A name also in a whole zone stays: the generator keeps
+                // those, and dropping it would narrow routes that don't change.
                 if allows(served, old, n)
                     && allows(new, next, n)
                     && alike(&zone.name)
-                    && !zones.contains(&zone.name)
                     && !names.contains(n)
                 {
                     names.push(n.clone());
                 }
             }
             let public = old.public && next.public && same_public;
-            let alike = |t: &&mut DnsTier| {
+            let same_tier = |t: &&mut DnsTier| {
                 t.tier == old.tier && t.zones == zones && t.names == names && t.public == public
             };
-            match out.tiers.iter_mut().find(alike) {
+            match out.tiers.iter_mut().find(same_tier) {
                 Some(tier) => tier.members.push(*member),
                 None => out.tiers.push(DnsTier {
                     tier: old.tier.clone(),
