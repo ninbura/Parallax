@@ -1391,6 +1391,7 @@ PY
             for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
             kill -0 "$pid" 2>/dev/null && fail "(y) the router's tailscaled did not stop"
         fi
+        return 0
     }
     start_router
 
