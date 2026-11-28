@@ -107,16 +107,23 @@ static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
 
 async fn upstream() -> Upstream {
     // UDP and TCP on the same port; walk a private range until both bind.
+    // Only a taken port is worth another try.
+    let taken = |e: &std::io::Error| e.kind() == std::io::ErrorKind::AddrInUse;
+    let mut tries = 0;
     let (udp, tcp, port) = loop {
         let base = 20000 + (std::process::id() % 20000) as u16;
         let port = base.wrapping_add(NEXT_PORT.fetch_add(1, Ordering::SeqCst));
-        let Ok(udp) = UdpSocket::bind((UPSTREAM, port)).await else {
-            continue;
+        let bound = match UdpSocket::bind((UPSTREAM, port)).await {
+            Ok(udp) => TcpListener::bind((UPSTREAM, port))
+                .await
+                .map(|tcp| (udp, tcp)),
+            Err(e) => Err(e),
         };
-        let Ok(tcp) = TcpListener::bind((UPSTREAM, port)).await else {
-            continue;
-        };
-        break (udp, tcp, port);
+        match bound {
+            Ok((udp, tcp)) => break (udp, tcp, port),
+            Err(e) if taken(&e) && tries < 1000 => tries += 1,
+            Err(e) => panic!("binding the fake upstream on {UPSTREAM}:{port}: {e}"),
+        }
     };
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let record = |seen: &Arc<Mutex<Vec<String>>>, m: &Message| {
@@ -237,13 +244,14 @@ async fn start_tapped(tap: Option<Tap>) -> Running {
     let reload = dns.reloader();
     // UDP and TCP on the same port. The kernel picks a UDP port that's free
     // for UDP only, so TCP may already be taken there (#95): try another.
+    let mut tries = 0;
     let (udp, tcp, addr) = loop {
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = udp.local_addr().unwrap();
         match TcpListener::bind(addr).await {
             Ok(tcp) => break (udp, tcp, addr),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(e) => panic!("binding TCP on {addr}: {e}"),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 100 => tries += 1,
+            Err(e) => panic!("binding TCP on {addr} (after {tries} ports taken on TCP): {e}"),
         }
     };
     tokio::spawn(dns.run(udp, tcp));
@@ -572,8 +580,12 @@ async fn a_reload_is_confirmed_once_queries_under_the_old_routes_answered() {
         tokio::spawn(async move { ask(PERSONAL, addr, "slow.mydomain.com.", RecordType::A).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     s.reload(parsed(true)).await;
+    // Its answer is sent by then; the client may take a moment to read it.
+    // Confirmed too early, it would still be over a second from its timeout.
     assert!(
-        slow.is_finished(),
+        tokio::time::timeout(Duration::from_millis(300), slow)
+            .await
+            .is_ok(),
         "confirmed while a query under the old routes was still out"
     );
 }
