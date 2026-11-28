@@ -1245,33 +1245,43 @@ fn narrow_proxy(
     // for open connections also covers every older routes still held.
     *served = Some(both);
     *confirmed = false;
-    // Inside the runtime: a timer needs its clock. One deadline for both.
-    let taken = rt.block_on(async {
-        tokio::time::timeout(PROXY_TAKES, async { (loaded.await, checked.await) }).await
-    });
     const LEFT: &str =
         "the firewall and WireGuard weren't changed, and the next try waits for the proxy again";
-    let (loaded, checked) = match taken {
-        Ok((Ok(loaded), Ok(checked))) => (loaded, checked),
-        Ok(_) => bail!("the HTTPS proxy has stopped; the firewall and WireGuard weren't changed"),
-        Err(_) => bail!(
+    const STOPPED: &str = "the HTTPS proxy has stopped; the firewall and WireGuard weren't changed";
+    let late = || {
+        anyhow!(
             "the HTTPS proxy didn't take its routes for the change within {} s; {LEFT}",
             PROXY_TAKES.as_secs()
-        ),
+        )
     };
-    if let Err(why) = loaded {
-        warn(format!(
-            "the HTTPS proxy couldn't load its routes for the change ({why}); it refuses every connection until a reload works"
-        ));
-        *served = Some(refused);
+    // Inside the runtime: a timer needs its clock. One deadline for both,
+    // and what loaded is recorded as soon as it's known, so a late
+    // `checked` doesn't lose it (#114).
+    let (loaded, checked) = rt.block_on(async {
+        let deadline = tokio::time::Instant::now() + PROXY_TAKES;
+        let loaded = tokio::time::timeout_at(deadline, loaded).await;
+        (loaded, tokio::time::timeout_at(deadline, checked))
+    });
+    match loaded.map_err(|_| late())? {
+        Err(_) => bail!(STOPPED),
+        Ok(Ok(())) => {}
+        Ok(Err(why)) => {
+            warn(format!(
+                "the HTTPS proxy couldn't load its routes for the change ({why}); it refuses every connection until a reload works"
+            ));
+            *served = Some(refused);
+        }
     }
-    if !checked {
-        bail!(
+    match rt.block_on(checked).map_err(|_| late())? {
+        Err(_) => bail!(STOPPED),
+        Ok(false) => bail!(
             "the HTTPS proxy's open connections didn't all move on to its routes for the change in time; {LEFT}"
-        );
+        ),
+        Ok(true) => {
+            *confirmed = true;
+            Ok(())
+        }
     }
-    *confirmed = true;
-    Ok(())
 }
 
 /// After a good apply: the proxy serves the new `routes` in full, recorded

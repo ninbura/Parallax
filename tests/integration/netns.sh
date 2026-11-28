@@ -711,7 +711,14 @@ def https(src, addr):
     s = ctx.wrap_socket(raw, server_hostname="immich.mydomain.com")
     def ask(_):
         s.sendall(b"GET / HTTP/1.1\r\nHost: immich.mydomain.com\r\n\r\n")
-        return b"home-immich" in s.recv(4096)
+        # The head and the body can come in separate reads.
+        got = b""
+        while b"home-immich" not in got:
+            part = s.recv(4096)
+            if not part:
+                return False
+            got += part
+        return True
     return ask
 cases = [
     ("guest-lan", tcp, "10.8.0.3", "198.18.1.5"),

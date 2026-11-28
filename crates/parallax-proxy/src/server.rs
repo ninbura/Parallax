@@ -119,6 +119,13 @@ impl State {
             .get(hostname)
             .filter(|site| site.route.allows(client))
     }
+
+    /// Whether `client` may still use `hostname`, and, for work that goes
+    /// to `upstream`, the hostname still goes there.
+    fn still(&self, hostname: &str, client: Ipv4Addr, upstream: Option<SocketAddrV4>) -> bool {
+        self.authorized(hostname, client)
+            .is_some_and(|site| upstream.is_none_or(|u| site.route.upstream == u))
+    }
 }
 
 type Shared = watch::Receiver<Arc<State>>;
@@ -565,10 +572,7 @@ async fn while_authorized<F: Future>(
     loop {
         let now = Arc::clone(&state.borrow_and_update());
         if !checked.as_ref().is_some_and(|c| Arc::ptr_eq(c, &now)) {
-            let still = now
-                .authorized(hostname, client)
-                .is_some_and(|site| upstream.is_none_or(|u| site.route.upstream == u));
-            if !still {
+            if !now.still(hostname, client, upstream) {
                 log(format!(
                     "{client}: {hostname}: access revoked or moved, closing"
                 ));
@@ -1053,17 +1057,21 @@ fn guarded(
     }
     let size = body.size_hint();
     let (tx, rx) = mpsc::channel(1);
+    let streamed = Streamed {
+        pieces: rx,
+        size,
+        ended: false,
+        state: state.clone(),
+        hostname: hostname.clone(),
+        client,
+        upstream,
+    };
     tokio::spawn(async move {
         let pump = pass_on(body, &tx);
         // `None` drops the sender without an end: the body fails.
         let _ = while_authorized(pump, state, &hostname, client, Some(upstream)).await;
     });
-    Streamed {
-        pieces: rx,
-        size,
-        ended: false,
-    }
-    .boxed()
+    streamed.boxed()
 }
 
 /// Send `body`'s frames down `tx` until it ends, fails or nobody reads.
@@ -1087,6 +1095,12 @@ struct Streamed {
     /// The upstream body's: passing it on keeps a known length known.
     size: SizeHint,
     ended: bool,
+    /// Checked again for each frame: one queued before the pump was cut
+    /// off doesn't go out after (#115).
+    state: Shared,
+    hostname: String,
+    client: Ipv4Addr,
+    upstream: SocketAddrV4,
 }
 
 impl hyper::body::Body for Streamed {
@@ -1100,7 +1114,16 @@ impl hyper::body::Body for Streamed {
         if self.ended {
             return Poll::Ready(None);
         }
-        Poll::Ready(match std::task::ready!(self.pieces.poll_recv(cx)) {
+        let piece = std::task::ready!(self.pieces.poll_recv(cx));
+        let still = self
+            .state
+            .borrow()
+            .still(&self.hostname, self.client, Some(self.upstream));
+        Poll::Ready(match piece {
+            Some(Some(Ok(_))) if !still => {
+                self.ended = true;
+                Some(Err("access was revoked or moved".into()))
+            }
             Some(Some(Ok(frame))) => Some(Ok(frame)),
             Some(Some(Err(e))) => {
                 self.ended = true;
