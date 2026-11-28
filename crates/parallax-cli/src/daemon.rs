@@ -276,7 +276,8 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
             // The router may still route from a run before (one that
             // crashed): take that away too before this teardown.
             let config = views.borrow().as_ref().map(|v| Arc::clone(&v.config));
-            let teardown = withdraw(config, opts.tailscale_socket.clone(), None).await;
+            let withdrawn = withdraw(config, opts.tailscale_socket.clone(), None);
+            let teardown = withdrawn_in_time(tokio::time::timeout(ROUTER_STOP, withdrawn).await);
             stop_engine(&tx, &mut done_rx, teardown).await;
             return Err(e);
         }
@@ -325,20 +326,14 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     // Before teardown removes the firewall: the router stops routing first.
     // Until it's known to have, the firewall stays, as after a crash (#75).
     let _ = stop_router.send(true);
-    let teardown = match tokio::time::timeout(ROUTER_STOP, router).await {
-        Ok(Ok(withdrawn)) => withdrawn,
+    let teardown = withdrawn_in_time(match tokio::time::timeout(ROUTER_STOP, router).await {
+        Ok(Ok(withdrawn)) => Ok(withdrawn),
         Ok(Err(e)) => {
             warn(format!("warning: the subnet router's task failed: {e}"));
-            false
+            Ok(false)
         }
-        Err(_) => {
-            warn("warning: the subnet router didn't withdraw its routes in time");
-            false
-        }
-    };
-    if !teardown {
-        warn("warning: leaving the firewall and wg0 in place: Parallax's subnet router may still route Tailscale peers, and without the firewall they'd reach the networks unfiltered. Start Parallax again, or stop the router, then stop Parallax");
-    }
+        Err(e) => Err(e),
+    });
     // Only our own: another daemon may have bound the path since.
     if file_id(&opts.socket) == Some(socket_id) {
         if let Err(e) = std::fs::remove_file(&opts.socket) {
@@ -359,6 +354,19 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
         warn("the activity collector didn't stop in time; its last records may be lost");
     }
     result
+}
+
+/// Whether teardown may remove the firewall, given how the router's
+/// withdraw went within [`ROUTER_STOP`]; says why not when it may not.
+fn withdrawn_in_time(withdrawn: Result<bool, tokio::time::error::Elapsed>) -> bool {
+    let teardown = withdrawn.unwrap_or_else(|_| {
+        warn("warning: the subnet router didn't withdraw its routes in time");
+        false
+    });
+    if !teardown {
+        warn("warning: leaving the firewall and wg0 in place: Parallax's subnet router may still route Tailscale peers, and without the firewall they'd reach the networks unfiltered. Start Parallax again, or stop the router, then stop Parallax");
+    }
+    teardown
 }
 
 /// Ask the engine to stop, tearing the gateway down if `teardown`, and
