@@ -1,0 +1,1765 @@
+#!/usr/bin/env bash
+# Parallax integration test on Linux network namespaces. Needs root, and:
+# nft, wg, ip, dnsmasq, dig, curl, openssl, ping, python3, and the parallax
+# binary (PARALLAX=...). KEEP_LOG=<file> keeps a copy of the daemon's log.
+# NETNS_PREFIX=<prefix> names the namespaces (default: one per run, so several
+# runs can share a machine). Interfaces live inside them and keep their names.
+# NETNS_DAEMON=unit runs the daemon (and a doctor) as an unprivileged user under
+# packaging/systemd/parallax.service's sandbox and capabilities, as a native
+# install does; needs systemd. The default, root, is how the Docker image runs it.
+#
+# Topology (every namespace is fresh; names below are without the prefix):
+#   home    192.168.1.5   "nginx" (TLS, picks the site by Host: immich and a sibling
+#           other.mydomain.com) + home DNS + plain HTTP on 8080 + an echo on 7000
+#   gw      eth0 192.168.1.1 (home LAN), wan0 203.0.113.1 (clients), up0 (internet),
+#           docker0 172.17.0.1 (a Docker bridge); runs `parallax daemon` (apply, DNS,
+#           the HTTPS proxy), which the CLI drives over its socket
+#   client  wan0 203.0.113.2 -> gw; lan0 192.168.1.10 on a *foreign* LAN with the
+#           same prefix as home; WireGuard interfaces wgp (personal), wgf (family)
+#           and wgx (friend)
+#   foreign 192.168.1.5   the foreign host (same address as home's) + foreign DNS
+#   net     the internet: 9.9.9.9 (a public server and the public resolver),
+#           1.2.3.4 (stands in for the home's public IP, which the router would
+#           hairpin back into the home) and
+#           10.99.0.5 (a private subnet the router knows but Parallax doesn't, like
+#           another VLAN)
+#   ctr     172.17.0.2, a "container" behind the gateway's Docker bridge
+#   tsc     wan0 203.0.114.2 -> gw wan1 203.0.114.1; a phone on Tailscale, for (w)
+#
+# Grants: personal (all_networks + internet, public DNS), family (the proxied
+# Immich, a service on the gateway host, two echo ports), friend (internet only),
+# one peer each; (r) combines them and adds a grant for everyone.
+#
+# Assertions: (a) mapped virtual IP lands on the real host, (b) the DNS server
+# answers in virtual space, (c) guest reaches only its grants even with 0.0.0.0/0
+# AllowedIPs, (d) reapply is idempotent, (e) concurrent changes through the daemon,
+# (f) colliding guest network with split DNS, (g) the proxy: by name only, one
+# hostname, Host/SNI/:authority checked, (h) internet means public addresses,
+# (i) nothing else on the gateway, its Docker bridge or the public address,
+# (j) IPv6 from a peer is dropped, (k) a revoked grant cuts open connections,
+# (l) DNS answers each tier only its names, and no private address outside the
+# configured networks, (m) large DNS answers, (o) guests with internet can't reach
+# the home's public IP, and a lookup answered with a private address is refused,
+# (p) hosts granted by DNS name are looked up on save and bad ones refused, (q) names
+# on the home's public IP reach one port forward each, or HTTPS through the proxy,
+# (n) the daemon tears down on SIGTERM and after a failed first apply, re-applies on
+# SIGHUP and repairs a deleted table, and keeps the home's public IP across the restart, (r) a peer with two grants
+# reaches both and nothing more, a grant for everyone reaches every peer, and changing
+# grants keeps addresses and client configs, (s) `grant` and `peer grants` commands
+# change access when they return, and a refused one changes nothing, (t) activity
+# logging records logged peers' connections, bytes, blocked attempts, proxied
+# requests and (when asked) DNS queries, and nobody else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
+# node's address from Headscale, (w) the subnet router: the daemon logs Parallax's
+# tailscaled in to Headscale, advertises and approves the mapped routes, and a phone
+# on Tailscale reaches what its grant allows, DNS included, (x) a stopping daemon
+# withdraws the router's routes, (y) an operator's expired node, its tailscaled
+# restarted, stays theirs. Every change goes through
+# the daemon and takes effect without SIGHUP.
+set -euo pipefail
+# Under pipefail `cmd | grep -q` fails when grep stops reading before cmd has
+# written everything (SIGPIPE), so a check can flake or a `&& fail` pass
+# (issue #89). Let grep read it all: `cmd | grep >/dev/null pattern`.
+
+PARALLAX="${PARALLAX:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/parallax}"
+[ -x "$PARALLAX" ] || { echo "parallax binary not found at $PARALLAX (cargo build first)"; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
+for t in nft wg ip dnsmasq dig curl openssl ping python3; do command -v $t >/dev/null || { echo "missing $t"; exit 2; }; done
+
+PREFIX="${NETNS_PREFIX-pxit$$-}"
+[[ $PREFIX =~ ^[A-Za-z0-9_-]*$ ]] || { echo "NETNS_PREFIX may hold only letters, digits, _ and -"; exit 2; }
+NAMESPACES=""
+for ns in home gw client foreign net ctr tsc; do NAMESPACES+=" $PREFIX$ns"; done
+# Cleanup kills everything in these namespaces, so never adopt ones that already exist.
+for ns in $NAMESPACES; do
+    ip netns list | grep >/dev/null "^$ns\( \|$\)" && { echo "namespace $ns already exists; delete it first"; exit 2; }
+done
+
+MODE="${NETNS_DAEMON:-root}"
+case $MODE in
+    root) ;;
+    unit) command -v systemd-run >/dev/null && command -v runuser >/dev/null && [ -d /run/systemd/system ] \
+              || { echo "NETNS_DAEMON=unit needs systemd and runuser"; exit 2; }
+          # The iptables-nft backend's capability check, below.
+          for t in iptables iptables-restore ipset; do
+              command -v $t >/dev/null || { echo "NETNS_DAEMON=unit needs $t"; exit 2; }
+          done ;;
+    *) echo "NETNS_DAEMON is root or unit"; exit 2 ;;
+esac
+UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.service"
+
+# The unit's private /tmp would hide one under /tmp.
+WORK_IN=$([ "$MODE" = unit ] && echo /run || echo /tmp)
+# The run copies the binary (and Tailscale's) in, and both are often RAM-backed
+# tmpfs: a full one fails a case halfway with "No space left on device". Say so
+# first: the copies, and 256 MiB for databases, logs and Headscale.
+need=$(stat -L -c %s "$PARALLAX")
+for t in "${TAILSCALE:-}" "${TAILSCALED:-}"; do [ -z "$t" ] || need=$((need + $(stat -L -c %s "$t"))); done
+need=$((need / 1024 + 256 * 1024))
+free=$(df --output=avail -k "$WORK_IN" | tail -n1)
+[ "$free" -ge "$need" ] || { echo "only $((free / 1024)) MiB free in $WORK_IN; a run needs about $((need / 1024)) MiB"; exit 2; }
+WORK=$(mktemp -d "$WORK_IN/parallax-it.XXXXXX")
+PIDS=()
+UNITS=()
+CREATED=() # only these are cleaned up: a run that lost a race for a name leaves the winner's alone
+cleanup() {
+    # A second signal (Ctrl-C twice, `timeout` signalling the process group, CI
+    # cancelling) would end bash mid-cleanup and leave the namespaces behind.
+    trap '' INT TERM HUP
+    set +e
+    for u in "${UNITS[@]:-}"; do [ -n "$u" ] && systemctl stop "$u" 2>/dev/null; done
+    for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+    # $! above is the backgrounded `inns` subshell, not the server it starts: kill
+    # whatever still runs in each namespace, or they outlive the test and keep the
+    # caller's stdout open.
+    for ns in "${CREATED[@]:-}"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null
+    done
+    sleep 0.2
+    for ns in "${CREATED[@]:-}"; do ip netns del "$ns" 2>/dev/null; done
+    [ -n "${KEEP_LOG:-}" ] && cp "$WORK/daemon.log" "$KEEP_LOG"
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+pass() { echo "PASS: $*"; }
+fail() {
+    echo "FAIL: $*"
+    [ -s "$WORK/daemon.log" ] && { echo "--- daemon log"; tail -30 "$WORK/daemon.log"; }
+    exit 1
+}
+inns() { local ns=$PREFIX$1; shift; ip netns exec "$ns" "$@"; } # role (gw, home, ...), command
+
+# ---------------------------------------------------------------- topology
+for ns in $NAMESPACES; do ip netns add "$ns"; CREATED+=("$ns"); ip netns exec "$ns" ip link set lo up; done
+veth() { ip link add "$1" netns "$PREFIX$2" type veth peer name "$3" netns "$PREFIX$4"; } # name, ns, peer, ns
+veth eth0 gw lan0 home
+veth wan0 gw wan0 client
+veth lan0 client lan0 foreign
+veth up0 gw up0 net
+veth vethctr gw eth0 ctr
+veth wan1 gw wan0 tsc
+inns gw ip addr add 192.168.1.1/24 dev eth0;   inns gw ip link set eth0 up
+inns gw ip addr add 203.0.113.1/24 dev wan0;   inns gw ip link set wan0 up
+inns gw ip addr add 198.51.100.1/24 dev up0;   inns gw ip link set up0 up
+inns gw ip addr add 203.0.114.1/24 dev wan1;   inns gw ip link set wan1 up
+inns gw ip route add default via 198.51.100.2
+inns gw ip link add docker0 type bridge
+inns gw ip addr add 172.17.0.1/16 dev docker0; inns gw ip link set docker0 up
+inns gw ip link set vethctr master docker0 up
+# Docker's DOCKER-USER chain, as iptables-nft makes it, with the FORWARD jump
+# Docker adds. The policy accepts: only Parallax's own accepts are checked here.
+inns gw nft add table ip filter
+inns gw nft add chain ip filter FORWARD '{ type filter hook forward priority 0; policy accept; }'
+inns gw nft add chain ip filter DOCKER-USER
+inns gw nft add rule ip filter FORWARD jump DOCKER-USER
+inns gw nft add rule ip filter DOCKER-USER return
+# Docker's chain as it was, without Parallax's accepts: listed, its own return
+# and FORWARD's jump kept, nothing commented "parallax" left.
+docker_user_is_dockers() {
+    local listing
+    listing=$(inns gw nft list chain ip filter DOCKER-USER) || return 1
+    grep -q 'return' <<< "$listing" || return 1
+    inns gw nft list chain ip filter FORWARD | grep 'jump DOCKER-USER' >/dev/null || return 1
+    ! grep -q 'comment "parallax"' <<< "$listing"
+}
+inns home ip addr add 192.168.1.5/24 dev lan0; inns home ip link set lan0 up
+inns home ip route add 10.8.0.0/16 via 192.168.1.1      # the static route the docs demand
+inns home ip route add 100.64.0.0/10 via 192.168.1.1
+inns client ip addr add 203.0.113.2/24 dev wan0; inns client ip link set wan0 up
+inns client ip addr add 192.168.1.10/24 dev lan0; inns client ip link set lan0 up
+inns foreign ip addr add 192.168.1.5/24 dev lan0; inns foreign ip link set lan0 up
+inns net ip addr add 198.51.100.2/24 dev up0; inns net ip link set up0 up
+inns net ip addr add 9.9.9.9/32 dev lo
+inns net ip addr add 10.99.0.5/32 dev lo
+inns net ip addr add 1.2.3.4/32 dev lo
+inns ctr ip addr add 172.17.0.2/16 dev eth0; inns ctr ip link set eth0 up
+inns ctr ip route add default via 172.17.0.1
+inns tsc ip addr add 203.0.114.2/24 dev wan0; inns tsc ip link set wan0 up
+inns gw sysctl -qw net.ipv4.ip_forward=1
+
+# ---------------------------------------------------------------- certificates
+# A throwaway CA; one certificate covers both sites on the home "nginx".
+mkdir -p "$WORK/ca" "$WORK/certs/immich.mydomain.com"
+(
+    cd "$WORK/ca"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+        -subj /CN=parallax-test-ca -keyout ca.key -out ca.pem \
+        -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -subj /CN=immich.mydomain.com -keyout leaf.key -out leaf.csr
+    printf 'subjectAltName=DNS:immich.mydomain.com,DNS:other.mydomain.com,DNS:public.mydomain.com\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n' > leaf.ext
+    openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 \
+        -extfile leaf.ext -out leaf.pem
+) >/dev/null 2>&1 || fail "could not make the test certificates"
+cat "$WORK/ca/leaf.pem" "$WORK/ca/ca.pem" > "$WORK/certs/immich.mydomain.com/fullchain.pem"
+cp "$WORK/ca/leaf.key" "$WORK/certs/immich.mydomain.com/privkey.pem"
+CA="$WORK/ca/ca.pem"
+
+# ---------------------------------------------------------------- services
+serve() { # ns, address, port, body
+    inns "$1" python3 - "$2" "$3" "$4" <<'PY' &
+import sys, http.server
+addr, port, body = sys.argv[1], int(sys.argv[2]), sys.argv[3].encode()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer((addr, port), H).serve_forever()
+PY
+    PIDS+=($!)
+}
+echo_server() { # ns, port: echoes lines back, for connections held across an apply
+    # Quiet: held connections end in resets when (n) tears the gateway down.
+    inns "$1" python3 - "$2" 2>/dev/null <<'PY' &
+import sys, socketserver
+class H(socketserver.StreamRequestHandler):
+    def handle(self):
+        for line in self.rfile:
+            self.wfile.write(line)
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer(("0.0.0.0", int(sys.argv[1])), H).serve_forever()
+PY
+    PIDS+=($!)
+}
+# The home "nginx": TLS on 443, the site picked by Host, like a box with several vhosts.
+inns home python3 - "$WORK/ca/leaf.pem" "$WORK/ca/leaf.key" <<'PY' &
+import sys, ssl, http.server
+sites = {"immich.mydomain.com": b"home-immich", "other.mydomain.com": b"home-other-vhost"}
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        body = sites.get((self.headers.get("Host") or "").split(":")[0], b"home-default")
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.ThreadingHTTPServer(("0.0.0.0", 443), H)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+PIDS+=($!)
+serve home 0.0.0.0 8080 home-other
+echo_server home 7000
+serve gw 0.0.0.0 9090 gw-self
+serve gw 0.0.0.0 9091 gw-hidden
+echo_server gw 7000
+serve foreign 0.0.0.0 443 foreign-immich
+serve net 9.9.9.9 80 internet
+serve net 10.99.0.5 80 vlan
+serve net 1.2.3.4 80 home-public
+serve net 1.2.3.4 8080 home-public-other
+# A web server behind the home's public IP (a port forward), with every site on it.
+inns net python3 - "$WORK/ca/leaf.pem" "$WORK/ca/leaf.key" <<'PY' &
+import sys, ssl, http.server
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        body = ("forwarded-" + (self.headers.get("Host") or "").split(":")[0]).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.ThreadingHTTPServer(("1.2.3.4", 443), H)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+PIDS+=($!)
+serve ctr 0.0.0.0 80 container
+# Home DNS: authoritative-ish answers for mydomain.com (big.mydomain.com has 40
+# addresses, more than a 512-byte UDP answer holds); foreign DNS for hisdomain.com;
+# a "public resolver" on the internet, with one name that points into private space.
+BIG=()
+for i in $(seq 10 49); do BIG+=(--host-record=big.mydomain.com,192.168.1.$i); done
+inns home dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
+    --address=/immich.mydomain.com/192.168.1.5 --address=/other.mydomain.com/192.168.1.5 \
+    --host-record=vlan.mydomain.com,10.99.0.5 --host-record=vlan.mydomain.com,192.168.1.6 \
+    --host-record=web.mydomain.com,192.168.1.5 --host-record=away.mydomain.com,10.99.0.5 \
+    --host-record=game.mydomain.com,1.2.3.4 --host-record=public.mydomain.com,1.2.3.4 \
+    "${BIG[@]}" >/dev/null 2>&1 &
+PIDS+=($!)
+inns net dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts --listen-address=9.9.9.9 --bind-interfaces \
+    --address=/example.org/9.9.9.9 --address=/rebind.example.org/192.168.1.5 >/dev/null 2>&1 &
+PIDS+=($!)
+inns foreign dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts --listen-address=192.168.1.5 --bind-interfaces \
+    --address=/immich.hisdomain.com/192.168.1.5 >/dev/null 2>&1 &
+PIDS+=($!)
+sleep 1
+
+# ---------------------------------------------------------------- gateway
+FAMILY_GRANTS='{ kind = "service", name = "immich" }, { kind = "service", name = "gwapp" }, { kind = "host_port", ip = "192.168.1.5", port = 7000 }, { kind = "host_port", ip = "192.168.1.1", port = 7000 }'
+cat > "$WORK/parallax.toml" <<TOML
+[server]
+wan_interface = "up0"
+[server.wireguard]
+supernet = "10.8.0.0/16"
+endpoint = "203.0.113.1:51820"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+private_key_file = "$WORK/wg-server.key"
+[server.dns]
+public_resolver = "9.9.9.9"
+[server.firewall]
+docker_coexistence = true
+[server.backup]
+directory = "$WORK/backups"
+passphrase_file = "$WORK/backup.passphrase"
+[server.proxy]
+certificates = "$WORK/certs"
+upstream_ca = "$CA"
+[server.logs]
+path = "$WORK/logs.db"
+[[network]]
+name = "home"
+interface = "eth0"
+gateway_address = "192.168.1.1"
+subnet = "192.168.1.0/24"
+mapped_to = "198.18.1.0/24"
+upstream_dns = ["192.168.1.5"]
+domains = ["mydomain.com"]
+[[service]]
+name = "immich"
+host = "192.168.1.5"
+port = 443
+hostnames = ["immich.mydomain.com"]
+[[service]]
+name = "gwapp"
+host = "192.168.1.1"
+port = 9090
+[[grant]]
+name = "personal"
+rules = [{ kind = "all_networks" }, { kind = "internet" }, { kind = "public_dns" }]
+[[grant]]
+name = "family"
+rules = [$FAMILY_GRANTS]
+[[grant]]
+name = "friend"
+rules = [{ kind = "internet" }]
+TOML
+SOCK="$WORK/run/parallax.sock"
+# A copy every user can run. Root runs this one too in unit mode, as it
+# would /usr/bin/parallax: it starts the CLI again as the service's user for
+# the service's files, and that user can't reach a build under a home.
+cp "$PARALLAX" "$WORK/parallax"
+# The subnet router's socket, (w); the daemon runs `tailscale` from PATH.
+TS_SOCK="$WORK/tsr/sock"
+mkdir -p "$WORK/bin" "$WORK/tsr"
+if [ -n "${TAILSCALE:-}" ] && [ -n "${TAILSCALED:-}" ]; then
+    cp "$TAILSCALE" "$WORK/bin/tailscale"
+    cp "$TAILSCALED" "$WORK/bin/tailscaled"
+fi
+export PATH="$WORK/bin:$PATH"
+if [ "$MODE" = unit ]; then
+    P="$WORK/parallax --db $WORK/parallax.db --socket $SOCK --tailscale-socket $TS_SOCK"
+else
+    P="$PARALLAX --db $WORK/parallax.db --socket $SOCK --tailscale-socket $TS_SOCK"
+fi
+$P config import "$WORK/parallax.toml" >/dev/null
+$P keygen --write-config >/dev/null
+# Addresses come from the supernet in order: 10.8.0.2, .3, .4.
+$P peer add laptop --grant personal --keep-private-key --platform linux > "$WORK/laptop.conf" 2>/dev/null
+$P peer add guest --grant family --dns tunnel_wide --allowed-ips grants_only --keep-private-key \
+    --platform mobile > "$WORK/guest.conf" 2>/dev/null
+$P peer add friend --grant friend --allowed-ips full_tunnel --keep-private-key --platform linux \
+    > "$WORK/friend.conf" 2>/dev/null
+$P validate >/dev/null
+inns gw $P doctor > "$WORK/doctor" || { cat "$WORK/doctor"; fail "doctor rejects the gateway namespace"; }
+# Root in a user namespace (as under rootless Docker) must be refused. That root
+# maps only uid 0, so run a copy it can reach (not one under someone's home).
+if inns gw unshare -U -r "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" doctor > "$WORK/doctor-userns" 2>&1; then
+    fail "doctor accepted a user namespace"
+fi
+grep -q "^FAIL  user namespace" "$WORK/doctor-userns" || fail "doctor did not name the user namespace"
+pass "doctor passes on the gateway and refuses a user namespace"
+
+# As a native install runs it: `nobody` (the test's stand-in for the `parallax`
+# user) in the gateway namespace, with the unit's sandbox and capabilities. Only
+# what names the unit's own install (its user, paths, commands) is left out; the
+# test brings its own.
+if [ "$MODE" = unit ]; then
+    SANDBOX=()
+    while IFS= read -r line; do
+        case ${line%%=*} in
+            User | Group | Exec* | Restart* | StateDirectory* | RuntimeDirectory* | ReadWritePaths) ;;
+            *) SANDBOX+=(-p "$line") ;;
+        esac
+    done < <(sed -n '/^\[Service\]/,/^\[/p' "$UNIT_FILE" | grep -E '^[A-Za-z]+=')
+    printf '%s\n' "${SANDBOX[@]}" | grep >/dev/null '^AmbientCapabilities=CAP_NET_ADMIN' \
+        || fail "could not read the sandbox from $UNIT_FILE"
+    AS_UNIT=(systemd-run --quiet --collect -p User=nobody -p "NetworkNamespacePath=/run/netns/${PREFIX}gw"
+        -p "ReadWritePaths=$WORK" -p "Environment=PATH=$WORK/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+        "${SANDBOX[@]}")
+    # A first start from nothing: the unit's own ExecStartPre lines, in order,
+    # pointed at a fresh directory.
+    for d in first bad none; do mkdir "$WORK/$d"; done
+    sed "s|^private_key_file = .*|private_key_file = \"$WORK/first/wg-server.key\"|" "$WORK/parallax.toml" \
+        > "$WORK/first/parallax.toml"
+    printf '[server\n' > "$WORK/bad/parallax.toml"
+    chown -R nobody "$WORK"
+    starts=0
+    first_start() { # directory
+        local line
+        while IFS= read -r line; do
+            line=${line#ExecStartPre=}
+            line=${line//\/usr\/bin\/parallax/"$WORK/parallax --db $1/parallax.db --socket $1/parallax.sock"}
+            line=${line//\/etc\/parallax\/parallax.toml/"$1/parallax.toml"}
+            starts=$((starts + 1))
+            "${AS_UNIT[@]}" --unit="${PREFIX}first-$starts" -p Type=exec --wait --pipe /bin/sh -c "$line" || return 1
+        done < <(grep '^ExecStartPre=' "$UNIT_FILE")
+    }
+    first_start "$WORK/first" > "$WORK/first.out" 2>&1 \
+        || { cat "$WORK/first.out"; fail "the unit's first start (import, doctor, keygen) fails as the service"; }
+    grep -q "^imported" "$WORK/first.out" || { cat "$WORK/first.out"; fail "the first start did not import the TOML"; }
+    [ "$(stat -c '%U %a' "$WORK/first/wg-server.key")" = "nobody 600" ] \
+        || fail "the first start's server key is not the service's own, 0600"
+    if first_start "$WORK/bad" > "$WORK/bad.out" 2>&1; then fail "a broken TOML did not stop the first start"; fi
+    grep -q "^imported" "$WORK/bad.out" && fail "a broken TOML was imported"
+    if first_start "$WORK/none" > "$WORK/none.out" 2>&1; then fail "a start with no TOML and no database passed"; fi
+    grep -q "^FAIL  configuration" "$WORK/none.out" \
+        || { cat "$WORK/none.out"; fail "with no TOML, doctor did not say there's no configuration"; }
+    pass "the unit's first start: imports, checks and makes the key as the service; a broken TOML stops it"
+    "${AS_UNIT[@]}" --unit="${PREFIX}doctor" -p Type=exec --wait --pipe \
+        "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" doctor > "$WORK/doctor-unit" 2>&1 \
+        || { cat "$WORK/doctor-unit"; fail "doctor fails as the native service"; }
+    grep -q "^ok    CAP_NET_ADMIN: held, and ambient" "$WORK/doctor-unit" \
+        || { cat "$WORK/doctor-unit"; fail "doctor did not see CAP_NET_ADMIN as ambient"; }
+    pass "doctor passes as the native service: unprivileged, sandboxed, two ambient capabilities"
+
+    # The iptables-nft backend (issue #52): `iptables-restore` looks the ipsets its
+    # rules match up through a raw socket. The unit leaves CAP_NET_RAW out, so
+    # doctor stops the start; docs/native.md's drop-in adds it. A drop-in's
+    # capability lines add to the unit's, but systemd-run's -p replaces them, so
+    # the merged sets are spelled out here.
+    WITH_NET_RAW=()
+    for p in "${AS_UNIT[@]}"; do
+        case $p in
+            CapabilityBoundingSet=* | AmbientCapabilities=*) WITH_NET_RAW+=("$p CAP_NET_RAW") ;;
+            *) WITH_NET_RAW+=("$p") ;;
+        esac
+    done
+    [ "$(printf '%s\n' "${WITH_NET_RAW[@]}" | grep -c ' CAP_NET_RAW$')" = 2 ] \
+        || fail "could not add CAP_NET_RAW to the unit's capabilities"
+    mkdir "$WORK/ipt"
+    sed 's|^docker_coexistence = true$|&\nbackend = "iptables-nft"|' "$WORK/parallax.toml" > "$WORK/ipt/parallax.toml"
+    grep -q '^backend = "iptables-nft"$' "$WORK/ipt/parallax.toml" || fail "could not set the iptables-nft backend"
+    printf '*filter\n:PARALLAX_PROBE - [0:0]\n-A PARALLAX_PROBE -m set --match-set netraw_probe src -j ACCEPT\nCOMMIT\n' \
+        > "$WORK/ipt/rules"
+    chown -R nobody "$WORK/ipt"
+    "${AS_UNIT[@]}" --unit="${PREFIX}ipt-import" -p Type=exec --wait --pipe \
+        "$WORK/parallax" --db "$WORK/ipt/parallax.db" --socket "$WORK/ipt/parallax.sock" \
+        config import "$WORK/ipt/parallax.toml" > "$WORK/ipt/import" 2>&1 \
+        || { cat "$WORK/ipt/import"; fail "could not import the iptables-nft configuration as the service"; }
+    ipt_doctor() { # unit name, then systemd-run's options
+        local name=$1; shift
+        "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe \
+            "$WORK/parallax" --db "$WORK/ipt/parallax.db" --socket "$WORK/ipt/parallax.sock" doctor
+    }
+    ipt_restore() { # unit name, then systemd-run's options
+        local name=$1; shift
+        "$@" --unit="${PREFIX}$name" -p Type=exec --wait --pipe \
+            /bin/sh -c 'ipset create -exist netraw_probe hash:net && iptables-restore --noflush "$1"' sh "$WORK/ipt/rules"
+    }
+    if ipt_doctor ipt-doctor "${AS_UNIT[@]}" > "$WORK/ipt/doctor" 2>&1; then
+        cat "$WORK/ipt/doctor"; fail "doctor passed iptables-nft under the unit without CAP_NET_RAW"
+    fi
+    grep -q '^FAIL  CAP_NET_RAW: missing' "$WORK/ipt/doctor" \
+        || { cat "$WORK/ipt/doctor"; fail "doctor did not name the missing CAP_NET_RAW"; }
+    if ipt_restore ipt-restore "${AS_UNIT[@]}" > "$WORK/ipt/restore" 2>&1; then
+        fail "iptables-restore matched an ipset under the unit without CAP_NET_RAW (is the unit too wide?)"
+    fi
+    grep -q "Can't open socket to ipset" "$WORK/ipt/restore" \
+        || { cat "$WORK/ipt/restore"; fail "iptables-restore failed under the unit for another reason"; }
+    ipt_doctor ipt-doctor-raw "${WITH_NET_RAW[@]}" > "$WORK/ipt/doctor-raw" 2>&1 \
+        || { cat "$WORK/ipt/doctor-raw"; fail "doctor fails iptables-nft under the unit with the drop-in"; }
+    grep -q '^ok    CAP_NET_RAW: held, and ambient' "$WORK/ipt/doctor-raw" \
+        || { cat "$WORK/ipt/doctor-raw"; fail "doctor did not see CAP_NET_RAW as ambient with the drop-in"; }
+    inns gw iptables -S PARALLAX_PROBE >/dev/null 2>&1 && fail "iptables-restore loaded rules without CAP_NET_RAW"
+    # With it the service makes the set and commits the rule itself, as apply does.
+    ipt_restore ipt-restore-raw "${WITH_NET_RAW[@]}" > "$WORK/ipt/restore-raw" 2>&1 \
+        || { cat "$WORK/ipt/restore-raw"; fail "the service can't make an ipset and load a rule matching it with the drop-in"; }
+    inns gw iptables -S PARALLAX_PROBE | grep -- '-m set --match-set netraw_probe src -j ACCEPT' >/dev/null \
+        || { inns gw iptables -S PARALLAX_PROBE; fail "the rule matching the service's ipset is not in"; }
+    inns gw iptables -F PARALLAX_PROBE
+    inns gw iptables -X PARALLAX_PROBE
+    inns gw ipset destroy netraw_probe
+    pass "iptables-nft under the unit: doctor asks for CAP_NET_RAW; with the drop-in the service makes an ipset and loads a rule matching it"
+fi
+
+# The daemon applies, then serves DNS and the proxy on the tunnel address. Drift
+# checks are hourly here, so the tests below can change live rules on purpose;
+# (n) restarts it with a short interval.
+start_daemon() { # reconcile interval in seconds
+    local unit="${PREFIX}daemon-${#UNITS[@]}"
+    if [ "$MODE" = unit ]; then
+        UNITS+=("$unit")
+        "${AS_UNIT[@]}" --unit="$unit" -p "StandardOutput=append:$WORK/daemon.log" \
+            -p "StandardError=append:$WORK/daemon.log" \
+            "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" --tailscale-socket "$TS_SOCK" \
+            daemon -o "$WORK/out" --reconcile-every "$1"
+    else
+        inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$WORK/daemon.pid" \
+            $P daemon -o "$WORK/out" --reconcile-every "$1" >> "$WORK/daemon.log" 2>&1 &
+        PIDS+=($!)
+    fi
+    for _ in $(seq 100); do
+        if $P status >/dev/null 2>&1 && inns gw ss -Hltn 'sport = :53' | grep >/dev/null . \
+            && inns gw ss -Hltn 'sport = :8443' | grep >/dev/null .; then
+            if [ "$MODE" = unit ]; then
+                # 0 would mean it already exited, and `kill 0` hits this whole test.
+                local pid
+                pid=$(systemctl show -p MainPID --value "$unit")
+                [ "${pid:-0}" -gt 0 ] || fail "the daemon's unit $unit has no main process"
+                echo "$pid" > "$WORK/daemon.pid"
+            fi
+            return 0
+        fi
+        sleep 0.1
+    done
+    fail "parallax daemon did not start"
+}
+start_daemon 3600
+[ "$(stat -c %a "$SOCK")" = 600 ] && [ "$(stat -c %a "$WORK/run")" = 700 ] \
+    || fail "the socket or its directory is not owner-only"
+# The server's key comes first in the export, before any peer's.
+GW_PUB=$($P config export | sed -n 's/^public_key = "\(.*\)"/\1/p' | head -n1)
+
+# Through the daemon: an import applies on save, `apply` re-applies. No SIGHUP;
+# the DNS server re-reads its routes right after the apply, and the proxy gets
+# its routes from the daemon around it.
+apply() { # [TOML file to import]
+    if [ -n "${1:-}" ]; then
+        $P config import "$1" >/dev/null 2>&1 || fail "import of $1 through the daemon failed"
+    else
+        $P apply >/dev/null || fail "apply through the daemon failed"
+    fi
+    sleep 0.3
+}
+
+# ---------------------------------------------------------------- clients
+# Deliberately widen AllowedIPs to 0.0.0.0/0 (minus the foreign LAN, which stays local):
+# the client config is never an enforcement point.
+mkclient() { # iface, conf, addr
+    local key
+    key=$(sed -n 's/^PrivateKey = //p' "$2")
+    inns client ip link add "$1" type wireguard
+    inns client ip addr add "$3/32" dev "$1"
+    inns client wg set "$1" private-key <(echo "$key") peer "$GW_PUB" endpoint 203.0.113.1:51820 \
+        allowed-ips 0.0.0.0/0 persistent-keepalive 5
+    inns client ip link set "$1" up
+}
+mkclient wgp "$WORK/laptop.conf" 10.8.0.2
+mkclient wgf "$WORK/guest.conf" 10.8.0.3
+mkclient wgx "$WORK/friend.conf" 10.8.0.4
+# Split tunnel routes for the laptop: virtual range, the gateway and the test's internet hosts.
+for dst in 198.18.1.0/24 10.8.0.1/32 9.9.9.9/32 10.99.0.5/32 1.2.3.4/32; do
+    inns client ip route add $dst dev wgp src 10.8.0.2
+done
+# Guest and friend send everything through their tunnel (full tunnel), in their own
+# routing tables so all three tunnels coexist in one namespace.
+inns client ip rule add from 10.8.0.3 table 200
+inns client ip route add default dev wgf table 200
+inns client ip rule add from 10.8.0.4 table 201
+inns client ip route add default dev wgx table 201
+sleep 1
+
+curl_as() { # src, [curl args...], url  -> body or "BLOCKED"
+    local src=$1; shift
+    inns client curl -s -m 3 --interface "$src" "$@" || echo BLOCKED
+}
+https_as() { # src, name, address, [curl args...]  -> body or "BLOCKED"
+    local src=$1 name=$2 addr=$3; shift 3
+    curl_as "$src" --cacert "$CA" --resolve "$name:443:$addr" "$@" "https://$name/"
+}
+
+LAPTOP=10.8.0.2 GUEST=10.8.0.3 FRIEND=10.8.0.4
+
+# (a) mapped virtual IP lands on the real host
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(a) personal -> 198.18.1.5:8080"
+[ "$(https_as $LAPTOP immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(a) personal -> immich directly"
+[ "$(https_as $LAPTOP other.mydomain.com 198.18.1.5)" = home-other-vhost ] || fail "(a) personal -> the sibling vhost directly"
+[ "$(curl_as $LAPTOP http://198.18.1.1:9090/)" = gw-self ] || fail "(a) personal -> service on the gateway host"
+pass "(a) personal peer reaches the mapped virtual address on the real host and on the gateway host"
+
+# (b) DNS answers in virtual space
+ANS=$(inns client dig +short -b $LAPTOP @10.8.0.1 immich.mydomain.com)
+[ "$ANS" = 198.18.1.5 ] || fail "(b) DNS answered '$ANS'"
+pass "(b) DNS rewrites immich.mydomain.com to 198.18.1.5"
+
+# (c) guest: granted host:port works, everything else is dropped despite 0.0.0.0/0
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(c) guest reached a non-granted port"
+[ "$(curl_as $GUEST http://198.18.1.1:9090/)" = gw-self ] || fail "(c) guest -> granted service on the gateway host"
+[ "$(curl_as $GUEST http://198.18.1.1:9091/)" = BLOCKED ] || fail "(c) guest reached a non-granted port on the gateway host"
+[ "$(curl_as $GUEST http://198.18.1.1:8080/)" = BLOCKED ] || fail "(c) guest reached the gateway LAN address"
+ANS=$(inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
+[ "$ANS" = 198.18.1.5 ] || fail "(c) guest could not look up its granted name (tunnel-wide DNS): '$ANS'"
+pass "(c) guest reaches only its granted host:port; wider AllowedIPs change nothing"
+
+# (d) reapply is idempotent
+inns gw nft list table inet parallax > "$WORK/nft1"; inns gw wg showconf wg0 > "$WORK/wg1"
+apply
+inns gw nft list table inet parallax > "$WORK/nft2"; inns gw wg showconf wg0 > "$WORK/wg2"
+diff -q "$WORK/nft1" "$WORK/nft2" >/dev/null || fail "(d) nft ruleset changed on reapply"
+diff -q "$WORK/wg1" "$WORK/wg2" >/dev/null || fail "(d) wg config changed on reapply"
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(d) traffic broken after reapply"
+pass "(d) reapply is idempotent"
+
+# (e) changes through the daemon: eight `peer add`s at once all land, with distinct
+# addresses, and are live on wg0 when each command returns (one writer, no SIGHUP)
+ADDS=()
+for i in $(seq 8); do
+    $P peer add "dev$i" --grant family >/dev/null 2>"$WORK/add$i.err" &
+    ADDS+=($!)
+done
+for i in $(seq 8); do
+    wait "${ADDS[$((i - 1))]}" || { cat "$WORK/add$i.err"; fail "(e) concurrent peer add dev$i failed"; }
+done
+ADDRS=$($P peer show | sed -n 's/^dev[0-9]* .*address=\([^ ]*\).*/\1/p' | sort -u)
+[ "$(grep -c . <<<"$ADDRS")" = 8 ] || fail "(e) eight peers, eight addresses: '$ADDRS'"
+[ "$(inns gw wg show wg0 peers | grep -c .)" = 11 ] || fail "(e) the new peers are not on wg0"
+for i in $(seq 8); do $P peer remove "dev$i" >/dev/null 2>&1 || fail "(e) peer remove dev$i"; done
+[ "$(inns gw wg show wg0 peers | grep -c .)" = 3 ] || fail "(e) removed peers are still on wg0"
+grep -q 'applying (SIGHUP)' "$WORK/daemon.log" && fail "(e) something sent SIGHUP"
+pass "(e) concurrent peer adds through the daemon land with distinct addresses and apply on save"
+
+# (f) colliding guest network: same name pattern, both boxes at 192.168.1.5
+FOREIGN=$(inns client dig +short @192.168.1.5 immich.hisdomain.com)   # via lan0, local resolver
+[ "$FOREIGN" = 192.168.1.5 ] || fail "(f) foreign resolver answered '$FOREIGN'"
+HOME_ANS=$(inns client dig +short -b $LAPTOP @10.8.0.1 immich.mydomain.com)
+[ "$HOME_ANS" = 198.18.1.5 ] || fail "(f) home name via the gateway answered '$HOME_ANS'"
+[ "$(inns client curl -s -m 3 --resolve immich.hisdomain.com:443:$FOREIGN http://immich.hisdomain.com:443/)" = foreign-immich ] \
+    || fail "(f) immich.hisdomain.com did not reach the foreign box"
+[ "$(https_as $LAPTOP immich.mydomain.com "$HOME_ANS")" = home-immich ] \
+    || fail "(f) immich.mydomain.com did not reach the home box"
+pass "(f) foreign 192.168.1.5 and home 198.18.1.5 are both reachable, names resolve to the right one"
+
+# (g) the proxy: the guest reaches Immich by name, and nothing else on that box
+ANS=$(inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
+[ "$(https_as $GUEST immich.mydomain.com "$ANS" -w ' %{http_version}')" = "home-immich 2" ] \
+    || fail "(g) guest -> immich by name through the proxy (HTTP/2)"
+[ "$(https_as $GUEST immich.mydomain.com "$ANS" --http1.1)" = home-immich ] \
+    || fail "(g) guest -> immich by name through the proxy (HTTP/1.1)"
+[ "$(curl_as $GUEST -k https://198.18.1.5/)" = BLOCKED ] || fail "(g) guest reached the raw IP (no SNI)"
+[ "$(https_as $GUEST other.mydomain.com 198.18.1.5)" = BLOCKED ] || fail "(g) guest reached the sibling vhost"
+[ "$(https_as $GUEST other.mydomain.com 198.18.1.5 -k)" = BLOCKED ] || fail "(g) guest reached the sibling vhost (no verify)"
+CODE=$(https_as $GUEST immich.mydomain.com 198.18.1.5 --http1.1 -H 'Host: other.mydomain.com' -o /dev/null -w '%{http_code}')
+[ "$CODE" = 421 ] || fail "(g) Host != SNI answered '$CODE'"
+CODE=$(https_as $GUEST immich.mydomain.com 198.18.1.5 --http2 -H 'Host: other.mydomain.com' -o /dev/null -w '%{http_code} %{http_version}')
+[ "$CODE" = "421 2" ] || fail "(g) HTTP/2 :authority != SNI answered '$CODE'"
+[ "$(curl_as $GUEST http://198.18.1.5:443/)" = BLOCKED ] || fail "(g) guest spoke plain HTTP to 443"
+pass "(g) guest reaches immich by name through the proxy; raw IP, sibling vhost, Host and :authority mismatches fail"
+
+# (h) internet: public addresses only, except for an all_networks tier
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(h) friend -> a public address"
+[ "$(curl_as $FRIEND http://10.99.0.5/)" = BLOCKED ] || fail "(h) friend reached a private subnet through the router"
+[ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(h) friend reached a configured network"
+[ "$(curl_as $LAPTOP http://10.99.0.5/)" = vlan ] || fail "(h) personal (all_networks) -> a private subnet through the router"
+[ "$(curl_as $GUEST http://9.9.9.9/)" = BLOCKED ] || fail "(h) guest without internet reached a public address"
+pass "(h) internet reaches public addresses only; all_networks keeps private space"
+
+# (i) nothing else on the gateway: other ports, the proxy, the Docker bridge, the public address
+[ "$(inns gw curl -s -m 3 http://172.17.0.2/)" = container ] || fail "(i) the container is not up"
+for src in $GUEST $FRIEND; do
+    [ "$(curl_as $src http://172.17.0.1:9090/)" = BLOCKED ] || fail "(i) $src reached the Docker bridge address"
+    [ "$(curl_as $src http://172.17.0.2/)" = BLOCKED ] || fail "(i) $src reached a container"
+    [ "$(curl_as $src http://203.0.113.1:9090/)" = BLOCKED ] || fail "(i) $src reached the gateway's public address"
+    [ "$(curl_as $src http://10.8.0.1:9091/)" = BLOCKED ] || fail "(i) $src reached another port on the gateway"
+done
+for src in $LAPTOP $FRIEND; do
+    [ "$(curl_as $src -k --resolve immich.mydomain.com:8443:10.8.0.1 https://immich.mydomain.com:8443/)" = BLOCKED ] \
+        || fail "(i) $src reached the proxy port without a proxied grant"
+done
+pass "(i) other gateway ports, the proxy port, the Docker bridge and the public address are dropped"
+
+# (j) IPv6: the gateway forwards it, a peer sends it, and the firewall drops it.
+# WireGuard alone would drop it (AllowedIPs is IPv4), so widen the guest's on the gateway.
+inns gw sysctl -qw net.ipv6.conf.all.forwarding=1
+inns gw ip -6 addr add fd00:1::1/64 dev eth0 nodad
+inns home ip -6 addr add fd00:1::5/64 dev lan0 nodad
+inns home ip -6 route add fd00:8::/64 via fd00:1::1
+inns gw ip -6 route add fd00:8::/64 dev wg0
+inns client ip -6 addr add fd00:8::2/128 dev wgf nodad
+inns client ip -6 route add fd00:1::/64 dev wgf
+inns client wg set wgf peer "$GW_PUB" allowed-ips 0.0.0.0/0,::/0
+GUEST_PUB=$(inns client wg show wgf public-key)
+widen() { inns gw wg set wg0 peer "$GUEST_PUB" allowed-ips 10.8.0.3/32,fd00:8::2/128; }
+ping6_as() { inns client ping -6 -c 1 -W 2 -I fd00:8::2 "$1" >/dev/null 2>&1 && echo reached || echo BLOCKED; }
+widen
+inns gw nft flush chain inet parallax input
+inns gw nft flush chain inet parallax forward
+[ "$(ping6_as fd00:1::5)" = reached ] || fail "(j) IPv6 setup: without Parallax's rules the guest can't reach home"
+[ "$(ping6_as fd00:1::1)" = reached ] || fail "(j) IPv6 setup: without Parallax's rules the guest can't reach the gateway"
+apply
+widen
+[ "$(ping6_as fd00:1::5)" = BLOCKED ] || fail "(j) IPv6 from a peer was forwarded"
+[ "$(ping6_as fd00:1::1)" = BLOCKED ] || fail "(j) IPv6 from a peer reached the gateway"
+apply   # back to IPv4-only AllowedIPs
+pass "(j) IPv6 from a peer is dropped, forwarded or to the gateway"
+
+# (k) revoking a grant cuts connections that are already open: forwarded to the LAN,
+# to a service on the gateway host, and through the proxy. The laptop's connection
+# is the control: its grants don't change, so it must survive the same apply.
+inns client python3 - "$WORK/hold" "$CA" <<'PY' > "$WORK/hold.out" 2>&1 &
+import os, socket, ssl, sys, threading, time
+gate, ca = sys.argv[1], sys.argv[2]
+def tcp(src, addr):
+    s = socket.create_connection((addr, 7000), timeout=3, source_address=(src, 0))
+    def ask(word):
+        s.sendall(word + b"\n")
+        return s.recv(64) == word + b"\n"
+    return ask
+def https(src, addr):
+    ctx = ssl.create_default_context(cafile=ca)
+    raw = socket.create_connection((addr, 443), timeout=3, source_address=(src, 0))
+    s = ctx.wrap_socket(raw, server_hostname="immich.mydomain.com")
+    def ask(_):
+        s.sendall(b"GET / HTTP/1.1\r\nHost: immich.mydomain.com\r\n\r\n")
+        return b"home-immich" in s.recv(4096)
+    return ask
+cases = [
+    ("guest-lan", tcp, "10.8.0.3", "198.18.1.5"),
+    ("guest-gateway", tcp, "10.8.0.3", "198.18.1.1"),
+    ("guest-proxy", https, "10.8.0.3", "198.18.1.5"),
+    ("laptop-lan", tcp, "10.8.0.2", "198.18.1.5"),
+]
+results = {}
+def run(name, kind, src, addr):
+    try:
+        ask = kind(src, addr)
+        if not ask(b"one"):
+            results[name] = "BROKEN"; return
+        opened.add(name)
+        print(f"open {name}", flush=True)
+        while not os.path.exists(gate):
+            time.sleep(0.1)
+        results[name] = "ALIVE" if ask(b"two") else "CLOSED"
+    except OSError:
+        results[name] = "CLOSED" if name in opened else "BROKEN"
+opened = set()
+threads = []
+for c in cases:
+    t = threading.Thread(target=run, args=c); t.start(); threads.append(t)
+for t in threads:
+    t.join()
+for name, *_ in cases:
+    print(f"{name} {results.get(name, 'BROKEN')}", flush=True)
+PY
+PIDS+=($!)
+for _ in $(seq 50); do [ "$(grep -c '^open' "$WORK/hold.out")" = 4 ] && break; sleep 0.1; done
+[ "$(grep -c '^open' "$WORK/hold.out")" = 4 ] || { cat "$WORK/hold.out"; fail "(k) could not open the held connections"; }
+# The whole configuration (peers included), and a copy whose family grant
+# keeps only its gwapp rule.
+$P config export > "$WORK/full.toml"
+python3 - "$WORK/full.toml" > "$WORK/revoked.toml" <<'PY'
+# `config export` writes several rules one per line inside `rules = [`.
+import sys
+grant, in_rules = None, False
+for line in open(sys.argv[1]):
+    if line.startswith("[["):
+        grant = None
+    elif line.startswith("name = ") and grant is None:
+        grant = line.split('"')[1]
+    if line.startswith("rules = ["):
+        in_rules = line.rstrip().endswith("[")
+    elif in_rules and line.startswith("]"):
+        in_rules = False
+    elif in_rules and grant == "family" and '"gwapp"' not in line:
+        continue
+    sys.stdout.write(line)
+PY
+python3 - "$WORK/full.toml" "$WORK/revoked.toml" <<'PY' || fail "(k) could not write the revoked config"
+import sys, tomllib
+def rules(path):
+    g = next(g for g in tomllib.load(open(path, "rb"))["grant"] if g["name"] == "family")
+    return g["rules"]
+full, revoked = rules(sys.argv[1]), rules(sys.argv[2])
+assert len(full) == 4 and revoked == [{"kind": "service", "name": "gwapp"}], (full, revoked)
+PY
+apply "$WORK/revoked.toml"
+touch "$WORK/hold"
+for _ in $(seq 100); do [ "$(grep -cE ' (ALIVE|CLOSED|BROKEN)$' "$WORK/hold.out")" = 4 ] && break; sleep 0.1; done
+for c in guest-lan guest-gateway guest-proxy; do
+    grep -q "^$c CLOSED$" "$WORK/hold.out" || { cat "$WORK/hold.out"; fail "(k) $c survived the revoked grant"; }
+done
+grep -q "^laptop-lan ALIVE$" "$WORK/hold.out" || { cat "$WORK/hold.out"; fail "(k) the laptop's connection did not survive an unrelated change"; }
+[ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = BLOCKED ] || fail "(k) guest opened a new connection after the revoke"
+# The DNS server re-read its routes after the same apply: the name went with the grant.
+ST=$(inns client dig +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
+[ "$ST" = REFUSED ] || fail "(k) guest still looked up immich after the revoke: '$ST'"
+apply "$WORK/full.toml"   # restore the grants
+[ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(k) guest grant not restored"
+ANS=$(inns client dig +short +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
+[ "$ANS" = 198.18.1.5 ] || fail "(k) guest name not restored: '$ANS'"
+pass "(k) a revoked grant cuts open connections (LAN, gateway host, proxy) and the name; others survive"
+
+# (l) DNS answers each tier only the names it may reach
+status_as() { # src, name, [dig args...]  -> the response status, e.g. NOERROR
+    local src=$1 name=$2; shift 2
+    inns client dig +time=2 +tries=1 -b "$src" @10.8.0.1 "$name" "$@" | sed -n 's/.*status: \([A-Z]*\).*/\1/p'
+}
+short_as() { # src, name, [dig args...]
+    local src=$1 name=$2; shift 2
+    inns client dig +short +time=2 +tries=1 -b "$src" @10.8.0.1 "$name" "$@" || true
+}
+[ "$(short_as $LAPTOP example.org)" = 9.9.9.9 ] || fail "(l) personal (public_dns) could not look up a public name"
+[ -z "$(short_as $LAPTOP rebind.example.org)" ] || fail "(l) a public name answered with a private address"
+[ "$(status_as $LAPTOP rebind.example.org)" = NOERROR ] || fail "(l) rebind.example.org: wanted an empty NOERROR"
+[ "$(status_as $LAPTOP immich.mydomain.com AAAA)" = NOERROR ] && [ -z "$(short_as $LAPTOP immich.mydomain.com AAAA)" ] \
+    || fail "(l) a home name answered AAAA"
+[ "$(short_as $LAPTOP vlan.mydomain.com)" = 198.18.1.6 ] \
+    || fail "(l) vlan.mydomain.com: wanted only 198.18.1.6, not the address on no configured network"
+[ "$(status_as $GUEST other.mydomain.com)" = REFUSED ] || fail "(l) guest looked up a sibling vhost's name"
+[ "$(status_as $GUEST example.org)" = REFUSED ] || fail "(l) guest (no public_dns) looked up a public name"
+[ "$(status_as $GUEST example.org +tcp)" = REFUSED ] || fail "(l) guest looked up a public name over TCP"
+[ "$(status_as $FRIEND example.org)" = REFUSED ] || fail "(l) friend (internet, no public_dns) looked up a public name"
+[ "$(status_as $FRIEND immich.mydomain.com)" = REFUSED ] || fail "(l) friend looked up a home name"
+ST=$(inns gw dig +time=2 +tries=1 @10.8.0.1 immich.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')
+[ "$ST" = REFUSED ] || fail "(l) a source outside every tier got '$ST'"
+pass "(l) DNS: personal gets home and public names; guest only its hostname; friend nothing; rebinding answers and unknown private addresses dropped"
+
+# (m) large answers: truncated over plain UDP, then complete over TCP (dig retries itself)
+BIG_ANS=$(short_as $LAPTOP big.mydomain.com +noedns)
+[ "$(grep -c '^198\.18\.1\.' <<<"$BIG_ANS")" = 40 ] || fail "(m) big.mydomain.com over UDP then TCP: '$BIG_ANS'"
+inns client dig +noedns +ignore +time=2 +tries=1 -b $LAPTOP @10.8.0.1 big.mydomain.com | grep >/dev/null 'flags: qr tc' \
+    || fail "(m) the 512-byte UDP answer was not truncated"
+[ "$(short_as $LAPTOP big.mydomain.com +tcp | grep -c '^198\.18\.1\.')" = 40 ] || fail "(m) big.mydomain.com over TCP"
+pass "(m) a 40-address answer truncates over UDP and arrives whole over TCP, rewritten"
+
+# (p) a host granted by name: looked up through its network's resolver when the change
+# is saved; the tier reaches that port and may look the name up. A name that doesn't
+# resolve is refused, and so is one that resolves outside every configured network.
+$P config export > "$WORK/named-before.toml"
+grep -q 'host = "192.168.1.5", ports = \["7000/tcp"\]' "$WORK/named-before.toml" \
+    || fail "(p) host_port grants written with ip = ... don't export as host grants with ports"
+named() { # host -> a config granting family a few ports on it, 8080/tcp among them
+    sed "/host = \"192.168.1.5\", ports = \[\"7000\/tcp\"\] }/a\\
+    { kind = \"host\", host = \"$1\", ports = [\"8080\/tcp\", \"5353\/udp\", \"9000-9010\/tcp\"] }," \
+        "$WORK/named-before.toml" > "$WORK/named-$1.toml"
+    echo "$WORK/named-$1.toml"
+}
+[ "$(status_as $GUEST web.mydomain.com)" = REFUSED ] || fail "(p) guest looked up a name it isn't granted"
+apply "$(named web.mydomain.com)"
+grep -qx "name web.mydomain.com: 192.168.1.5" <<<"$($P status)" || { $P status; fail "(p) the name was not looked up on save"; }
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = home-other ] || fail "(p) guest -> the host granted by name"
+[ "$(short_as $GUEST web.mydomain.com)" = 198.18.1.5 ] || fail "(p) guest could not look up the name it's granted"
+refused() { # host, what the refusal must say
+    if $P config import "$(named "$1")" > "$WORK/named.err" 2>&1; then
+        fail "(p) a save granting $1 was accepted"
+    fi
+    grep -qF "$2" "$WORK/named.err" || { cat "$WORK/named.err"; fail "(p) the refusal of $1 doesn't say why"; }
+}
+refused nosuch.mydomain.com "nosuch.mydomain.com"
+refused away.mydomain.com "away.mydomain.com resolved to 10.99.0.5, outside every configured network"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = home-other ] || fail "(p) a refused save changed the gateway"
+apply "$WORK/named-before.toml"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(p) the grant by name outlived its removal"
+grep -q "^name " <<<"$($P status)" && fail "(p) a name no longer used is still listed"
+pass "(p) a host granted by name: looked up on save, reached on its port, its name answers; bad names are refused"
+
+# (o) the home's public IP: guests with internet drop it (the router would hairpin it
+# back into the home); the owner's all_networks tier doesn't. The endpoint here
+# is a documentation address, so not the public IP; a fixed address counts the moment
+# it's saved. A hostname is looked up and re-applied when it changes; an answer with
+# a private address is refused, and the last address found stays.
+public_ip_is() { # address
+    for _ in $(seq 50); do grep -qx "home public IP: $1" <<<"$($P status)" && return 0; sleep 0.1; done
+    $P status; return 1
+}
+grep -q "home public IP" <<<"$($P status)" && fail "(o) the private endpoint was taken as the public IP"
+grep -q "the endpoint 203.0.113.1:51820 is not a public address" "$WORK/daemon.log" \
+    || fail "(o) the daemon did not say why the public IP is unknown"
+# A refused save changes nothing, not even the public IP its own endpoint gives (#45):
+# it adds a name, so its endpoint's hostname is looked up, but the name doesn't resolve.
+sed 's/^endpoint = .*/endpoint = "home.example.org:51820"/' "$(named nosuch.mydomain.com)" \
+    > "$WORK/refused-ip.toml"
+grep -q '^endpoint = "home.example.org:51820"$' "$WORK/refused-ip.toml" || fail "(o) no endpoint to change"
+$P config import "$WORK/refused-ip.toml" > "$WORK/refused-ip.err" 2>&1 \
+    && fail "(o) a save granting nosuch.mydomain.com was accepted"
+grep -q "nosuch.mydomain.com" "$WORK/refused-ip.err" \
+    || { cat "$WORK/refused-ip.err"; fail "(o) the save was refused for another reason"; }
+STATUS=$($P status) || fail "(o) status failed"
+grep -q "home public IP" <<<"$STATUS" && fail "(o) a refused save recorded the public IP its endpoint gives"
+$P config export > "$WORK/public-ip.toml"
+sed -i 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' "$WORK/public-ip.toml"
+apply "$WORK/public-ip.toml"
+public_ip_is 1.2.3.4 || fail "(o) a saved public_ip.address is not in effect"
+[ "$(curl_as $FRIEND http://1.2.3.4/)" = BLOCKED ] || fail "(o) friend reached the home's public IP"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(o) friend lost the internet"
+[ "$(curl_as $LAPTOP http://1.2.3.4/)" = home-public ] || fail "(o) personal (all_networks) can't reach the home's public IP"
+# A hostname the public resolver answers with 9.9.9.9 (dnsmasq answers all of example.org).
+sed -e '/^address = "1.2.3.4"$/d' -e 's/^endpoint = .*/endpoint = "home.example.org:51820"/' \
+    "$WORK/public-ip.toml" > "$WORK/public-ip-name.toml"
+apply "$WORK/public-ip-name.toml"
+public_ip_is 9.9.9.9 || fail "(o) the endpoint's hostname was not looked up"
+for _ in $(seq 50); do grep -q "applying (the home's public IP changed)" "$WORK/daemon.log" && break; sleep 0.1; done
+grep -q "applying (the home's public IP changed)" "$WORK/daemon.log" || fail "(o) no re-apply for the looked-up address"
+sleep 0.3
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(o) friend reached the looked-up public IP"
+[ "$(curl_as $FRIEND http://1.2.3.4/)" = home-public ] || fail "(o) the old address is still dropped"
+sed -e 's/^endpoint = .*/endpoint = "rebind.example.org:51820"/' \
+    "$WORK/public-ip-name.toml" > "$WORK/public-ip-rebind.toml"
+apply "$WORK/public-ip-rebind.toml"
+for _ in $(seq 50); do grep -q "isn't a public address" "$WORK/daemon.log" && break; sleep 0.1; done
+grep -q "rebind.example.org through 9.9.9.9: answered 192.168.1.5, which isn't a public address" "$WORK/daemon.log" \
+    || fail "(o) a private answer was not refused"
+grep -q "keeping the last known 9.9.9.9" "$WORK/daemon.log" || fail "(o) the last known address was not kept"
+public_ip_is 9.9.9.9 || fail "(o) the address changed after a refused answer"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(o) friend reached the home's public IP after a refused lookup"
+# Without a daemon, `generate` looks the public IP up as `apply` does (#44): on a
+# database that never stored one, the guests' drop still has the address.
+FRESH="${P%% --db *} --db $WORK/fresh.db --socket $WORK/fresh.sock"
+# As the service's user: root refuses a database under its directory.
+[ "$MODE" = unit ] && FRESH="runuser -u nobody -- $FRESH"
+$FRESH config import "$WORK/public-ip-name.toml" >/dev/null || fail "(o) import into a fresh database failed"
+inns gw $FRESH generate -o "$WORK/fresh-out" >/dev/null 2>"$WORK/fresh.err" \
+    || { cat "$WORK/fresh.err"; fail "(o) generate without a daemon failed"; }
+grep -Eq 'elements = \{.* 9\.9\.9\.9, .*198\.18\.0\.0/15' "$WORK/fresh-out/nftables/parallax.nft" \
+    || fail "(o) generate without a daemon did not look the public IP up"
+pass "(o) guests drop the home's public IP: configured, looked up and re-applied on change; a private answer is refused"
+
+# (n) the daemon's lifecycle: SIGTERM takes the gateway down and removes the socket;
+# a new daemon re-applies on SIGHUP and puts back a table someone deleted.
+# Docker coexistence is on: the accepts are in Docker's chain until the end.
+[ "$(inns gw nft list chain ip filter DOCKER-USER | grep -c 'comment "parallax"')" -ge 2 ] \
+    || fail "(n) Parallax's DOCKER-USER accepts aren't there while it runs"
+DAEMON=$(cat "$WORK/daemon.pid")
+kill -TERM "$DAEMON"
+for _ in $(seq 50); do kill -0 "$DAEMON" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$DAEMON" 2>/dev/null && fail "(n) the daemon did not stop on SIGTERM"
+inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) the table outlived the daemon"
+inns gw ip link show wg0 >/dev/null 2>&1 && fail "(n) wg0 outlived the daemon"
+docker_user_is_dockers || fail "(n) DOCKER-USER isn't Docker's own after the daemon stopped"
+[ -e "$SOCK" ] && fail "(n) the socket outlived the daemon"
+if [ "$MODE" = unit ]; then
+    # Root opening the service's database would leave files the service can't open.
+    if $P validate > "$WORK/root.err" 2>&1; then fail "(n) root opened the service's database directly"; fi
+    grep -q "belongs to user 'nobody', and no daemon answers" "$WORK/root.err" \
+        || { cat "$WORK/root.err"; fail "(n) root's refusal doesn't say whose database it is"; }
+    if inns gw timeout 20 $P daemon -o "$WORK/out" > "$WORK/root-daemon.err" 2>&1; then
+        fail "(n) root ran a daemon on the service's database"
+    fi
+    grep -q "a daemon run as root would leave files that user can't open" "$WORK/root-daemon.err" \
+        || { cat "$WORK/root-daemon.err"; fail "(n) root's daemon didn't say why it refused"; }
+    inns gw nft list table inet parallax >/dev/null 2>&1 && fail "(n) root's refused daemon applied anyway"
+    runuser -u nobody -- "$WORK/parallax" --db "$WORK/parallax.db" --socket "$SOCK" validate >/dev/null \
+        || fail "(n) without a daemon the service's user opens the database itself"
+else
+    $P validate >/dev/null || fail "(n) without a daemon the CLI opens the database itself"
+fi
+# A first apply that fails partway takes down what it set up (#53): another
+# socket holds WireGuard's port, so wg0 can't come up once the table and wg0 are in.
+# Not through `inns`: $! must be python itself, or killing it leaves the port held.
+ip netns exec "${PREFIX}gw" python3 -c 'import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 51820)); time.sleep(60)' &
+HOLDER=$!
+PIDS+=($HOLDER)
+for _ in $(seq 50); do inns gw ss -Hlun 'sport = :51820' | grep >/dev/null . && break; sleep 0.1; done
+inns gw ss -Hlun 'sport = :51820' | grep >/dev/null . || fail "(n) could not hold WireGuard's port"
+if [ "$MODE" = unit ]; then
+    UNITS+=("${PREFIX}held")
+    held=(timeout 30 "${AS_UNIT[@]}" --unit="${PREFIX}held" --wait --pipe "$WORK/parallax"
+        --db "$WORK/parallax.db" --socket "$SOCK" daemon -o "$WORK/out")
+else
+    held=(inns gw timeout 30 $P daemon -o "$WORK/out")
+fi
+status=0
+"${held[@]}" > "$WORK/held.log" 2>&1 || status=$?
+# 124: still running when `timeout` stopped it, so it started.
+case $status in 0|124) cat "$WORK/held.log"; fail "(n) the daemon started with WireGuard's port taken" ;; esac
+kill "$HOLDER" 2>/dev/null || true
+wait "$HOLDER" 2>/dev/null || true
+inns gw ss -Hlun 'sport = :51820' | grep >/dev/null . && fail "(n) WireGuard's port is still held"
+grep -q "the first apply failed" "$WORK/held.log" || { cat "$WORK/held.log"; fail "(n) the held port didn't fail the first apply"; }
+inns gw nft list table inet parallax >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left the table"; }
+inns gw ip link show wg0 >/dev/null 2>&1 && { cat "$WORK/held.log"; fail "(n) a failed first apply left wg0"; }
+docker_user_is_dockers || { cat "$WORK/held.log"; fail "(n) DOCKER-USER isn't Docker's own after a failed first apply"; }
+grep -q "removed table inet parallax" "$WORK/held.log" && grep -q "removed interface wg0" "$WORK/held.log" \
+    && grep -q "removed Parallax's DOCKER-USER rules" "$WORK/held.log" \
+    || { cat "$WORK/held.log"; fail "(n) a failed first apply didn't log what it took down"; }
+start_daemon 1
+# wg0 is new: the clients' sessions are gone until they handshake again (up to ~15 s).
+for _ in $(seq 10); do [ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] && break; done
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after a restart"
+# The lookup still fails (see (o)); the address from before the restart stays.
+public_ip_is 9.9.9.9 || fail "(n) the home's public IP was lost in the restart"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = BLOCKED ] || fail "(n) friend reached the home's public IP after a restart"
+before=$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log" || true)
+kill -HUP "$(cat "$WORK/daemon.pid")"
+for _ in $(seq 50); do [ "$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log")" -gt "$before" ] && break; sleep 0.1; done
+[ "$(grep -c 'applying (SIGHUP)' "$WORK/daemon.log")" -gt "$before" ] || fail "(n) SIGHUP did not re-apply"
+sleep 3   # a few idle reconcile ticks: an unchanged gateway must not count as drift
+grep -q 'applying (the live' "$WORK/daemon.log" && fail "(n) an unchanged gateway was taken for drift"
+inns gw nft delete table inet parallax
+for _ in $(seq 50); do inns gw nft list table inet parallax >/dev/null 2>&1 && break; sleep 0.1; done
+inns gw nft list table inet parallax >/dev/null 2>&1 || fail "(n) the deleted table did not come back"
+grep -q 'applying (the live' "$WORK/daemon.log" || fail "(n) the repair was not logged as drift"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(n) guest grants after the repair"
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(n) traffic after the repair"
+pass "(n) SIGTERM tears down, DOCKER-USER accepts too; a failed first apply takes down what it set up; SIGHUP re-applies; a deleted table comes back on its own"
+
+# (q) names on the home's public IP are port forwards: friend (full tunnel, internet,
+# which drops the public IP) reaches the one port it's granted there, and HTTPS by name
+# through the proxy, which connects to the public IP itself. A host grant there (every
+# port) and a raw web port are refused.
+$P config export > "$WORK/current.toml"
+sed -e 's/^\[server.public_ip\]$/&\naddress = "1.2.3.4"/' \
+    -e '0,/^\[\[grant\]\]$/s//[[service]]\nname = "forwarded"\nhost = "public.mydomain.com"\nports = ["443\/tcp"]\nhostnames = ["public.mydomain.com"]\n\n&/' \
+    "$WORK/current.toml" > "$WORK/forward-base.toml"
+grep -q '^address = "1.2.3.4"$' "$WORK/forward-base.toml" && grep -q '^name = "forwarded"$' "$WORK/forward-base.toml" \
+    || fail "(q) could not write the test configuration"
+forward() { # extra friend grants -> a config file
+    sed "s|^rules = \[{ kind = \"internet\" }\]\$|rules = [{ kind = \"internet\" }, $1]|" \
+        "$WORK/forward-base.toml" > "$WORK/forward.toml"
+    grep -qF "$1" "$WORK/forward.toml" || fail "(q) could not grant friend $1"
+    echo "$WORK/forward.toml"
+}
+apply "$(forward '{ kind = "host", host = "game.mydomain.com", ports = ["8080/tcp"] }, { kind = "service", name = "forwarded" }')"
+# Friend's session may still be handshaking with the daemon (n) restarted.
+for _ in $(seq 10); do [ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] && break; done
+grep -qx "name game.mydomain.com: 1.2.3.4" <<<"$($P status)" || { $P status; fail "(q) game.mydomain.com was not looked up"; }
+[ "$(curl_as $FRIEND http://1.2.3.4:8080/)" = home-public-other ] || fail "(q) friend -> the granted port forward"
+[ "$(curl_as $FRIEND http://1.2.3.4/)" = BLOCKED ] || fail "(q) friend reached another port on the public IP"
+[ "$(short_as $FRIEND game.mydomain.com)" = 1.2.3.4 ] || fail "(q) friend could not look up the forwarded name"
+[ "$(https_as $FRIEND public.mydomain.com 1.2.3.4)" = forwarded-public.mydomain.com ] \
+    || fail "(q) friend -> HTTPS by name through the proxy to the public IP"
+[ "$(https_as $FRIEND other.mydomain.com 1.2.3.4)" = BLOCKED ] || fail "(q) friend reached another site behind the forward"
+[ "$(https_as $FRIEND other.mydomain.com 1.2.3.4 -k)" = BLOCKED ] || fail "(q) friend reached another site (no verify)"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(q) friend lost the internet"
+refused_forward() { # grant, what the refusal must say
+    if $P config import "$(forward "$1")" > "$WORK/forward.err" 2>&1; then
+        fail "(q) a save granting friend $1 was accepted"
+    fi
+    grep -qF "$2" "$WORK/forward.err" || { cat "$WORK/forward.err"; fail "(q) the refusal of $1 doesn't say why"; }
+}
+refused_forward '{ kind = "host", host = "game.mydomain.com" }' "every port there is a port forward"
+refused_forward '{ kind = "host", host = "game.mydomain.com", ports = ["80/tcp"] }' "grant it as a service with hostnames"
+apply "$WORK/forward-base.toml"
+[ "$(curl_as $FRIEND http://1.2.3.4:8080/)" = BLOCKED ] || fail "(q) the port forward outlived its grant"
+pass "(q) names on the home's public IP: one granted port, HTTPS by name through the proxy; all ports and raw web refused"
+
+# (r) grants combine: friend also gets family and reaches both, nothing more; a grant
+# for everyone reaches every peer without being attached; and none of it changes an
+# address or what a client config holds (only comments may differ).
+FRIEND_CONF=$($P export friend --platform linux 2>/dev/null | grep -v '^#')
+sed '/^name = "friend"$/{n;s/^grants = \["friend"\]$/grants = ["friend", "family"]/}' \
+    "$WORK/forward-base.toml" > "$WORK/union.toml"
+grep -q '^grants = \["friend", "family"\]$' "$WORK/union.toml" || fail "(r) could not give friend two grants"
+apply "$WORK/union.toml"
+grep -q '^friend  grants=family,friend  .*address=10.8.0.4 ' <<<"$($P peer show friend)" \
+    || { $P peer show friend; fail "(r) friend's grants or address"; }
+[ "$(https_as $FRIEND immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(r) friend -> family's Immich"
+[ "$(curl_as $FRIEND http://198.18.1.1:9090/)" = gw-self ] || fail "(r) friend -> family's service on the gateway"
+[ "$(curl_as $FRIEND http://9.9.9.9/)" = internet ] || fail "(r) friend lost its own internet"
+[ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(r) friend reached what neither grant gives"
+[ "$(short_as $FRIEND immich.mydomain.com)" = 198.18.1.5 ] || fail "(r) friend could not look up family's name"
+[ "$(curl_as $GUEST http://9.9.9.9/)" = BLOCKED ] || fail "(r) guest got friend's internet"
+sed '/^# Peers$/i\
+[[grant]]\
+name = "everyone-web"\
+everyone = true\
+rules = [{ kind = "host", host = "192.168.1.5", ports = ["8080/tcp"] }]\
+' "$WORK/union.toml" > "$WORK/everyone.toml"
+apply "$WORK/everyone.toml"
+for src in $LAPTOP $GUEST $FRIEND; do
+    [ "$(curl_as $src http://198.18.1.5:8080/)" = home-other ] || fail "(r) $src missed the grant for everyone"
+done
+[ "$($P export friend --platform linux 2>/dev/null | grep -v '^#')" = "$FRIEND_CONF" ] \
+    || fail "(r) friend's client config changed with its grants"
+apply "$WORK/forward-base.toml"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(r) the grant for everyone outlived its removal"
+[ "$(https_as $FRIEND immich.mydomain.com 198.18.1.5)" = BLOCKED ] || fail "(r) friend kept family after it was detached"
+pass "(r) two grants reach their union and nothing more; a grant for everyone reaches every peer; addresses and client configs stay"
+
+# (s) the same from the command line: each `grant` and `peer grants` command is live
+# when it returns, and one that's refused (a rule that isn't there, a grant someone
+# still has) leaves access as it was. Laptop's own grants never change: the control.
+GUEST_CONF=$($P export guest --platform mobile 2>/dev/null | grep -v '^#')
+g() { $P "$@" >/dev/null 2>"$WORK/grant.err" || { cat "$WORK/grant.err"; fail "(s) parallax $*"; }; sleep 0.3; }
+refused() { if $P "$@" >/dev/null 2>&1; then fail "(s) parallax $* should be refused"; fi; }
+web() { curl_as "$1" http://198.18.1.5:8080/; }
+[ "$(web $GUEST)" = BLOCKED ] || fail "(s) guest reached 8080 before any grant gave it"
+g grant create web host:192.168.1.5:8080/tcp
+[ "$(web $GUEST)" = BLOCKED ] || fail "(s) a grant attached to no one gave access"
+g grant attach web --to guest
+[ "$(web $GUEST)" = home-other ] || fail "(s) guest -> its attached grant"
+[ "$(web $FRIEND)" = BLOCKED ] || fail "(s) friend got guest's grant"
+g peer grants guest remove web
+[ "$(web $GUEST)" = BLOCKED ] || fail "(s) guest kept a grant detached from its side"
+g grant everyone web on
+for src in $GUEST $FRIEND; do [ "$(web $src)" = home-other ] || fail "(s) $src missed the grant for everyone"; done
+refused grant rule remove web host:192.168.1.5:8080/udp
+refused grant detach web --from friend
+refused grant remove web
+[ "$(web $FRIEND)" = home-other ] || fail "(s) a refused change took access away"
+g grant rename web lan-web
+[ "$(web $GUEST)" = home-other ] || fail "(s) a rename changed access"
+g grant remove lan-web --force
+for src in $GUEST $FRIEND; do [ "$(web $src)" = BLOCKED ] || fail "(s) $src kept a removed grant"; done
+[ "$(web $LAPTOP)" = home-other ] || fail "(s) laptop's access changed with others' grants"
+[ "$(https_as $GUEST immich.mydomain.com 198.18.1.5)" = home-immich ] || fail "(s) guest lost family"
+grep -q '^guest  grants=family  .*address=10.8.0.3 ' <<<"$($P peer show guest)" \
+    || { $P peer show guest; fail "(s) guest's grants or address"; }
+[ "$($P export guest --platform mobile 2>/dev/null | grep -v '^#')" = "$GUEST_CONF" ] \
+    || fail "(s) guest's client config changed with its grants"
+pass "(s) grant and peer grants commands change access on return; refused ones change nothing"
+
+# (t) activity logging: off, the firewall has no logging rules; levels set by grant
+# and by peer record what each level covers (guest at `blocked`: its blocked
+# attempts, not its connections; laptop at `detailed`: connections and their bytes),
+# with both destinations, and nothing of anyone else; off again, the rules go.
+inns gw nft list table inet parallax | grep 'log_flows\|log prefix' >/dev/null \
+    && fail "(t) logging rules with nobody logged"
+# Byte counts are a host setting; a short TIME_WAIT ends closed TCP flows at once.
+inns gw sysctl -qw net.netfilter.nf_conntrack_acct=1
+inns gw sysctl -qw net.netfilter.nf_conntrack_tcp_timeout_time_wait=1
+feed_up() { # which feed's start to wait for in the daemon's log
+    for _ in $(seq 50); do grep -q "activity logging: reading $1" "$WORK/daemon.log" && return 0; sleep 0.1; done
+    fail "(t) the collector didn't start reading $1"
+}
+# `blocked` alone first: only the blocked attempts feed runs, so the guest's
+# allowed connection is never even marked.
+g log level blocked --grant family
+feed_up "blocked attempts"
+grep -q 'activity logging: reading connections' "$WORK/daemon.log" \
+    && fail "(t) connections are read with only blocked attempts logged"
+[ "$(curl_as $GUEST http://198.18.1.1:9090/)" = gw-self ] || fail "(t) guest -> its gateway service"
+[ "$(curl_as $GUEST http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) guest reached 8080"
+g log level detailed --peer laptop
+feed_up connections
+[ "$(curl_as $LAPTOP http://198.18.1.5:8080/)" = home-other ] || fail "(t) laptop -> 8080"
+[ "$(curl_as $FRIEND http://198.18.1.5:8080/)" = BLOCKED ] || fail "(t) friend reached 8080"
+# A flow's end is reported when connection tracking's periodic sweep removes it,
+# some seconds after TIME_WAIT (about 11 s on a 7.2 kernel); wait for it.
+for _ in $(seq 60); do
+    $P log show --peer laptop --kind closed | grep >/dev/null . && break
+    sleep 1
+done
+LOGS=$($P log show --limit 1000)
+echo "$LOGS" | grep >/dev/null '  guest  blocked  tcp 198.18.1.5:8080 (192.168.1.5, home)  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's blocked attempt, with both destinations"; }
+echo "$LOGS" | grep >/dev/null '  guest  \(opened\|closed\)  ' \
+    && { echo "$LOGS"; fail "(t) guest's connections recorded at blocked"; }
+echo "$LOGS" | grep >/dev/null '  laptop  opened  tcp 198.18.1.5:8080 (192.168.1.5, home)' \
+    || { echo "$LOGS"; fail "(t) laptop's connection"; }
+echo "$LOGS" | grep >/dev/null '  laptop  closed  tcp 198.18.1.5:8080 (192.168.1.5, home)  [0-9.]* [KMG]*i*B out, [0-9.]* [KMG]*i*B in' \
+    || { echo "$LOGS"; fail "(t) laptop's bytes when the flow ended"; }
+echo "$LOGS" | grep >/dev/null '  friend  ' && { echo "$LOGS"; fail "(t) friend is logged at off"; }
+[ "$($P log show --peer guest --kind blocked | wc -l)" -ge 1 ] || fail "(t) log show --peer --kind"
+# The proxy and DNS: at `connections` one record per proxied request (never its
+# path) and each refusal; DNS queries only once `log dns` turns them on.
+g log level connections --grant family
+ANS=$(inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)
+[ "$(curl_as $GUEST --cacert "$CA" --resolve "immich.mydomain.com:443:$ANS" https://immich.mydomain.com/secret-album-42)" = home-immich ] \
+    || fail "(t) guest -> immich through the proxy"
+https_as $GUEST immich.mydomain.com "$ANS" --http1.1 -H 'Host: other.mydomain.com' -o /dev/null >/dev/null || true
+g log dns on --peer guest
+inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com >/dev/null || true
+inns client dig +short +time=1 +tries=1 -b $GUEST @10.8.0.1 other.mydomain.com >/dev/null || true
+for _ in $(seq 20); do
+    [ "$($P log show --peer guest --kind query | wc -l)" -ge 2 ] \
+        && [ "$($P log show --peer guest --kind request,refused | wc -l)" -ge 2 ] && break
+    sleep 0.5
+done
+LOGS=$($P log show --peer guest --kind request,refused,query --limit 1000)
+echo "$LOGS" | grep >/dev/null '  guest  request  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 200  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's proxied request"; }
+echo "$LOGS" | grep >/dev/null '  guest  refused  tcp 198.18.1.5:443 (192.168.1.5, home)  GET immich.mydomain.com 421: this connection serves a different hostname' \
+    || { echo "$LOGS"; fail "(t) guest's misdirected request"; }
+echo "$LOGS" | grep >/dev/null 'secret-album-42' && { echo "$LOGS"; fail "(t) a URL path was recorded"; }
+[ "$(echo "$LOGS" | grep -c '  guest  query  ')" -eq 2 ] \
+    || { echo "$LOGS"; fail "(t) only the queries after log dns on"; }
+echo "$LOGS" | grep >/dev/null '  guest  query  udp 10.8.0.1:53  immich.mydomain.com. A answered  grants family$' \
+    || { echo "$LOGS"; fail "(t) guest's DNS query"; }
+echo "$LOGS" | grep >/dev/null '  guest  query  udp 10.8.0.1:53  other.mydomain.com. A refused' \
+    || { echo "$LOGS"; fail "(t) guest's refused DNS query"; }
+g log dns inherit --peer guest
+g log level inherit --grant family
+g log level inherit --peer laptop
+inns gw nft list table inet parallax | grep 'log_flows\|log prefix' >/dev/null \
+    && fail "(t) logging rules left after everyone went back to off"
+# The records stay readable with logging off.
+[ "$($P log show --peer laptop | wc -l)" -ge 2 ] || fail "(t) records after logging went off"
+pass "(t) each level records what it covers (blocked attempts; connections and bytes; proxied requests and refusals, no paths) with both destinations; DNS queries only when asked; nobody else's; off removes the rules"
+
+# (v) Root writes what the service's configuration names as the service: a
+# configuration naming a file in root's own directory gets no write from root.
+if [ "$MODE" = unit ]; then
+    mkdir -m 0700 "$WORK/rootonly"
+    echo untouched > "$WORK/rootonly/victim"
+    $P config export > "$WORK/before.toml" || fail "(v) config export"
+    sed "s#^passphrase_file = .*#passphrase_file = \"$WORK/rootonly/victim\"#" "$WORK/before.toml" > "$WORK/rogue.toml"
+    grep -q "rootonly/victim" "$WORK/rogue.toml" || fail "(v) the exported configuration has no passphrase_file"
+    $P config import "$WORK/rogue.toml" >/dev/null || fail "(v) importing through the daemon"
+    if $P backup passphrase --generate --replace > "$WORK/rogue.out" 2>&1; then
+        fail "(v) root wrote the file the service's configuration named in root's directory"
+    fi
+    [ "$(cat "$WORK/rootonly/victim")" = untouched ] || fail "(v) root's file changed"
+    grep -q "(as uid $(id -u nobody)).*$WORK/rootonly/victim: Permission denied" "$WORK/rogue.out" \
+        || { cat "$WORK/rogue.out"; fail "(v) the refusal isn't the service's user being denied root's file"; }
+    $P config import "$WORK/before.toml" >/dev/null || fail "(v) putting the configuration back"
+    $P backup passphrase --generate --replace > "$WORK/own.out" 2>&1 \
+        || { cat "$WORK/own.out"; fail "(v) the service's own passphrase file"; }
+    [ "$(stat -c %U "$WORK/backup.passphrase")" = nobody ] || fail "(v) the passphrase isn't the service's"
+    pass "(v) root writes the files the service's configuration names as the service, and nowhere else"
+fi
+
+# (u) Tailscale peers follow Headscale: a real Headscale and a node logged in to it
+# (userspace tailscaled) in the gateway's namespace. The daemon puts the node's
+# address in its peer's tier set within a poll, keeps it while Headscale is down,
+# and drops it once the node is deleted. Needs HEADSCALE, TAILSCALED and TAILSCALE
+# (tests/integration/headscale-binaries.sh builds them); skipped without.
+if [ -n "${HEADSCALE:-}" ] && [ -n "${TAILSCALED:-}" ] && [ -n "${TAILSCALE:-}" ]; then
+    HS="$WORK/hs"
+    mkdir -p "$HS/ts"
+    # A tailscaled in a namespace still reaches the host's systemd-resolved over
+    # the system D-Bus, and resets DNS on whichever host link has its
+    # tailscale0's interface index. Each one here gets no D-Bus and a plain
+    # resolv.conf, so it leaves the host's DNS alone.
+    printf '# netns test: not systemd-resolved\nnameserver 192.0.2.53\n' > "$WORK/ts-resolv.conf"
+    chmod 0644 "$WORK/ts-resolv.conf"
+    no_host_dns() { # ns, command...  (a private mount namespace)
+        local ns=$1; shift
+        inns "$ns" unshare -m --propagation private sh -c \
+            'mount --bind "$0" /etc/resolv.conf && { [ ! -d /run/dbus ] || mount -t tmpfs tmpfs /run/dbus; } && exec "$@"' \
+            "$WORK/ts-resolv.conf" "$@"
+    }
+    # No internet here: one offline DERP region, so Headscale starts.
+    cat > "$HS/derp.yaml" <<YAML
+regions:
+  900:
+    regionid: 900
+    regioncode: test
+    regionname: Offline test region
+    nodes:
+      - name: 900a
+        regionid: 900
+        hostname: 127.0.0.1
+YAML
+    cat > "$HS/config.yaml" <<YAML
+server_url: http://127.0.0.1:18080
+# Also on wan1, for the phone in (w).
+listen_addr: 0.0.0.0:18080
+metrics_listen_addr: ""
+unix_socket: $HS/headscale.sock
+noise:
+  private_key_path: $HS/noise.key
+database:
+  sqlite:
+    path: $HS/db.sqlite
+derp:
+  urls: []
+  paths: [$HS/derp.yaml]
+# info: a slow start shows what it was doing (#91).
+log:
+  level: info
+YAML
+    start_headscale() {
+        # Its own pid, not the backgrounded subshell's, so (u) can stop it.
+        inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$HS/headscale.pid" \
+            "$HEADSCALE" serve -c "$HS/config.yaml" >> "$HS/headscale.log" 2>&1 &
+        PIDS+=($!)
+        # The backgrounded subshell lives as long as Headscale does; (u) waits
+        # on it to know the first one has stopped.
+        HS_BG=$!
+        local pid=$! start=$SECONDS
+        # A first start makes its database and keys, which can take a while
+        # on a busy CI runner (#91). One that exits says so at once.
+        while [ $((SECONDS - start)) -lt 30 ]; do
+            inns gw curl -sf -m 1 http://127.0.0.1:18080/version >/dev/null && return 0
+            kill -0 "$pid" 2>/dev/null \
+                || { cat "$HS/headscale.log" 2>/dev/null || true; fail "(u) Headscale exited before it answered (after $((SECONDS - start)) s)"; }
+            sleep 0.1
+        done
+        cat "$HS/headscale.log" 2>/dev/null || true; fail "(u) Headscale is running but didn't answer in 30 s"
+    }
+    start_headscale
+    HS_KEY=$(inns gw "$HEADSCALE" -c "$HS/config.yaml" apikeys create 2>/dev/null | tail -n1)
+    hs_api() { # method, path, [JSON body]
+        inns gw curl -sf -m 5 -X "$1" -H "Authorization: Bearer $HS_KEY" \
+            -H 'Content-Type: application/json' ${3:+-d "$3"} "http://127.0.0.1:18080$2"
+    }
+    HS_USER=$(hs_api POST /api/v1/user '{"name":"family"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["user"]["id"])')
+    AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"2099-01-01T00:00:00Z\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
+    no_host_dns gw "$TAILSCALED" --tun=userspace-networking --state=mem: --socket="$HS/ts/sock" \
+        --statedir="$HS/ts" --port=0 >> "$HS/tailscaled.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 50); do [ -S "$HS/ts/sock" ] && break; sleep 0.1; done
+    inns gw timeout 30 "$TAILSCALE" --socket="$HS/ts/sock" up --login-server=http://127.0.0.1:18080 \
+        --authkey="$AUTH" --hostname=tablet >/dev/null 2>&1 || { tail -20 "$HS/tailscaled.log"; fail "(u) the node did not log in"; }
+    read -r NODE NODE_IP < <(hs_api GET /api/v1/node | python3 -c '
+import json, sys
+n = json.load(sys.stdin)["nodes"][0]
+print(n["id"], next(a for a in n["ipAddresses"] if "." in a))')
+    install -m 0600 /dev/null "$WORK/headscale-api.key"
+    echo "$HS_KEY" > "$WORK/headscale-api.key"
+    [ "$MODE" = unit ] && chown nobody "$WORK/headscale-api.key"
+    $P config export > "$WORK/current.toml"
+    python3 - "$WORK/current.toml" "$WORK/tailscale.toml" "$WORK/headscale-api.key" "$NODE" <<'PY'
+import re, sys
+src, dst, key, node = sys.argv[1:]
+s = open(src).read()
+s = re.sub(r'(?m)^server_url = ".*"$', 'server_url = "http://127.0.0.1:18080"', s, count=1)
+s = re.sub(r'(?m)^api_key_file = ".*"$', f'api_key_file = "{key}"', s, count=1)
+s += f'\n[[peer]]\nname = "tablet"\ngrants = ["family"]\ntransport = "tailscale"\n[peer.tailscale]\nnode_id = {node}\n'
+open(dst, "w").write(s)
+PY
+    grep -q '^server_url = "http://127.0.0.1:18080"$' "$WORK/tailscale.toml" || fail "(u) could not point the configuration at Headscale"
+    # Not grep -q: it stops reading at the match, and with pipefail nft's SIGPIPE
+    # would fail the pipeline exactly when the address is there.
+    in_set() { inns gw nft list table inet parallax | grep "elements = {[^}]*\b$NODE_IP\b" >/dev/null; }
+    wait_set() { # want: in | out
+        for _ in $(seq 30); do
+            if in_set; then [ "$1" = in ] && return 0; else [ "$1" = out ] && return 0; fi
+            sleep 0.5
+        done
+        return 1
+    }
+    apply "$WORK/tailscale.toml"
+    wait_set in || { inns gw nft list table inet parallax | grep -A5 'set ts_'; fail "(u) the node's address $NODE_IP never reached the firewall"; }
+    inns gw $P headscale status | grep "^node $NODE tablet: user family, $NODE_IP, online; peer tablet$" >/dev/null \
+        || { inns gw $P headscale status; fail "(u) headscale status did not show the node as tablet"; }
+    $P status | grep "^Headscale node $NODE: $NODE_IP$" >/dev/null || { $P status; fail "(u) the daemon's status lacks the node"; }
+    HS_PID=$(cat "$HS/headscale.pid")
+    kill "$HS_PID"
+    # Gone before the restart below, so that one can't be answered by this one.
+    wait "$HS_BG" || true
+    sleep 12
+    in_set || fail "(u) the node lost its access while Headscale was down"
+    grep -q "keeping the addresses it gave last" "$WORK/daemon.log" || fail "(u) Headscale being down was not logged"
+    start_headscale
+    hs_api DELETE "/api/v1/node/$NODE" >/dev/null || fail "(u) could not delete the node"
+    wait_set out || fail "(u) a deleted node kept its peer's access"
+    pass "(u) a Tailscale peer gets its node's address from Headscale, keeps it while Headscale is down, loses it with the node"
+
+    # (w) The subnet router. Parallax's own tailscaled (kernel tun, as the image
+    # and parallax-tailscaled.service run it), logged out; the daemon logs it in,
+    # advertises the mapped network and the DNS address, and approves them. A
+    # phone on Tailscale in its own namespace then reaches what its grant allows,
+    # exactly what the WireGuard guest with the same grant reaches.
+    TSD_UNIT="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax-tailscaled.service"
+    ROUTER_ARGS=(--state="$WORK/tsr/state" --statedir="$WORK/tsr" --socket="$TS_SOCK" --tun=tailscale0 --port=41641)
+    if [ "$MODE" = unit ]; then
+        # parallax-tailscaled.service's sandbox, root as there, then its
+        # ExecStartPost: the daemon's user may manage it.
+        TSD_SANDBOX=()
+        while IFS= read -r line; do
+            case ${line%%=*} in
+                Type | Exec* | Restart* | StateDirectory* | RuntimeDirectory*) ;;
+                *) TSD_SANDBOX+=(-p "$line") ;;
+            esac
+        done < <(sed -n '/^\[Service\]/,/^\[/p' "$TSD_UNIT" | grep -E '^[A-Za-z]+=')
+        printf '%s\n' "${TSD_SANDBOX[@]}" | grep >/dev/null '^CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW$' \
+            || fail "(w) could not read the sandbox from $TSD_UNIT"
+        # Root without CAP_DAC_OVERRIDE: its directory is root's, as
+        # StateDirectory and RuntimeDirectory make it, and $WORK (the
+        # service's) only traversable.
+        chmod 0711 "$WORK"
+        chown root:root "$WORK/tsr"
+        chmod 0755 "$WORK/tsr"
+    fi
+    # Started again with the same state in (y).
+    start_router() {
+        rm -f "$TS_SOCK"
+        if [ "$MODE" = unit ]; then
+            ROUTER_UNIT="${PREFIX}tailscaled-${#UNITS[@]}"
+            UNITS+=("$ROUTER_UNIT")
+            systemd-run --quiet --collect --unit="$ROUTER_UNIT" -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" \
+                -p "ReadWritePaths=$WORK" -p "StandardOutput=append:$HS/router.log" -p "StandardError=append:$HS/router.log" \
+                -p "BindReadOnlyPaths=$WORK/ts-resolv.conf:/etc/resolv.conf" -p "TemporaryFileSystem=/run/dbus" \
+                "${TSD_SANDBOX[@]}" "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}"
+        else
+            # Its own pid, to stop it in (y).
+            no_host_dns gw sh -c 'echo $$ > "$0"; exec "$@"' "$HS/router.pid" \
+                "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}" >> "$HS/router.log" 2>&1 &
+            PIDS+=($!)
+        fi
+        for _ in $(seq 50); do [ -S "$TS_SOCK" ] && break; sleep 0.1; done
+        [ -S "$TS_SOCK" ] || { cat "$HS/router.log"; fail "(w) the router's tailscaled did not start"; }
+        if [ "$MODE" = unit ]; then
+            # The unit's ExecStartPost, in its sandbox, with the test's user.
+            systemd-run --quiet --collect --unit="${PREFIX}tailscaled-operator" -p Type=exec --wait --pipe \
+                -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" -p "ReadWritePaths=$WORK" "${TSD_SANDBOX[@]}" \
+                "$WORK/bin/tailscale" --socket="$TS_SOCK" set --operator=nobody \
+                || fail "(w) could not make the service the router's operator"
+        fi
+    }
+    stop_router() {
+        if [ "$MODE" = unit ]; then
+            systemctl stop "$ROUTER_UNIT"
+        else
+            local pid
+            pid=$(cat "$HS/router.pid")
+            kill "$pid"
+            for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+            kill -0 "$pid" 2>/dev/null && fail "(y) the router's tailscaled did not stop"
+        fi
+        return 0
+    }
+    start_router
+
+    # Short-lived, and on stdin, as Parallax passes its own.
+    PHONE_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
+    mkdir -p "$HS/phone"
+    no_host_dns tsc "$TAILSCALED" --tun=tailscale0 --state=mem: --socket="$HS/phone/sock" --statedir="$HS/phone" \
+        --port=0 >> "$HS/phone.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 50); do [ -S "$HS/phone/sock" ] && break; sleep 0.1; done
+    # --accept-dns=false too: the phone has no DNS of its own to set.
+    printf '%s' "$PHONE_AUTH" | inns tsc timeout 30 "$TAILSCALE" --socket="$HS/phone/sock" up \
+        --login-server=http://203.0.114.1:18080 --auth-key=file:/dev/stdin --hostname=phone --accept-routes \
+        --accept-dns=false >/dev/null 2>&1 \
+        || { tail -20 "$HS/phone.log"; fail "(w) the phone did not log in"; }
+    read -r PHONE PHONE_IP < <(hs_api GET /api/v1/node | python3 -c '
+import json, sys
+n = next(n for n in json.load(sys.stdin)["nodes"] if n["givenName"] == "phone")
+print(n["id"], next(a for a in n["ipAddresses"] if "." in a))')
+    $P config export > "$WORK/current.toml"
+    printf '\n[[peer]]\nname = "phone"\ngrants = ["family"]\ntransport = "tailscale"\n[peer.tailscale]\nnode_id = %s\n' \
+        "$PHONE" >> "$WORK/current.toml"
+    apply "$WORK/current.toml"
+    router_routes() {
+        hs_api GET /api/v1/node | python3 -c '
+import json, sys
+for n in json.load(sys.stdin)["nodes"]:
+    if n["givenName"] == "parallax-gateway" and n["user"]["name"] == "parallax":
+        print(",".join(sorted(n["approvedRoutes"])), ",".join(sorted(n["availableRoutes"])))'
+    }
+    for _ in $(seq 60); do
+        [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] && break
+        sleep 0.5
+    done
+    [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] \
+        || { hs_api GET /api/v1/node; tail -20 "$HS/router.log"; fail "(w) the router's routes were not advertised and approved"; }
+    grep -q "logged the router in to Headscale" "$WORK/daemon.log" || fail "(w) the router's login was not logged"
+    inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+assert p["NetfilterMode"] == 0 and p["NoSNAT"] and not p["CorpDNS"] and not p["RouteAll"], p' \
+        || fail "(w) the router does not have its own filtering, SNAT, DNS and routes off"
+    for _ in $(seq 60); do
+        inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0' && break
+        sleep 0.5
+    done
+    inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0' \
+        || { inns tsc ip route show table 52; fail "(w) the phone has no route to the mapped network"; }
+    phone() { inns tsc curl -s -m 3 "$@" || echo BLOCKED; }
+    # The first packets may wait for the path between the two to be found.
+    for _ in $(seq 20); do [ "$(phone http://198.18.1.1:9090/)" = gw-self ] && break; sleep 0.5; done
+    [ "$(phone http://198.18.1.1:9090/)" = gw-self ] || fail "(w) phone -> the granted service on the gateway host"
+    for url in http://198.18.1.1:9090/ http://198.18.1.1:9091/ http://198.18.1.1:8080/ http://198.18.1.5:8080/ http://198.18.1.5:7000/ http://9.9.9.9/; do
+        [ "$(phone "$url")" = "$(curl_as $GUEST "$url")" ] || fail "(w) the phone and the guest, same grant, differ on $url"
+    done
+    [ "$(phone http://198.18.1.1:9091/)" = BLOCKED ] || fail "(w) the phone reached a port its grant lacks"
+    ANS=$(inns tsc dig +short +time=2 +tries=1 @10.8.0.1 immich.mydomain.com || true)
+    [ -n "$ANS" ] && [ "$ANS" = "$(inns client dig +short +time=2 +tries=1 -b $GUEST @10.8.0.1 immich.mydomain.com || true)" ] \
+        || fail "(w) the phone's DNS answer for immich ('$ANS') is not the guest's"
+    [ "$(inns tsc curl -s -m 3 --cacert "$CA" --resolve "immich.mydomain.com:443:$ANS" https://immich.mydomain.com/ || echo BLOCKED)" = home-immich ] \
+        || fail "(w) the phone did not reach Immich through the proxy"
+    [ "$(inns tsc dig +time=2 +tries=1 @10.8.0.1 other.mydomain.com | sed -n 's/.*status: \([A-Z]*\).*/\1/p')" = REFUSED ] \
+        || fail "(w) the phone looked up a name its grant lacks"
+    inns gw $P doctor > "$WORK/doctor-router" 2>&1 || true
+    grep -q "^ok    tailscale router: Parallax's router is node" "$WORK/doctor-router" \
+        || { cat "$WORK/doctor-router"; fail "(w) doctor does not see the router in place"; }
+    pass "(w) the daemon logs the subnet router in and approves its routes; a Tailscale phone reaches what its grant allows, DNS and the proxy included"
+
+
+    # ---------------------------------------------------------------- lane C #113 bench
+    LC_BUGS=()
+    lc_bug() { echo "BUG: $*"; LC_BUGS+=("$*"); }
+    lc_ok() { echo "LCOK: $*"; }
+    withdrew_count() { grep -c "subnet router: withdrew its routes" "$WORK/daemon.log" || true; }
+    fw_present() { inns gw nft list table inet parallax >/dev/null 2>&1; }
+    wg_present() { inns gw ip link show wg0 >/dev/null 2>&1; }
+    router_advertises() { # [socket]
+        inns gw "$WORK/bin/tailscale.orig" --socket="${1:-$TS_SOCK}" debug prefs | python3 -c '
+import json, sys
+print(",".join(sorted(json.load(sys.stdin)["AdvertiseRoutes"] or [])))'
+    }
+    phone_route() { inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0'; }
+    # A host reachable at 198.18.1.77 on the gateway itself once nothing
+    # rewrites that address: stands in for an unmapped LAN's host.
+    mkdir -p "$WORK/probe"
+    echo unfiltered > "$WORK/probe/index.html"
+    chmod -R a+rX "$WORK/probe"
+    probe_up() {
+        inns gw ip link add lcprobe type dummy
+        inns gw ip addr add 198.18.1.77/32 dev lcprobe
+        inns gw ip link set lcprobe up
+        inns gw python3 -I -m http.server --bind 198.18.1.77 9077 --directory "$WORK/probe" >/dev/null 2>&1 &
+        PROBE_PID=$!
+        PIDS+=($!)
+        for _ in $(seq 30); do inns gw curl -s -m 1 http://198.18.1.77:9077/ | grep >/dev/null unfiltered && break; sleep 0.2; done
+    }
+    probe_down() {
+        kill "$PROBE_PID" 2>/dev/null || true
+        inns gw pkill -f "http.server --bind 198.18.1.77" 2>/dev/null || true
+        inns gw ip link del lcprobe 2>/dev/null || true
+    }
+    phone_probe() {
+        local r=BLOCKED
+        for _ in $(seq 8); do
+            r=$(inns tsc curl -s -m 2 http://198.18.1.77:9077/ || echo BLOCKED)
+            [ "$r" = unfiltered ] && break
+            sleep 0.5
+        done
+        echo "$r"
+    }
+    wait_routes_back() {
+        for _ in $(seq 240); do
+            [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] \
+                && [ "$(router_advertises)" = "10.8.0.1/32,198.18.1.0/24" ] && phone_route && return 0
+            sleep 0.5
+        done
+        lc_diag routes-back-failed; fail "(lc) the router's routes did not come back"
+    }
+    wait_stopped() { # seconds
+        local pid
+        pid=$(cat "$WORK/daemon.pid")
+        for _ in $(seq $(( $1 * 10 ))); do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.1; done
+        fail "(lc) the daemon did not stop within $1 s"
+    }
+    lc_diag() { # label
+        echo "DIAG $1: phone route: $(phone_route && echo yes || echo no)"
+        hs_api GET /api/v1/node | python3 -c '
+import json, sys
+for n in json.load(sys.stdin)["nodes"]:
+    print("DIAG node", n["id"], n["givenName"], n["user"]["name"], "online" if n["online"] else "offline", n["availableRoutes"], n["approvedRoutes"])' || echo "DIAG: Headscale unreachable"
+        inns tsc "$TAILSCALE" --socket="$HS/phone/sock" status 2>&1 | head -5 | sed 's/^/DIAG phone status: /'
+        tail -15 "$HS/phone.log" | sed 's/^/DIAG phone.log: /'
+    }
+    cp "$WORK/bin/tailscale" "$WORK/bin/tailscale.orig"
+    lc_diag before-lc
+
+    stop_daemon() { # what for
+        local pid
+        pid=$(cat "$WORK/daemon.pid")
+        kill -TERM "$pid"
+        for _ in $(seq 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -0 "$pid" 2>/dev/null && fail "$1: the daemon did not stop on SIGTERM"
+        return 0
+    }
+    # (lc-b) The router's socket isn't where the daemon looks (a stale bind
+    # mount, a restart in progress): teardown goes ahead.
+    mv "$TS_SOCK" "$TS_SOCK.hidden"
+    before=$(withdrew_count)
+    stop_daemon "(lc-b)"
+    [ "$(withdrew_count)" -gt "$before" ] && echo "INFO (lc-b): withdrew" || echo "INFO (lc-b): did not withdraw"
+    fw_present && lc_ok "(lc-b) firewall kept" || echo "INFO (lc-b): firewall removed"
+    echo "INFO (lc-b): router advertises '$(router_advertises "$TS_SOCK.hidden")'"
+    probe_up
+    r=$(phone_probe)
+    [ "$r" = BLOCKED ] && lc_ok "(lc-b) nothing reachable" || lc_bug "(lc-b) hidden socket: firewall removed while the router routes; phone -> 198.18.1.77: $r"
+    probe_down
+    mv "$TS_SOCK.hidden" "$TS_SOCK"
+    start_daemon 3600
+    wait_routes_back
+
+    # (lc-c) The withdraw fails: fail closed.
+    cat > "$WORK/bin/tailscale" <<'SH'
+#!/bin/sh
+for a in "$@"; do
+    [ "$a" = "--advertise-routes=" ] && { echo "lanec: refusing to withdraw" >&2; exit 1; }
+done
+exec "$(dirname "$0")/tailscale.orig" "$@"
+SH
+    chmod 0755 "$WORK/bin/tailscale"
+    stop_daemon "(lc-c)"
+    fw_present && wg_present && lc_ok "(lc-c) failed withdraw keeps the firewall and wg0" || lc_bug "(lc-c) failed withdraw removed the firewall or wg0"
+    grep -q "could not withdraw its routes" "$WORK/daemon.log" && grep -q "leaving the firewall and wg0 in place" "$WORK/daemon.log" \
+        && lc_ok "(lc-c) logged" || lc_bug "(lc-c) not logged"
+    # (lc-c2) The withdraw hangs: kept after 45 s.
+    start_daemon 3600
+    wait_routes_back
+    cat > "$WORK/bin/tailscale" <<'SH'
+#!/bin/sh
+for a in "$@"; do
+    [ "$a" = "--advertise-routes=" ] && exec sleep 70
+done
+exec "$(dirname "$0")/tailscale.orig" "$@"
+SH
+    chmod 0755 "$WORK/bin/tailscale"
+    : > "$WORK/lc-c2.mark"
+    t0=$SECONDS
+    kill -TERM "$(cat "$WORK/daemon.pid")"
+    wait_stopped 70
+    echo "INFO (lc-c2): the daemon stopped after $((SECONDS - t0)) s"
+    fw_present && wg_present && lc_ok "(lc-c2) a hanging withdraw keeps the firewall" || lc_bug "(lc-c2) a hanging withdraw removed the firewall"
+    grep -q "didn't withdraw its routes in time" "$WORK/daemon.log" && lc_ok "(lc-c2) logged" || lc_bug "(lc-c2) the timeout not logged"
+    cp "$WORK/bin/tailscale.orig" "$WORK/bin/tailscale"
+    inns gw pkill -f "^sleep 70" 2>/dev/null || true
+    start_daemon 3600
+    wait_routes_back
+
+    # (lc-d) The configuration moves to another Headscale: the old router
+    # stays logged in to the first one.
+    HS2="$WORK/hs2"
+    mkdir -p "$HS2"
+    sed -e "s#18080#18081#g" -e "s#$HS/#$HS2/#g" "$HS/config.yaml" > "$HS2/config.yaml"
+    cp "$HS/derp.yaml" "$HS2/derp.yaml"
+    inns gw "$HEADSCALE" serve -c "$HS2/config.yaml" >> "$HS2/headscale.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 300); do inns gw curl -sf -m 1 http://127.0.0.1:18081/version >/dev/null && break; sleep 0.1; done
+    HS2_KEY=$(inns gw "$HEADSCALE" -c "$HS2/config.yaml" apikeys create 2>/dev/null | tail -n1)
+    install -m 0600 /dev/null "$WORK/headscale2-api.key"
+    echo "$HS2_KEY" > "$WORK/headscale2-api.key"
+    [ "$MODE" = unit ] && chown nobody "$WORK/headscale2-api.key"
+    python3 - "$WORK/current.toml" "$WORK/lc-d.toml" "$WORK/headscale2-api.key" <<'PY'
+import re, sys
+src, dst, key = sys.argv[1:]
+s = open(src).read()
+s = re.sub(r'(?m)^server_url = ".*"$', 'server_url = "http://127.0.0.1:18081"', s, count=1)
+s = re.sub(r'(?m)^api_key_file = ".*"$', f'api_key_file = "{key}"', s, count=1)
+open(dst, "w").write(s)
+PY
+    $P config import "$WORK/lc-d.toml" > "$WORK/lc-d.import" 2>&1 || { cat "$WORK/lc-d.import"; echo "INFO (lc-d): import failed"; }
+    sleep 8
+    tail -5 "$WORK/daemon.log" | sed 's/^/INFO (lc-d) log: /'
+    before=$(withdrew_count)
+    stop_daemon "(lc-d)"
+    [ "$(withdrew_count)" -gt "$before" ] && echo "INFO (lc-d): withdrew" || echo "INFO (lc-d): did not withdraw"
+    fw_present && echo "INFO (lc-d): firewall kept" || echo "INFO (lc-d): firewall removed"
+    echo "INFO (lc-d): router advertises '$(router_advertises)', Headscale A: $(router_routes)"
+    probe_up
+    r=$(phone_probe)
+    [ "$r" = BLOCKED ] && lc_ok "(lc-d) nothing reachable" || lc_bug "(lc-d) Headscale moved: firewall removed while the old router routes; phone -> 198.18.1.77: $r"
+    probe_down
+    inns gw pkill -f "$HS2/config.yaml" 2>/dev/null || true
+    start_daemon 3600
+    $P config import "$WORK/current.toml" >/dev/null 2>&1 || fail "(lc-d) could not restore the configuration"
+    wait_routes_back
+
+    # (lc-a) Withdrawn routes stop forwarding at once, Headscale or not:
+    # the router's control connection is blocked, so Headscale (and the
+    # phone) still have its routes.
+    inns gw nft add table inet lctest
+    inns gw nft add chain inet lctest out '{ type filter hook output priority -10; }'
+    inns gw nft add rule inet lctest out ip daddr 127.0.0.1 tcp dport 18080 drop
+    before=$(withdrew_count)
+    stop_daemon "(lc-a)"
+    [ "$(withdrew_count)" -gt "$before" ] && lc_ok "(lc-a) withdrew with Headscale unreachable (remembered key)" \
+        || lc_bug "(lc-a) did not withdraw with Headscale unreachable"
+    fw_present && lc_bug "(lc-a) firewall still present after a good withdraw" || lc_ok "(lc-a) firewall removed"
+    phone_route && echo "INFO (lc-a): the phone still has its route" || echo "INFO (lc-a): the phone lost its route (control below is void)"
+    probe_up
+    r=$(phone_probe)
+    [ "$r" = BLOCKED ] && lc_ok "(lc-a) withdrawn router forwards nothing" || lc_bug "(lc-a) withdrawn router still forwards: $r"
+    # Control: advertising again (locally only) with no firewall reaches the probe.
+    inns gw tailscale --socket="$TS_SOCK" set --advertise-routes=198.18.1.0/24 --advertise-exit-node=false
+    r=$(phone_probe)
+    echo "INFO (lc-a) control, routes re-advertised locally, no firewall: $r (unfiltered proves the probe)"
+    inns gw tailscale --socket="$TS_SOCK" set --advertise-routes= --advertise-exit-node=false
+    r=$(phone_probe)
+    echo "INFO (lc-a) control, withdrawn again: $r"
+    probe_down
+    inns gw tailscale --socket="$TS_SOCK" set --advertise-routes=10.8.0.1/32,198.18.1.0/24 --advertise-exit-node=false
+    inns gw nft delete table inet lctest
+    start_daemon 3600
+    wait_routes_back
+
+    # (lc-e) An unclean stop (SIGKILL, OOM, power loss): no withdraw, so the
+    # router keeps its routes in its saved prefs and brings them back at boot,
+    # before Parallax has a firewall. Stand-in for the reboot: the daemon
+    # killed, its table and wg0 gone, the router left running.
+    kill -KILL "$(cat "$WORK/daemon.pid")"
+    wait_stopped 10
+    inns gw nft delete table inet parallax 2>/dev/null || true
+    inns gw ip link del wg0 2>/dev/null || true
+    echo "INFO (lc-e): router advertises '$(router_advertises)', Parallax not running, phone route: $(phone_route && echo yes || echo no)"
+    probe_up
+    r=$(phone_probe)
+    [ "$r" = BLOCKED ] && lc_ok "(lc-e) nothing reachable" || lc_bug "(lc-e) after an unclean stop the router routes with no firewall; phone -> 198.18.1.77: $r"
+    probe_down
+    start_daemon 3600
+    wait_routes_back
+
+    echo "LC SUMMARY: ${#LC_BUGS[@]} bug line(s)"
+    for b in "${LC_BUGS[@]}"; do echo "  $b"; done
+    # (x) Stopping Parallax takes its router's routes away before the firewall
+    # goes, so a Tailscale peer never reaches a network unfiltered (#75); the
+    # next start advertises them again.
+    stop_daemon() { # what for
+        local pid
+        pid=$(cat "$WORK/daemon.pid")
+        kill -TERM "$pid"
+        for _ in $(seq 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -0 "$pid" 2>/dev/null && fail "$1: the daemon did not stop on SIGTERM"
+        return 0
+    }
+    stop_daemon "(x)"
+    grep -q "subnet router: withdrew its routes" "$WORK/daemon.log" \
+        || { tail -20 "$WORK/daemon.log"; fail "(x) the stopping daemon did not withdraw the router's routes"; }
+    inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
+import json, sys
+assert not json.load(sys.stdin)["AdvertiseRoutes"]' || fail "(x) the router still advertises routes with Parallax stopped"
+    for _ in $(seq 60); do
+        inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0' || break
+        sleep 0.5
+    done
+    inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0' \
+        && fail "(x) the phone keeps its route to the mapped network with Parallax stopped"
+    start_daemon 3600
+    for _ in $(seq 60); do
+        [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] && break
+        sleep 0.5
+    done
+    [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] \
+        || { hs_api GET /api/v1/node; fail "(x) the restarted daemon did not advertise the router's routes again"; }
+    pass "(x) a stopping daemon withdraws its router's routes (the phone loses them); a restart advertises them again"
+
+    # (y) An operator's own node whose key expired, its tailscaled restarted, is
+    # still theirs: no node key, but not logged out (#76). Parallax mints no key
+    # and changes nothing, and says to log it in again.
+    stop_daemon "(y)"
+    OP_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
+    inns gw tailscale --socket="$TS_SOCK" logout >/dev/null 2>&1 || fail "(y) could not log the router out"
+    printf '%s' "$OP_AUTH" | inns gw timeout 30 tailscale --socket="$TS_SOCK" up --reset \
+        --login-server=http://127.0.0.1:18080 --auth-key=file:/dev/stdin --hostname=operator-gw \
+        --netfilter-mode=off --accept-dns=false --operator=nobody >/dev/null 2>&1 \
+        || { tail -20 "$HS/router.log"; fail "(y) the router did not log in as the operator's node"; }
+    OP_NODE=$(hs_api GET /api/v1/node | python3 -c '
+import json, sys
+print(next(n["id"] for n in json.load(sys.stdin)["nodes"] if n["givenName"] == "operator-gw"))')
+    hs_api POST "/api/v1/node/$OP_NODE/expire" >/dev/null || fail "(y) could not expire the operator's node"
+    stop_router
+    start_router
+    for _ in $(seq 50); do
+        inns gw tailscale --socket="$TS_SOCK" status --json 2>/dev/null | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+assert s["BackendState"] == "NeedsLogin" and set(s["Self"]["PublicKey"][8:]) == {"0"}' 2>/dev/null && break
+        sleep 0.2
+    done
+    inns gw tailscale --socket="$TS_SOCK" status --json | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+assert s["BackendState"] == "NeedsLogin" and set(s["Self"]["PublicKey"][8:]) == {"0"}, s' \
+        || fail "(y) the restarted router still has a node key (not the case under test)"
+    inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+assert not p["LoggedOut"] and p["Config"]["NodeID"] == sys.argv[1], p' "$OP_NODE" \
+        || fail "(y) the restarted router is not an expired profile (the case under test)"
+    parallax_keys() {
+        hs_api GET /api/v1/preauthkey | python3 -c '
+import json, sys
+print(sum(k["user"]["name"] == "parallax" for k in json.load(sys.stdin)["preAuthKeys"]))'
+    }
+    KEYS=$(parallax_keys)
+    start_daemon 3600
+    for _ in $(seq 40); do grep -q "log it in again" "$WORK/daemon.log" && break; sleep 0.25; done
+    grep -q "this machine's own Tailscale (node $OP_NODE) is the router.*log it in again" "$WORK/daemon.log" \
+        || { tail -20 "$WORK/daemon.log"; fail "(y) the daemon did not tell the operator to log their node in again"; }
+    # Past the quick look after a change, had there been one.
+    sleep 3
+    [ "$(parallax_keys)" = "$KEYS" ] || fail "(y) Parallax minted a pre-auth key for the operator's expired node"
+    inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+assert p["Hostname"] == "operator-gw" and not p["AdvertiseRoutes"], p' \
+        || fail "(y) Parallax changed the operator's expired node"
+    pass "(y) an operator's expired node, its tailscaled restarted, stays theirs: no key minted, nothing changed, told to log it in again"
+else
+    echo "SKIP: (u), (w), (x) and (y), Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
+fi
+
+echo "ALL PASS"
