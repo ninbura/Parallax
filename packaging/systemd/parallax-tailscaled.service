@@ -10,6 +10,11 @@ Documentation=https://github.com/ninbura/Parallax/blob/main/docs/native.md
 Wants=network-pre.target
 After=network-pre.target NetworkManager.service systemd-resolved.service
 Before=parallax.service
+# Stopped and restarted with Parallax: its own filtering is off, so with
+# Parallax's firewall gone it would forward Tailscale peers into unmapped
+# networks unfiltered (#75). Ordered before it, so it stops after Parallax,
+# which first takes its routes away.
+PartOf=parallax.service
 # One tailscaled per machine: they'd share tailscale0, its port and its
 # routing table.
 Conflicts=tailscaled.service
@@ -64,4 +69,6 @@ SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 
 [Install]
-WantedBy=multi-user.target
+# parallax.service too: enabled, it starts with Parallax, so a stop and a
+# start (PartOf= only carries stops and restarts) bring both back.
+WantedBy=multi-user.target parallax.service

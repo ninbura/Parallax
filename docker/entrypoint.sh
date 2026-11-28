@@ -62,11 +62,24 @@ parallax keygen --if-missing --write-config
 # The daemon logs it in to Headscale and keeps its settings (its own filtering and
 # NAT off: Parallax's firewall is the gate). PARALLAX_TAILSCALED=host: this machine
 # already runs Tailscale, its socket is mounted at /var/run/tailscale (compose.yml),
-# and Parallax uses that client without changing its settings.
+# and Parallax uses that client: logged in as the operator's own node, it's left
+# as it is; logged out, Parallax logs it in as its own router.
+# The image's own is kept running: nothing else would start it again if it
+# exited, and the container stays up as long as the daemon does (#80).
+# `--cleanup` clears what an exited one left, as parallax-tailscaled.service does.
+keep_tailscaled() {
+    : >/var/log/tailscaled.log
+    while :; do
+        tailscaled --cleanup >>/var/log/tailscaled.log 2>&1 || true
+        tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock \
+            --tun=tailscale0 --port=41641 >>/var/log/tailscaled.log 2>&1 || true
+        echo "parallax: warning: tailscaled exited; starting it again in 5 s (/var/log/tailscaled.log)" >&2
+        sleep 5
+    done
+}
 case "${PARALLAX_TAILSCALED:-own}" in
     own)
-        tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock \
-            --tun=tailscale0 --port=41641 >/var/log/tailscaled.log 2>&1 &
+        keep_tailscaled &
         ;;
     host) ;;
     *)
@@ -77,5 +90,5 @@ esac
 
 # The daemon holds the database from here on; `docker exec parallax parallax ...`
 # goes through its socket. tini (the image's init) forwards signals to it and
-# reaps tailscaled if it dies.
+# reaps what's orphaned.
 exec parallax daemon -o "$OUT"

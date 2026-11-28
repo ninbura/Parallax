@@ -1169,14 +1169,25 @@ pub(crate) fn find_tailnet(config: &Config) -> Result<Option<Tailnet>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Look at the subnet router and make it what `config` says. Returns what
-/// was done, and what's still wrong or left to the operator. With no peer
-/// on Tailscale, only Parallax's own router follows the routes, and
-/// nothing is reported: the machine may have no Tailscale at all.
+/// What one look at the subnet router did and found.
+pub(crate) struct RouterLook {
+    /// What was done, one line each.
+    pub done: Vec<String>,
+    /// What's still wrong or left to the operator.
+    pub note: Option<String>,
+    /// The node key of Parallax's own router, when it is.
+    pub ours: Option<String>,
+}
+
+/// Look at the subnet router and make it what `config` says, while
+/// `current` says the look still counts. With no peer on Tailscale, only
+/// Parallax's own router follows the routes, and nothing is reported: the
+/// machine may have no Tailscale at all.
 pub(crate) fn sync_router(
     config: &Config,
     socket: &str,
-) -> Result<(Vec<String>, Option<String>), String> {
+    current: &dyn Fn() -> bool,
+) -> Result<RouterLook, String> {
     let needed = parallax_core::subnet_router::needed(config);
     let model = parallax_core::Model::resolve(config, today()).map_err(|e| e.to_string())?;
     let api = headscale::Api::new(&config.server, owner::ConfigFiles::default());
@@ -1186,22 +1197,57 @@ pub(crate) fn sync_router(
         operator: operator.as_deref(),
         runner: &RealRunner,
     };
-    let synced = parallax_core::subnet_router::sync(&model, &ts, &api, needed);
+    let synced = parallax_core::subnet_router::sync(&model, &ts, &api, needed, current);
     let (router, done) = match synced {
         Ok(synced) => synced,
-        Err(_) if !needed => return Ok((Vec::new(), None)),
+        Err(_) if !needed => {
+            return Ok(RouterLook {
+                done: Vec::new(),
+                note: None,
+                ours: None,
+            })
+        }
         Err(e) => return Err(e.to_string()),
     };
-    if !needed {
-        return Ok((done, None));
-    }
+    let ours = match &router {
+        parallax_core::subnet_router::Router::Ours { key, .. } => Some(key.clone()),
+        _ => None,
+    };
     // Right after a login or a change, the next look says how it went.
-    let note = if done.is_empty() {
+    let note = if needed && done.is_empty() {
         parallax_core::subnet_router::describe(&model, &router).err()
     } else {
         None
     };
-    Ok((done, note))
+    Ok(RouterLook { done, note, ours })
+}
+
+/// Take Parallax's own router's routes away, for a daemon about to remove
+/// its firewall ([`parallax_core::subnet_router::withdraw`]). `known`: the
+/// key the last look found as Parallax's. True if it withdrew; false if
+/// there was nothing to withdraw.
+pub(crate) fn withdraw_router(
+    config: &Config,
+    socket: &str,
+    known: Option<&str>,
+) -> Result<bool, String> {
+    // No tailscaled behind the socket: no tailscale0, so nothing is routed.
+    if let Err(e) = std::os::unix::net::UnixStream::connect(socket) {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ) {
+            return Ok(false);
+        }
+    }
+    let api = headscale::Api::new(&config.server, owner::ConfigFiles::default());
+    let ts = parallax_core::subnet_router::Tailscaled {
+        socket,
+        operator: None,
+        runner: &RealRunner,
+    };
+    parallax_core::subnet_router::withdraw(&config.server.headscale, &ts, &api, known)
+        .map_err(|e| e.to_string())
 }
 
 /// Why Headscale's nodes are unknown, and what that means.
