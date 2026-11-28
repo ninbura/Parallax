@@ -23,7 +23,7 @@ use crate::date::Date;
 use crate::doctor::{Check, Outcome};
 use crate::headscale::{self, Node};
 use crate::io::{HeadscaleApi, ProcessRunner};
-use crate::model::{Config, TransportKind};
+use crate::model::{Config, HeadscaleServer, TransportKind};
 use crate::secret::Secret;
 use crate::validate::Model;
 use crate::{Error, Result};
@@ -119,9 +119,18 @@ pub struct Client {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Prefs {
-    /// Logged out on purpose (`tailscale logout`), not just expired.
+    /// Never logged in, or logged out on purpose (`tailscale logout`). An
+    /// expired profile isn't: tailscaled restarted with one reports no node
+    /// key, but keeps its node in `profile`.
     #[serde(default)]
     pub logged_out: bool,
+    /// The control server its profile is for.
+    #[serde(rename = "ControlURL", default)]
+    pub control_url: String,
+    /// The node it was logged in as, private keys blanked; `null` when it
+    /// never logged in or logged out.
+    #[serde(rename = "Config", default)]
+    pub profile: Option<Profile>,
     #[serde(default)]
     pub hostname: String,
     #[serde(default)]
@@ -137,6 +146,14 @@ pub struct Prefs {
     /// `--accept-routes`.
     #[serde(default)]
     pub route_all: bool,
+}
+
+/// The node a client's profile is for (`Config` in its prefs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Profile {
+    /// Headscale's node id, as a string.
+    #[serde(rename = "NodeID", default)]
+    pub node_id: String,
 }
 
 /// `tailscale status --json`.
@@ -185,8 +202,13 @@ pub fn prefs(ts: &Tailscaled<'_>) -> Result<Prefs> {
 /// Whose the client is, and what's still to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Router {
-    /// Parallax's own node, `id`, set up as it should be once `steps` ran.
-    Ours { id: u64, steps: Vec<Step> },
+    /// Parallax's own node, `id` with node key `key`, set up as it should
+    /// be once `steps` ran.
+    Ours {
+        id: u64,
+        key: String,
+        steps: Vec<Step>,
+    },
     /// Logged out: Parallax logs it in.
     LoggedOut,
     /// The operator's own node, `id`: left alone. `todo` is what the
@@ -242,26 +264,74 @@ fn as_ip(routes: &[Ipv4Net]) -> Vec<IpNet> {
     routes.iter().copied().map(IpNet::V4).collect()
 }
 
-/// `have` plus whichever of `wanted` it doesn't cover, every family kept:
-/// the full list a replacing command (`--advertise-routes`) needs.
-fn with_missing(have: &[String], wanted: &[Ipv4Net]) -> Option<String> {
-    let parsed = parse_routes(have);
-    let missing: Vec<&Ipv4Net> = wanted
-        .iter()
-        // A default route is an exit node: devices accepting routes don't
-        // use it for Parallax's networks.
-        .filter(|w| {
-            !parsed
-                .iter()
-                .any(|h| matches!(h, IpNet::V4(h) if h.prefix_len() > 0 && h.contains(*w)))
-        })
-        .collect();
-    if missing.is_empty() {
-        return None;
+/// The IPv4 prefix in `routes` that covers `wanted`, if any. A default
+/// route is an exit node: devices accepting routes don't use it for
+/// Parallax's networks.
+fn covering(routes: &[IpNet], wanted: &Ipv4Net) -> Option<Ipv4Net> {
+    routes.iter().find_map(|r| match r {
+        IpNet::V4(r) if r.prefix_len() > 0 && r.contains(wanted) => Some(*r),
+        _ => None,
+    })
+}
+
+/// What the operator has to run so their node serves `wanted`. Headscale
+/// serves a route only when the same prefix is both advertised and
+/// approved (#79), so a route counts once one prefix covering it is in
+/// both lists; otherwise both commands name the same prefix: one already
+/// advertised or approved that covers it, or the route itself. Each
+/// command is a replacing one, so it lists everything the node has, every
+/// family kept.
+fn operator_todo(node: &Node, wanted: &[Ipv4Net]) -> Vec<String> {
+    let advertised = parse_routes(&node.available_routes);
+    let approved = parse_routes(&node.approved_routes);
+    let mut needed: Vec<Ipv4Net> = Vec::new();
+    for w in wanted {
+        let served = advertised
+            .iter()
+            .any(|a| approved.contains(a) && covering(std::slice::from_ref(a), w).is_some());
+        if served {
+            continue;
+        }
+        let prefix = covering(&advertised, w)
+            .or_else(|| covering(&approved, w))
+            .unwrap_or(*w);
+        if !needed.contains(&prefix) {
+            needed.push(prefix);
+        }
     }
-    let mut all: Vec<String> = have.to_vec();
-    all.extend(missing.iter().map(ToString::to_string));
-    Some(all.join(","))
+    let with = |have: &[String], parsed: &[IpNet]| -> Option<String> {
+        let missing: Vec<String> = needed
+            .iter()
+            .filter(|n| !parsed.contains(&IpNet::V4(**n)))
+            .map(ToString::to_string)
+            .collect();
+        (!missing.is_empty()).then(|| [have, &missing].concat().join(","))
+    };
+    let mut todo = Vec::new();
+    if let Some(all) = with(&node.available_routes, &advertised) {
+        todo.push(format!(
+            "advertise Parallax's routes: `tailscale set --advertise-routes={all}`"
+        ));
+    }
+    if let Some(all) = with(&node.approved_routes, &approved) {
+        todo.push(format!(
+            "approve them: `headscale nodes approve-routes --identifier {} --routes {all}`",
+            node.id
+        ));
+    }
+    todo
+}
+
+/// The operator's own node: left alone, with what they still have to run.
+fn theirs(node: &Node, state: &str, wanted: &[Ipv4Net]) -> Router {
+    let mut todo = Vec::new();
+    match state {
+        "Stopped" => todo.push("start it: `tailscale up`".to_string()),
+        "NeedsLogin" => todo.push("log it in again: `tailscale up`".to_string()),
+        _ => {}
+    }
+    todo.extend(operator_todo(node, wanted));
+    Router::Theirs { id: node.id, todo }
 }
 
 /// Decide whose the client is and what it needs. Pure: `prefs` is read
@@ -294,36 +364,40 @@ pub fn decide(
             )))
         }
     };
-    let Some(node) = node else {
-        // Logged out means never logged in, or `tailscale logout`. An
-        // expired node also needs a login, and it may be anyone's.
-        if needs_login && (client.node_key.is_none() || prefs()?.logged_out) {
-            return Ok(Router::LoggedOut);
-        }
-        return Ok(Router::Elsewhere(format!(
+    let elsewhere = || {
+        Router::Elsewhere(format!(
             "the router's tailscaled is logged in, but not as a node of Headscale at {}. Log it out (`tailscale logout`) to let Parallax log it in there",
             server.server_url
-        )));
+        ))
+    };
+    let Some(node) = node else {
+        if !needs_login {
+            return Ok(elsewhere());
+        }
+        // Logged out means never logged in, or `tailscale logout`.
+        let prefs = prefs()?;
+        if prefs.logged_out {
+            return Ok(Router::LoggedOut);
+        }
+        // An expired profile: a tailscaled restarted with one has no node
+        // key, only its profile's node (#76). It may be anyone's.
+        let same_server =
+            prefs.control_url.trim_end_matches('/') == server.server_url.trim_end_matches('/');
+        let profile = prefs.profile.as_ref().filter(|_| same_server);
+        let Some(node) = profile.and_then(|p| nodes.iter().find(|n| n.id.to_string() == p.node_id))
+        else {
+            return Ok(Router::Elsewhere(format!(
+                "the router's tailscaled needs to log in again, to a node Headscale at {} doesn't have. Log it in (`tailscale up`), or log it out (`tailscale logout`) to let Parallax log it in there",
+                server.server_url
+            )));
+        };
+        if node.user != USER {
+            return Ok(theirs(node, &client.state, &wanted));
+        }
+        return Ok(Router::LoggedOut);
     };
     if node.user != USER {
-        let mut todo = Vec::new();
-        match client.state.as_str() {
-            "Stopped" => todo.push("start it: `tailscale up`".to_string()),
-            "NeedsLogin" => todo.push("log it in again: `tailscale up`".to_string()),
-            _ => {}
-        }
-        if let Some(all) = with_missing(&node.available_routes, &wanted) {
-            todo.push(format!(
-                "advertise Parallax's routes: `tailscale set --advertise-routes={all}`"
-            ));
-        }
-        if let Some(all) = with_missing(&node.approved_routes, &wanted) {
-            todo.push(format!(
-                "approve them: `headscale nodes approve-routes --identifier {} --routes {all}`",
-                node.id
-            ));
-        }
-        return Ok(Router::Theirs { id: node.id, todo });
+        return Ok(theirs(node, &client.state, &wanted));
     }
     // Its own node, logged out or expired: log it in again.
     if needs_login {
@@ -361,7 +435,11 @@ pub fn decide(
     if parse_routes(&node.approved_routes) != as_ip(&wanted) {
         steps.push(Step::Approve(wanted));
     }
-    Ok(Router::Ours { id: node.id, steps })
+    Ok(Router::Ours {
+        id: node.id,
+        key: node.node_key.clone(),
+        steps,
+    })
 }
 
 /// The flags Parallax's router always has.
@@ -369,6 +447,8 @@ fn settings(model: &Model<'_>, routes: &str) -> Vec<String> {
     vec![
         format!("--hostname={}", model.server().headscale.subnet_router_node),
         format!("--advertise-routes={routes}"),
+        // `set --advertise-routes` keeps an exit node unless told (#77).
+        "--advertise-exit-node=false".into(),
         "--netfilter-mode=off".into(),
         "--snat-subnet-routes=false".into(),
         "--accept-dns=false".into(),
@@ -431,11 +511,16 @@ fn list_flag(routes: &[Ipv4Net]) -> String {
 ///
 /// `login` false (no peer is on Tailscale): Parallax's own router still
 /// follows the configuration's routes, but nothing is logged in.
+///
+/// `current` is asked before each change: once it says no (the
+/// configuration was replaced, or the daemon is stopping), nothing more is
+/// changed, and what was done so far is returned.
 pub fn sync(
     model: &Model<'_>,
     ts: &Tailscaled<'_>,
     api: &dyn HeadscaleApi,
     login: bool,
+    current: &dyn Fn() -> bool,
 ) -> Result<(Router, Vec<String>)> {
     let server = &model.server().headscale;
     let client = client(ts)?;
@@ -443,6 +528,7 @@ pub fn sync(
     let router = decide(model, &client, || prefs(ts), &nodes)?;
     let mut done = Vec::new();
     match &router {
+        _ if !current() => {}
         Router::LoggedOut if !login => {}
         Router::LoggedOut => {
             let user = match headscale::user(server, api, USER)? {
@@ -455,6 +541,9 @@ pub fn sync(
             };
             // Single use, and void within two days if the login fails.
             let expires = Date::from_unix_days(model.today().to_unix_days() + 2);
+            if !current() {
+                return Ok((router, done));
+            }
             let key = headscale::create_pre_auth_key(server, api, user.id, expires)?;
             up(model, ts, Some(&key))?;
             done.push(format!(
@@ -465,8 +554,11 @@ pub fn sync(
             ));
             // Its routes are approved on the next look, once it's a node.
         }
-        Router::Ours { id, steps } => {
+        Router::Ours { id, steps, .. } => {
             for step in steps {
+                if !current() {
+                    break;
+                }
                 match step {
                     Step::Up => up(model, ts, None)?,
                     Step::Set(_) => {
@@ -485,16 +577,49 @@ pub fn sync(
     Ok((router, done))
 }
 
+/// Stop Parallax's own router routing for Tailscale peers: it advertises
+/// nothing more, so it forwards nothing and Headscale serves nothing (#75).
+/// For a stopping daemon, before its firewall goes. The operator's node is
+/// left alone, as always. `known` is the node key the last look found as
+/// Parallax's, trusted when Headscale can't say. True if it withdrew.
+pub fn withdraw(
+    server: &HeadscaleServer,
+    ts: &Tailscaled<'_>,
+    api: &dyn HeadscaleApi,
+    known: Option<&str>,
+) -> Result<bool> {
+    let client = client(ts)?;
+    // Not logged in: it routes nothing.
+    let Some(key) = client.node_key else {
+        return Ok(false);
+    };
+    let ours = match headscale::nodes(server, api) {
+        Ok(nodes) => nodes.iter().any(|n| n.node_key == key && n.user == USER),
+        Err(_) if known == Some(key.as_str()) => true,
+        Err(e) => return Err(e),
+    };
+    if !ours {
+        return Ok(false);
+    }
+    // tailscaled drops forwarded packets outside what it advertises, so
+    // this holds even while Headscale is unreachable.
+    ts.run(
+        &["set", "--advertise-routes=", "--advertise-exit-node=false"],
+        None,
+    )?;
+    Ok(true)
+}
+
 /// What the router's state means for an operator, one line.
 pub fn describe(model: &Model<'_>, router: &Router) -> std::result::Result<String, String> {
     let server = &model.server().headscale;
     match router {
-        Router::Ours { id, steps } if steps.is_empty() => Ok(format!(
+        Router::Ours { id, steps, .. } if steps.is_empty() => Ok(format!(
             "Parallax's router is node {id} on Headscale at {}, routing {}",
             server.server_url,
             list(&routes(model))
         )),
-        Router::Ours { id, steps } => Err(format!(
+        Router::Ours { id, steps, .. } => Err(format!(
             "Parallax's router (node {id}) needs to {}; the daemon does it",
             steps
                 .iter()
@@ -558,6 +683,12 @@ mod tests {
     /// Recorded from `tailscale status --json` (v1.104.7), trimmed.
     const LOGGED_OUT: &str = r#"{"Version":"1.104.7","TUN":false,"BackendState":"NeedsLogin","AuthURL":"","TailscaleIPs":null,"Self":{"ID":"","NodeID":0,"PublicKey":"nodekey:0000000000000000000000000000000000000000000000000000000000000000","HostName":"gateway","OS":"linux","UserID":0},"Health":["Tailscale is stopped."]}"#;
     const ROUTES: &str = "198.18.1.0/24,10.8.0.1/32";
+    /// Recorded from `tailscale debug prefs` (v1.104.7) on a client that
+    /// never logged in, or after `tailscale logout`, trimmed.
+    const LOGGED_OUT_PREFS: &str = r#"{"ControlURL":"","RouteAll":false,"CorpDNS":true,"WantRunning":false,"LoggedOut":true,"Hostname":"","AdvertiseRoutes":null,"NoSNAT":false,"NetfilterMode":2,"Config":null}"#;
+    /// Recorded the same way from a client whose node (id 1) expired and
+    /// whose tailscaled then restarted: no node key, but not logged out.
+    const EXPIRED_PREFS: &str = r#"{"ControlURL":"https://headscale.mydomain.com","RouteAll":false,"CorpDNS":false,"WantRunning":true,"LoggedOut":false,"Hostname":"operator-gw","AdvertiseRoutes":null,"NoSNAT":false,"NetfilterMode":2,"Config":{"PrivateNodeKey":"privkey:0000000000000000000000000000000000000000000000000000000000000000","OldPrivateNodeKey":"privkey:0000000000000000000000000000000000000000000000000000000000000000","UserProfile":{"ID":1,"LoginName":"family","DisplayName":"family"},"NetworkLockKey":"nlpriv:0000000000000000000000000000000000000000000000000000000000000000","NodeID":"1"}}"#;
 
     fn running() -> String {
         LOGGED_OUT.replace("NeedsLogin", "Running").replace(
@@ -688,6 +819,7 @@ mod tests {
             router,
             Router::Ours {
                 id: 1,
+                key: KEY.into(),
                 steps: vec![]
             }
         );
@@ -720,6 +852,7 @@ mod tests {
             router,
             Router::Ours {
                 id: 1,
+                key: KEY.into(),
                 steps: vec![
                     Step::Set(vec![
                         "routes to 10.8.0.1/32,198.18.1.0/24,198.18.2.0/24".into()
@@ -760,6 +893,7 @@ mod tests {
             router,
             Router::Ours {
                 id: 1,
+                key: KEY.into(),
                 steps: vec![Step::Up]
             }
         );
@@ -813,7 +947,7 @@ mod tests {
                 state: "NeedsLogin".into(),
                 node_key: None,
             },
-            || prefs(ROUTES),
+            || Ok(serde_json::from_str(LOGGED_OUT_PREFS).unwrap()),
             &[],
         )
         .unwrap();
@@ -905,6 +1039,7 @@ mod tests {
         let model = Model::resolve(&config, today()).unwrap();
         let runner = RecordingRunner::new();
         runner.respond("tailscale", ok(LOGGED_OUT));
+        runner.respond("tailscale", ok(LOGGED_OUT_PREFS));
         runner.respond(
             "tailscale",
             Output {
@@ -926,7 +1061,9 @@ mod tests {
             operator: None,
             runner: &runner,
         };
-        let e = sync(&model, &ts, &api, true).unwrap_err().to_string();
+        let e = sync(&model, &ts, &api, true, &|| true)
+            .unwrap_err()
+            .to_string();
         assert!(!e.contains("hskey-auth-test"), "{e}");
         assert!(e.contains("invalid key: <pre-auth key> not valid"), "{e}");
     }
@@ -937,17 +1074,18 @@ mod tests {
         let model = Model::resolve(&config, today()).unwrap();
         let runner = RecordingRunner::new();
         runner.respond("tailscale", ok(LOGGED_OUT));
+        runner.respond("tailscale", ok(LOGGED_OUT_PREFS));
         let api = FakeHeadscale::new().reply("/api/v1/node", 200, r#"{"nodes":[]}"#);
         let ts = Tailscaled {
             socket: SOCKET,
             operator: None,
             runner: &runner,
         };
-        let (router, done) = sync(&model, &ts, &api, false).unwrap();
+        let (router, done) = sync(&model, &ts, &api, false, &|| true).unwrap();
         assert_eq!(router, Router::LoggedOut);
         assert!(done.is_empty());
         assert!(api.posted.borrow().is_empty());
-        assert_eq!(runner.calls.borrow().len(), 1);
+        assert_eq!(runner.calls.borrow().len(), 2);
     }
 
     const USERS_NONE: &str = r#"{"users":[]}"#;
@@ -961,6 +1099,7 @@ mod tests {
         let model = Model::resolve(&config, today()).unwrap();
         let runner = RecordingRunner::new();
         runner.respond("tailscale", ok(LOGGED_OUT));
+        runner.respond("tailscale", ok(LOGGED_OUT_PREFS));
         let api = FakeHeadscale::new()
             .reply("/api/v1/node", 200, r#"{"nodes":[]}"#)
             .reply("/api/v1/user?name=parallax", 200, USERS_NONE)
@@ -971,7 +1110,7 @@ mod tests {
             operator: Some("parallax"),
             runner: &runner,
         };
-        let (router, done) = sync(&model, &ts, &api, true).unwrap();
+        let (router, done) = sync(&model, &ts, &api, true, &|| true).unwrap();
         assert_eq!(router, Router::LoggedOut);
         assert_eq!(done.len(), 2, "{done:?}");
         assert_eq!(
@@ -982,10 +1121,10 @@ mod tests {
             )
         );
         let calls = runner.calls.borrow();
-        let (_, args, stdin) = &calls[1];
+        let (_, args, stdin) = &calls[2];
         assert_eq!(
             args.join(" "),
-            format!("--socket={SOCKET} up --reset --login-server=https://headscale.mydomain.com --auth-key=file:/dev/stdin --hostname=parallax-gateway --advertise-routes=10.8.0.1/32,198.18.1.0/24 --netfilter-mode=off --snat-subnet-routes=false --accept-dns=false --accept-routes=false --operator=parallax --timeout=30s")
+            format!("--socket={SOCKET} up --reset --login-server=https://headscale.mydomain.com --auth-key=file:/dev/stdin --hostname=parallax-gateway --advertise-routes=10.8.0.1/32,198.18.1.0/24 --advertise-exit-node=false --netfilter-mode=off --snat-subnet-routes=false --accept-dns=false --accept-routes=false --operator=parallax --timeout=30s")
         );
         // The key goes on stdin, never in the arguments.
         assert_eq!(stdin.as_deref(), Some("hskey-auth-test-0123456789"));
@@ -1009,7 +1148,7 @@ mod tests {
             operator: None,
             runner: &runner,
         };
-        let (_, done) = sync(&model, &ts, &api, true).unwrap();
+        let (_, done) = sync(&model, &ts, &api, true, &|| true).unwrap();
         assert_eq!(
             done,
             vec![
@@ -1019,12 +1158,224 @@ mod tests {
         );
         assert_eq!(
             runner.command_lines()[2],
-            format!("tailscale --socket={SOCKET} set --hostname=parallax-gateway --advertise-routes=10.8.0.1/32,198.18.1.0/24 --netfilter-mode=off --snat-subnet-routes=false --accept-dns=false --accept-routes=false")
+            format!("tailscale --socket={SOCKET} set --hostname=parallax-gateway --advertise-routes=10.8.0.1/32,198.18.1.0/24 --advertise-exit-node=false --netfilter-mode=off --snat-subnet-routes=false --accept-dns=false --accept-routes=false")
         );
         assert_eq!(
             api.posted.borrow()[0].1,
             r#"{"routes":["10.8.0.1/32","198.18.1.0/24"]}"#
         );
+    }
+
+    #[test]
+    fn an_expired_profile_restarted_stays_its_owners() {
+        // #76: no node key and not logged out is an expired profile, not a
+        // logged-out client. Its profile's node says whose it is.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let expired = || Ok(serde_json::from_str(EXPIRED_PREFS).unwrap());
+        let restarted = Client {
+            state: "NeedsLogin".into(),
+            node_key: None,
+        };
+        let nodes = [node("family", ROUTES, ROUTES)];
+        let router = decide(&model, &restarted, expired, &nodes).unwrap();
+        assert_eq!(
+            router,
+            Router::Theirs {
+                id: 1,
+                todo: vec!["log it in again: `tailscale up`".into()]
+            }
+        );
+        // Parallax's own, expired and restarted: logged in again.
+        let nodes = [node(USER, ROUTES, ROUTES)];
+        let router = decide(&model, &restarted, expired, &nodes).unwrap();
+        assert_eq!(router, Router::LoggedOut);
+        // A node this Headscale doesn't have, or a profile for another
+        // control server: not Parallax's to log in.
+        let router = decide(&model, &restarted, expired, &[]).unwrap();
+        assert!(matches!(router, Router::Elsewhere(_)), "{router:?}");
+        let other = || {
+            let mut p: Prefs = serde_json::from_str(EXPIRED_PREFS).unwrap();
+            p.control_url = "https://controlplane.tailscale.com".into();
+            Ok(p)
+        };
+        let router = decide(&model, &restarted, other, &nodes).unwrap();
+        assert!(matches!(router, Router::Elsewhere(_)), "{router:?}");
+    }
+
+    #[test]
+    fn a_route_is_served_only_by_one_prefix_both_advertised_and_approved() {
+        // #79: Headscale serves the exact prefix that's both advertised and
+        // approved; a covering /16 advertised and the /24 approved serve
+        // nothing.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let never = || -> Result<Prefs> { panic!("not needed") };
+        let nodes = [node(
+            "operator",
+            "198.18.0.0/16,10.8.0.1/32",
+            "198.18.1.0/24,10.8.0.1/32",
+        )];
+        let router = decide(&model, &client("Running"), never, &nodes).unwrap();
+        assert_eq!(
+            router,
+            Router::Theirs {
+                id: 1,
+                todo: vec![
+                    "approve them: `headscale nodes approve-routes --identifier 1 --routes 198.18.1.0/24,10.8.0.1/32,198.18.0.0/16`".into(),
+                ]
+            }
+        );
+        // Once the /16 is approved too, it serves the /24.
+        let nodes = [node(
+            "operator",
+            "198.18.0.0/16,10.8.0.1/32",
+            "198.18.1.0/24,10.8.0.1/32,198.18.0.0/16",
+        )];
+        let router = decide(&model, &client("Running"), never, &nodes).unwrap();
+        assert!(describe(&model, &router).is_ok(), "{router:?}");
+        // Approved but not advertised: advertise that same prefix.
+        let nodes = [node("operator", "10.8.0.1/32", "198.18.0.0/16,10.8.0.1/32")];
+        let Router::Theirs { todo, .. } =
+            decide(&model, &client("Running"), never, &nodes).unwrap()
+        else {
+            panic!("not theirs");
+        };
+        assert_eq!(
+            todo,
+            vec!["advertise Parallax's routes: `tailscale set --advertise-routes=10.8.0.1/32,198.18.0.0/16`"]
+        );
+    }
+
+    #[test]
+    fn an_exit_node_on_its_own_router_is_turned_off() {
+        // #77: `tailscale set` keeps an exit node unless told, so the
+        // routes would never match and the step would repeat forever.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        runner.respond(
+            "tailscale",
+            ok(&prefs_json("0.0.0.0/0,::/0,10.8.0.1/32,198.18.1.0/24")),
+        );
+        let nodes = format!(
+            r#"{{"nodes":[{{"id":"1","nodeKey":"{KEY}","ipAddresses":["100.64.0.1"],"givenName":"parallax-gateway","user":{{"id":"3","name":"parallax"}},"online":true,"availableRoutes":["10.8.0.1/32","198.18.1.0/24"],"approvedRoutes":["10.8.0.1/32","198.18.1.0/24"]}}]}}"#
+        );
+        let api = FakeHeadscale::new().reply("/api/v1/node", 200, &nodes);
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let (_, done) = sync(&model, &ts, &api, true, &|| true).unwrap();
+        assert_eq!(
+            done,
+            vec!["router: set the router's routes to 10.8.0.1/32,198.18.1.0/24"]
+        );
+        assert!(
+            runner.command_lines()[2].contains(" --advertise-exit-node=false "),
+            "{:?}",
+            runner.command_lines()
+        );
+    }
+
+    #[test]
+    fn a_replaced_configuration_changes_nothing_more() {
+        // #82: a look that started on a configuration since replaced stops
+        // before its next change.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        runner.respond("tailscale", ok(&prefs_json("198.18.1.0/24")));
+        let nodes = format!(
+            r#"{{"nodes":[{{"id":"1","nodeKey":"{KEY}","ipAddresses":["100.64.0.1"],"givenName":"parallax-gateway","user":{{"id":"3","name":"parallax"}},"online":true,"availableRoutes":["198.18.1.0/24"],"approvedRoutes":[]}}]}}"#
+        );
+        let api = FakeHeadscale::new().reply("/api/v1/node", 200, &nodes);
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let (router, done) = sync(&model, &ts, &api, true, &|| false).unwrap();
+        assert!(matches!(router, Router::Ours { .. }), "{router:?}");
+        assert!(done.is_empty(), "{done:?}");
+        assert_eq!(runner.calls.borrow().len(), 2, "only looked");
+        assert!(api.posted.borrow().is_empty());
+        // Nor is a logged-out one logged in.
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(LOGGED_OUT));
+        runner.respond("tailscale", ok(LOGGED_OUT_PREFS));
+        let api = FakeHeadscale::new().reply("/api/v1/node", 200, r#"{"nodes":[]}"#);
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let (_, done) = sync(&model, &ts, &api, true, &|| false).unwrap();
+        assert!(done.is_empty(), "{done:?}");
+        assert!(api.posted.borrow().is_empty());
+    }
+
+    #[test]
+    fn withdraw_stops_only_parallaxs_own_router() {
+        // #75: a stopping daemon takes its router's routes away before its
+        // firewall goes.
+        let config = config();
+        let server = &config.server.headscale;
+        let ours = format!(
+            r#"{{"nodes":[{{"id":"1","nodeKey":"{KEY}","ipAddresses":["100.64.0.1"],"givenName":"parallax-gateway","user":{{"id":"3","name":"parallax"}},"online":true,"availableRoutes":[],"approvedRoutes":[]}}]}}"#
+        );
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        runner.respond("tailscale", ok(""));
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let api = FakeHeadscale::new().reply("/api/v1/node", 200, &ours);
+        assert!(withdraw(server, &ts, &api, None).unwrap());
+        assert_eq!(
+            runner.command_lines()[1],
+            format!(
+                "tailscale --socket={SOCKET} set --advertise-routes= --advertise-exit-node=false"
+            )
+        );
+        // The operator's node: untouched.
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let theirs = ours.replace(r#""name":"parallax""#, r#""name":"family""#);
+        let api = FakeHeadscale::new().reply("/api/v1/node", 200, &theirs);
+        assert!(!withdraw(server, &ts, &api, None).unwrap());
+        assert_eq!(runner.calls.borrow().len(), 1);
+        // Headscale unreachable: the key the last look found as Parallax's
+        // is enough; any other key isn't.
+        let down = || FakeHeadscale::new().reply("/api/v1/node", 502, "bad gateway");
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        runner.respond("tailscale", ok(""));
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        assert!(withdraw(server, &ts, &down(), Some(KEY)).unwrap());
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        assert!(withdraw(server, &ts, &down(), Some("nodekey:other")).is_err());
+        assert_eq!(runner.calls.borrow().len(), 1);
     }
 
     #[test]

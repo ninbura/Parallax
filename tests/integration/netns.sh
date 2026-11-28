@@ -51,7 +51,9 @@
 # requests and (when asked) DNS queries, and nobody else's, (u) with HEADSCALE, TAILSCALED and TAILSCALE set, a Tailscale peer gets its
 # node's address from Headscale, (w) the subnet router: the daemon logs Parallax's
 # tailscaled in to Headscale, advertises and approves the mapped routes, and a phone
-# on Tailscale reaches what its grant allows, DNS included. Every change goes through
+# on Tailscale reaches what its grant allows, DNS included, (x) a stopping daemon
+# withdraws the router's routes, (y) an operator's expired node, its tailscaled
+# restarted, stays theirs. Every change goes through
 # the daemon and takes effect without SIGHUP.
 set -euo pipefail
 # Under pipefail `cmd | grep -q` fails when grep stops reading before cmd has
@@ -1352,24 +1354,45 @@ PY
         chmod 0711 "$WORK"
         chown root:root "$WORK/tsr"
         chmod 0755 "$WORK/tsr"
-        UNITS+=("${PREFIX}tailscaled")
-        systemd-run --quiet --collect --unit="${PREFIX}tailscaled" -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" \
-            -p "ReadWritePaths=$WORK" -p "StandardOutput=append:$HS/router.log" -p "StandardError=append:$HS/router.log" \
-            -p "BindReadOnlyPaths=$WORK/ts-resolv.conf:/etc/resolv.conf" -p "TemporaryFileSystem=/run/dbus" \
-            "${TSD_SANDBOX[@]}" "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}"
-    else
-        no_host_dns gw "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}" >> "$HS/router.log" 2>&1 &
-        PIDS+=($!)
     fi
-    for _ in $(seq 50); do [ -S "$TS_SOCK" ] && break; sleep 0.1; done
-    [ -S "$TS_SOCK" ] || { cat "$HS/router.log"; fail "(w) the router's tailscaled did not start"; }
-    if [ "$MODE" = unit ]; then
-        # The unit's ExecStartPost, in its sandbox, with the test's user.
-        systemd-run --quiet --collect --unit="${PREFIX}tailscaled-operator" -p Type=exec --wait --pipe \
-            -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" -p "ReadWritePaths=$WORK" "${TSD_SANDBOX[@]}" \
-            "$WORK/bin/tailscale" --socket="$TS_SOCK" set --operator=nobody \
-            || fail "(w) could not make the service the router's operator"
-    fi
+    # Started again with the same state in (y).
+    start_router() {
+        rm -f "$TS_SOCK"
+        if [ "$MODE" = unit ]; then
+            ROUTER_UNIT="${PREFIX}tailscaled-${#UNITS[@]}"
+            UNITS+=("$ROUTER_UNIT")
+            systemd-run --quiet --collect --unit="$ROUTER_UNIT" -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" \
+                -p "ReadWritePaths=$WORK" -p "StandardOutput=append:$HS/router.log" -p "StandardError=append:$HS/router.log" \
+                -p "BindReadOnlyPaths=$WORK/ts-resolv.conf:/etc/resolv.conf" -p "TemporaryFileSystem=/run/dbus" \
+                "${TSD_SANDBOX[@]}" "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}"
+        else
+            # Its own pid, to stop it in (y).
+            no_host_dns gw sh -c 'echo $$ > "$0"; exec "$@"' "$HS/router.pid" \
+                "$WORK/bin/tailscaled" "${ROUTER_ARGS[@]}" >> "$HS/router.log" 2>&1 &
+            PIDS+=($!)
+        fi
+        for _ in $(seq 50); do [ -S "$TS_SOCK" ] && break; sleep 0.1; done
+        [ -S "$TS_SOCK" ] || { cat "$HS/router.log"; fail "(w) the router's tailscaled did not start"; }
+        if [ "$MODE" = unit ]; then
+            # The unit's ExecStartPost, in its sandbox, with the test's user.
+            systemd-run --quiet --collect --unit="${PREFIX}tailscaled-operator" -p Type=exec --wait --pipe \
+                -p "NetworkNamespacePath=/run/netns/${PREFIX}gw" -p "ReadWritePaths=$WORK" "${TSD_SANDBOX[@]}" \
+                "$WORK/bin/tailscale" --socket="$TS_SOCK" set --operator=nobody \
+                || fail "(w) could not make the service the router's operator"
+        fi
+    }
+    stop_router() {
+        if [ "$MODE" = unit ]; then
+            systemctl stop "$ROUTER_UNIT"
+        else
+            local pid
+            pid=$(cat "$HS/router.pid")
+            kill "$pid"
+            for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+            kill -0 "$pid" 2>/dev/null && fail "(y) the router's tailscaled did not stop"
+        fi
+    }
+    start_router
 
     # Short-lived, and on stdin, as Parallax passes its own.
     PHONE_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}" \
@@ -1436,8 +1459,89 @@ assert p["NetfilterMode"] == 0 and p["NoSNAT"] and not p["CorpDNS"] and not p["R
     grep -q "^ok    tailscale router: Parallax's router is node" "$WORK/doctor-router" \
         || { cat "$WORK/doctor-router"; fail "(w) doctor does not see the router in place"; }
     pass "(w) the daemon logs the subnet router in and approves its routes; a Tailscale phone reaches what its grant allows, DNS and the proxy included"
+
+    # (x) Stopping Parallax takes its router's routes away before the firewall
+    # goes, so a Tailscale peer never reaches a network unfiltered (#75); the
+    # next start advertises them again.
+    stop_daemon() { # what for
+        local pid
+        pid=$(cat "$WORK/daemon.pid")
+        kill -TERM "$pid"
+        for _ in $(seq 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -0 "$pid" 2>/dev/null && fail "$1: the daemon did not stop on SIGTERM"
+        return 0
+    }
+    stop_daemon "(x)"
+    grep -q "subnet router: withdrew its routes" "$WORK/daemon.log" \
+        || { tail -20 "$WORK/daemon.log"; fail "(x) the stopping daemon did not withdraw the router's routes"; }
+    inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
+import json, sys
+assert not json.load(sys.stdin)["AdvertiseRoutes"]' || fail "(x) the router still advertises routes with Parallax stopped"
+    for _ in $(seq 60); do
+        inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0' || break
+        sleep 0.5
+    done
+    inns tsc ip route show table 52 | grep >/dev/null '^198.18.1.0/24 dev tailscale0' \
+        && fail "(x) the phone keeps its route to the mapped network with Parallax stopped"
+    start_daemon 3600
+    for _ in $(seq 60); do
+        [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] && break
+        sleep 0.5
+    done
+    [ "$(router_routes)" = "10.8.0.1/32,198.18.1.0/24 10.8.0.1/32,198.18.1.0/24" ] \
+        || { hs_api GET /api/v1/node; fail "(x) the restarted daemon did not advertise the router's routes again"; }
+    pass "(x) a stopping daemon withdraws its router's routes (the phone loses them); a restart advertises them again"
+
+    # (y) An operator's own node whose key expired, its tailscaled restarted, is
+    # still theirs: no node key, but not logged out (#76). Parallax mints no key
+    # and changes nothing, and says to log it in again.
+    stop_daemon "(y)"
+    OP_AUTH=$(hs_api POST /api/v1/preauthkey "{\"user\":\"$HS_USER\",\"reusable\":false,\"expiration\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["preAuthKey"]["key"])')
+    inns gw tailscale --socket="$TS_SOCK" logout >/dev/null 2>&1 || fail "(y) could not log the router out"
+    printf '%s' "$OP_AUTH" | inns gw timeout 30 tailscale --socket="$TS_SOCK" up --reset \
+        --login-server=http://127.0.0.1:18080 --auth-key=file:/dev/stdin --hostname=operator-gw \
+        --netfilter-mode=off --accept-dns=false --operator=nobody >/dev/null 2>&1 \
+        || { tail -20 "$HS/router.log"; fail "(y) the router did not log in as the operator's node"; }
+    OP_NODE=$(hs_api GET /api/v1/node | python3 -c '
+import json, sys
+print(next(n["id"] for n in json.load(sys.stdin)["nodes"] if n["givenName"] == "operator-gw"))')
+    hs_api POST "/api/v1/node/$OP_NODE/expire" >/dev/null || fail "(y) could not expire the operator's node"
+    stop_router
+    start_router
+    for _ in $(seq 50); do
+        inns gw tailscale --socket="$TS_SOCK" status --json 2>/dev/null | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+assert s["BackendState"] == "NeedsLogin" and set(s["Self"]["PublicKey"][8:]) == {"0"}' 2>/dev/null && break
+        sleep 0.2
+    done
+    inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+assert not p["LoggedOut"] and p["Config"]["NodeID"] == sys.argv[1], p' "$OP_NODE" \
+        || fail "(y) the restarted router is not an expired profile (the case under test)"
+    parallax_keys() {
+        hs_api GET /api/v1/preauthkey | python3 -c '
+import json, sys
+print(sum(k["user"]["name"] == "parallax" for k in json.load(sys.stdin)["preAuthKeys"]))'
+    }
+    KEYS=$(parallax_keys)
+    start_daemon 3600
+    for _ in $(seq 40); do grep -q "log it in again" "$WORK/daemon.log" && break; sleep 0.25; done
+    grep -q "this machine's own Tailscale (node $OP_NODE) is the router.*log it in again" "$WORK/daemon.log" \
+        || { tail -20 "$WORK/daemon.log"; fail "(y) the daemon did not tell the operator to log their node in again"; }
+    # Past the quick look after a change, had there been one.
+    sleep 3
+    [ "$(parallax_keys)" = "$KEYS" ] || fail "(y) Parallax minted a pre-auth key for the operator's expired node"
+    inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+assert p["Hostname"] == "operator-gw" and not p["AdvertiseRoutes"], p' \
+        || fail "(y) Parallax changed the operator's expired node"
+    pass "(y) an operator's expired node, its tailscaled restarted, stays theirs: no key minted, nothing changed, told to log it in again"
 else
-    echo "SKIP: (u) and (w), Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
+    echo "SKIP: (u), (w), (x) and (y), Headscale (set HEADSCALE, TAILSCALED and TAILSCALE; see tests/integration/headscale-binaries.sh)"
 fi
 
 echo "ALL PASS"

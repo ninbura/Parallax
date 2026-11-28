@@ -429,10 +429,32 @@ share `tailscale0`, its port and its routing table. Parallax then uses that
 client as the router and never changes its settings or its routes; the
 daemon's log and `parallax doctor` say what to run (`tailscale set
 --advertise-routes=...` and the route approval). Parallax uses a client only
-when it's logged out or logged in as its own node. With Docker, mount the
-host's socket and set `PARALLAX_TAILSCALED=host` (commented out in
-`docker/compose.yml`). A machine on Tailscale's hosted service rather than
-your Headscale can't be the router: Parallax reads its nodes from Headscale.
+when it's logged out or logged in as its own node; one whose login expired
+stays yours to log in again. The Headscale user `parallax` is Parallax's:
+don't give your own account that name. A machine on Tailscale's hosted
+service rather than your Headscale can't be the router: Parallax reads its
+nodes from Headscale.
+
+With Docker, mount the host's `/run/tailscale` and set
+`PARALLAX_TAILSCALED=host` (both commented out in `docker/compose.yml`).
+Tailscale's `tailscaled.service` deletes and recreates `/run/tailscale` each
+time it restarts (an upgrade, `systemctl restart`), which leaves the
+container's mount on the deleted directory until the container restarts.
+Keep the directory across restarts with a drop-in:
+
+```sh
+sudo systemctl edit tailscaled
+```
+
+```ini
+[Service]
+RuntimeDirectoryPreserve=yes
+```
+
+When Parallax stops, its own router stops advertising its routes (the
+daemon takes them away before it removes its firewall), so Tailscale peers
+never reach a network unfiltered. It advertises them again on the next
+start.
 
 ### Certificates for Tailscale devices
 

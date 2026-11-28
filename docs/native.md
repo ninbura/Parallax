@@ -45,6 +45,7 @@ Either one installs:
 |---|---|
 | `/usr/bin/parallax` | the binary (static, musl) |
 | `/usr/lib/systemd/system/parallax.service` | the service |
+| `/usr/lib/systemd/system/parallax-tailscaled.service` | Parallax's own subnet router, for Tailscale peers (below) |
 | `/usr/lib/sysusers.d/parallax.conf` | the `parallax` system user: no shell, no login |
 | `/usr/lib/tmpfiles.d/parallax.conf` | `/etc/parallax`, mode 0700, owned by `parallax` |
 | `/usr/lib/modules-load.d/parallax.conf` | loads `wireguard` at boot |
@@ -56,7 +57,8 @@ on forwarding right away, so no reboot is needed. The service is installed
 but **not enabled**: it has nothing to run until it has a configuration.
 
 It depends on `nftables`, `wireguard-tools` and `iproute2`. `iptables` and
-`ipset` are optional, only for `backend = "iptables-nft"`.
+`ipset` are optional, only for `backend = "iptables-nft"`, and `tailscale`
+only for Tailscale peers.
 
 **Static binary, any distribution:** install the binary and the files under
 `packaging/` at the paths above, then do what a package does:
@@ -64,6 +66,7 @@ It depends on `nftables`, `wireguard-tools` and `iproute2`. `iptables` and
 ```sh
 sudo install -m 0755 parallax /usr/bin/parallax
 sudo install -m 0644 packaging/systemd/parallax.service /usr/lib/systemd/system/
+sudo install -m 0644 packaging/systemd/parallax-tailscaled.service /usr/lib/systemd/system/
 sudo install -m 0644 packaging/sysusers.d/parallax.conf /usr/lib/sysusers.d/
 sudo install -m 0644 packaging/tmpfiles.d/parallax.conf /usr/lib/tmpfiles.d/
 sudo install -m 0644 packaging/modules-load.d/parallax.conf /usr/lib/modules-load.d/
@@ -115,7 +118,9 @@ sudo parallax backup passphrase --generate
 
 Stopping the service (`sudo systemctl stop parallax`) removes what it set
 up: the firewall table (on iptables-nft, its `PARALLAX_*` chains and ipsets),
-its rules in Docker's `DOCKER-USER` chain, and `wg0`. `sudo systemctl reload parallax` re-applies, like SIGHUP in
+its rules in Docker's `DOCKER-USER` chain, and `wg0`. Before that, its own
+subnet router stops advertising its routes, and `parallax-tailscaled` stops
+and restarts with it. `sudo systemctl reload parallax` re-applies, like SIGHUP in
 Docker. Every saved change applies anyway.
 
 ## The iptables-nft backend
@@ -241,16 +246,18 @@ suggests.
 
 Install the new package the same way. On Debian and Ubuntu a running
 service restarts onto the new binary. On Arch, restart it yourself:
-`sudo systemctl restart parallax`.
+`sudo systemctl restart parallax` (which restarts `parallax-tailscaled` too).
 
 Removing the package (`apt remove`, `pacman -R`) stops the service, which
 takes `wg0` and the firewall table down with it. Even `apt purge` keeps
 `/etc/parallax` (the server key, the backup passphrase) and
-`/var/lib/parallax` (the database, the backups). Losing the server key means
-a new config for every device. To remove those too, after taking a backup:
+`/var/lib/parallax` (the database, the backups), and
+`/var/lib/parallax-tailscale` (the subnet router's state and node key).
+Losing the server key means a new config for every device. To remove those
+too, after taking a backup:
 
 ```sh
-sudo rm -r /etc/parallax /var/lib/parallax
+sudo rm -r /etc/parallax /var/lib/parallax /var/lib/parallax-tailscale
 ```
 
 ## Headscale

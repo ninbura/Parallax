@@ -28,6 +28,7 @@
 //! ([`parallax_core::subnet_router`]). The machine's own Tailscale is left
 //! alone; what its operator has to run is logged. Parallax's own router
 //! follows route changes even with no peer on Tailscale, but isn't logged in.
+//! On shutdown its routes are taken away before the firewall is.
 //!
 //! One engine thread owns the database and does everything that changes
 //! state (saves, applies, backups), one batch at a time: requests that
@@ -98,6 +99,10 @@ const ROUTER_EVERY: Duration = Duration::from_secs(subnet_router::POLL_SECONDS);
 const ROUTER_SOON: Duration = Duration::from_secs(2);
 /// The longest wait between looks while the router keeps failing.
 const ROUTER_BACKOFF: Duration = Duration::from_secs(900);
+/// How long shutdown waits for the router to withdraw its routes: a look in
+/// flight may be a `tailscale up` with its 30 s timeout. Inside systemd's
+/// default 90 s stop timeout.
+const ROUTER_STOP: Duration = Duration::from_secs(45);
 /// How long a client may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -273,7 +278,12 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let refresher = tokio::spawn(refresh_public_ip(tx.clone(), views.clone()));
     let names = tokio::spawn(refresh_names(tx.clone(), views.clone()));
     let tailnet = tokio::spawn(refresh_tailnet(tx.clone(), views.clone()));
-    let router = tokio::spawn(keep_router(views.clone(), opts.tailscale_socket.clone()));
+    let (stop_router, router_stop) = watch::channel(false);
+    let router = tokio::spawn(keep_router(
+        views.clone(),
+        opts.tailscale_socket.clone(),
+        router_stop,
+    ));
     let logs = collector::Slot::default();
     let collecting = tokio::spawn(collector::supervise(views.clone(), Arc::clone(&logs), taps));
     let server = tokio::spawn(accept(listener, tx.clone(), views, database, logs));
@@ -305,7 +315,11 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     refresher.abort();
     names.abort();
     tailnet.abort();
-    router.abort();
+    // Before teardown removes the firewall: the router stops routing first.
+    let _ = stop_router.send(true);
+    if tokio::time::timeout(ROUTER_STOP, router).await.is_err() {
+        warn("warning: the subnet router didn't stop in time; Tailscale peers may keep its routes until it does");
+    }
     // Only our own: another daemon may have bound the path since.
     if file_id(&opts.socket) == Some(socket_id) {
         if let Err(e) = std::fs::remove_file(&opts.socket) {
@@ -787,71 +801,174 @@ async fn refresh_tailnet(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
 /// and each problem (or what the operator still has to do) once. After a
 /// failure it waits longer each time, up to [`ROUTER_BACKOFF`], so a login
 /// that keeps failing doesn't mint a pre-auth key every poll.
-async fn keep_router(mut views: Views, socket: String) {
+///
+/// When `stop` changes (or the engine is gone), it lets a look in flight
+/// finish without changing anything more, takes Parallax's own router's
+/// routes away ([`withdraw_router`]) and returns: the caller removes the
+/// firewall only after that (#75).
+async fn keep_router(mut views: Views, socket: String, mut stop: watch::Receiver<bool>) {
     let config = |views: &Views| views.borrow().as_ref().map(|v| Arc::clone(&v.config));
     let mut last = config(&views);
     let mut said: Option<String> = None;
-    let mut wait = Duration::ZERO;
-    let mut failures: u32 = 0;
-    // The last look was the quick one after a change.
-    let mut quick = false;
-    loop {
+    // A kept deadline: a publish that doesn't change the configuration
+    // (a node's address, a name's answer) mustn't put the next look off (#78).
+    let mut next = tokio::time::Instant::now();
+    let mut pace = Pace::default();
+    // The node key the last look found as Parallax's own router.
+    let mut ours: Option<String> = None;
+    'looking: loop {
         tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
+            _ = tokio::time::sleep_until(next) => {}
+            _ = stop.changed() => break,
             changed = views.changed() => {
                 if changed.is_err() {
-                    return;
+                    break;
                 }
                 // Every apply publishes; only a new configuration counts.
                 if config(&views) == last {
                     continue;
                 }
-                failures = 0;
+                pace = Pace::default();
             }
         }
-        wait = ROUTER_EVERY;
+        next = tokio::time::Instant::now() + ROUTER_EVERY;
         last = config(&views);
-        let Some(config) = last.clone() else {
+        let Some(looking_at) = last.clone() else {
             continue;
         };
-        if !subnet_router::needed(&config) {
+        if !subnet_router::needed(&looking_at) {
             // Nothing to report: the machine may have no Tailscale at all.
             said = None;
         }
-        let socket = socket.clone();
-        let Ok(looked) =
-            tokio::task::spawn_blocking(move || crate::sync_router(&config, &socket)).await
-        else {
+        // Cleared when the configuration is replaced or the daemon stops:
+        // the look then changes nothing more (#82).
+        let current = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut look = tokio::task::spawn_blocking({
+            let (current, socket) = (Arc::clone(&current), socket.clone());
+            move || {
+                let still = || current.load(std::sync::atomic::Ordering::SeqCst);
+                crate::sync_router(&looking_at, &socket, &still)
+            }
+        });
+        let mut stopping = false;
+        let looked = loop {
+            let watching = current.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::select! {
+                looked = &mut look => break looked,
+                _ = stop.changed(), if !stopping => {
+                    stopping = true;
+                    current.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                changed = views.changed(), if watching => {
+                    if changed.is_err() {
+                        stopping = true;
+                    }
+                    if changed.is_err() || config(&views) != last {
+                        current.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        };
+        if stopping {
+            break;
+        }
+        if config(&views) != last {
+            // Replaced meanwhile: look again at once, at the new one.
+            pace = Pace::default();
+            next = tokio::time::Instant::now();
+            continue;
+        }
+        let Ok(looked) = looked else {
             continue;
         };
-        let note = match looked {
-            Ok((done, _)) if !done.is_empty() => {
-                done.iter().for_each(log);
-                // Once more soon (a router that just logged in gets its
-                // routes approved), then the usual pace.
-                quick = !quick;
-                if quick {
-                    wait = ROUTER_SOON;
-                }
-                continue;
+        let (wait, note) = match looked {
+            Ok(look) if !look.done.is_empty() => {
+                ours = look.ours;
+                look.done.iter().for_each(log);
+                next = tokio::time::Instant::now() + pace.after(Looked::Changed);
+                continue 'looking;
             }
-            Ok((_, note)) => {
-                (failures, quick) = (0, false);
-                note
+            Ok(look) => {
+                ours = look.ours;
+                (pace.after(Looked::Fine), look.note)
             }
-            Err(e) => {
-                quick = false;
-                failures = failures.saturating_add(1);
-                wait = (ROUTER_EVERY * 2u32.saturating_pow(failures.min(5))).min(ROUTER_BACKOFF);
-                Some(e)
-            }
+            Err(e) => (pace.after(Looked::Failed), Some(e)),
         };
+        next = tokio::time::Instant::now() + wait;
         if note != said {
             match &note {
                 Some(note) => warn(format!("subnet router: {note}")),
                 None => log("subnet router: in place"),
             }
             said = note;
+        }
+    }
+    let Some(config) = last else {
+        return;
+    };
+    // No Tailscale on this machine is the usual reason it fails, when
+    // nothing needs it.
+    let quiet = !subnet_router::needed(&config) && ours.is_none();
+    let withdrawn = tokio::task::spawn_blocking(move || {
+        crate::withdraw_router(&config, &socket, ours.as_deref())
+    })
+    .await;
+    match withdrawn {
+        Ok(Ok(true)) => log("subnet router: withdrew its routes"),
+        Ok(Ok(false)) => {}
+        Ok(Err(_)) if quiet => {}
+        Ok(Err(e)) => warn(format!(
+            "warning: subnet router: could not withdraw its routes: {e}"
+        )),
+        Err(e) => warn(format!(
+            "warning: subnet router: could not withdraw its routes: {e}"
+        )),
+    }
+}
+
+/// What a look at the router came to, for [`Pace`].
+#[derive(Debug, Clone, Copy)]
+enum Looked {
+    /// It changed something.
+    Changed,
+    /// Nothing to change.
+    Fine,
+    Failed,
+}
+
+/// How long the router waits after each look (#78). Starts afresh with
+/// each new configuration.
+#[derive(Debug, Default)]
+struct Pace {
+    failures: u32,
+    /// The last look was the quick one after a change.
+    quick: bool,
+}
+
+impl Pace {
+    fn after(&mut self, looked: Looked) -> Duration {
+        match looked {
+            // Once more soon (a router that just logged in gets its routes
+            // approved), then the usual pace. A step that worked ends a run
+            // of failures.
+            Looked::Changed => {
+                self.failures = 0;
+                self.quick = !self.quick;
+                if self.quick {
+                    ROUTER_SOON
+                } else {
+                    ROUTER_EVERY
+                }
+            }
+            Looked::Fine => {
+                *self = Pace::default();
+                ROUTER_EVERY
+            }
+            Looked::Failed => {
+                self.quick = false;
+                self.failures = self.failures.saturating_add(1);
+                (ROUTER_EVERY * 2u32.saturating_pow(self.failures.min(5))).min(ROUTER_BACKOFF)
+            }
         }
     }
 }
@@ -1676,6 +1793,31 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "test")]
 
     use super::*;
+
+    #[test]
+    fn the_router_backs_off_and_a_step_that_worked_ends_it() {
+        // #78: a recovered router that changed something starts its
+        // failures afresh, so one more error isn't the 15-minute wait.
+        let mut pace = Pace::default();
+        let waits: Vec<u64> = (0..6)
+            .map(|_| pace.after(Looked::Failed).as_secs())
+            .collect();
+        assert_eq!(waits, [60, 120, 240, 480, 900, 900]);
+        assert_eq!(pace.after(Looked::Changed), ROUTER_SOON);
+        assert_eq!(pace.after(Looked::Failed).as_secs(), 60);
+        // After a change: soon once, then the usual pace.
+        let mut pace = Pace::default();
+        assert_eq!(pace.after(Looked::Changed), ROUTER_SOON);
+        assert_eq!(pace.after(Looked::Changed), ROUTER_EVERY);
+        assert_eq!(pace.after(Looked::Changed), ROUTER_SOON);
+        assert_eq!(pace.after(Looked::Fine), ROUTER_EVERY);
+        // A new configuration starts afresh (`Pace::default()`), so the
+        // look after its first change is the quick one again.
+        let mut pace = Pace::default();
+        assert_eq!(pace.after(Looked::Changed), ROUTER_SOON);
+        pace = Pace::default();
+        assert_eq!(pace.after(Looked::Changed), ROUTER_SOON);
+    }
     use parallax_core::generate::proxy::ProxySite;
 
     /// `immich.mydomain.com` for `allowed`, or no site for none; neither

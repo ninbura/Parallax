@@ -34,8 +34,12 @@ services:
       - tailscale-state:/var/lib/tailscale
       # This machine already on Tailscale? Use its client as the subnet
       # router instead of starting a second one (they'd clash): mount its
-      # socket here and set PARALLAX_TAILSCALED below. Parallax then never
-      # changes its settings; `parallax doctor` says what to run. docs/setup.md.
+      # socket's directory here and set PARALLAX_TAILSCALED below. While
+      # that client is logged in as your own node, Parallax never changes
+      # its settings; `parallax doctor` says what to run. Logged out, Parallax
+      # logs it in as its own router. The host's tailscaled.service needs
+      # RuntimeDirectoryPreserve=yes, or a restart of it leaves this mount
+      # pointing at a deleted directory. docs/setup.md.
       # - /run/tailscale:/var/run/tailscale
     environment:
       # PARALLAX_TAILSCALED: host
