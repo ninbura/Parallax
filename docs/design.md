@@ -288,10 +288,16 @@ An apply that fails partway can leave the old firewall live, the new one,
 or (iptables) a mix (issue #71). So before anything live changes, the daemon
 hands the proxy only what its current routes and the new ones both grant:
 the sites both have alike (hostname, service, upstream), each for the
-addresses both allow. It waits until the proxy serves them, and stops the
-apply if that takes more than 10 s. Only once the apply has worked does the
-proxy get the new routes in full. After a failure it keeps that overlap,
-narrowed again by each failed retry, until an apply succeeds.
+addresses both allow, with the current listener, certificates and upstream
+CA bundle (a new bundle may trust more upstreams; issue #104). It waits
+until the proxy serves them, and stops the apply if that takes more than
+10 s. The proxy puts routes in force in the order it gets them, even when
+the daemon has stopped waiting, so after a failure the daemon counts the
+overlap as served (issue #103), and narrows it again on each failed retry,
+until an apply succeeds. Only once the apply has worked does the proxy get
+the new routes in full. The daemon waits until they're in force; if they
+don't load, the proxy refuses everything and the apply counts as failed, so
+the next tick tries again.
 
 Validation keeps it honest: hostnames are lower-case DNS names, unique
 across services, inside a `domains` zone of the service's network (or
@@ -338,7 +344,7 @@ Reloads swap the routes whole. Every request looks its site up in
 the current routes, and open connections and WebSocket relays are closed
 when a reload takes their hostname away from their address (a WebSocket
 also when the hostname moves to another upstream). A reload that fails (an
-unreadable CA bundle) refuses everything until one succeeds: the old routes may grant what the new configuration took away.
+unreadable CA bundle) refuses everything until one succeeds: the old routes may grant what the new configuration took away. When the proxy itself stops, its open connections and relays close too: nothing could revoke what they were granted any more (issue #102).
 
 Certificates: every directory under the folder holding `fullchain.pem` and
 `privkey.pem` is one certificate. An exact name beats a wildcard; ties go to

@@ -1028,8 +1028,8 @@ fn narrow_dns(
 /// Before the apply writes or changes anything: one that fails partway can
 /// leave the old firewall, the new one or (iptables) a mix, so the proxy
 /// first serves only what both its routes `served` and the `new` ones grant
-/// (issue #71). Waits until it does; if it doesn't in time, nothing has
-/// changed and the apply stops.
+/// (issue #71). Waits until it does; if it doesn't in time, the apply stops
+/// before anything else has changed.
 fn narrow_proxy(
     rt: &tokio::runtime::Runtime,
     proxy: Option<&parallax_proxy::Reload>,
@@ -1041,23 +1041,58 @@ fn narrow_proxy(
         return Ok(());
     };
     let both = generate::proxy::overlap(before, new);
-    if both == *before {
+    if both.serves_alike(before) {
         return Ok(());
     }
-    let taken = proxy.send(both.clone());
+    let parallax_proxy::Taking {
+        checked,
+        mut loaded,
+    } = proxy.send(both.clone());
+    // The proxy serves them next whatever comes of the wait: routes go in
+    // in the order sent, even once nobody waits for them (#103).
+    *served = Some(both);
     // Inside the runtime: a timer needs its clock.
-    match rt.block_on(async { tokio::time::timeout(PROXY_TAKES, taken).await }) {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => bail!(
-            "the HTTPS proxy couldn't take its routes for the change (stopped, or open connections didn't move on); nothing was changed"
-        ),
+    let checked = rt.block_on(async { tokio::time::timeout(PROXY_TAKES, checked).await });
+    const LEFT: &str = "the firewall and WireGuard weren't changed, and the proxy serves only what both configurations grant until an apply works";
+    match checked {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => match loaded.try_recv() {
+            // Told whether they loaded: they went in, and the wait for
+            // open connections ran out.
+            Ok(_) => bail!(
+                "the HTTPS proxy's open connections didn't all move on to its routes for the change in time; {LEFT}"
+            ),
+            Err(_) => bail!("the HTTPS proxy has stopped; {LEFT}"),
+        },
         Err(_) => bail!(
-            "the HTTPS proxy didn't take its routes for the change within {} s; nothing was changed",
+            "the HTTPS proxy didn't take its routes for the change within {} s; {LEFT}",
             PROXY_TAKES.as_secs()
         ),
     }
-    *served = Some(both);
-    Ok(())
+}
+
+/// After a good apply: the proxy serves the new routes in full. Waits only
+/// until they're in force, not for open connections, which they grant at
+/// least as much as the narrowed ones. When they don't load, the proxy
+/// refuses every connection, and the apply counts as failed so the next
+/// tick tries again (#103).
+fn widen_proxy(
+    rt: &tokio::runtime::Runtime,
+    proxy: &parallax_proxy::Reload,
+    routes: &ProxyRoutes,
+) -> anyhow::Result<()> {
+    let loaded = proxy.send(routes.clone()).loaded;
+    match rt.block_on(async { tokio::time::timeout(PROXY_TAKES, loaded).await }) {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(why))) => bail!(
+            "the HTTPS proxy couldn't load its new routes ({why}); it refuses every connection until a reload works"
+        ),
+        Ok(Err(_)) => bail!("the HTTPS proxy has stopped"),
+        Err(_) => bail!(
+            "the HTTPS proxy didn't take its new routes within {} s",
+            PROXY_TAKES.as_secs()
+        ),
+    }
 }
 
 impl Engine {
@@ -1278,11 +1313,12 @@ impl Engine {
                 self.reconciler
                     .applied(today, reconcile::live_state(server, sys()));
                 self.applied = Some(server.clone());
+                let mut proxy_failed = None;
                 if let (Some(servers), Some((routes, dns))) = (&self.servers, &made) {
-                    // Not waited for: the next apply's narrowing is taken
-                    // after these.
-                    drop(servers.proxy.send(routes.clone()));
+                    // DNS not waited for: the next apply's narrowing is
+                    // taken after these.
                     drop(servers.dns.send(dns.clone()));
+                    proxy_failed = widen_proxy(&self.rt, &servers.proxy, routes).err();
                 }
                 if let Some((routes, dns)) = made {
                     self.proxy_routes = Some(routes);
@@ -1290,6 +1326,16 @@ impl Engine {
                 }
                 // What the activity log attributes by from now on.
                 self.view.applied = Some(Arc::clone(&self.view.config));
+                if let Some(e) = proxy_failed {
+                    let e = format!("{e:#}");
+                    warn(format!(
+                        "apply failed after the firewall changed, trying again in a minute: {e}"
+                    ));
+                    self.reconciler.failed();
+                    self.view.apply_error = Some(e.clone());
+                    self.publish();
+                    return (lines, Some(e));
+                }
                 self.view.apply_error = None;
                 self.publish();
                 (lines, None)
@@ -1738,15 +1784,47 @@ mod tests {
     }
 
     /// A proxy that can't take the overlap stops the apply before anything
-    /// changes, and what it serves is still what it was.
+    /// else changes. The overlap is what it's recorded to serve next: a
+    /// proxy that's slow, not stopped, still puts it in (#103).
     #[test]
     fn a_stopped_proxy_stops_the_apply() {
         let mut served = Some(routes(&["10.8.2.1/32"]));
         let err = narrow_proxy(&engine_rt(), Some(&stopped()), &mut served, &routes(&[]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("the HTTPS proxy couldn't take"), "{err}");
-        assert_eq!(served, Some(routes(&["10.8.2.1/32"])));
+        assert!(err.contains("the HTTPS proxy has stopped"), "{err}");
+        assert!(err.contains("weren't changed"), "{err}");
+        assert_eq!(served, Some(routes(&[])));
+    }
+
+    /// #104: routes that differ only in order aren't a change to narrow.
+    #[test]
+    fn reordered_routes_are_not_narrowed() {
+        let mut served = Some(routes(&["10.8.2.1/32", "10.8.3.0/24"]));
+        let reordered = routes(&["10.8.3.0/24", "10.8.2.1/32"]);
+        narrow_proxy(&engine_rt(), Some(&stopped()), &mut served, &reordered).unwrap();
+    }
+
+    /// #103: after a good apply, routes the proxy can't load fail it (the
+    /// next tick tries again), and routes it loads don't.
+    #[test]
+    fn the_full_routes_must_load() {
+        let proxy_rt = tokio::runtime::Runtime::new().unwrap();
+        let proxy = parallax_proxy::Proxy::new(routes(&[])).unwrap();
+        let reload = proxy.reloader();
+        let listener = proxy_rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        proxy_rt.spawn(proxy.run(listener));
+        // A site needs the CA bundle, and `/nonexistent/ca.pem` isn't there.
+        let err = widen_proxy(&engine_rt(), &reload, &routes(&["10.8.2.1/32"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("couldn't load its new routes"), "{err}");
+        assert!(err.contains("ca.pem"), "{err}");
+        widen_proxy(&engine_rt(), &reload, &routes(&[])).unwrap();
+        let err = widen_proxy(&engine_rt(), &stopped(), &routes(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stopped"), "{err}");
     }
 
     /// The proxy task ended (the daemon aborts it on shutdown): its reloader
