@@ -86,7 +86,16 @@ esac
 UNIT_FILE="$(cd "$(dirname "$0")/../.." && pwd)/packaging/systemd/parallax.service"
 
 # The unit's private /tmp would hide one under /tmp.
-WORK=$(mktemp -d "$([ "$MODE" = unit ] && echo /run || echo /tmp)/parallax-it.XXXXXX")
+WORK_IN=$([ "$MODE" = unit ] && echo /run || echo /tmp)
+# The run copies the binary (and Tailscale's) in, and both are often RAM-backed
+# tmpfs: a full one fails a case halfway with "No space left on device". Say so
+# first: the copies, and 256 MiB for databases, logs and Headscale.
+need=$(stat -L -c %s "$PARALLAX")
+for t in "${TAILSCALE:-}" "${TAILSCALED:-}"; do [ -z "$t" ] || need=$((need + $(stat -L -c %s "$t"))); done
+need=$((need / 1024 + 256 * 1024))
+free=$(df --output=avail -k "$WORK_IN" | tail -n1)
+[ "$free" -ge "$need" ] || { echo "only $((free / 1024)) MiB free in $WORK_IN; a run needs about $((need / 1024)) MiB"; exit 2; }
+WORK=$(mktemp -d "$WORK_IN/parallax-it.XXXXXX")
 PIDS=()
 UNITS=()
 CREATED=() # only these are cleaned up: a run that lost a race for a name leaves the winner's alone
@@ -1235,19 +1244,28 @@ database:
 derp:
   urls: []
   paths: [$HS/derp.yaml]
+# info: a slow start shows what it was doing (#91).
 log:
-  level: warn
+  level: info
 YAML
     start_headscale() {
         # Its own pid, not the backgrounded subshell's, so (u) can stop it.
         inns gw sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$HS/headscale.pid" \
             "$HEADSCALE" serve -c "$HS/config.yaml" >> "$HS/headscale.log" 2>&1 &
         PIDS+=($!)
-        for _ in $(seq 100); do
+        # The backgrounded subshell lives as long as Headscale does; (u) waits
+        # on it to know the first one has stopped.
+        HS_BG=$!
+        local pid=$! start=$SECONDS
+        # A first start makes its database and keys, which can take a while
+        # on a busy CI runner (#91). One that exits says so at once.
+        while [ $((SECONDS - start)) -lt 30 ]; do
             inns gw curl -sf -m 1 http://127.0.0.1:18080/version >/dev/null && return 0
+            kill -0 "$pid" 2>/dev/null \
+                || { cat "$HS/headscale.log" 2>/dev/null || true; fail "(u) Headscale exited before it answered (after $((SECONDS - start)) s)"; }
             sleep 0.1
         done
-        cat "$HS/headscale.log"; fail "(u) Headscale did not start"
+        cat "$HS/headscale.log" 2>/dev/null || true; fail "(u) Headscale is running but didn't answer in 30 s"
     }
     start_headscale
     HS_KEY=$(inns gw "$HEADSCALE" -c "$HS/config.yaml" apikeys create 2>/dev/null | tail -n1)
@@ -1299,7 +1317,8 @@ PY
     $P status | grep "^Headscale node $NODE: $NODE_IP$" >/dev/null || { $P status; fail "(u) the daemon's status lacks the node"; }
     HS_PID=$(cat "$HS/headscale.pid")
     kill "$HS_PID"
-    for _ in $(seq 50); do kill -0 "$HS_PID" 2>/dev/null || break; sleep 0.1; done
+    # Gone before the restart below, so that one can't be answered by this one.
+    wait "$HS_BG" || true
     sleep 12
     in_set || fail "(u) the node lost its access while Headscale was down"
     grep -q "keeping the addresses it gave last" "$WORK/daemon.log" || fail "(u) Headscale being down was not logged"
