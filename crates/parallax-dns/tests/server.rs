@@ -235,9 +235,17 @@ async fn start_tapped(tap: Option<Tap>) -> Running {
         dns = dns.tap(tap);
     }
     let reload = dns.reloader();
-    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = udp.local_addr().unwrap();
-    let tcp = TcpListener::bind(addr).await.unwrap();
+    // UDP and TCP on the same port. The kernel picks a UDP port that's free
+    // for UDP only, so TCP may already be taken there (#95): try another.
+    let (udp, tcp, addr) = loop {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp.local_addr().unwrap();
+        match TcpListener::bind(addr).await {
+            Ok(tcp) => break (udp, tcp, addr),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("binding TCP on {addr}: {e}"),
+        }
+    };
     tokio::spawn(dns.run(udp, tcp));
     Running {
         addr,
