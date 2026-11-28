@@ -1748,4 +1748,33 @@ mod tests {
             "the set and the router's key were lost: {looked:?}"
         );
     }
+
+    #[test]
+    fn lc_withdraw_leaves_the_hosts_own_tailscale_alone_without_headscale() {
+        // A WireGuard-only gateway (no Tailscale peer, the default Headscale
+        // settings, no API key) on a host whose own Tailscale is logged in
+        // elsewhere and advertises nothing. Nothing of Parallax's routes
+        // there, so a stopping daemon may take its firewall down.
+        let config = canonical_config();
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        runner.respond(
+            "tailscale",
+            ok(&prefs_json("").replace(
+                "https://headscale.mydomain.com",
+                "https://controlplane.tailscale.com",
+            )),
+        );
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let no_key = FakeHeadscale::new().reply("/api/v1/node", 401, "unauthorized");
+        let withdrew = withdraw(&config.server.headscale, &ts, &no_key, None);
+        assert!(
+            matches!(withdrew, Ok(false)),
+            "a stop would keep the firewall and wg0: {withdrew:?}"
+        );
+    }
 }
