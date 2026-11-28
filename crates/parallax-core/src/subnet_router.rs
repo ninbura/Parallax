@@ -1656,4 +1656,96 @@ mod tests {
         let check = super::check(&quiet, &ts, &FakeHeadscale::new());
         assert!(matches!(check.outcome, Outcome::Ok(_)));
     }
+
+    // Post-merge tests of #113, failing on main (8a7abdc).
+
+    #[test]
+    fn lc_withdraw_checks_the_nodes_id_as_well_as_a_remembered_key() {
+        // The last look found key K as Parallax's node 2. At shutdown the
+        // client reports K with the operator's node id 1 (two nodes with one
+        // key, as a_shared_node_key_is_told_apart_by_the_nodes_id sets up):
+        // the operator's node must not be changed.
+        let config = config();
+        let runner = RecordingRunner::new();
+        runner.respond(
+            "tailscale",
+            ok(&running().replace(r#""ID":"""#, r#""ID":"1""#)),
+        );
+        runner.respond("tailscale", ok(""));
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let down = FakeHeadscale::new().reply("/api/v1/node", 502, "bad gateway");
+        let withdrew = withdraw(&config.server.headscale, &ts, &down, Some(KEY));
+        assert!(
+            runner.command_lines().iter().all(|c| !c.contains(" set ")),
+            "the operator's node was changed: {:?} ({withdrew:?})",
+            runner.command_lines()
+        );
+    }
+
+    #[test]
+    fn lc_an_expired_operator_profile_is_not_ours_by_a_reused_node_id() {
+        // The operator's expired profile (user family, node 1) after
+        // tailscaled restarted, against a Headscale whose node 1 is now
+        // Parallax's (a new database at the same URL). The profile still
+        // says it's family's: not Parallax's to log in.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let expired = || Ok(serde_json::from_str(EXPIRED_PREFS).unwrap());
+        let restarted = Client {
+            state: "NeedsLogin".into(),
+            node_key: None,
+            id: None,
+        };
+        let mut reused = node(USER, ROUTES, ROUTES);
+        reused.node_key = "nodekey:another".into();
+        let router = decide(&model, &restarted, expired, &[reused]).unwrap();
+        assert_ne!(router, Router::LoggedOut);
+    }
+
+    #[test]
+    fn lc_doctor_does_not_say_routing_before_headscale_has_the_routes() {
+        // Prefs and approvals match, but Headscale hasn't seen the routes
+        // advertised (the router's control connection is down): Headscale
+        // serves nothing yet, so this isn't "routing".
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let mut c = client("Running");
+        c.id = Some("1".into());
+        let router = decide(&model, &c, || prefs(ROUTES), &[node(USER, "", ROUTES)]).unwrap();
+        let said = describe(&model, &router);
+        assert!(said.is_err(), "{router:?}: {said:?}");
+    }
+
+    #[test]
+    fn lc_a_failed_approval_keeps_what_the_look_did() {
+        // The set works, the approval fails: the look still says what it
+        // did and whose the router is, so the daemon can remember its key.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        runner.respond("tailscale", ok(&prefs_json("198.18.1.0/24")));
+        runner.respond("tailscale", ok(""));
+        let nodes = format!(
+            r#"{{"nodes":[{{"id":"1","nodeKey":"{KEY}","ipAddresses":["100.64.0.1"],"givenName":"parallax-gateway","user":{{"id":"3","name":"parallax"}},"online":true,"availableRoutes":["198.18.1.0/24"],"approvedRoutes":[]}}]}}"#
+        );
+        let api = FakeHeadscale::new()
+            .reply("/api/v1/node", 200, &nodes)
+            .reply("POST /api/v1/node/1/approve_routes", 502, "bad gateway");
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let looked = sync(&model, &ts, &api, true, &|| true);
+        assert_eq!(runner.calls.borrow().len(), 3, "the set ran");
+        assert!(
+            looked.is_ok(),
+            "the set and the router's key were lost: {looked:?}"
+        );
+    }
 }
