@@ -119,16 +119,18 @@ impl Store {
         };
         // Before a migration or the switch to MVCC writes to it (#99).
         store.tighten()?;
-        if mvcc {
-            // Refuse a database too new for this build before changing it.
-            store
-                .check_version(migrations.len() as i64)
-                .await
-                .map_err(|e| store.busy(e))?;
-            store.use_mvcc().await.map_err(|e| store.busy(e))?;
+        let changed = async {
+            if mvcc {
+                // Refuse a database too new for this build before changing it.
+                store.check_version(migrations.len() as i64).await?;
+                store.use_mvcc().await?;
+            }
+            store.migrate().await
         }
-        store.migrate().await.map_err(|e| store.busy(e))?;
+        .await;
+        // Also after a failed migration: it may have written sidecars.
         store.tighten_after_commit();
+        changed.map_err(|e| store.busy(e))?;
         Ok(store)
     }
 
@@ -150,29 +152,34 @@ impl Store {
                     }
                 }
             }
+            // Every file is tried, even after one fails: the log comes last.
+            let mut first: Option<Error> = None;
             for file in &files {
-                let mode = match std::fs::metadata(file) {
-                    Ok(m) => m.permissions().mode(),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(Error::io(format!("securing {}", file.display()), e)),
+                let secured = match std::fs::metadata(file) {
+                    // Already private: nothing to change, so no need to be its owner.
+                    Ok(m) if m.permissions().mode() & 0o777 == 0o600 => Ok(()),
+                    Ok(_) => std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)),
+                    Err(e) => Err(e),
                 };
-                // Already private: nothing to change, so no need to be its owner.
-                if mode & 0o777 == 0o600 {
-                    continue;
-                }
-                match std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
+                match secured {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(Error::io(format!("securing {}", file.display()), e)),
+                    Err(e) => {
+                        first.get_or_insert(Error::io(format!("securing {}", file.display()), e));
+                    }
                 }
+            }
+            if let Some(e) = first {
+                return Err(e);
             }
         }
         Ok(())
     }
 
-    /// After a commit: secure the files Turso may have just created (its
-    /// log appears with the first write). The commit has happened, so a
-    /// failure here mustn't turn it into a refusal (#99). The same files
+    /// After a write, committed or rolled back: secure the files Turso may
+    /// have just created (its log appears with the first write, and holds
+    /// what a rolled-back write put there too). A commit has happened by
+    /// then, so a failure here mustn't turn it into a refusal (#99). The same files
     /// were made owner-only before the write began, and the CLI's umask
     /// covers new ones; this is for library use without it.
     fn tighten_after_commit(&self) {

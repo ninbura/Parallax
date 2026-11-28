@@ -273,9 +273,9 @@ impl Store {
             Ok(())
         }
         .await;
-        self.finish(result).await.map_err(|e| self.busy(e))?;
+        let finished = self.finish(result).await;
         self.tighten_after_commit();
-        Ok(())
+        finished.map_err(|e| self.busy(e))
     }
 
     /// Every table holding data, each after the tables it points at.

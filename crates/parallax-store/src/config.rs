@@ -49,9 +49,9 @@ impl Store {
         self.tighten()?;
         self.begin().await.map_err(|e| self.busy(e))?;
         let result = self.save_inner(config).await;
-        self.finish(result).await.map_err(|e| self.busy(e))?;
+        let finished = self.finish(result).await;
         self.tighten_after_commit();
-        Ok(())
+        finished.map_err(|e| self.busy(e))
     }
 
     /// Read, change and write the configuration in one write transaction, so
@@ -81,8 +81,9 @@ impl Store {
             }
         };
         let saved = self.save_inner(&config).await;
-        self.finish(saved).await.map_err(|e| self.busy(e))?;
+        let finished = self.finish(saved).await;
         self.tighten_after_commit();
+        finished.map_err(|e| self.busy(e))?;
         Ok(out)
     }
 
@@ -99,9 +100,9 @@ impl Store {
             Ok(true)
         }
         .await;
-        let saved = self.finish(result).await.map_err(|e| self.busy(e))?;
+        let finished = self.finish(result).await;
         self.tighten_after_commit();
-        Ok(saved)
+        finished.map_err(|e| self.busy(e))
     }
 
     async fn save_inner(&self, config: &Config) -> Result<()> {
