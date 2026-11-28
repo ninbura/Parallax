@@ -549,8 +549,10 @@ mod tests {
             .find(|p| p.grants == ["family"])
             .unwrap();
         let addr = family.wireguard.as_ref().unwrap().address.unwrap();
-        family.wireguard.as_mut().unwrap().public_key =
-            crate::secret::PublicKey::from_bytes([7; 32]);
+        let wg = family.wireguard.as_mut().unwrap();
+        wg.public_key = crate::secret::PublicKey::from_bytes([7; 32]);
+        // The kept private key would no longer match.
+        wg.private_key = None;
         let after = Holders::of(&Model::resolve(&rekeyed, today()).unwrap());
         assert_eq!(before.moved(&after), vec![addr]);
         assert_eq!(after.moved(&before), vec![addr]);
