@@ -453,8 +453,9 @@ RuntimeDirectoryPreserve=yes
 
 When Parallax stops, its own router stops advertising its routes (the
 daemon takes them away before it removes its firewall), so Tailscale peers
-never reach a network unfiltered. It advertises them again on the next
-start.
+never reach a network unfiltered. If it can't (the router doesn't answer),
+it leaves the firewall and `wg0` in place and says so in its log. The routes
+come back on the next start.
 
 ### Certificates for Tailscale devices
 

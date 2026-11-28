@@ -1224,12 +1224,22 @@ pub(crate) fn sync_router(
 
 /// Take Parallax's own router's routes away, for a daemon about to remove
 /// its firewall ([`parallax_core::subnet_router::withdraw`]). `known`: the
-/// key the last look found as Parallax's. True if it withdrew.
+/// key the last look found as Parallax's. True if it withdrew; false if
+/// there was nothing to withdraw.
 pub(crate) fn withdraw_router(
     config: &Config,
     socket: &str,
     known: Option<&str>,
 ) -> Result<bool, String> {
+    // No tailscaled behind the socket: no tailscale0, so nothing is routed.
+    if let Err(e) = std::os::unix::net::UnixStream::connect(socket) {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ) {
+            return Ok(false);
+        }
+    }
     let api = headscale::Api::new(&config.server, owner::ConfigFiles::default());
     let ts = parallax_core::subnet_router::Tailscaled {
         socket,

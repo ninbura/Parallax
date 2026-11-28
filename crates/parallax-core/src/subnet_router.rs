@@ -113,6 +113,21 @@ pub struct Client {
     pub state: String,
     /// Its node key, if it has one.
     pub node_key: Option<String>,
+    /// Its node's id (`Self.ID`), once it has one. Two Headscale nodes can
+    /// share a node key (one left over from an earlier login); this tells
+    /// them apart.
+    pub id: Option<String>,
+}
+
+impl Client {
+    /// Its node among Headscale's: the same node key, and the same id when
+    /// it reports one.
+    fn node<'a>(&self, nodes: &'a [Node]) -> Option<&'a Node> {
+        let key = self.node_key.as_deref()?;
+        nodes.iter().find(|n| {
+            n.node_key == key && self.id.as_ref().is_none_or(|id| n.id.to_string() == *id)
+        })
+    }
 }
 
 /// The client's settings that matter here (`tailscale debug prefs`).
@@ -170,6 +185,8 @@ pub fn client(ts: &Tailscaled<'_>) -> Result<Client> {
     struct SelfNode {
         #[serde(default)]
         public_key: String,
+        #[serde(rename = "ID", default)]
+        id: String,
     }
     let out = ts.run(&["status", "--json"], None)?;
     let status: Status = serde_json::from_str(&out).map_err(|e| {
@@ -178,12 +195,14 @@ pub fn client(ts: &Tailscaled<'_>) -> Result<Client> {
             ts.socket
         ))
     })?;
+    let (key, id) = status.me.map(|s| (s.public_key, s.id)).unwrap_or_default();
     // A client that never logged in has an all-zero key.
-    let node_key = status.me.map(|s| s.public_key).filter(|k| {
+    let node_key = Some(key).filter(|k| {
         k.starts_with("nodekey:") && !k.trim_start_matches("nodekey:").bytes().all(|b| b == b'0')
     });
     Ok(Client {
         state: status.backend_state,
+        id: Some(id).filter(|id| !id.is_empty() && node_key.is_some()),
         node_key,
     })
 }
@@ -264,23 +283,26 @@ fn as_ip(routes: &[Ipv4Net]) -> Vec<IpNet> {
     routes.iter().copied().map(IpNet::V4).collect()
 }
 
-/// The IPv4 prefix in `routes` that covers `wanted`, if any. A default
-/// route is an exit node: devices accepting routes don't use it for
-/// Parallax's networks.
+/// The narrowest IPv4 prefix in `routes` that covers `wanted`, if any. A
+/// default route is an exit node: devices accepting routes don't use it
+/// for Parallax's networks.
 fn covering(routes: &[IpNet], wanted: &Ipv4Net) -> Option<Ipv4Net> {
-    routes.iter().find_map(|r| match r {
-        IpNet::V4(r) if r.prefix_len() > 0 && r.contains(wanted) => Some(*r),
-        _ => None,
-    })
+    routes
+        .iter()
+        .filter_map(|r| match r {
+            IpNet::V4(r) if r.prefix_len() > 0 && r.contains(wanted) => Some(*r),
+            _ => None,
+        })
+        .max_by_key(Ipv4Net::prefix_len)
 }
 
 /// What the operator has to run so their node serves `wanted`. Headscale
 /// serves a route only when the same prefix is both advertised and
 /// approved (#79), so a route counts once one prefix covering it is in
-/// both lists; otherwise both commands name the same prefix: one already
-/// advertised or approved that covers it, or the route itself. Each
-/// command is a replacing one, so it lists everything the node has, every
-/// family kept.
+/// both lists; otherwise both commands name the same prefix: the narrowest
+/// one already advertised or approved that covers it, so nothing wider is
+/// enabled than the node already has, or the route itself. Each command is
+/// a replacing one, so it lists everything the node has, every family kept.
 fn operator_todo(node: &Node, wanted: &[Ipv4Net]) -> Vec<String> {
     let advertised = parse_routes(&node.available_routes);
     let approved = parse_routes(&node.approved_routes);
@@ -292,9 +314,8 @@ fn operator_todo(node: &Node, wanted: &[Ipv4Net]) -> Vec<String> {
         if served {
             continue;
         }
-        let prefix = covering(&advertised, w)
-            .or_else(|| covering(&approved, w))
-            .unwrap_or(*w);
+        let prefix =
+            covering(&[advertised.as_slice(), approved.as_slice()].concat(), w).unwrap_or(*w);
         if !needed.contains(&prefix) {
             needed.push(prefix);
         }
@@ -345,10 +366,7 @@ pub fn decide(
 ) -> Result<Router> {
     let server = &model.server().headscale;
     let wanted = routes(model);
-    let node = client
-        .node_key
-        .as_deref()
-        .and_then(|key| nodes.iter().find(|n| n.node_key == key));
+    let node = client.node(nodes);
     let needs_login = match client.state.as_str() {
         "NeedsLogin" => true,
         "Running" | "Stopped" => false,
@@ -533,6 +551,7 @@ pub fn sync(
         Router::LoggedOut => {
             let user = match headscale::user(server, api, USER)? {
                 Some(user) => user,
+                None if !current() => return Ok((router, done)),
                 None => {
                     let user = headscale::create_user(server, api, USER)?;
                     done.push(format!("created the Headscale user {USER} for the router"));
@@ -545,6 +564,10 @@ pub fn sync(
                 return Ok((router, done));
             }
             let key = headscale::create_pre_auth_key(server, api, user.id, expires)?;
+            // Unused, it's void in two days.
+            if !current() {
+                return Ok((router, done));
+            }
             up(model, ts, Some(&key))?;
             done.push(format!(
                 "logged the router in to Headscale at {} as {}, advertising {}",
@@ -581,7 +604,8 @@ pub fn sync(
 /// nothing more, so it forwards nothing and Headscale serves nothing (#75).
 /// For a stopping daemon, before its firewall goes. The operator's node is
 /// left alone, as always. `known` is the node key the last look found as
-/// Parallax's, trusted when Headscale can't say. True if it withdrew.
+/// Parallax's: still the client's, it's still Parallax's, whatever the
+/// Headscale configured now says. True if it withdrew.
 pub fn withdraw(
     server: &HeadscaleServer,
     ts: &Tailscaled<'_>,
@@ -590,14 +614,17 @@ pub fn withdraw(
 ) -> Result<bool> {
     let client = client(ts)?;
     // Not logged in: it routes nothing.
-    let Some(key) = client.node_key else {
+    let Some(key) = client.node_key.as_deref() else {
         return Ok(false);
     };
-    let ours = match headscale::nodes(server, api) {
-        Ok(nodes) => nodes.iter().any(|n| n.node_key == key && n.user == USER),
-        Err(_) if known == Some(key.as_str()) => true,
-        Err(e) => return Err(e),
-    };
+    if known != Some(key) && server.server_url.is_empty() {
+        // No Headscale: Parallax never logged it in.
+        return Ok(false);
+    }
+    let ours = known == Some(key)
+        || client
+            .node(&headscale::nodes(server, api)?)
+            .is_some_and(|n| n.user == USER);
     if !ours {
         return Ok(false);
     }
@@ -756,6 +783,7 @@ mod tests {
         Client {
             state: state.into(),
             node_key: Some(KEY.into()),
+            id: None,
         }
     }
 
@@ -799,7 +827,8 @@ mod tests {
             super::client(&ts).unwrap(),
             Client {
                 state: "NeedsLogin".into(),
-                node_key: None
+                node_key: None,
+                id: None,
             }
         );
         assert_eq!(super::client(&ts).unwrap(), client("Running"));
@@ -946,6 +975,7 @@ mod tests {
             &Client {
                 state: "NeedsLogin".into(),
                 node_key: None,
+                id: None,
             },
             || Ok(serde_json::from_str(LOGGED_OUT_PREFS).unwrap()),
             &[],
@@ -995,6 +1025,7 @@ mod tests {
         let fresh = Client {
             state: "NoState".into(),
             node_key: None,
+            id: None,
         };
         let router = decide(&model, &fresh, never, &[]).unwrap();
         assert!(matches!(router, Router::Waiting(_)), "{router:?}");
@@ -1176,6 +1207,7 @@ mod tests {
         let restarted = Client {
             state: "NeedsLogin".into(),
             node_key: None,
+            id: None,
         };
         let nodes = [node("family", ROUTES, ROUTES)];
         let router = decide(&model, &restarted, expired, &nodes).unwrap();
@@ -1207,7 +1239,7 @@ mod tests {
     fn a_route_is_served_only_by_one_prefix_both_advertised_and_approved() {
         // #79: Headscale serves the exact prefix that's both advertised and
         // approved; a covering /16 advertised and the /24 approved serve
-        // nothing.
+        // nothing. Advertising the /24 fixes it without enabling the /16.
         let config = config();
         let model = Model::resolve(&config, today()).unwrap();
         let never = || -> Result<Prefs> { panic!("not needed") };
@@ -1222,7 +1254,7 @@ mod tests {
             Router::Theirs {
                 id: 1,
                 todo: vec![
-                    "approve them: `headscale nodes approve-routes --identifier 1 --routes 198.18.1.0/24,10.8.0.1/32,198.18.0.0/16`".into(),
+                    "advertise Parallax's routes: `tailscale set --advertise-routes=198.18.0.0/16,10.8.0.1/32,198.18.1.0/24`".into(),
                 ]
             }
         );
@@ -1234,7 +1266,7 @@ mod tests {
         )];
         let router = decide(&model, &client("Running"), never, &nodes).unwrap();
         assert!(describe(&model, &router).is_ok(), "{router:?}");
-        // Approved but not advertised: advertise that same prefix.
+        // Only a wider prefix approved: advertise that same prefix.
         let nodes = [node("operator", "10.8.0.1/32", "198.18.0.0/16,10.8.0.1/32")];
         let Router::Theirs { todo, .. } =
             decide(&model, &client("Running"), never, &nodes).unwrap()
@@ -1319,6 +1351,83 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_node_key_is_told_apart_by_the_nodes_id() {
+        // An earlier takeover (#76) could leave the operator's node and
+        // Parallax's with one node key; the client's own id says which.
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let never =
+            || -> Result<Prefs> { panic!("the operator's prefs are none of Parallax's business") };
+        let mut ours = node(USER, ROUTES, ROUTES);
+        ours.id = 2;
+        let nodes = [ours, node("family", ROUTES, ROUTES)];
+        let mut theirs = client("Running");
+        theirs.id = Some("1".into());
+        let router = decide(&model, &theirs, never, &nodes).unwrap();
+        assert!(matches!(router, Router::Theirs { id: 1, .. }), "{router:?}");
+        // Read from `tailscale status --json`.
+        let runner = RecordingRunner::new();
+        runner.respond(
+            "tailscale",
+            ok(&running().replace(r#""ID":"""#, r#""ID":"1""#)),
+        );
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        assert_eq!(super::client(&ts).unwrap(), theirs);
+        // Nor does shutdown take the operator's routes away.
+        let listed = r#"{"nodes":[{"id":"2","nodeKey":"KEY","ipAddresses":["100.64.0.2"],"givenName":"parallax-gateway","user":{"id":"3","name":"parallax"},"online":false,"availableRoutes":[],"approvedRoutes":[]},{"id":"1","nodeKey":"KEY","ipAddresses":["100.64.0.1"],"givenName":"operator-gw","user":{"id":"1","name":"family"},"online":true,"availableRoutes":[],"approvedRoutes":[]}]}"#.replace("KEY", KEY);
+        let api = FakeHeadscale::new().reply("/api/v1/node", 200, &listed);
+        let runner = RecordingRunner::new();
+        runner.respond(
+            "tailscale",
+            ok(&running().replace(r#""ID":"""#, r#""ID":"1""#)),
+        );
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        assert!(!withdraw(&config.server.headscale, &ts, &api, None).unwrap());
+        assert_eq!(runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_look_replaced_after_minting_a_key_does_not_log_in() {
+        // #82: the key is minted, then the configuration is replaced: no
+        // `tailscale up` with it (it's void in two days).
+        let config = config();
+        let model = Model::resolve(&config, today()).unwrap();
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(LOGGED_OUT));
+        runner.respond("tailscale", ok(LOGGED_OUT_PREFS));
+        let api = FakeHeadscale::new()
+            .reply("/api/v1/node", 200, r#"{"nodes":[]}"#)
+            .reply(
+                "/api/v1/user?name=parallax",
+                200,
+                r#"{"users":[{"id":"3","name":"parallax"}]}"#,
+            )
+            .reply("POST /api/v1/preauthkey", 200, KEY_CREATED);
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let asked = std::cell::Cell::new(0);
+        let current = || {
+            asked.set(asked.get() + 1);
+            asked.get() <= 2
+        };
+        let (_, done) = sync(&model, &ts, &api, true, &current).unwrap();
+        assert!(done.is_empty(), "{done:?}");
+        assert_eq!(api.posted.borrow().len(), 1, "the key was minted");
+        assert_eq!(runner.calls.borrow().len(), 2, "but not used");
+    }
+
+    #[test]
     fn withdraw_stops_only_parallaxs_own_router() {
         // #75: a stopping daemon takes its router's routes away before its
         // firewall goes.
@@ -1367,6 +1476,19 @@ mod tests {
             runner: &runner,
         };
         assert!(withdraw(server, &ts, &down(), Some(KEY)).unwrap());
+        // The key the last look found as Parallax's is trusted over a
+        // Headscale that no longer lists it (the configuration moved to
+        // another one).
+        let runner = RecordingRunner::new();
+        runner.respond("tailscale", ok(&running()));
+        runner.respond("tailscale", ok(""));
+        let ts = Tailscaled {
+            socket: SOCKET,
+            operator: None,
+            runner: &runner,
+        };
+        let elsewhere = FakeHeadscale::new().reply("/api/v1/node", 200, r#"{"nodes":[]}"#);
+        assert!(withdraw(server, &ts, &elsewhere, Some(KEY)).unwrap());
         let runner = RecordingRunner::new();
         runner.respond("tailscale", ok(&running()));
         let ts = Tailscaled {

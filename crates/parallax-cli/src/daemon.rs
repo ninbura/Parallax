@@ -171,7 +171,10 @@ enum Msg {
     Names(NameInputs, Refreshed),
     /// Headscale was asked for its nodes, for these inputs.
     Tailnet(TailnetInputs, Result<Option<Tailnet>, String>),
-    Shutdown,
+    /// Stop; `teardown` false leaves the gateway as it is, firewall included.
+    Shutdown {
+        teardown: bool,
+    },
 }
 
 type Views = watch::Receiver<Option<View>>;
@@ -270,7 +273,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     let ((mut dns, mut proxy, reloaders), (listener, socket_id)) = match started {
         Ok(started) => started,
         Err(e) => {
-            stop_engine(&tx, &mut done_rx).await;
+            stop_engine(&tx, &mut done_rx, true).await;
             return Err(e);
         }
     };
@@ -316,9 +319,21 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     names.abort();
     tailnet.abort();
     // Before teardown removes the firewall: the router stops routing first.
+    // Until it's known to have, the firewall stays, as after a crash (#75).
     let _ = stop_router.send(true);
-    if tokio::time::timeout(ROUTER_STOP, router).await.is_err() {
-        warn("warning: the subnet router didn't stop in time; Tailscale peers may keep its routes until it does");
+    let teardown = match tokio::time::timeout(ROUTER_STOP, router).await {
+        Ok(Ok(withdrawn)) => withdrawn,
+        Ok(Err(e)) => {
+            warn(format!("warning: the subnet router's task failed: {e}"));
+            false
+        }
+        Err(_) => {
+            warn("warning: the subnet router didn't withdraw its routes in time");
+            false
+        }
+    };
+    if !teardown {
+        warn("warning: leaving the firewall and wg0 in place: Parallax's subnet router may still route Tailscale peers, and without the firewall they'd reach the networks unfiltered. Start Parallax again, or stop the router, then stop Parallax");
     }
     // Only our own: another daemon may have bound the path since.
     if file_id(&opts.socket) == Some(socket_id) {
@@ -329,7 +344,7 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     dns.abort();
     proxy.abort();
     if engine_alive {
-        stop_engine(&tx, &mut done_rx).await;
+        stop_engine(&tx, &mut done_rx, teardown).await;
     }
     // With the engine gone its view closes, so the collector stops its
     // sources and writes what they hold; don't wait long for it.
@@ -342,9 +357,14 @@ async fn serve(opts: Options) -> anyhow::Result<()> {
     result
 }
 
-/// Ask the engine to tear the gateway down, and wait until it has.
-async fn stop_engine(tx: &mpsc::UnboundedSender<Msg>, done: &mut oneshot::Receiver<()>) {
-    if tx.send(Msg::Shutdown).is_ok() {
+/// Ask the engine to stop, tearing the gateway down if `teardown`, and
+/// wait until it has.
+async fn stop_engine(
+    tx: &mpsc::UnboundedSender<Msg>,
+    done: &mut oneshot::Receiver<()>,
+    teardown: bool,
+) {
+    if tx.send(Msg::Shutdown { teardown }).is_ok() {
         let _ = done.await;
     }
 }
@@ -804,9 +824,10 @@ async fn refresh_tailnet(tx: mpsc::UnboundedSender<Msg>, mut views: Views) {
 ///
 /// When `stop` changes (or the engine is gone), it lets a look in flight
 /// finish without changing anything more, takes Parallax's own router's
-/// routes away ([`withdraw_router`]) and returns: the caller removes the
-/// firewall only after that (#75).
-async fn keep_router(mut views: Views, socket: String, mut stop: watch::Receiver<bool>) {
+/// routes away ([`crate::withdraw_router`]) and returns whether the router
+/// is known to route nothing now: only then may the caller remove the
+/// firewall (#75).
+async fn keep_router(mut views: Views, socket: String, mut stop: watch::Receiver<bool>) -> bool {
     let config = |views: &Views| views.borrow().as_ref().map(|v| Arc::clone(&v.config));
     let mut last = config(&views);
     let mut said: Option<String> = None;
@@ -904,25 +925,30 @@ async fn keep_router(mut views: Views, socket: String, mut stop: watch::Receiver
         }
     }
     let Some(config) = last else {
-        return;
+        return true;
     };
-    // No Tailscale on this machine is the usual reason it fails, when
-    // nothing needs it.
-    let quiet = !subnet_router::needed(&config) && ours.is_none();
     let withdrawn = tokio::task::spawn_blocking(move || {
         crate::withdraw_router(&config, &socket, ours.as_deref())
     })
     .await;
     match withdrawn {
-        Ok(Ok(true)) => log("subnet router: withdrew its routes"),
-        Ok(Ok(false)) => {}
-        Ok(Err(_)) if quiet => {}
-        Ok(Err(e)) => warn(format!(
-            "warning: subnet router: could not withdraw its routes: {e}"
-        )),
-        Err(e) => warn(format!(
-            "warning: subnet router: could not withdraw its routes: {e}"
-        )),
+        Ok(Ok(true)) => {
+            log("subnet router: withdrew its routes");
+            true
+        }
+        Ok(Ok(false)) => true,
+        Ok(Err(e)) => {
+            warn(format!(
+                "warning: subnet router: could not withdraw its routes: {e}"
+            ));
+            false
+        }
+        Err(e) => {
+            warn(format!(
+                "warning: subnet router: could not withdraw its routes: {e}"
+            ));
+            false
+        }
     }
 }
 
@@ -1025,16 +1051,21 @@ fn engine_thread(
         .zip(engine.dns_routes.clone())
         .ok_or_else(|| anyhow!("the first apply made no proxy or DNS routes"));
     let _ = ready.send(routes);
+    // With its channel gone, nothing said otherwise.
+    let mut teardown = true;
     while let Some(first) = rx.blocking_recv() {
         let mut batch = vec![first];
         while let Ok(msg) = rx.try_recv() {
             batch.push(msg);
         }
-        if engine.handle(batch) {
+        if let Some(down) = engine.handle(batch) {
+            teardown = down;
             break;
         }
     }
-    engine.teardown();
+    if teardown {
+        engine.teardown();
+    }
     // Let a backup being written finish: the process ends when this returns.
     drop(engine);
     let _ = writer.join();
@@ -1244,16 +1275,20 @@ impl Engine {
         }
     }
 
-    /// Handle a batch of work. Returns true to shut down.
-    fn handle(&mut self, batch: Vec<Msg>) -> bool {
+    /// Handle a batch of work. Returns `Some(teardown)` to shut down.
+    fn handle(&mut self, batch: Vec<Msg>) -> Option<bool> {
         // Shutting down: change nothing, refuse whatever else is queued.
-        if batch.iter().any(|m| matches!(m, Msg::Shutdown)) {
+        let stop = batch.iter().find_map(|m| match m {
+            Msg::Shutdown { teardown } => Some(*teardown),
+            _ => None,
+        });
+        if let Some(teardown) = stop {
             for msg in batch {
                 if let Msg::Request(_, reply) = msg {
                     let _ = reply.send(shutting_down());
                 }
             }
-            return true;
+            return Some(teardown);
         }
         // Requests answered after the apply, with their own lines first.
         let mut waiting: Vec<(oneshot::Sender<Reply>, Vec<String>)> = Vec::new();
@@ -1334,7 +1369,7 @@ impl Engine {
                         why.get_or_insert("Headscale gave a Tailscale node another address");
                     }
                 }
-                Msg::Shutdown => {}
+                Msg::Shutdown { .. } => {}
             }
         }
         if let Some(why) = why {
@@ -1359,7 +1394,7 @@ impl Engine {
         if backup_due {
             self.backup(true, None);
         }
-        false
+        None
     }
 
     /// Apply the configuration. Returns the log, and why it failed.

@@ -69,4 +69,6 @@ SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 
 [Install]
-WantedBy=multi-user.target
+# parallax.service too: enabled, it starts with Parallax, so a stop and a
+# start (PartOf= only carries stops and restarts) bring both back.
+WantedBy=multi-user.target parallax.service

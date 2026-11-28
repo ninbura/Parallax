@@ -61,8 +61,13 @@ operator's own Tailscale or Headscale objects (step 10, external mode).
   networks unfiltered (#75). A stopping daemon first takes its own router's
   routes away (`tailscale set --advertise-routes=`: tailscaled then drops
   forwarded packets at once, Headscale or not), then removes the firewall.
-  `parallax-tailscaled.service` is also `PartOf=parallax.service`. A daemon
-  that crashes leaves its firewall in place, so nothing goes unfiltered.
+  If that fails or takes too long, the daemon fails closed: it leaves the
+  firewall and `wg0` in place, as a crash does, and says so. A node key the
+  last look found as Parallax's is trusted at shutdown without asking
+  Headscale; a client is matched to its Headscale node by key and node id,
+  since an earlier login can leave two nodes with one key.
+  `parallax-tailscaled.service` is `PartOf=parallax.service` and wanted by
+  it, so it stops, restarts and starts with Parallax.
 - **Native `tailscaled` runs as root, bounded:** only `CAP_NET_ADMIN` and
   `CAP_NET_RAW`, only `/dev/net/tun`, the service's sandbox otherwise. Its
   `ExecStartPost` makes `parallax` its operator, so the unprivileged daemon

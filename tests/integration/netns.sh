@@ -1516,6 +1516,11 @@ s = json.load(sys.stdin)
 assert s["BackendState"] == "NeedsLogin" and set(s["Self"]["PublicKey"][8:]) == {"0"}' 2>/dev/null && break
         sleep 0.2
     done
+    inns gw tailscale --socket="$TS_SOCK" status --json | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+assert s["BackendState"] == "NeedsLogin" and set(s["Self"]["PublicKey"][8:]) == {"0"}, s' \
+        || fail "(y) the restarted router still has a node key (not the case under test)"
     inns gw tailscale --socket="$TS_SOCK" debug prefs | python3 -c '
 import json, sys
 p = json.load(sys.stdin)

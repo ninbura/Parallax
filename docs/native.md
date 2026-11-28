@@ -119,8 +119,9 @@ sudo parallax backup passphrase --generate
 Stopping the service (`sudo systemctl stop parallax`) removes what it set
 up: the firewall table (on iptables-nft, its `PARALLAX_*` chains and ipsets),
 its rules in Docker's `DOCKER-USER` chain, and `wg0`. Before that, its own
-subnet router stops advertising its routes, and `parallax-tailscaled` stops
-and restarts with it. `sudo systemctl reload parallax` re-applies, like SIGHUP in
+subnet router stops advertising its routes; if that fails, the firewall and
+`wg0` stay up, and the log says why. `parallax-tailscaled`, once enabled,
+starts, stops and restarts with it. `sudo systemctl reload parallax` re-applies, like SIGHUP in
 Docker. Every saved change applies anyway.
 
 ## The iptables-nft backend
