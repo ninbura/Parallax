@@ -120,24 +120,62 @@ impl State {
 
 type Shared = watch::Receiver<Arc<State>>;
 
-/// Routes on their way to the proxy, and who to tell once they're in force.
-type Handover = (ProxyRoutes, oneshot::Sender<()>);
+/// Routes on their way to the proxy, and who to tell what came of them.
+struct Handover {
+    routes: ProxyRoutes,
+    loaded: oneshot::Sender<std::result::Result<(), String>>,
+    checked: oneshot::Sender<bool>,
+}
 
 /// Hands a proxy new routes ([`Proxy::reloader`]).
 #[derive(Debug, Clone)]
 pub struct Reload(mpsc::UnboundedSender<Handover>);
 
+/// What a proxy says about routes it was handed ([`Reload::send`]). Either
+/// receiver gets an error if the proxy has stopped.
+#[derive(Debug)]
+pub struct Taking {
+    /// Once they're in force: `Ok` when they loaded, or why they didn't,
+    /// in which case the proxy refuses every connection until some do.
+    pub loaded: oneshot::Receiver<std::result::Result<(), String>>,
+    /// Once they're in force, whether every open connection has checked
+    /// them in time (`false` when some still held older routes after a few
+    /// seconds). Drop it when nobody waits: the proxy then doesn't wait
+    /// either.
+    pub checked: oneshot::Receiver<bool>,
+}
+
 impl Reload {
-    /// Have the proxy serve `routes`. The receiver gets `()` once it does,
-    /// or refuses everything because they didn't load, and every open
-    /// connection has checked them. It gets an error if the proxy has
-    /// stopped, or connections didn't all check them in time. Routes are
-    /// taken in the order sent.
-    pub fn send(&self, routes: ProxyRoutes) -> oneshot::Receiver<()> {
-        let (done, taken) = oneshot::channel();
-        // A stopped proxy drops `done`, which the receiver reports.
-        let _ = self.0.send((routes, done));
-        taken
+    /// Have the proxy serve `routes`. Routes are put in force in the order
+    /// sent, each one whatever came of the one before.
+    pub fn send(&self, routes: ProxyRoutes) -> Taking {
+        let (loaded, loaded_rx) = oneshot::channel();
+        let (checked, checked_rx) = oneshot::channel();
+        // A stopped proxy drops the senders, which the receivers report.
+        let _ = self.0.send(Handover {
+            routes,
+            loaded,
+            checked,
+        });
+        Taking {
+            loaded: loaded_rx,
+            checked: checked_rx,
+        }
+    }
+
+    /// [`Reload::send`] for routes nobody waits on open connections for:
+    /// the proxy doesn't wait either. The receiver says whether they loaded.
+    pub fn load(&self, routes: ProxyRoutes) -> oneshot::Receiver<std::result::Result<(), String>> {
+        let (loaded, loaded_rx) = oneshot::channel();
+        // Closed before it's sent, so the reloader never starts a wait
+        // that would hold up the next routes.
+        let (checked, _) = oneshot::channel();
+        let _ = self.0.send(Handover {
+            routes,
+            loaded,
+            checked,
+        });
+        loaded_rx
     }
 }
 
@@ -367,16 +405,21 @@ async fn reloader(
             handover = reloads.recv(), if open => {
                 // Nobody can send routes any more: the last ones stay, and
                 // certificates are still renewed.
-                let Some((routes, done)) = handover else {
+                let Some(Handover { routes, loaded, checked }) = handover else {
                     open = false;
                     continue;
                 };
-                replaced.push(reload(routes, &tx));
+                // Put in force even when nobody waits any more: the daemon
+                // counts on routes being taken in the order sent (#103).
+                let (old, outcome) = reload(routes, &tx);
+                replaced.push(old);
+                let _ = loaded.send(outcome);
                 // Not confirmed until then: the daemon changes the firewall
-                // next. Dropping `done` tells it so. Nobody waiting: the next
-                // confirmation waits for these too.
-                if !done.is_closed() && drained(&mut replaced).await {
-                    let _ = done.send(());
+                // next. Nobody waiting: the next confirmation waits for
+                // these too.
+                if !checked.is_closed() {
+                    let all = drained(&mut replaced).await;
+                    let _ = checked.send(all);
                 }
             }
             _ = tick.tick() => {
@@ -416,8 +459,11 @@ async fn drained(replaced: &mut Vec<Arc<State>>) -> bool {
 
 /// Serve `routes`. When they don't load, refuse everything until some do:
 /// the old routes may grant what the new configuration takes away. Returns
-/// the routes they replaced.
-fn reload(routes: ProxyRoutes, tx: &watch::Sender<Arc<State>>) -> Arc<State> {
+/// the routes they replaced, and why they didn't load.
+fn reload(
+    routes: ProxyRoutes,
+    tx: &watch::Sender<Arc<State>>,
+) -> (Arc<State>, std::result::Result<(), String>) {
     let old = Arc::clone(&tx.borrow());
     match load_state(routes) {
         Ok(state) => {
@@ -429,6 +475,7 @@ fn reload(routes: ProxyRoutes, tx: &watch::Sender<Arc<State>>) -> Arc<State> {
             }
             log(format!("routes reloaded, {} site(s)", state.sites.len()));
             tx.send_replace(Arc::new(state));
+            (old, Ok(()))
         }
         Err(e) => {
             log(format!(
@@ -439,9 +486,9 @@ fn reload(routes: ProxyRoutes, tx: &watch::Sender<Arc<State>>) -> Arc<State> {
                 sites: HashMap::new(),
                 certs_fingerprint: old.certs_fingerprint,
             }));
+            (old, Err(e.to_string()))
         }
     }
-    old
 }
 
 /// Pick up renewed certificates. A renewal caught halfway (certbot swaps the
@@ -496,11 +543,11 @@ fn refresh_certificates(tx: &watch::Sender<Arc<State>>) {
 }
 
 /// Drive `work` until it ends (its output) or `client` loses `hostname` in
-/// a reload, or, for work with `upstream`, the hostname moves elsewhere
-/// (`None`). Checked against
-/// the current routes first, and again on every change before `work` goes
-/// on. The routes last checked are held meanwhile: a reload is confirmed
-/// only once no connection holds the ones it replaced ([`drained`]).
+/// a reload, or, for work with `upstream`, the hostname moves elsewhere, or
+/// the proxy stops (`None`). Checked against the current routes first, and
+/// again on every change before `work` goes on. The routes last checked are
+/// held meanwhile: a reload is confirmed only once no connection holds the
+/// ones it replaced ([`drained`]).
 async fn while_authorized<F: Future>(
     work: F,
     mut state: Shared,
@@ -528,8 +575,10 @@ async fn while_authorized<F: Future>(
             biased;
             changed = state.changed() => {
                 if changed.is_err() {
-                    // The reloader is gone; the last state stays in force.
-                    return Some(work.await);
+                    // The proxy has stopped, and nothing could revoke what
+                    // these routes grant any more (#102).
+                    log(format!("{client}: {hostname}: the proxy stopped, closing"));
+                    return None;
                 }
             }
             done = &mut work => return Some(done),

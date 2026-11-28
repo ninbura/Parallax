@@ -118,7 +118,36 @@ async fn fake_upstream((chain, key): (String, String)) -> SocketAddrV4 {
     addr
 }
 
+/// Bytes the fake upstream has read from `/upload` bodies. Only
+/// [`an_upload_stops_at_the_revocation`] uploads.
+static UPLOADED: AtomicUsize = AtomicUsize::new(0);
+
+/// A request body fed from a channel, one frame per message.
+struct Chunks(tokio::sync::mpsc::Receiver<Bytes>);
+
+impl hyper::body::Body for Chunks {
+    type Data = Bytes;
+    type Error = Infallible;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        self.0
+            .poll_recv(cx)
+            .map(|b| b.map(|b| Ok(hyper::body::Frame::data(b))))
+    }
+}
+
 async fn upstream_service(mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.uri().path() == "/upload" {
+        let mut body = req.into_body();
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Some(data) = frame.data_ref() {
+                UPLOADED.fetch_add(data.len(), Ordering::SeqCst);
+            }
+        }
+        return Ok(Response::new(Full::default()));
+    }
     if req.headers().contains_key(UPGRADE) {
         let on = hyper::upgrade::on(&mut req);
         tokio::spawn(async move {
@@ -157,10 +186,12 @@ struct Env {
     roots: RootCertStore,
     routes: ProxyRoutes,
     reload: Reload,
+    task: tokio::task::JoinHandle<parallax_proxy::Result<()>>,
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
+        self.task.abort();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -205,7 +236,7 @@ impl Env {
         let reload = proxy.reloader();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(proxy.run(listener));
+        let task = tokio::spawn(proxy.run(listener));
         let mut roots = RootCertStore::empty();
         roots.add(ca.0.der().clone()).unwrap();
         Env {
@@ -215,19 +246,23 @@ impl Env {
             roots,
             routes,
             reload,
+            task,
         }
     }
 
-    /// Hand the proxy `routes` and wait until it serves them.
-    async fn reload_with(&self, routes: ProxyRoutes) {
-        self.reload.send(routes).await.unwrap();
+    /// Hand the proxy `routes` and wait until every connection has checked
+    /// them. Returns whether they loaded.
+    async fn reload_with(&self, routes: ProxyRoutes) -> Result<(), String> {
+        let taking = self.reload.send(routes);
+        assert!(taking.checked.await.unwrap(), "connections didn't move on");
+        taking.loaded.await.unwrap()
     }
 
     /// Reload with IMMICH granted to another tier only.
     async fn revoke_immich(&self) {
         let mut routes = self.routes.clone();
         routes.sites[0].allowed = vec!["10.0.0.0/8".parse().unwrap()];
-        self.reload_with(routes).await;
+        self.reload_with(routes).await.unwrap();
     }
 
     async fn connect(&self, sni: &str, alpn: &[u8]) -> std::io::Result<TlsStream<TcpStream>> {
@@ -444,6 +479,49 @@ async fn revoking_a_grant_closes_open_connections() {
     assert!(env.connect(IMMICH, b"http/1.1").await.is_err());
 }
 
+/// An upload in progress when the grant is revoked reaches the upstream no
+/// further once the proxy has confirmed the revocation (lane C, #104).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_stops_at_the_revocation() {
+    let env = Env::start().await;
+    let tls = env.connect(IMMICH, b"h2").await.unwrap();
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("https://{IMMICH}/upload"))
+        .body(Chunks(rx))
+        .unwrap();
+    let resp = tokio::spawn(async move { h2.send_request(req).await.map(|r| r.status()) });
+    tx.send(Bytes::from(vec![b'a'; 1000])).await.unwrap();
+    for _ in 0..50 {
+        if UPLOADED.load(Ordering::SeqCst) >= 1000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        UPLOADED.load(Ordering::SeqCst),
+        1000,
+        "the first chunk never arrived"
+    );
+
+    env.revoke_immich().await;
+    let _ = tx.send(Bytes::from(vec![b'b'; 1000])).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        UPLOADED.load(Ordering::SeqCst),
+        1000,
+        "bytes sent after the revocation reached the upstream"
+    );
+    drop(tx);
+    let _ = resp.await;
+}
+
 /// A hostname moved to another upstream closes the WebSocket relayed to the
 /// old one.
 #[tokio::test(flavor = "multi_thread")]
@@ -453,7 +531,7 @@ async fn moving_a_hostname_closes_relays_to_the_old_upstream() {
     let mut moved = env.routes.clone();
     // Nothing listens there; only the move matters.
     moved.sites[0].upstream = "127.0.0.1:9".parse().unwrap();
-    env.reload_with(moved).await;
+    env.reload_with(moved).await.unwrap();
     let mut buf = [0u8; 4];
     let _ = ws.write_all(b"ping").await;
     assert!(
@@ -469,10 +547,76 @@ async fn a_failed_reload_refuses_everything() {
     // The CA bundle is gone.
     let mut broken = env.routes.clone();
     broken.upstream_ca = env.dir.join("missing.pem");
-    env.reload_with(broken).await;
+    // The daemon is told, so it can count the apply as failed (#103).
+    let why = env.reload_with(broken).await.unwrap_err();
+    assert!(why.contains("missing.pem"), "{why}");
     assert!(env.connect(IMMICH, b"http/1.1").await.is_err());
-    env.reload_with(env.routes.clone()).await;
+    env.reload_with(env.routes.clone()).await.unwrap();
     assert!(env.connect(IMMICH, b"http/1.1").await.is_ok());
+}
+
+/// #103: routes nobody waits for any more still go in, so the daemon knows
+/// what the proxy serves next.
+#[tokio::test(flavor = "multi_thread")]
+async fn routes_go_in_even_when_nobody_waits() {
+    let env = Env::start().await;
+    let mut revoked = env.routes.clone();
+    revoked.sites[0].allowed = vec!["10.0.0.0/8".parse().unwrap()];
+    drop(env.reload.send(revoked));
+    let mut refused = false;
+    for _ in 0..100 {
+        if env.connect(IMMICH, b"http/1.1").await.is_err() {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(refused, "the routes nobody waited for never went in");
+}
+
+/// #102: once the proxy has stopped, nothing could revoke what its last
+/// routes grant, so open connections close too.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_connections_close_when_the_proxy_stops() {
+    let mut env = Env::start().await;
+    let tls = env.connect(IMMICH, b"h2").await.unwrap();
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let req = || {
+        Request::builder()
+            .uri(format!("https://{IMMICH}/"))
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    assert_eq!(
+        h2.send_request(req()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let mut ws = websocket(&env).await;
+
+    env.task.abort();
+    let _ = (&mut env.task).await;
+    let mut buf = [0u8; 4];
+    let _ = ws.write_all(b"ping").await;
+    // Closed, not just quiet: an end or an error before the timeout.
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), ws.read(&mut buf)).await,
+            Ok(Ok(0) | Err(_))
+        ),
+        "the WebSocket must be closed"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), h2.send_request(req()))
+            .await
+            .is_ok_and(|r| r.is_err()),
+        "the HTTP/2 connection must be closed"
+    );
+    // A later reload is answered as stopped.
+    assert!(env.reload.send(env.routes.clone()).loaded.await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
