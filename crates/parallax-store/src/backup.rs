@@ -220,6 +220,7 @@ impl Store {
                 self.path.display()
             )));
         }
+        self.tighten()?;
         self.begin().await.map_err(|e| self.busy(e))?;
         let result = async {
             let found = match self.load_inner().await {
@@ -272,8 +273,9 @@ impl Store {
             Ok(())
         }
         .await;
-        self.finish(result).await.map_err(|e| self.busy(e))?;
-        self.tighten()
+        let finished = self.finish(result).await;
+        self.tighten_after_commit();
+        finished.map_err(|e| self.busy(e))
     }
 
     /// Every table holding data, each after the tables it points at.

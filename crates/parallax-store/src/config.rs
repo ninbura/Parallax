@@ -45,10 +45,13 @@ impl Store {
     ///
     /// Takes `&mut self`: one transaction at a time on this connection.
     pub async fn save(&mut self, config: &Config) -> Result<()> {
+        // Before anything changes: afterwards it's saved, whatever happens.
+        self.tighten()?;
         self.begin().await.map_err(|e| self.busy(e))?;
         let result = self.save_inner(config).await;
-        self.finish(result).await.map_err(|e| self.busy(e))?;
-        self.tighten()
+        let finished = self.finish(result).await;
+        self.tighten_after_commit();
+        finished.map_err(|e| self.busy(e))
     }
 
     /// Read, change and write the configuration in one write transaction, so
@@ -61,6 +64,7 @@ impl Store {
     where
         E: From<Error>,
     {
+        self.tighten()?;
         self.begin().await.map_err(|e| self.busy(e))?;
         let mut config = match self.load_inner().await {
             Ok(config) => config,
@@ -77,14 +81,16 @@ impl Store {
             }
         };
         let saved = self.save_inner(&config).await;
-        self.finish(saved).await.map_err(|e| self.busy(e))?;
-        self.tighten()?;
+        let finished = self.finish(saved).await;
+        self.tighten_after_commit();
+        finished.map_err(|e| self.busy(e))?;
         Ok(out)
     }
 
     /// Save `config` only if the database holds no configuration yet, checked
     /// inside the same transaction. Returns whether it saved.
     pub async fn save_if_empty(&mut self, config: &Config) -> Result<bool> {
+        self.tighten()?;
         self.begin().await.map_err(|e| self.busy(e))?;
         let result = async {
             if self.load_server().await?.is_some() {
@@ -94,9 +100,9 @@ impl Store {
             Ok(true)
         }
         .await;
-        let saved = self.finish(result).await.map_err(|e| self.busy(e))?;
-        self.tighten()?;
-        Ok(saved)
+        let finished = self.finish(result).await;
+        self.tighten_after_commit();
+        finished.map_err(|e| self.busy(e))
     }
 
     async fn save_inner(&self, config: &Config) -> Result<()> {

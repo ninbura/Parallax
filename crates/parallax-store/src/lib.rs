@@ -117,35 +117,73 @@ impl Store {
             db,
             conn,
         };
-        if mvcc {
-            // Refuse a database too new for this build before changing it.
-            store
-                .check_version(migrations.len() as i64)
-                .await
-                .map_err(|e| store.busy(e))?;
-            store.use_mvcc().await.map_err(|e| store.busy(e))?;
-        }
-        store.migrate().await.map_err(|e| store.busy(e))?;
+        // Before a migration or the switch to MVCC writes to it (#99).
         store.tighten()?;
+        let changed = async {
+            if mvcc {
+                // Refuse a database too new for this build before changing it.
+                store.check_version(migrations.len() as i64).await?;
+                store.use_mvcc().await?;
+            }
+            store.migrate().await
+        }
+        .await;
+        // Also after a failed migration: it may have written sidecars.
+        store.tighten_after_commit();
+        changed.map_err(|e| store.busy(e))?;
         Ok(store)
     }
 
     /// The database, its log and its coordination file hold private keys:
     /// make whichever exist owner-only. By path, never by opening them:
     /// closing any descriptor of a file drops this process's locks on it.
-    /// The CLI's owner-only umask covers files Turso creates later.
+    /// The CLI's owner-only umask covers files Turso creates later. Turso
+    /// names its log after the database's real path, so a database opened
+    /// through a symlink has its files secured at both.
     fn tighten(&self) -> Result<()> {
         #[cfg(unix)]
-        for file in sidecars(&self.path) {
+        {
             use std::os::unix::fs::PermissionsExt;
-            let file = file.as_path();
-            match std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(Error::io(format!("securing {}", file.display()), e)),
+            let mut files = sidecars(&self.path).to_vec();
+            if let Ok(real) = std::fs::canonicalize(&self.path) {
+                for file in sidecars(&real) {
+                    if !files.contains(&file) {
+                        files.push(file);
+                    }
+                }
+            }
+            // Every file is tried, even after one fails: the log comes last.
+            let mut first: Option<Error> = None;
+            for file in &files {
+                let secured = match std::fs::metadata(file) {
+                    // Already private: nothing to change, so no need to be its owner.
+                    Ok(m) if m.permissions().mode() & 0o777 == 0o600 => Ok(()),
+                    Ok(_) => std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)),
+                    Err(e) => Err(e),
+                };
+                match secured {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        first.get_or_insert(Error::io(format!("securing {}", file.display()), e));
+                    }
+                }
+            }
+            if let Some(e) = first {
+                return Err(e);
             }
         }
         Ok(())
+    }
+
+    /// After a write, committed or rolled back: secure the files Turso may
+    /// have just created (its log appears with the first write, and holds
+    /// what a rolled-back write put there too). A commit has happened by
+    /// then, so a failure here mustn't turn it into a refusal (#99). The same files
+    /// were made owner-only before the write began, and the CLI's umask
+    /// covers new ones; this is for library use without it.
+    fn tighten_after_commit(&self) {
+        let _ = self.tighten();
     }
 
     /// Name the database when another process held it too long.

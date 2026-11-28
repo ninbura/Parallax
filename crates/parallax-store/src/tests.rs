@@ -315,6 +315,32 @@ async fn the_database_and_its_log_are_owner_only() {
     assert_eq!(mode & 0o777, 0o600, "state.db-log");
 }
 
+/// Turso names the log after the database's real path: one created and used
+/// through a symlink still has its real log made owner-only.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_database_used_through_a_symlink_has_its_real_log_secured() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new();
+    let real = dir.0.join("real.db");
+    let alias = dir.0.join("alias.db");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let mut store = Store::create(&alias).await.unwrap();
+    store.save(&everything_config()).await.unwrap();
+    let log = dir.0.join("real.db-log");
+    assert!(
+        log.exists(),
+        "Turso's log is no longer named after the real path"
+    );
+    for file in ["real.db", "real.db-log"] {
+        let mode = std::fs::metadata(dir.0.join(file))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{file}");
+    }
+}
+
 #[tokio::test]
 async fn a_newer_schema_is_refused() {
     let dir = TempDir::new();
